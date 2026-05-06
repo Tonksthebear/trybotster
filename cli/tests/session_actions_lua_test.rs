@@ -20,6 +20,7 @@ fn lua_src_dir() -> PathBuf {
 fn new_lua() -> Lua {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
+    botster::lua::primitives::hook_timeout::register(&lua).expect("register hook timeout");
 
     let dir = lua_src_dir();
     let setup = format!(
@@ -274,6 +275,42 @@ fn run_preserves_plugin_returned_errors() {
 
     assert_eq!(result["ok"], JsonValue::Null);
     assert_eq!(result["err"], json!("plugin refused"));
+}
+
+#[test]
+fn run_times_out_plugin_owned_handler() {
+    let lua = new_lua();
+    install_session_stub(&lua);
+
+    let result: JsonValue = lua
+        .load(
+            r#"
+            local actions = require("lib.session_actions")
+            actions._reset_for_tests()
+            _G._loading_plugin_key = "slow-plugin"
+            actions.register("example.slow", {
+              label = "Slow",
+              timeout_ms = 5,
+              run = function()
+                while true do end
+              end,
+            })
+            _G._loading_plugin_key = nil
+            local ok, err = actions.run("sess-a", "example.slow", { params = {} })
+            return { ok = ok, err = err }
+            "#,
+        )
+        .eval::<Value>()
+        .map(|value| lua.from_value(value).unwrap())
+        .expect("run action");
+
+    assert_eq!(result["ok"], JsonValue::Null);
+    assert!(
+        result["err"]
+            .as_str()
+            .is_some_and(|err| err.contains("timeout")),
+        "expected timeout error, got {result:?}"
+    );
 }
 
 #[test]

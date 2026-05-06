@@ -79,7 +79,7 @@ describe('<SessionList> fidelity row', () => {
       session_uuid: 'uuid-active',
       session_type: 'agent',
       label: 'api-work',
-      is_idle: false,
+      output_activity: 'active',
     })
     const ctx = fakeCtx()
     render(<SessionList density="panel" grouping="flat" ctx={ctx} />)
@@ -93,7 +93,7 @@ describe('<SessionList> fidelity row', () => {
       id: 'sess-idle',
       session_uuid: 'uuid-idle',
       session_type: 'agent',
-      is_idle: true,
+      output_activity: 'idle',
     })
     render(<SessionList density="panel" grouping="flat" ctx={ctx} />)
     expect(screen.getByTestId('session-row-primary').closest('[data-row-state]'))
@@ -106,7 +106,7 @@ describe('<SessionList> fidelity row', () => {
       id: 'sess-notif',
       session_uuid: 'uuid-notif',
       session_type: 'agent',
-      is_idle: false,
+      output_activity: 'active',
       notification: true,
     })
     render(<SessionList density="panel" grouping="flat" ctx={ctx} />)

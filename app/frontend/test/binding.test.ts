@@ -27,13 +27,13 @@ describe('resolveBindings', () => {
         {
           session_uuid: 'sess-a',
           title: 'alpha',
-          is_idle: false,
+          output_activity: 'active',
           plugin_state: { example_provider: { status: 'running', url: 'https://x' } },
         },
         {
           session_uuid: 'sess-b',
           title: 'beta',
-          is_idle: true,
+          output_activity: 'idle',
         },
       ],
       snapshot_seq: 1,
@@ -57,7 +57,7 @@ describe('resolveBindings', () => {
 
   it('resolves a whole-record path', () => {
     const out = resolveBindings({ $bind: '/session/sess-a' })
-    expect(out).toMatchObject({ title: 'alpha', is_idle: false })
+    expect(out).toMatchObject({ title: 'alpha', output_activity: 'active' })
   })
 
   it('resolves a list path to an array of records sorted by store order', () => {

@@ -29,6 +29,7 @@
 //! `timer.after` and `timer.every` return a timer ID string.
 //! `timer.cancel` returns `true` if the timer was found, `false` otherwise.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -41,6 +42,10 @@ use crate::hub::events::HubEvent;
 struct TimerEntry {
     /// Lua registry key for the callback function.
     callback_key: LuaRegistryKey,
+    /// Stable handler id used when this is a plugin-owned timer callback.
+    handler_id: Option<String>,
+    /// Plugin that owns the callback. Scheduling remains hub-owned.
+    owner_plugin: Option<String>,
     /// When this timer should next fire (used by test-mode polling).
     fire_at: Instant,
     /// If `Some`, the timer repeats with this interval.
@@ -63,6 +68,9 @@ pub struct TimerEntries {
     entries: Vec<(String, TimerEntry)>,
     /// Counter for generating unique timer IDs.
     next_id: u64,
+    /// Per-plugin stable handler id counters. Kept separate from `next_id`
+    /// so hub and worker VMs derive the same handler ids while loading a plugin.
+    plugin_handler_counters: HashMap<String, u64>,
     /// Event channel for instant timer delivery (production mode).
     ///
     /// When `Some`, `timer.after()` and `timer.every()` spawn tokio tasks
@@ -82,11 +90,68 @@ fn timer_perf_enabled() -> bool {
     })
 }
 
+fn current_plugin_key(lua: &Lua) -> Option<String> {
+    let globals = lua.globals();
+    globals
+        .get::<Option<String>>("_loading_plugin_key")
+        .ok()
+        .flatten()
+        .or_else(|| {
+            globals
+                .get::<Option<String>>("_loading_plugin_name")
+                .ok()
+                .flatten()
+        })
+        .filter(|key| !key.is_empty())
+}
+
+fn next_plugin_handler_id(entries: &mut TimerEntries, owner: &str) -> String {
+    let next = entries
+        .plugin_handler_counters
+        .entry(owner.to_string())
+        .or_insert(0);
+    let handler_id = format!("{owner}:timer_{next}");
+    *next += 1;
+    handler_id
+}
+
+fn explicit_plugin_handler_id(owner: Option<&str>, timer_id: &str) -> Option<String> {
+    owner.map(|owner| format!("{owner}:{timer_id}"))
+}
+
+enum FiredTimer {
+    Local(LuaRegistryKey),
+    Plugin {
+        owner_plugin: String,
+        handler_id: String,
+    },
+}
+
+fn invoke_plugin_timer(lua: &Lua, owner_plugin: &str, handler_id: &str) -> LuaResult<()> {
+    let invoke: LuaFunction = lua.globals().get("__plugin_worker_invoke")?;
+    invoke.call::<LuaValue>((
+        owner_plugin.to_string(),
+        "timer".to_string(),
+        handler_id.to_string(),
+        LuaValue::Nil,
+        lua.create_table()?,
+        5000_u64,
+    ))?;
+    Ok(())
+}
+
+fn fire_local_timer(lua: &Lua, key: &LuaRegistryKey) -> LuaResult<()> {
+    let callback: LuaFunction = lua.registry_value(key)?;
+    callback.call::<()>(())?;
+    Ok(())
+}
+
 impl Default for TimerEntries {
     fn default() -> Self {
         Self {
             entries: Vec::new(),
             next_id: 0,
+            plugin_handler_counters: HashMap::new(),
             hub_event_tx: None,
             tokio_handle: None,
         }
@@ -170,6 +235,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
     let reg = Arc::clone(&registry);
     let after_fn = lua
         .create_function(move |lua, (seconds, callback): (f64, LuaFunction)| {
+            let owner_plugin = current_plugin_key(lua);
             let callback_key = lua.create_registry_value(callback).map_err(|e| {
                 LuaError::external(format!("timer.after: failed to store callback: {e}"))
             })?;
@@ -177,6 +243,9 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
             let mut entries = reg.lock().expect("TimerEntries mutex poisoned");
             let id = format!("timer_{}", entries.next_id);
             entries.next_id += 1;
+            let handler_id = owner_plugin
+                .as_deref()
+                .map(|owner| next_plugin_handler_id(&mut entries, owner));
 
             let duration = Duration::from_secs_f64(seconds);
 
@@ -197,6 +266,8 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                 id.clone(),
                 TimerEntry {
                     callback_key,
+                    handler_id,
+                    owner_plugin,
                     fire_at: Instant::now() + duration,
                     repeat_interval: None,
                     cancelled: false,
@@ -219,6 +290,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
     let reg2 = Arc::clone(&registry);
     let every_fn = lua
         .create_function(move |lua, (seconds, callback): (f64, LuaFunction)| {
+            let owner_plugin = current_plugin_key(lua);
             let callback_key = lua.create_registry_value(callback).map_err(|e| {
                 LuaError::external(format!("timer.every: failed to store callback: {e}"))
             })?;
@@ -227,6 +299,9 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
             let mut entries = reg2.lock().expect("TimerEntries mutex poisoned");
             let id = format!("timer_{}", entries.next_id);
             entries.next_id += 1;
+            let handler_id = owner_plugin
+                .as_deref()
+                .map(|owner| next_plugin_handler_id(&mut entries, owner));
 
             // Spawn looping tokio task for instant delivery if event channel
             // is available. The task runs until cancelled via `handle.abort()`.
@@ -255,6 +330,8 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                 id.clone(),
                 TimerEntry {
                     callback_key,
+                    handler_id,
+                    owner_plugin,
                     fire_at: Instant::now() + interval,
                     repeat_interval: Some(interval),
                     cancelled: false,
@@ -283,6 +360,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
     let after_idle_fn = lua
         .create_function(
             move |lua, (id, seconds, callback): (String, f64, LuaFunction)| {
+                let owner_plugin = current_plugin_key(lua);
                 let callback_key = lua.create_registry_value(callback).map_err(|e| {
                     LuaError::external(format!("timer.after_idle: failed to store callback: {e}"))
                 })?;
@@ -305,12 +383,16 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                     _ => None,
                 };
 
+                let handler_id = explicit_plugin_handler_id(owner_plugin.as_deref(), &id);
+
                 if let Some((_, entry)) = entries.entries.iter_mut().find(|(eid, _)| *eid == id) {
                     if let Some(handle) = entry.task_handle.take() {
                         handle.abort();
                     }
                     let old_key = std::mem::replace(&mut entry.callback_key, callback_key);
                     let _ = lua.remove_registry_value(old_key);
+                    entry.handler_id = handler_id;
+                    entry.owner_plugin = owner_plugin;
                     entry.fire_at = Instant::now() + duration;
                     entry.repeat_interval = None;
                     entry.cancelled = false;
@@ -320,6 +402,8 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                         id.clone(),
                         TimerEntry {
                             callback_key,
+                            handler_id,
+                            owner_plugin,
                             fire_at: Instant::now() + duration,
                             repeat_interval: None,
                             cancelled: false,
@@ -342,6 +426,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
     // Marks a timer as cancelled and aborts its spawned task (if any).
     // Returns true if the timer was found.
     let reg3 = registry;
+    let reg4 = Arc::clone(&reg3);
     let cancel_fn = lua
         .create_function(move |_, timer_id: String| {
             let mut entries = reg3.lock().expect("TimerEntries mutex poisoned");
@@ -364,6 +449,34 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
     timer_table
         .set("cancel", cancel_fn)
         .map_err(|e| anyhow!("Failed to set timer.cancel: {e}"))?;
+
+    let invoke_fn = lua
+        .create_function(move |lua, handler_id: String| {
+            let callback_key = {
+                let entries = reg4.lock().expect("TimerEntries mutex poisoned");
+                let Some((_, entry)) = entries.entries.iter().find(|(_, entry)| {
+                    entry.handler_id.as_deref() == Some(handler_id.as_str()) && !entry.cancelled
+                }) else {
+                    return Err(LuaError::external(format!(
+                        "timer handler not registered: {handler_id}"
+                    )));
+                };
+                let callback: LuaFunction = lua.registry_value(&entry.callback_key)?;
+                lua.create_registry_value(callback)?
+            };
+
+            let result = (|| {
+                let callback: LuaFunction = lua.registry_value(&callback_key)?;
+                callback.call::<LuaValue>(())
+            })();
+            let _ = lua.remove_registry_value(callback_key);
+            result
+        })
+        .map_err(|e| anyhow!("Failed to create timer._invoke_registered function: {e}"))?;
+
+    timer_table
+        .set("_invoke_registered", invoke_fn)
+        .map_err(|e| anyhow!("Failed to set timer._invoke_registered: {e}"))?;
 
     lua.globals()
         .set("timer", timer_table)
@@ -394,7 +507,7 @@ pub fn poll_timers(lua: &Lua, registry: &TimerRegistry) -> usize {
     let now = Instant::now();
 
     // Phase 1: collect fired timers and clean up under the lock.
-    let fired_keys: Vec<LuaRegistryKey> = {
+    let fired_timers: Vec<FiredTimer> = {
         let mut entries = registry.lock().expect("TimerEntries mutex poisoned");
 
         // Collect callback keys for timers that should fire
@@ -406,10 +519,19 @@ pub fn poll_timers(lua: &Lua, registry: &TimerRegistry) -> usize {
             }
 
             if now >= entry.fire_at {
-                // Clone the callback key for firing outside the lock
-                if let Ok(callback) = lua.registry_value::<LuaFunction>(&entry.callback_key) {
-                    if let Ok(key) = lua.create_registry_value(callback) {
-                        fired.push(key);
+                if let (Some(owner_plugin), Some(handler_id)) =
+                    (&entry.owner_plugin, &entry.handler_id)
+                {
+                    fired.push(FiredTimer::Plugin {
+                        owner_plugin: owner_plugin.clone(),
+                        handler_id: handler_id.clone(),
+                    });
+                } else {
+                    // Clone the callback key for firing outside the lock
+                    if let Ok(callback) = lua.registry_value::<LuaFunction>(&entry.callback_key) {
+                        if let Ok(key) = lua.create_registry_value(callback) {
+                            fired.push(FiredTimer::Local(key));
+                        }
                     }
                 }
 
@@ -440,14 +562,21 @@ pub fn poll_timers(lua: &Lua, registry: &TimerRegistry) -> usize {
     // Lock released here — callbacks can safely call timer functions.
 
     // Phase 2: fire callbacks without holding the lock.
-    let count = fired_keys.len();
+    let count = fired_timers.len();
 
-    for key in &fired_keys {
-        let result: LuaResult<()> = (|| {
-            let callback: LuaFunction = lua.registry_value(key)?;
-            callback.call::<()>(())?;
-            Ok(())
-        })();
+    let mut local_keys = Vec::new();
+    for fired in fired_timers {
+        let result = match fired {
+            FiredTimer::Local(key) => {
+                let result = fire_local_timer(lua, &key);
+                local_keys.push(key);
+                result
+            }
+            FiredTimer::Plugin {
+                owner_plugin,
+                handler_id,
+            } => invoke_plugin_timer(lua, &owner_plugin, &handler_id),
+        };
 
         if let Err(e) = result {
             log::warn!("[timer] Callback error: {e}");
@@ -455,7 +584,7 @@ pub fn poll_timers(lua: &Lua, registry: &TimerRegistry) -> usize {
     }
 
     // Phase 3: clean up temporary registry keys.
-    for key in fired_keys {
+    for key in local_keys {
         let _ = lua.remove_registry_value(key);
     }
 
@@ -481,7 +610,7 @@ pub(crate) fn fire_single_timer(lua: &Lua, registry: &TimerRegistry, timer_id: &
     let total_started = Instant::now();
 
     // Phase 1: look up entry under lock, clone callback, handle one-shot.
-    let callback_key = {
+    let fired_timer = {
         let mut entries = registry.lock().expect("TimerEntries mutex poisoned");
 
         let entry_pos = entries
@@ -496,20 +625,30 @@ pub(crate) fn fire_single_timer(lua: &Lua, registry: &TimerRegistry, timer_id: &
 
         let entry = &mut entries.entries[pos].1;
 
-        // Clone the callback for firing outside the lock.
-        let callback = match lua.registry_value::<LuaFunction>(&entry.callback_key) {
-            Ok(cb) => cb,
-            Err(e) => {
-                log::warn!("[timer] Failed to retrieve callback for {timer_id}: {e}");
-                return;
+        let fired = if let (Some(owner_plugin), Some(handler_id)) =
+            (&entry.owner_plugin, &entry.handler_id)
+        {
+            FiredTimer::Plugin {
+                owner_plugin: owner_plugin.clone(),
+                handler_id: handler_id.clone(),
             }
-        };
-        let cloned_key = match lua.create_registry_value(callback) {
-            Ok(k) => k,
-            Err(e) => {
-                log::warn!("[timer] Failed to clone callback for {timer_id}: {e}");
-                return;
-            }
+        } else {
+            // Clone the callback for firing outside the lock.
+            let callback = match lua.registry_value::<LuaFunction>(&entry.callback_key) {
+                Ok(cb) => cb,
+                Err(e) => {
+                    log::warn!("[timer] Failed to retrieve callback for {timer_id}: {e}");
+                    return;
+                }
+            };
+            let cloned_key = match lua.create_registry_value(callback) {
+                Ok(k) => k,
+                Err(e) => {
+                    log::warn!("[timer] Failed to clone callback for {timer_id}: {e}");
+                    return;
+                }
+            };
+            FiredTimer::Local(cloned_key)
         };
 
         if entry.repeat_interval.is_none() {
@@ -518,17 +657,19 @@ pub(crate) fn fire_single_timer(lua: &Lua, registry: &TimerRegistry, timer_id: &
         }
         // Repeating timers keep the entry alive; the looping task sends again.
 
-        cloned_key
+        fired
     };
     let lookup_done = Instant::now();
     // Lock released — callback can safely call timer functions.
 
     // Phase 2: fire callback.
-    let result: LuaResult<()> = (|| {
-        let callback: LuaFunction = lua.registry_value(&callback_key)?;
-        callback.call::<()>(())?;
-        Ok(())
-    })();
+    let result = match &fired_timer {
+        FiredTimer::Local(key) => fire_local_timer(lua, key),
+        FiredTimer::Plugin {
+            owner_plugin,
+            handler_id,
+        } => invoke_plugin_timer(lua, owner_plugin, handler_id),
+    };
     let callback_done = Instant::now();
 
     if let Err(e) = result {
@@ -536,7 +677,9 @@ pub(crate) fn fire_single_timer(lua: &Lua, registry: &TimerRegistry, timer_id: &
     }
 
     // Phase 3: clean up temporary registry key.
-    let _ = lua.remove_registry_value(callback_key);
+    if let FiredTimer::Local(key) = fired_timer {
+        let _ = lua.remove_registry_value(key);
+    }
 
     // Phase 4: remove cancelled entries and clean up their registry keys.
     {

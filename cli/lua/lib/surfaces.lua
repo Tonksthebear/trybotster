@@ -74,6 +74,18 @@ local registry = state.get("surfaces.registry", { by_name = {}, seq = 0 })
 if registry.by_name == nil then registry.by_name = {} end
 if registry.seq == nil then registry.seq = 0 end
 
+local function current_plugin_key()
+    local key = rawget(_G, "_loading_plugin_key") or rawget(_G, "_loading_plugin_name")
+    if type(key) == "string" and key ~= "" then return key end
+    return nil
+end
+
+local function running_in_plugin_worker(plugin_key)
+    return type(plugin_key) == "string"
+        and plugin_key ~= ""
+        and rawget(_G, "_plugin_worker_key") == plugin_key
+end
+
 -- -------------------------------------------------------------------------
 -- Internal helpers
 -- -------------------------------------------------------------------------
@@ -517,6 +529,8 @@ function M.register(name, opts)
         hide_from_nav = opts.hide_from_nav == true,
         order = type(opts.order) == "number" and opts.order or nil,
         source = is_nonempty_string(opts.source) and opts.source or nil,
+        owner_plugin = opts.owner_plugin or current_plugin_key(),
+        timeout_ms = opts.timeout_ms or 5000,
         seq = seq,
     }
     -- A small number of legacy surfaces (workspace_sidebar) register WITHOUT
@@ -565,6 +579,22 @@ function M.unregister(name)
     end
     notify_changed()
     return true
+end
+
+function M.unregister_by_plugin(plugin_key)
+    if type(plugin_key) ~= "string" or plugin_key == "" then return 0 end
+    local removed = 0
+    local names = {}
+    for name, entry in pairs(registry.by_name) do
+        if entry.owner_plugin == plugin_key then
+            names[#names + 1] = name
+        end
+    end
+    table.sort(names)
+    for _, name in ipairs(names) do
+        if M.unregister(name) then removed = removed + 1 end
+    end
+    return removed
 end
 
 --- Look up a registered surface.
@@ -634,6 +664,7 @@ function M.list()
             order = entry.order,
             seq = entry.seq,
             source = entry.source,
+            owner_plugin = entry.owner_plugin,
         }
     end
     table.sort(out, function(a, b)
@@ -709,7 +740,28 @@ end
 function M.render_node(name, render_state)
     local entry = M.get(name)
     if not entry then return nil end
+    if entry.owner_plugin and not running_in_plugin_worker(entry.owner_plugin) then
+        local ok, result = require("lib.plugin_supervisor").invoke(
+            entry.owner_plugin,
+            "surface_route:" .. tostring(name),
+            entry.render,
+            {
+                timeout_ms = entry.timeout_ms or 5000,
+                handler_kind = "surface_route",
+                handler_id = name,
+                payload = { render_state = render_state or {} },
+            },
+            render_state)
+        if not ok then error(result) end
+        return result
+    end
     return entry.render(render_state)
+end
+
+function M._invoke_render(name, render_state)
+    local entry = M.get(name)
+    if not entry then error("surface not registered: " .. tostring(name)) end
+    return entry.render(render_state or {})
 end
 
 --- Build per-subscription input state for `surface_name`. Uses the

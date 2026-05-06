@@ -3,9 +3,9 @@ use super::test_support::*;
 #[test]
 pub(super) fn test_browser_attach_delegates_to_terminal_stream_runtime() {
     let source = include_str!("terminal_attach.rs");
-    let body = function_body(source, "try_attach_terminal_forwarder");
+    let body = function_body(source, "try_attach_browser_terminal_subscription");
     assert!(
-        body.contains("spawn_terminal_client_forwarder_runtime"),
+        body.contains("start_terminal_client_subscription"),
         "browser attach must use the shared ClientWorker/SessionIoWorker terminal runtime"
     );
     for forbidden in ["snapshot_and_subscribe", "PtyEvent", "TerminalBytes"] {
@@ -20,10 +20,10 @@ pub(super) fn test_browser_attach_delegates_to_terminal_stream_runtime() {
 pub(super) fn test_tui_and_socket_attach_handlers_delegate_to_terminal_stream_runtime() {
     let source = include_str!("terminal_clients.rs");
     for function in [
-        "create_lua_tui_pty_forwarder",
-        "try_attach_tui_terminal_forwarder",
-        "create_lua_socket_pty_forwarder",
-        "try_attach_socket_terminal_forwarder",
+        "create_tui_terminal_subscription",
+        "try_attach_tui_terminal_subscription",
+        "create_socket_terminal_subscription",
+        "try_attach_socket_terminal_subscription",
     ] {
         let body = function_body(source, function);
         assert!(
@@ -33,6 +33,13 @@ pub(super) fn test_tui_and_socket_attach_handlers_delegate_to_terminal_stream_ru
         assert!(
             !body.contains("PtyEvent"),
             "{function} must not own a transport-specific PTY event loop"
+        );
+        assert!(
+            body.contains("start_terminal_client_subscription")
+                || (function.starts_with("create_")
+                    && body.contains("try_attach_")
+                    && body.contains("terminal_subscription")),
+            "{function} must use the shared terminal subscription runtime"
         );
     }
 }
@@ -56,46 +63,31 @@ pub(super) fn test_browser_snapshot_refresh_uses_session_io_mailbox() {
 #[test]
 pub(super) fn test_terminal_stream_session_snapshots_use_session_io_mailbox() {
     let source = include_str!("terminal_stream.rs");
-    let body = function_body(source, "spawn_terminal_client_forwarder_runtime");
+    let body = function_body(source, "start_session_io_terminal_subscription");
     assert!(
-        body.contains("SessionIoRequest::GetSnapshot"),
-        "session-backed TUI/socket snapshots must be requested through SessionIoWorker"
+        body.contains("SessionIoRequest::GetInitialSnapshot"),
+        "session-backed terminal initial snapshots must be delivered through SessionIoWorker"
     );
-    for forbidden in ["resize_direct", ".get_snapshot()"] {
+    for forbidden in [
+        "resize_direct",
+        ".get_snapshot()",
+        "insert_pending_session_io_snapshot",
+        "PendingSessionIoSnapshotTarget",
+    ] {
         assert!(
             !body.contains(forbidden),
-            "shared TUI/socket runtime must not use direct session snapshot calls: {forbidden}"
+            "shared terminal runtime must not use hub-owned initial snapshot calls: {forbidden}"
         );
     }
 }
 
 #[test]
-pub(super) fn test_intentional_direct_snapshot_exceptions_are_documented() {
-    let allowed = [(
-        "terminal_stream.rs",
-        "spawn_terminal_client_forwarder_runtime",
-    )];
-    let source = include_str!("terminal_stream.rs");
-    let body = function_body(source, "spawn_terminal_client_forwarder_runtime");
-
-    assert_eq!(
-        body.matches("snapshot_and_subscribe").count(),
-        1,
-        "the only shared-runtime direct snapshot helper is the documented non-session-backed fallback"
-    );
-    assert_eq!(
-        allowed,
-        [(
-            "terminal_stream.rs",
-            "spawn_terminal_client_forwarder_runtime"
-        )],
-        "update the documented exception list before adding any direct snapshot helper"
-    );
-
+pub(super) fn test_direct_snapshot_subscription_helpers_are_not_used_for_terminal_attach() {
     for (file, source) in [
         ("terminal_attach.rs", include_str!("terminal_attach.rs")),
         ("terminal_clients.rs", include_str!("terminal_clients.rs")),
         ("terminal_snapshot.rs", include_str!("terminal_snapshot.rs")),
+        ("terminal_stream.rs", include_str!("terminal_stream.rs")),
     ] {
         assert!(
             !source.contains("snapshot_and_subscribe"),
@@ -105,30 +97,18 @@ pub(super) fn test_intentional_direct_snapshot_exceptions_are_documented() {
 }
 
 #[test]
-pub(super) fn test_shared_runtime_snapshot_and_subscribe_is_non_session_backed_only() {
+pub(super) fn test_terminal_stream_rejects_non_session_backed_data_plane() {
     let source = include_str!("terminal_stream.rs");
-    let body = function_body(source, "spawn_terminal_client_forwarder_runtime");
-
-    let session_branch = body
-        .find("if let Some(request_id) = snapshot_request_id")
-        .expect("shared runtime should branch on session-backed snapshot_request_id");
-    let direct_snapshot = body
-        .find("snapshot_and_subscribe")
-        .expect("documented non-session-backed direct snapshot helper should exist");
-    let non_session_branch = body[session_branch..direct_snapshot]
-        .find("} else {")
-        .map(|offset| session_branch + offset)
-        .expect("shared runtime should isolate non-session-backed fallback in else branch");
-
+    let attach_body = function_body(source, "start_terminal_client_subscription");
     assert!(
-        direct_snapshot > non_session_branch,
-        "snapshot_and_subscribe must stay in the non-session-backed else branch"
+        attach_body.contains("!spec.pty_handle.is_session_backed()")
+            && attach_body.contains("Refusing non-session-backed terminal subscription")
+            && attach_body.contains("start_session_io_terminal_subscription"),
+        "session-backed terminal attach must route into SessionIoWorker subscription handling"
     );
-    let session_body = &body[session_branch..non_session_branch];
     assert!(
-        session_body.contains("SessionIoRequest::Resize")
-            && session_body.contains("SessionIoRequest::GetSnapshot"),
-        "session-backed shared runtime must queue resize/snapshot through SessionIoWorker"
+        !source.contains("spawn_terminal_subscription_runtime"),
+        "terminal attach must not keep a hub-owned broadcast fallback runtime"
     );
 }
 
@@ -163,9 +143,9 @@ pub(super) fn test_terminal_attach_snapshot_paths_have_no_fixed_sleep_settle_win
         include_str!("terminal_stream.rs")
     );
     for function in [
-        "create_lua_pty_forwarder",
+        "create_browser_terminal_subscription",
         "refresh_lua_terminal_snapshot",
-        "spawn_terminal_client_forwarder_runtime",
+        "start_session_io_terminal_subscription",
     ] {
         let body = function_body(source, function);
         assert!(

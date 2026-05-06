@@ -16,6 +16,8 @@ function fakeHub() {
     isConnected: vi.fn(() => true),
     perform: vi.fn((operation, options) => operation(hub, options)),
     transport: {
+      requestRouteRegistry: vi.fn(async () => true),
+      requestEntitySnapshots: vi.fn(async () => true),
       uiRouteRegistry: vi.fn(() => []),
       on: vi.fn(),
     },
@@ -51,6 +53,25 @@ describe('hub bridge waitForHub', () => {
     await connect('durable-hub')
 
     await expect(waiting).resolves.toBe(hub)
+  })
+
+  it('pulls the workspace shell data after acquiring a hub', async () => {
+    const { connect } = await import('../lib/hub-bridge')
+    const hub = fakeHub()
+    mocks.acquire.mockResolvedValueOnce(hub)
+
+    await connect('hydrating-hub')
+
+    expect(hub.transport.requestRouteRegistry).toHaveBeenCalledTimes(1)
+    expect(hub.transport.requestEntitySnapshots).toHaveBeenCalledWith([
+      'hub',
+      'connection_code',
+      'session',
+      'session_action',
+      'workspace',
+      'spawn_target',
+      'worktree',
+    ])
   })
 
   it('still supports bounded optional waits', async () => {

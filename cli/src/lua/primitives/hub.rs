@@ -206,7 +206,7 @@ pub(crate) fn register(
     // hub.register_session(session_uuid, pty_handle, metadata) - Register session PTY handle
     //
     // Called by Lua Agent class to register a single PTY session handle with
-    // HandleCache, enabling Rust-side PTY operations (forwarders, write, resize).
+    // HandleCache, enabling Rust-side PTY operations (terminal subscriptions, write, resize).
     //
     // Arguments:
     //   session_uuid: string - Stable session UUID (e.g., "sess-1234567890-abcdef")
@@ -1240,7 +1240,7 @@ mod tests {
     #[test]
     fn prepare_plugin_command_sends_hub_request() {
         let lua = Lua::new();
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
         let tx: HubEventSender = Arc::new(Mutex::new(Some(event_tx.into())));
         let cache = Arc::new(HandleCache::new());
         let hid = "test-local-hub-id".to_string();
@@ -1287,7 +1287,7 @@ mod tests {
     #[test]
     fn run_command_gate_sends_hub_request() {
         let lua = Lua::new();
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
         let tx: HubEventSender = Arc::new(Mutex::new(Some(event_tx.into())));
         let cache = Arc::new(HandleCache::new());
         let hid = "test-local-hub-id".to_string();
@@ -1345,7 +1345,7 @@ mod tests {
     #[test]
     fn run_command_gate_rejects_non_string_config_options() {
         let lua = Lua::new();
-        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
         let tx: HubEventSender = Arc::new(Mutex::new(Some(event_tx.into())));
         let cache = Arc::new(HandleCache::new());
         let hid = "test-local-hub-id".to_string();
@@ -1380,7 +1380,7 @@ mod tests {
     #[test]
     fn run_command_gate_rejects_non_finite_timeout() {
         let lua = Lua::new();
-        let (event_tx, _event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(64);
         let tx: HubEventSender = Arc::new(Mutex::new(Some(event_tx.into())));
         let cache = Arc::new(HandleCache::new());
         let hid = "test-local-hub-id".to_string();
@@ -1414,7 +1414,7 @@ mod tests {
     #[test]
     fn test_register_session_spawns_notification_watcher_for_session_handles() {
         let lua = Lua::new();
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(64);
         let tx: HubEventSender = Arc::new(Mutex::new(Some(event_tx.into())));
         let cache = Arc::new(HandleCache::new());
         let hid = "test-local-hub-id".to_string();
@@ -1467,8 +1467,7 @@ mod tests {
         }
     }
 
-    // Legacy register_session tests removed during the session-process migration.
-    // Registration now requires a session_connection.
+    // Registration requires a session_connection.
 
     /// `hub.pty_tee` is now a no-op stub (returns nil always).
     #[test]
@@ -1603,7 +1602,7 @@ mod tests {
         let lua = Lua::new();
         let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
-        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut rx) = tokio::sync::mpsc::channel(64);
         *tx.lock().unwrap() = Some(sender.into());
 
         register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
@@ -1623,7 +1622,7 @@ mod tests {
         let lua = Lua::new();
         let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
-        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut rx) = tokio::sync::mpsc::channel(64);
         *tx.lock().unwrap() = Some(sender.into());
 
         register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
@@ -1645,7 +1644,7 @@ mod tests {
         let lua = Lua::new();
         let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
-        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut rx) = tokio::sync::mpsc::channel(64);
         *tx.lock().unwrap() = Some(sender.into());
 
         register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
@@ -1665,7 +1664,7 @@ mod tests {
         let lua = Lua::new();
         let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
-        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut rx) = tokio::sync::mpsc::channel(64);
         *tx.lock().unwrap() = Some(sender.into());
 
         register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
@@ -1708,7 +1707,7 @@ mod tests {
         let lua = Lua::new();
         let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
-        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut rx) = tokio::sync::mpsc::channel(64);
         *tx.lock().unwrap() = Some(sender.into());
 
         register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");
@@ -1754,7 +1753,7 @@ mod tests {
         let lua = Lua::new();
         let (tx, cache, hid, sid, state, cc) = create_test_deps();
 
-        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut rx) = tokio::sync::mpsc::channel(64);
         *tx.lock().unwrap() = Some(sender.into());
 
         register(&lua, tx, cache, hid, sid, state, cc).expect("Should register");

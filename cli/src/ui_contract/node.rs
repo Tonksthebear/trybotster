@@ -59,15 +59,19 @@ impl UiNode {
 }
 
 /// What can appear in a `children` array or a slot array — either a regular
-/// node or a `$kind`-tagged conditional wrapper.
+/// node, a `$kind`-tagged conditional wrapper, or a `$kind = "bind_list"`
+/// reactive list envelope.
 ///
-/// Serializes as an untagged union: serde tries the conditional variants
-/// first (they carry `$kind`) and falls through to the regular node shape.
+/// Serializes as an untagged union: serde tries the `$kind`-tagged variants
+/// first and falls through to the regular node shape.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum UiChild {
     /// A `$kind`-tagged conditional wrapper (`when` or `hidden`).
     Conditional(UiConditional),
+    /// A `$kind = "bind_list"` envelope, expanded by renderers before
+    /// primitive dispatch.
+    BindList(UiBindList),
     /// A regular primitive node.
     Node(UiNode),
 }
@@ -81,6 +85,12 @@ impl From<UiNode> for UiChild {
 impl From<UiConditional> for UiChild {
     fn from(value: UiConditional) -> Self {
         Self::Conditional(value)
+    }
+}
+
+impl From<UiBindList> for UiChild {
+    fn from(value: UiBindList) -> Self {
+        Self::BindList(value)
     }
 }
 
@@ -110,6 +120,26 @@ pub enum UiConditional {
         condition: UiCondition,
         /// Wrapped node.
         node: Box<UiNode>,
+    },
+}
+
+/// Reactive list-expansion envelope.
+///
+/// Renderers resolve this before primitive dispatch by reading `source` from
+/// entity stores, optionally filtering each record with `where`, then cloning
+/// `item_template` once per matching record.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "$kind", rename_all = "snake_case")]
+pub enum UiBindList {
+    /// Expand records from an entity source into sibling nodes.
+    BindList {
+        /// Entity source path, e.g. `/project-pipelines.ticket`.
+        source: String,
+        /// Exact-match filter applied per record.
+        #[serde(default, skip_serializing_if = "JsonMap::is_empty")]
+        r#where: JsonMap<String, JsonValue>,
+        /// Template cloned for each matching record.
+        item_template: Box<UiNode>,
     },
 }
 
@@ -460,6 +490,15 @@ mod tests {
         let from_wrapper: UiChild =
             serde_json::from_value(raw_wrapper).expect("deserialize wrapper");
         assert!(matches!(from_wrapper, UiChild::Conditional(_)));
+
+        let raw_bind_list = json!({
+            "$kind": "bind_list",
+            "source": "/project-pipelines.pipeline",
+            "item_template": { "type": "text", "props": { "text": { "$bind": "@/name" } } }
+        });
+        let from_bind_list: UiChild =
+            serde_json::from_value(raw_bind_list).expect("deserialize bind_list");
+        assert!(matches!(from_bind_list, UiChild::BindList(_)));
     }
 
     #[test]

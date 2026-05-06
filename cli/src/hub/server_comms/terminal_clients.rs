@@ -1,14 +1,16 @@
-use super::terminal_stream::TerminalStreamFilter;
+use super::terminal_stream::{
+    TerminalClientSubscription, TerminalInitialSnapshot, TerminalStreamFilter,
+};
 use super::*;
 
 impl Hub {
-    pub(super) fn create_lua_tui_pty_forwarder(
+    pub(super) fn create_tui_terminal_subscription(
         &mut self,
-        req: crate::lua::primitives::CreateTuiForwarderRequest,
+        req: crate::lua::primitives::TuiTerminalSubscriptionRequest,
     ) {
-        let forwarder_key = format!("tui:{}", req.session_uuid);
+        let subscription_key = format!("tui:{}", req.session_uuid);
 
-        if self.try_attach_tui_terminal_forwarder(&req) {
+        if self.try_attach_tui_terminal_subscription(&req) {
             return;
         }
 
@@ -22,19 +24,19 @@ impl Hub {
                 "pending",
             );
             self.terminal_client_workers
-                .insert(forwarder_key.clone(), worker);
+                .insert(subscription_key.clone(), worker);
         }
         self.replace_pending_terminal_attach(
-            &forwarder_key,
+            &subscription_key,
             PendingTerminalAttachRequest::Tui(req),
         );
     }
 
-    pub(super) fn try_attach_tui_terminal_forwarder(
+    pub(super) fn try_attach_tui_terminal_subscription(
         &mut self,
-        req: &crate::lua::primitives::CreateTuiForwarderRequest,
+        req: &crate::lua::primitives::TuiTerminalSubscriptionRequest,
     ) -> bool {
-        let forwarder_key = format!("tui:{}", req.session_uuid);
+        let subscription_key = format!("tui:{}", req.session_uuid);
 
         // Check if session exists
         let Some(session_handle) = self.handle_cache.get_session(&req.session_uuid) else {
@@ -47,14 +49,16 @@ impl Hub {
             return false;
         };
 
-        // Abort any existing forwarder for this key
-        if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
-            old_task.abort();
-            self.unregister_terminal_forwarder_peer(&forwarder_key, false);
-            self.remove_terminal_client_worker(&forwarder_key, &req.session_uuid, "Lua-TUI");
+        // Stop any existing subscription for this key.
+        if self
+            .terminal_subscription_peers
+            .contains_key(&subscription_key)
+            || self.terminal_client_workers.contains_key(&subscription_key)
+        {
+            self.stop_terminal_subscription(&subscription_key);
             log::debug!(
-                "[Lua-TUI] Aborted existing PTY forwarder for {}",
-                forwarder_key
+                "[TUI] Replaced terminal subscription for {}",
+                subscription_key
             );
         }
 
@@ -62,74 +66,37 @@ impl Hub {
         let subscription_id = req.subscription_id.clone();
         let target_rows = req.rows;
         let target_cols = req.cols;
-        let active_flag = Arc::clone(&req.active_flag);
         let _guard = self.tokio_runtime.enter();
         let worker = self.spawn_tui_client_worker_adapter(output_tx);
-        Self::register_worker_session_io_sender(
-            &worker,
-            &req.session_uuid,
-            pty_handle.clone(),
-            "Lua-TUI",
-        );
+        if let Ok(mut routes) = self.tui_session_input_routes.lock() {
+            routes.insert(req.session_uuid.clone(), worker.clone());
+        }
         self.terminal_client_workers
-            .insert(forwarder_key.clone(), worker.clone());
-        Self::send_worker_terminal_attach_state(
-            &worker,
-            &req.subscription_id,
-            &req.session_uuid,
-            "attached",
-        );
-        let snapshot_request_id = if pty_handle.is_session_backed() {
-            let request_id = Self::next_session_io_request_id("terminal-snapshot");
-            if !self.insert_pending_session_io_snapshot(
-                request_id.clone(),
-                crate::hub::PendingSessionIoSnapshot {
-                    session_uuid: req.session_uuid.clone(),
-                    started_at: Instant::now(),
-                    target: crate::hub::PendingSessionIoSnapshotTarget::TerminalClientInitial {
-                        worker: worker.clone(),
-                        forwarder_key: forwarder_key.clone(),
-                        subscription_id: req.subscription_id.clone(),
-                        rows: target_rows,
-                        cols: target_cols,
-                        kitty_enabled: pty_handle.kitty_enabled(),
-                        pty_handle: pty_handle.clone(),
-                    },
-                },
-            ) {
-                return false;
-            }
-            Some(request_id)
-        } else {
-            None
-        };
-        let hub_event_tx = self.hub_event_tx.clone();
-        let task = Self::spawn_terminal_client_forwarder_runtime(
-            pty_handle,
+            .insert(subscription_key.clone(), worker.clone());
+
+        self.start_terminal_client_subscription(TerminalClientSubscription {
+            pty_handle: pty_handle.clone(),
             worker,
             session_uuid,
             subscription_id,
-            target_rows,
-            target_cols,
-            active_flag,
-            snapshot_request_id,
-            hub_event_tx,
-            "Lua-TUI",
-            "tui".to_string(),
-            Vec::new(),
-            TerminalStreamFilter::None,
-        );
-        self.pty_forwarders.insert(forwarder_key, task);
-        true
+            rows: target_rows,
+            cols: target_cols,
+            log_prefix: "TUI",
+            client_label: "tui".to_string(),
+            output_prefix: Vec::new(),
+            filter: TerminalStreamFilter::None,
+            initial_snapshot: TerminalInitialSnapshot::Raw { subscription_key },
+            confirm_subscription: false,
+        })
     }
 
-    pub(super) fn create_lua_socket_pty_forwarder(
+    pub(super) fn create_socket_terminal_subscription(
         &mut self,
-        req: crate::lua::primitives::CreateSocketForwarderRequest,
+        req: crate::lua::primitives::SocketTerminalSubscriptionRequest,
     ) {
-        let forwarder_key = format!("{}:{}", req.client_id, req.session_uuid);
+        let subscription_key = format!("{}:{}", req.client_id, req.session_uuid);
 
-        if self.try_attach_socket_terminal_forwarder(&req) {
+        if self.try_attach_socket_terminal_subscription(&req) {
             return;
         }
 
@@ -147,19 +114,19 @@ impl Hub {
                 "pending",
             );
             self.terminal_client_workers
-                .insert(forwarder_key.clone(), worker);
+                .insert(subscription_key.clone(), worker);
         }
         self.replace_pending_terminal_attach(
-            &forwarder_key,
+            &subscription_key,
             PendingTerminalAttachRequest::Socket(req),
         );
     }
 
-    pub(super) fn try_attach_socket_terminal_forwarder(
+    pub(super) fn try_attach_socket_terminal_subscription(
         &mut self,
-        req: &crate::lua::primitives::CreateSocketForwarderRequest,
+        req: &crate::lua::primitives::SocketTerminalSubscriptionRequest,
     ) -> bool {
-        let forwarder_key = format!("{}:{}", req.client_id, req.session_uuid);
+        let subscription_key = format!("{}:{}", req.client_id, req.session_uuid);
 
         let Some(session_handle) = self.handle_cache.get_session(&req.session_uuid) else {
             return false;
@@ -175,14 +142,16 @@ impl Hub {
             return false;
         };
 
-        // Abort any existing forwarder for this key
-        if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
-            old_task.abort();
-            self.unregister_terminal_forwarder_peer(&forwarder_key, false);
-            self.remove_terminal_client_worker(&forwarder_key, &req.session_uuid, "Lua-Socket");
+        // Stop any existing subscription for this key.
+        if self
+            .terminal_subscription_peers
+            .contains_key(&subscription_key)
+            || self.terminal_client_workers.contains_key(&subscription_key)
+        {
+            self.stop_terminal_subscription(&subscription_key);
             log::debug!(
-                "[Lua-Socket] Aborted existing PTY forwarder for {}",
-                forwarder_key
+                "[Socket] Replaced terminal subscription for {}",
+                subscription_key
             );
         }
 
@@ -192,71 +161,35 @@ impl Hub {
         let subscription_id = req.subscription_id.clone();
         let target_rows = req.rows;
         let target_cols = req.cols;
-        let active_flag = Arc::clone(&req.active_flag);
         let client_id = req.client_id.clone();
 
         let _guard = self.tokio_runtime.enter();
         let worker = self.spawn_socket_client_worker_adapter(client_id.clone(), frame_tx.clone());
-        Self::register_worker_session_io_sender(
-            &worker,
-            &req.session_uuid,
-            pty_handle.clone(),
-            "Lua-Socket",
-        );
+        if let Some(conn) = self.socket_clients.get(&client_id) {
+            conn.register_session_input_route(req.session_uuid.clone(), worker.clone());
+        }
         self.terminal_client_workers
-            .insert(forwarder_key.clone(), worker.clone());
-        Self::send_worker_terminal_attach_state(
-            &worker,
-            &req.subscription_id,
-            &req.session_uuid,
-            "attached",
-        );
-        let snapshot_request_id = if pty_handle.is_session_backed() {
-            let request_id = Self::next_session_io_request_id("terminal-snapshot");
-            if !self.insert_pending_session_io_snapshot(
-                request_id.clone(),
-                crate::hub::PendingSessionIoSnapshot {
-                    session_uuid: req.session_uuid.clone(),
-                    started_at: Instant::now(),
-                    target: crate::hub::PendingSessionIoSnapshotTarget::TerminalClientInitial {
-                        worker: worker.clone(),
-                        forwarder_key: forwarder_key.clone(),
-                        subscription_id: req.subscription_id.clone(),
-                        rows: target_rows,
-                        cols: target_cols,
-                        kitty_enabled: pty_handle.kitty_enabled(),
-                        pty_handle: pty_handle.clone(),
-                    },
-                },
-            ) {
-                return false;
-            }
-            Some(request_id)
-        } else {
-            None
-        };
-        let hub_event_tx = self.hub_event_tx.clone();
-        let task = Self::spawn_terminal_client_forwarder_runtime(
-            pty_handle,
+            .insert(subscription_key.clone(), worker.clone());
+
+        self.start_terminal_client_subscription(TerminalClientSubscription {
+            pty_handle: pty_handle.clone(),
             worker,
             session_uuid,
             subscription_id,
-            target_rows,
-            target_cols,
-            active_flag,
-            snapshot_request_id,
-            hub_event_tx,
-            "Lua-Socket",
-            client_id.clone(),
-            Vec::new(),
-            TerminalStreamFilter::StripOscQueriesWhenInactive {
+            rows: target_rows,
+            cols: target_cols,
+            log_prefix: "Socket",
+            client_label: client_id.clone(),
+            output_prefix: Vec::new(),
+            filter: TerminalStreamFilter::StripOscQueriesWhenInactive {
                 active_terminal_peers,
                 peer_id: client_id,
             },
-        );
-        self.pty_forwarders.insert(forwarder_key, task);
-        true
+            initial_snapshot: TerminalInitialSnapshot::Raw { subscription_key },
+            confirm_subscription: false,
+        })
     }
+    #[cfg(test)]
     pub(super) fn poll_tui_requests(&mut self) {
         use crate::client::TuiRequest;
 
@@ -291,31 +224,6 @@ impl Hub {
             } => {
                 self.set_active_terminal_peer(&session_uuid, "tui", focused);
                 self.lua.set_pty_focused(&session_uuid, "tui", focused);
-            }
-            TuiRequest::PtyInput { session_uuid, data } => {
-                self.lua.notify_pty_input(&session_uuid);
-                let forwarder_key = format!("tui:{session_uuid}");
-                if let Some(worker) = self.terminal_client_workers.get(&forwarder_key) {
-                    let ingress = crate::worker::transport::TuiTransportAdapter::request_to_ingress(
-                        TuiRequest::PtyInput {
-                            session_uuid: session_uuid.clone(),
-                            data,
-                        },
-                    );
-                    let adapter = crate::worker::transport::TuiTransportAdapter::new();
-                    let message = crate::worker::transport::TransportAdapter::ingress_to_client(
-                        &adapter, ingress,
-                    );
-                    if let Err(e) = worker.try_send(message) {
-                        log::warn!("[PTY-INPUT] Worker input queue rejected {forwarder_key}: {e}");
-                    }
-                } else {
-                    log::warn!(
-                        "[PTY-INPUT] No workerized terminal subscription for UUID {} (cache has {} agents)",
-                        session_uuid,
-                        self.handle_cache.len()
-                    );
-                }
             }
         }
     }

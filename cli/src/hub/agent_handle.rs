@@ -201,7 +201,7 @@ pub struct PtyHandle {
     /// Whether the inner PTY has kitty keyboard protocol active.
     ///
     /// Updated by session reader from `FRAME_MODE_CHANGED` events.
-    /// Read by `snapshot_and_subscribe()` for reconnect metadata.
+    /// Read by SessionIo snapshot routing for reconnect metadata.
     kitty_enabled: Arc<AtomicBool>,
 
     /// Whether the terminal cursor is currently visible (DECTCEM).
@@ -233,7 +233,7 @@ pub struct PtyHandle {
     /// Routes I/O through the session process socket.
     session_connection: Option<crate::session::connection::SharedSessionConnection>,
 
-    /// Test-only snapshot payload used by hub forwarder regression tests.
+    /// Test-only snapshot payload used by hub terminal stream regression tests.
     #[cfg(test)]
     snapshot_override: Option<Vec<u8>>,
 }
@@ -400,24 +400,6 @@ impl PtyHandle {
     #[must_use]
     pub fn subscribe(&self) -> broadcast::Receiver<PtyEvent> {
         self.event_tx.subscribe()
-    }
-
-    /// Subscribe and capture an opaque terminal snapshot for client attach.
-    ///
-    /// Subscribes first, then generates a snapshot. Subscribe-before-snapshot
-    /// ordering ensures no output gap: bytes emitted during RPC are captured
-    /// by the subscription.
-    #[must_use]
-    pub fn snapshot_and_subscribe(
-        &self,
-    ) -> (Vec<u8>, bool, u16, u16, broadcast::Receiver<PtyEvent>) {
-        let kitty_enabled = self.kitty_enabled.load(Ordering::Relaxed);
-        let (rows, cols) = self.dims();
-
-        // Subscribe FIRST so no output is lost during snapshot generation.
-        let rx = self.event_tx.subscribe();
-        let snapshot = self.get_snapshot();
-        (snapshot, kitty_enabled, rows, cols, rx)
     }
 
     /// Whether the backing session RPC connection still has a live reader.

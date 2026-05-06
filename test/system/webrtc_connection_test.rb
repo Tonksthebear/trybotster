@@ -28,6 +28,12 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
     # Connection section should reach "direct" or "relay" (WebRTC data channel open)
     assert_sidebar_webrtc_connected
 
+    # The hub data plane must hydrate after the DataChannel opens. A direct or
+    # relay badge alone only proves transport readiness; this catches cases
+    # where the browser subscribes but never pulls route/entity/tree data.
+    wait_for_hub_ready(timeout: 30)
+    wait_for_surface_ready("workspace_panel", timeout: 30)
+
     # Hub section should show "online" (CLI heartbeating)
     assert_sidebar_connection_status(hub: "online", wait: 30)
 

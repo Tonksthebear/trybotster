@@ -555,6 +555,24 @@ commands.register("select_agent", function(_client, _sub_id, command)
     log.debug(string.format("select_agent: %s", tostring(new_selection)))
 end, { description = "Acknowledge selection (client-side only)" })
 
+commands.register("hub:route_registry", function(client, sub_id, _command)
+    if type(client.send_ui_route_registry) == "function" then
+        client:send_ui_route_registry(sub_id)
+    end
+end, { description = "Send the current hub route registry on demand" })
+
+commands.register("hub:entities", function(client, sub_id, command)
+    local entity_types = command.entity_types or command.types
+    if type(entity_types) ~= "table" then
+        entity_types = {}
+    end
+
+    local EB = require("lib.entity_broadcast")
+    EB.send_snapshots_to(client, sub_id, {
+        types = entity_types,
+    })
+end, { description = "Send requested entity snapshots on demand" })
+
 -- Phase 2b: structured browser → hub action envelopes. Wraps the Phase-1
 -- command channel with semantic action ids so plugin-registered handlers
 -- (`action.on("botster.session.select", name, handler)`) can intercept

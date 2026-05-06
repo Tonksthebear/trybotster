@@ -15,15 +15,15 @@ local connections = require("handlers.connections")
 
 --- Create a socket transport for a specific client.
 -- @param client_id The unique identifier for the socket client
--- @return Transport table with send(), send_binary(), create_pty_forwarder(), and type
+-- @return Transport table with send(), send_binary(), subscribe_terminal(), and type
 local function make_socket_transport(client_id)
     return {
         type = "socket",
         send = function(msg) socket.send(client_id, msg) end,
         send_binary = function(data) socket.send_binary(client_id, data) end,
-        create_pty_forwarder = function(opts)
+        subscribe_terminal = function(opts)
             opts.client_id = client_id
-            return socket.create_pty_forwarder(opts)
+            return socket.subscribe_terminal(opts)
         end,
     }
 end

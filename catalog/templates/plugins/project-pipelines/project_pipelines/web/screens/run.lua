@@ -41,9 +41,9 @@ local function render_step(step, ctx, ticket_id)
     return view.panel{ ui.stack{ direction = "vertical", gap = "1", children = children } }
 end
 
-local function review_nodes(run_id)
+local function review_nodes(run_id, overview)
     local nodes = {}
-    local rows = repo.run_reviews(run_id)
+    local rows = overview and overview.reviews or repo.run_reviews(run_id)
     if #rows == 0 then
         return { ui.text{ text = "No reviews submitted.", size = "sm", tone = "muted" } }
     end
@@ -62,9 +62,9 @@ local function review_nodes(run_id)
     return nodes
 end
 
-local function finding_nodes(run_id)
+local function finding_nodes(run_id, overview)
     local nodes = {}
-    local rows = repo.run_findings(run_id)
+    local rows = overview and overview.findings or repo.run_findings(run_id)
     if #rows == 0 then
         return { ui.text{ text = "No findings recorded.", size = "sm", tone = "muted" } }
     end
@@ -89,9 +89,9 @@ local function finding_nodes(run_id)
     return nodes
 end
 
-local function artifact_nodes(run_id)
+local function artifact_nodes(run_id, overview)
     local nodes = {}
-    local rows = repo.run_artifacts(run_id)
+    local rows = overview and overview.artifacts or repo.run_artifacts(run_id)
     if #rows == 0 then
         return { ui.text{ text = "No artifacts attached.", size = "sm", tone = "muted" } }
     end
@@ -116,20 +116,21 @@ end
 
 function M.render(view_state, ctx)
     local params = view_state and view_state.params or {}
-    local run = repo.get_run(params.run_id)
+    local overview = repo.run_detail_overview(params.run_id)
+    local run = overview and overview.run or nil
     if not run then
         return view.panel{ ui.text{ text = "Run not found", tone = "danger" } }
     end
 
-    local ticket = repo.get_ticket(run.ticket_id)
-    local pipeline = repo.get_pipeline(run.pipeline_id)
+    local ticket = overview.ticket
+    local pipeline = overview.pipeline
     local step_nodes = {}
-    for _, step in ipairs(repo.run_steps(run.id)) do
+    for _, step in ipairs(overview.steps) do
         table.insert(step_nodes, render_step(step, ctx, run.ticket_id))
     end
 
     local event_nodes = {}
-    for _, event in ipairs(repo.run_events(run.id, 12)) do
+    for _, event in ipairs(overview.events) do
         table.insert(event_nodes, ui.text{ text = event.kind, size = "xs", tone = "muted" })
     end
     if #event_nodes == 0 then
@@ -145,9 +146,9 @@ function M.render(view_state, ctx)
             description = (pipeline and pipeline.name or run.pipeline_id) .. " - current step: " .. (run.current_step_id or "none"),
         },
         view.section("Steps", step_nodes),
-        view.section("Reviews", review_nodes(run.id)),
-        view.section("Findings", finding_nodes(run.id)),
-        view.section("Artifacts", artifact_nodes(run.id)),
+        view.section("Reviews", review_nodes(run.id, overview)),
+        view.section("Findings", finding_nodes(run.id, overview)),
+        view.section("Artifacts", artifact_nodes(run.id, overview)),
         view.section("Recent Events", event_nodes),
     } }
 end

@@ -44,110 +44,167 @@ fn subscribe_browser_terminal(
     hub.process_webrtc_plaintext_payload(browser_identity, payload.to_string().as_bytes());
 }
 
+fn settle_webrtc_terminal_attach(hub: &mut Hub) {
+    for _ in 0..20 {
+        hub.tokio_runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        });
+        hub.poll_hub_events();
+    }
+}
+
+fn drain_initial_webrtc_terminal_attach_requests(
+    rx: &mut tokio::sync::mpsc::Receiver<crate::worker::session_io::SessionIoRequest>,
+) -> (
+    crate::worker::session_io::TerminalOutputSubscription,
+    crate::worker::session_io::TerminalInitialSnapshotDelivery,
+) {
+    let _ = recv_session_io_request_matching(rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::Resize { .. }
+        )
+    });
+    let subscription = match recv_session_io_request_matching(rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::SubscribeTerminal { .. }
+        )
+    }) {
+        crate::worker::session_io::SessionIoRequest::SubscribeTerminal { subscription } => {
+            subscription
+        }
+        other => panic!("expected SubscribeTerminal request, got {other:?}"),
+    };
+    let delivery = recv_terminal_initial_snapshot_delivery(rx);
+    (subscription, delivery)
+}
+
 #[test]
-pub(super) fn test_inactive_webrtc_forwarder_strips_probe_queries() {
+pub(super) fn test_inactive_webrtc_subscription_strips_probe_queries() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let session_uuid = "sess-filter-inactive-webrtc";
-    let session = test_session_handle(session_uuid);
-    let event_tx = session.pty().event_tx_clone();
-    hub.handle_cache.add_session(session);
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
     let mut command_rx =
         install_test_browser_worker(&mut hub, "browser-a", session_uuid, "terminal_sub");
 
-    assert!(hub.try_attach_terminal_forwarder(&test_forwarder_request(
-        "browser-a",
-        session_uuid,
-        "terminal_sub"
-    )));
+    assert!(
+        hub.try_attach_browser_terminal_subscription(&test_browser_subscription_request(
+            "browser-a",
+            session_uuid,
+            "terminal_sub"
+        ))
+    );
     hub.set_active_terminal_peer(session_uuid, "tui", true);
-    // No snapshot message (0x02) — test PtyHandle has no session process,
-    // so get_snapshot() returns empty and the snapshot send is skipped.
-    // Allow forwarder task to start the live loop.
-    hub.tokio_runtime.block_on(async {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    });
-
-    let _ = event_tx.send(crate::agent::pty::PtyEvent::Output(
-        b"before\x1b]11;?\x07after".to_vec(),
-    ));
+    let (subscription, _delivery) =
+        drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
+    let mut filter_buffer = Vec::new();
+    let filtered = subscription.filter.filter_chunk(
+        session_uuid,
+        &mut filter_buffer,
+        b"before\x1b]11;?\x07after",
+    );
+    subscription
+        .worker
+        .try_send(crate::worker::client::ClientWorkerMessage::TerminalBytes {
+            session_uuid: session_uuid.to_string(),
+            data: {
+                let mut data = subscription.output_prefix.clone();
+                data.extend(filtered);
+                data
+            },
+        })
+        .expect("send filtered terminal bytes");
 
     let (_subscription_id, data) = recv_next_webrtc_pty_command(&mut hub, &mut command_rx, 0x01);
     assert_eq!(data, b"\x01beforeafter");
 }
 
 #[test]
-pub(super) fn test_active_webrtc_forwarder_keeps_probe_queries() {
+pub(super) fn test_active_webrtc_subscription_keeps_probe_queries() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let session_uuid = "sess-filter-active-webrtc";
-    let session = test_session_handle(session_uuid);
-    let event_tx = session.pty().event_tx_clone();
-    hub.handle_cache.add_session(session);
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
     let mut command_rx =
         install_test_browser_worker(&mut hub, "browser-a", session_uuid, "terminal_sub");
 
-    assert!(hub.try_attach_terminal_forwarder(&test_forwarder_request(
-        "browser-a",
-        session_uuid,
-        "terminal_sub"
-    )));
+    assert!(
+        hub.try_attach_browser_terminal_subscription(&test_browser_subscription_request(
+            "browser-a",
+            session_uuid,
+            "terminal_sub"
+        ))
+    );
     hub.set_active_terminal_peer(session_uuid, "browser-a", true);
-    // No snapshot message — empty snapshot from test PtyHandle.
-    hub.tokio_runtime.block_on(async {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    });
-
-    let _ = event_tx.send(crate::agent::pty::PtyEvent::Output(
-        b"\x1b]11;?\x07after".to_vec(),
-    ));
+    let (subscription, _delivery) =
+        drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
+    let mut filter_buffer = Vec::new();
+    let filtered =
+        subscription
+            .filter
+            .filter_chunk(session_uuid, &mut filter_buffer, b"\x1b]11;?\x07after");
+    subscription
+        .worker
+        .try_send(crate::worker::client::ClientWorkerMessage::TerminalBytes {
+            session_uuid: session_uuid.to_string(),
+            data: {
+                let mut data = subscription.output_prefix.clone();
+                data.extend(filtered);
+                data
+            },
+        })
+        .expect("send terminal bytes");
 
     let (_subscription_id, data) = recv_next_webrtc_pty_command(&mut hub, &mut command_rx, 0x01);
     assert_eq!(data, b"\x01\x1b]11;?\x07after");
 }
 
 #[test]
-pub(super) fn test_webrtc_worker_live_output_runs_per_browser_pty_hooks() {
+pub(super) fn test_webrtc_worker_live_output_bypasses_lua_callbacks() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
-    let session_uuid = "sess-webrtc-live-hooks";
-    let session = test_session_handle(session_uuid);
-    let event_tx = session.pty().event_tx_clone();
-    hub.handle_cache.add_session(session);
+    let session_uuid = "sess-webrtc-live-callbacks";
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
     let mut command_rx =
-        install_test_browser_worker(&mut hub, "browser-hooks", session_uuid, "terminal_hooks");
+        install_test_browser_worker(&mut hub, "browser-callbacks", session_uuid, "terminal_live");
 
-    hub.lua
-        .lua()
-        .load(
-            r#"
-                _test_webrtc_pty_hook_peer = nil
-                hooks.intercept("pty_output", "test.webrtc_worker_live", function(ctx, data)
-                    _test_webrtc_pty_hook_peer = ctx.peer_id
-                    return data .. "-hooked"
-                end)
-                "#,
-        )
-        .exec()
-        .expect("register test pty_output interceptor");
-
-    assert!(hub.try_attach_terminal_forwarder(&test_forwarder_request(
-        "browser-hooks",
-        session_uuid,
-        "terminal_hooks"
-    )));
-    hub.tokio_runtime.block_on(async {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    });
-
-    let _ = event_tx.send(crate::agent::pty::PtyEvent::Output(b"live".to_vec()));
+    assert!(
+        hub.try_attach_browser_terminal_subscription(&test_browser_subscription_request(
+            "browser-callbacks",
+            session_uuid,
+            "terminal_live"
+        ))
+    );
+    let (subscription, _delivery) =
+        drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
+    subscription
+        .worker
+        .try_send(crate::worker::client::ClientWorkerMessage::TerminalBytes {
+            session_uuid: session_uuid.to_string(),
+            data: {
+                let mut data = subscription.output_prefix.clone();
+                data.extend(b"live");
+                data
+            },
+        })
+        .expect("send terminal bytes");
 
     let (_subscription_id, data) = recv_next_webrtc_pty_command(&mut hub, &mut command_rx, 0x01);
-    assert_eq!(data, b"\x01live-hooked");
-    let observed_peer: String = hub
-        .lua
-        .lua()
-        .load("return _test_webrtc_pty_hook_peer")
-        .eval()
-        .expect("read pty hook peer");
-    assert_eq!(observed_peer, "browser-hooks");
+    assert_eq!(data, b"\x01live");
 }
 
 #[test]
@@ -379,20 +436,21 @@ pub(super) fn test_terminal_attach_intent_resolves_when_session_appears() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let key = "peer-attach:sess-attach".to_string();
 
-    let req = test_forwarder_request("peer-attach", "sess-attach", "terminal_sess-attach");
-    hub.create_lua_pty_forwarder(req);
+    let req =
+        test_browser_subscription_request("peer-attach", "sess-attach", "terminal_sess-attach");
+    hub.create_browser_terminal_subscription(req);
 
     assert!(
         hub.pending_terminal_attaches.contains_key(&key),
         "missing session should create pending attach intent"
     );
-    assert!(
-        !hub.pty_forwarders.contains_key(&key),
-        "forwarder should not start until session is registered"
-    );
 
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
     hub.handle_cache
-        .add_session(test_session_handle("sess-attach"));
+        .add_session(test_session_backed_handle_with_mailbox(
+            "sess-attach",
+            session_io_tx,
+        ));
     let _command_rx = install_test_browser_worker(
         &mut hub,
         "peer-attach",
@@ -406,9 +464,12 @@ pub(super) fn test_terminal_attach_intent_resolves_when_session_appears() {
         "pending attach intent should clear once session exists"
     );
     assert!(
-        hub.pty_forwarders.contains_key(&key),
-        "forwarder should start after session registration"
+        hub.terminal_subscription_peers.contains_key(&key),
+        "subscription should register after session registration"
     );
+    let (subscription, _delivery) =
+        drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
+    assert_eq!(subscription.subscription_key, key);
     assert!(
         hub.browser_client_workers.contains_key("peer-attach"),
         "WebRTC peer should register a browser ClientWorker handle"
@@ -416,35 +477,44 @@ pub(super) fn test_terminal_attach_intent_resolves_when_session_appears() {
 }
 
 #[test]
-pub(super) fn test_webrtc_worker_handle_registered_and_removed_with_forwarder() {
+pub(super) fn test_webrtc_worker_handle_registered_and_removed_with_subscription() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let session_uuid = "sess-webrtc-worker-lifecycle";
     let key = format!("browser-worker:{session_uuid}");
 
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
     hub.handle_cache
-        .add_session(test_session_handle(session_uuid));
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
     let _command_rx =
         install_test_browser_worker(&mut hub, "browser-worker", session_uuid, "terminal_sub");
 
-    assert!(hub.try_attach_terminal_forwarder(&test_forwarder_request(
-        "browser-worker",
-        session_uuid,
-        "terminal_sub"
-    )));
+    assert!(
+        hub.try_attach_browser_terminal_subscription(&test_browser_subscription_request(
+            "browser-worker",
+            session_uuid,
+            "terminal_sub"
+        ))
+    );
     assert!(
         hub.browser_client_workers.contains_key("browser-worker"),
         "WebRTC peer should register a browser ClientWorker handle"
     );
+    let (subscription, _delivery) =
+        drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
+    assert_eq!(subscription.subscription_key, key);
 
-    hub.stop_lua_pty_forwarder(&key);
+    hub.stop_terminal_subscription(&key);
 
     assert!(
         hub.browser_client_workers.contains_key("browser-worker"),
-        "stopping one WebRTC forwarder should keep the peer-level ClientWorker handle"
+        "stopping one WebRTC subscription should keep the peer-level ClientWorker handle"
     );
     assert!(
-        !hub.pty_forwarders.contains_key(&key),
-        "stopping WebRTC forwarder should remove the task"
+        !hub.terminal_subscription_peers.contains_key(&key),
+        "stopping WebRTC subscription should remove the SessionIo subscription peer"
     );
 }
 
@@ -453,10 +523,14 @@ pub(super) fn test_webrtc_terminal_subscribe_routes_attach_through_browser_worke
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let browser_identity = "browser-subscribe-worker";
     let session_uuid = "sess-webrtc-subscribe-worker";
-    let forwarder_key = format!("{browser_identity}:{session_uuid}");
+    let subscription_key = format!("{browser_identity}:{session_uuid}");
 
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
     hub.handle_cache
-        .add_session(test_session_handle(session_uuid));
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
     let mut command_rx = install_test_browser_worker_unsubscribed(&mut hub, browser_identity);
 
     let payload = serde_json::json!({
@@ -477,9 +551,23 @@ pub(super) fn test_webrtc_terminal_subscribe_routes_attach_through_browser_worke
     hub.poll_hub_events();
 
     assert!(
-        hub.pty_forwarders.contains_key(&forwarder_key),
+        hub.terminal_subscription_peers
+            .contains_key(&subscription_key),
         "browser subscribe should attach through the peer-level ClientWorker"
     );
+    let (subscription, delivery) =
+        drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
+    assert_eq!(subscription.subscription_key, subscription_key);
+
+    let frames_before_snapshot = drain_webrtc_json_commands(&mut hub, &mut command_rx, 16);
+    assert!(
+        !frames_before_snapshot
+            .iter()
+            .any(|frame| frame.get("type").and_then(|v| v.as_str()) == Some("subscribed")),
+        "terminal subscribe ack must wait for SessionIo initial snapshot"
+    );
+
+    deliver_terminal_initial_snapshot(delivery, b"browser-initial-snapshot".to_vec());
 
     let mut saw_subscribed_ack = false;
     for _ in 0..20 {
@@ -509,7 +597,7 @@ pub(super) fn test_webrtc_terminal_subscribe_routes_attach_through_browser_worke
 }
 
 #[test]
-pub(super) fn test_webrtc_datachannel_open_delivers_entity_baseline_before_hub_subscribed() {
+pub(super) fn test_webrtc_hub_subscribe_does_not_push_entity_baseline_before_pull() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let browser_identity = "browser-hub-baseline";
     let mut command_rx = install_test_browser_worker_unsubscribed(&mut hub, browser_identity);
@@ -540,12 +628,10 @@ pub(super) fn test_webrtc_datachannel_open_delivers_entity_baseline_before_hub_s
         })
         .collect();
 
-    for required in ["session", "workspace", "hub", "connection_code"] {
-        assert!(
-            entity_types_before_ack.contains(required),
-            "missing baseline entity_snapshot({required}) before subscribed ack; saw {frames:?}"
-        );
-    }
+    assert!(
+        entity_types_before_ack.is_empty(),
+        "hub subscribe must not eagerly push entity_snapshot frames; saw {frames:?}"
+    );
 }
 
 #[test]
@@ -573,16 +659,7 @@ pub(super) fn test_webrtc_first_attach_queues_measured_resize_before_snapshot() 
         }
     });
     hub.process_webrtc_plaintext_payload(browser_identity, payload.to_string().as_bytes());
-
-    for _ in 0..20 {
-        hub.tokio_runtime.block_on(async {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        });
-        hub.poll_hub_events();
-        if !hub.pending_session_io_snapshots.is_empty() {
-            break;
-        }
-    }
+    settle_webrtc_terminal_attach(&mut hub);
 
     assert!(matches!(
         recv_session_io_request_matching(&mut session_io_rx, |request| matches!(
@@ -594,21 +671,28 @@ pub(super) fn test_webrtc_first_attach_queues_measured_resize_before_snapshot() 
         )),
         crate::worker::session_io::SessionIoRequest::Resize { .. }
     ));
-    assert!(matches!(
-        recv_session_io_request_matching(&mut session_io_rx, |request| matches!(
+    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
+        matches!(
             request,
-            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
-        )),
-        crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
+            crate::worker::session_io::SessionIoRequest::SubscribeTerminal { .. }
+        )
+    });
+    let delivery = recv_terminal_initial_snapshot_delivery(&mut session_io_rx);
+    assert_eq!(delivery.subscription_id, "terminal_first_attach");
+    assert!(matches!(
+        delivery.payload_mode,
+        crate::worker::session_io::TerminalSnapshotPayloadMode::PrefixedGzip
     ));
+    assert!(matches!(hub.pending_session_io_snapshots.is_empty(), true));
 }
 
 #[test]
-pub(super) fn test_webrtc_duplicate_subscribe_replaces_forwarder_and_preserves_latest_geometry() {
+pub(super) fn test_webrtc_duplicate_subscribe_replaces_subscription_and_preserves_latest_geometry()
+{
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let browser_identity = "browser-duplicate-subscribe";
     let session_uuid = "sess-duplicate-subscribe";
-    let forwarder_key = format!("{browser_identity}:{session_uuid}");
+    let subscription_key = format!("{browser_identity}:{session_uuid}");
     let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(16);
 
     hub.handle_cache
@@ -616,7 +700,7 @@ pub(super) fn test_webrtc_duplicate_subscribe_replaces_forwarder_and_preserves_l
             session_uuid,
             session_io_tx,
         ));
-    let mut command_rx = install_test_browser_worker_unsubscribed(&mut hub, browser_identity);
+    let _command_rx = install_test_browser_worker_unsubscribed(&mut hub, browser_identity);
 
     subscribe_browser_terminal(
         &mut hub,
@@ -626,27 +710,10 @@ pub(super) fn test_webrtc_duplicate_subscribe_replaces_forwarder_and_preserves_l
         24,
         80,
     );
-    for _ in 0..20 {
-        hub.tokio_runtime.block_on(async {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        });
-        hub.poll_hub_events();
-        if !hub.pending_session_io_snapshots.is_empty() {
-            break;
-        }
-    }
-    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
-        matches!(
-            request,
-            crate::worker::session_io::SessionIoRequest::Resize { rows: 24, cols: 80 }
-        )
-    });
-    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
-        matches!(
-            request,
-            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
-        )
-    });
+    settle_webrtc_terminal_attach(&mut hub);
+    let (_old_subscription, _old_delivery) =
+        drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
+    assert!(hub.pending_session_io_snapshots.is_empty());
 
     subscribe_browser_terminal(
         &mut hub,
@@ -656,74 +723,27 @@ pub(super) fn test_webrtc_duplicate_subscribe_replaces_forwarder_and_preserves_l
         44,
         160,
     );
-    for _ in 0..20 {
-        hub.tokio_runtime.block_on(async {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        });
-        hub.poll_hub_events();
-        if hub.pending_session_io_snapshots.len() >= 2
-            && hub.pty_forwarders.contains_key(&forwarder_key)
-        {
-            break;
-        }
-    }
-
-    assert!(
-        hub.pty_forwarders.contains_key(&forwarder_key),
-        "replacement forwarder should use the same browser/session key"
-    );
-    assert_eq!(
-        hub.pty_forwarders
-            .keys()
-            .filter(|key| key.ends_with(session_uuid))
-            .count(),
-        1,
-        "duplicate subscribe must not leave multiple forwarders"
-    );
+    settle_webrtc_terminal_attach(&mut hub);
 
     let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
         matches!(
             request,
-            crate::worker::session_io::SessionIoRequest::Resize {
-                rows: 44,
-                cols: 160
-            }
+            crate::worker::session_io::SessionIoRequest::UnsubscribeTerminal {
+                subscription_key: key
+            } if key == &subscription_key
         )
     });
-    let request_id = match recv_session_io_request_matching(&mut session_io_rx, |request| {
-        matches!(
-            request,
-            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
-        )
-    }) {
-        crate::worker::session_io::SessionIoRequest::GetSnapshot { request_id } => request_id,
-        other => panic!("expected GetSnapshot request, got {other:?}"),
-    };
-
-    hub.handle_session_io_event(
-        crate::worker::session_io::SessionIoEvent::PreparedSnapshot {
-            request_id,
-            session_uuid: session_uuid.to_string(),
-            uncompressed_len: 12,
-            payload: b"new-snapshot".to_vec(),
-            recovery: false,
-        },
-    );
-
-    let (subscription_id, data) = recv_next_webrtc_pty_command(&mut hub, &mut command_rx, b'n');
-    assert_eq!(subscription_id, "terminal_new_geometry");
-    assert_eq!(data, b"new-snapshot");
-    while let Ok(command) = command_rx.try_recv() {
-        if let crate::worker::webrtc::WebRtcAdapterCommand::Pty {
-            subscription_id, ..
-        } = command
-        {
-            assert_ne!(
-                subscription_id, "terminal_old_geometry",
-                "old subscription must not receive replacement scrollback"
-            );
-        }
-    }
+    let (new_subscription, new_delivery) =
+        drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
+    assert_eq!(new_subscription.subscription_key, subscription_key);
+    assert_eq!(new_subscription.subscription_id, "terminal_new_geometry");
+    assert_eq!(new_delivery.rows, 44);
+    assert_eq!(new_delivery.cols, 160);
+    assert_eq!(new_delivery.subscription_id, "terminal_new_geometry");
+    assert!(matches!(
+        new_delivery.payload_mode,
+        crate::worker::session_io::TerminalSnapshotPayloadMode::PrefixedGzip
+    ));
 }
 
 #[test]
@@ -752,27 +772,10 @@ pub(super) fn test_webrtc_request_snapshot_after_subscribe_uses_session_io_witho
         }
     });
     hub.process_webrtc_plaintext_payload(browser_identity, subscribe.to_string().as_bytes());
-    for _ in 0..20 {
-        hub.tokio_runtime.block_on(async {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        });
-        hub.poll_hub_events();
-        if !hub.pending_session_io_snapshots.is_empty() {
-            break;
-        }
-    }
-    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
-        matches!(
-            request,
-            crate::worker::session_io::SessionIoRequest::Resize { .. }
-        )
-    });
-    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
-        matches!(
-            request,
-            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
-        )
-    });
+    settle_webrtc_terminal_attach(&mut hub);
+    let (_subscription, _delivery) =
+        drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
+    assert!(hub.pending_session_io_snapshots.is_empty());
 
     let refresh = serde_json::json!({
         "type": "request_snapshot",
@@ -786,7 +789,7 @@ pub(super) fn test_webrtc_request_snapshot_after_subscribe_uses_session_io_witho
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         });
         hub.poll_hub_events();
-        if hub.pending_session_io_snapshots.len() >= 2 {
+        if hub.pending_session_io_snapshots.len() == 1 {
             break;
         }
     }
@@ -835,27 +838,10 @@ pub(super) fn test_webrtc_resize_after_subscribe_routes_through_session_io_mailb
         }
     });
     hub.process_webrtc_plaintext_payload(browser_identity, subscribe.to_string().as_bytes());
-    for _ in 0..20 {
-        hub.tokio_runtime.block_on(async {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        });
-        hub.poll_hub_events();
-        if !hub.pending_session_io_snapshots.is_empty() {
-            break;
-        }
-    }
-    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
-        matches!(
-            request,
-            crate::worker::session_io::SessionIoRequest::Resize { .. }
-        )
-    });
-    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
-        matches!(
-            request,
-            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
-        )
-    });
+    settle_webrtc_terminal_attach(&mut hub);
+    let (_subscription, _delivery) =
+        drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
+    assert!(hub.pending_session_io_snapshots.is_empty());
 
     let resize = serde_json::json!({
         "type": "resize",
@@ -884,19 +870,28 @@ pub(super) fn test_webrtc_peer_cleanup_removes_terminal_client_worker() {
     let session_uuid = "sess-webrtc-cleanup";
     let key = format!("{browser_identity}:{session_uuid}");
 
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
     hub.handle_cache
-        .add_session(test_session_handle(session_uuid));
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
     let _command_rx =
         install_test_browser_worker(&mut hub, browser_identity, session_uuid, "terminal_sub");
-    assert!(hub.try_attach_terminal_forwarder(&test_forwarder_request(
-        browser_identity,
-        session_uuid,
-        "terminal_sub"
-    )));
+    assert!(
+        hub.try_attach_browser_terminal_subscription(&test_browser_subscription_request(
+            browser_identity,
+            session_uuid,
+            "terminal_sub"
+        ))
+    );
     assert!(
         hub.browser_client_workers.contains_key(browser_identity),
         "WebRTC peer should register a browser ClientWorker handle"
     );
+    let (subscription, _delivery) =
+        drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
+    assert_eq!(subscription.subscription_key, key);
 
     let channel = crate::channel::WebRtcChannel::builder()
         .server_url(hub.config.server_url.clone())
@@ -930,8 +925,111 @@ pub(super) fn test_webrtc_peer_cleanup_removes_terminal_client_worker() {
         "WebRTC peer cleanup should remove the browser ClientWorker handle"
     );
     assert!(
-        !hub.pty_forwarders.contains_key(&key),
-        "WebRTC peer cleanup should remove the PTY forwarder task"
+        !hub.terminal_subscription_peers.contains_key(&key),
+        "WebRTC peer cleanup should remove the terminal subscription registration"
+    );
+}
+
+#[test]
+pub(super) fn test_webrtc_dead_sender_cleanup_removes_peer_owned_state() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let browser_identity = "browser-dead-sender";
+    let session_uuid = "sess-dead-sender";
+    let subscription_key = format!("{browser_identity}:{session_uuid}");
+
+    let _command_rx = install_test_browser_worker_unsubscribed(&mut hub, browser_identity);
+    hub.webrtc
+        .install_test_dead_connected_peer(browser_identity, &hub.tokio_runtime);
+    hub.browser_terminal_attach_sizes
+        .insert(subscription_key.clone(), (24, 80));
+    hub.register_terminal_subscription_peer(&subscription_key, session_uuid, browser_identity);
+    hub.pending_terminal_attaches.insert(
+        subscription_key.clone(),
+        crate::hub::PendingTerminalAttach {
+            request: crate::hub::PendingTerminalAttachRequest::WebRtc(
+                crate::lua::primitives::BrowserTerminalSubscriptionRequest {
+                    peer_id: browser_identity.to_string(),
+                    session_uuid: session_uuid.to_string(),
+                    prefix: None,
+                    subscription_id: "terminal_dead_sender".to_string(),
+                    rows: 24,
+                    cols: 80,
+                    active_flag: std::sync::Arc::new(std::sync::Mutex::new(true)),
+                },
+            ),
+            requested_at: std::time::Instant::now(),
+        },
+    );
+    hub.pending_session_io_snapshots.insert(
+        "snapshot-dead-sender".to_string(),
+        crate::hub::PendingSessionIoSnapshot {
+            session_uuid: session_uuid.to_string(),
+            started_at: std::time::Instant::now(),
+            target: crate::hub::PendingSessionIoSnapshotTarget::WebRtcOutput {
+                peer_id: browser_identity.to_string(),
+                rows: 24,
+                cols: 80,
+                kitty_enabled: false,
+                subscription_key: Some(subscription_key.clone()),
+                active_flag: None,
+            },
+        },
+    );
+
+    hub.cleanup_webrtc_peer_registry();
+
+    assert!(!hub.webrtc.has_channel(browser_identity));
+    assert!(!hub.browser_client_workers.contains_key(browser_identity));
+    assert!(!hub
+        .browser_terminal_attach_sizes
+        .contains_key(&subscription_key));
+    assert!(!hub
+        .terminal_subscription_peers
+        .contains_key(&subscription_key));
+    assert!(!hub
+        .pending_terminal_attaches
+        .contains_key(&subscription_key));
+    assert!(hub.pending_session_io_snapshots.is_empty());
+}
+
+#[test]
+pub(super) fn test_debug_memory_diagnostics_reports_counts_without_heap_claims() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let browser_identity = "browser-diagnostics";
+
+    let _command_rx = install_test_browser_worker_unsubscribed(&mut hub, browser_identity);
+    hub.webrtc
+        .install_test_dead_connected_peer(browser_identity, &hub.tokio_runtime);
+    hub.pending_session_io_snapshots.insert(
+        "snapshot-diagnostics".to_string(),
+        crate::hub::PendingSessionIoSnapshot {
+            session_uuid: "sess-diagnostics".to_string(),
+            started_at: std::time::Instant::now(),
+            target: crate::hub::PendingSessionIoSnapshotTarget::WebRtcPeerRecovery {
+                request: crate::worker::webrtc::WebRtcRecoverySnapshotRequest {
+                    request_id: "snapshot-diagnostics".to_string(),
+                    browser_identity: browser_identity.to_string(),
+                    session_uuid: "sess-diagnostics".to_string(),
+                    subscription_id: "terminal_diagnostics".to_string(),
+                },
+            },
+        },
+    );
+
+    let diagnostics = hub.debug_memory_diagnostics();
+
+    assert_eq!(diagnostics["type"], "debug_memory");
+    assert_eq!(diagnostics["process"]["allocator"], "mimalloc");
+    assert!(diagnostics["process"]["rust_heap_note"]
+        .as_str()
+        .is_some_and(|note| note.contains("not exposed")));
+    assert_eq!(diagnostics["webrtc"]["channels"], 1);
+    assert_eq!(diagnostics["webrtc"]["dead_send_tasks"], 1);
+    assert_eq!(diagnostics["workers"]["browser_client_workers"], 1);
+    assert_eq!(diagnostics["snapshots"]["pending_session_io_snapshots"], 1);
+    assert_eq!(
+        diagnostics["snapshots"]["pending_webrtc_recovery_snapshots"],
+        1
     );
 }
 
@@ -940,9 +1038,10 @@ pub(super) fn test_terminal_attach_intent_times_out_to_not_found() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let key = "peer-timeout:sess-timeout".to_string();
 
-    let req = test_forwarder_request("peer-timeout", "sess-timeout", "terminal_sess-timeout");
+    let req =
+        test_browser_subscription_request("peer-timeout", "sess-timeout", "terminal_sess-timeout");
     let active_flag = Arc::clone(&req.active_flag);
-    hub.create_lua_pty_forwarder(req);
+    hub.create_browser_terminal_subscription(req);
 
     {
         let intent = hub
@@ -962,8 +1061,8 @@ pub(super) fn test_terminal_attach_intent_times_out_to_not_found() {
     assert!(
         !*active_flag
             .lock()
-            .expect("Forwarder active_flag mutex poisoned"),
-        "not_found transition should deactivate forwarder handle"
+            .expect("Subscription active_flag mutex poisoned"),
+        "not_found transition should deactivate subscription handle"
     );
 }
 
@@ -972,13 +1071,13 @@ pub(super) fn test_terminal_attach_intent_replaces_previous_pending_request() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let key = "peer-replace:sess-replace".to_string();
 
-    let req1 = test_forwarder_request("peer-replace", "sess-replace", "terminal_old");
+    let req1 = test_browser_subscription_request("peer-replace", "sess-replace", "terminal_old");
     let req1_active = Arc::clone(&req1.active_flag);
-    hub.create_lua_pty_forwarder(req1);
+    hub.create_browser_terminal_subscription(req1);
 
-    let req2 = test_forwarder_request("peer-replace", "sess-replace", "terminal_new");
+    let req2 = test_browser_subscription_request("peer-replace", "sess-replace", "terminal_new");
     let req2_active = Arc::clone(&req2.active_flag);
-    hub.create_lua_pty_forwarder(req2);
+    hub.create_browser_terminal_subscription(req2);
 
     let pending = hub
         .pending_terminal_attaches
@@ -995,13 +1094,13 @@ pub(super) fn test_terminal_attach_intent_replaces_previous_pending_request() {
     assert!(
         !*req1_active
             .lock()
-            .expect("Forwarder active_flag mutex poisoned"),
+            .expect("Subscription active_flag mutex poisoned"),
         "previous pending attach should be deactivated"
     );
     assert!(
         *req2_active
             .lock()
-            .expect("Forwarder active_flag mutex poisoned"),
+            .expect("Subscription active_flag mutex poisoned"),
         "replacement attach should remain active"
     );
 }

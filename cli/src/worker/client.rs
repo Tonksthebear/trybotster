@@ -208,6 +208,15 @@ pub enum ClientWorkerMessage {
         /// Raw PTY input bytes.
         data: Vec<u8>,
     },
+    /// Browser file/drop payload from the client to a subscribed session.
+    PasteFile {
+        /// Session that should receive the file path injection.
+        session_uuid: SessionUuid,
+        /// Original client filename.
+        filename: String,
+        /// Raw file bytes.
+        data: Vec<u8>,
+    },
     /// Resize a subscribed session through the SessionIoWorker mailbox.
     SessionResize {
         /// Session that should receive the resize.
@@ -352,6 +361,7 @@ pub struct ClientWorker {
     subscriptions: HashMap<SessionUuid, ClientSubscription>,
     health: ClientConnectionHealth,
     generation: u64,
+    next_request_id: u64,
     outbound: BoundedQueueConfig,
     stats: ClientWorkerStats,
 }
@@ -381,6 +391,7 @@ impl ClientWorker {
             subscriptions: HashMap::new(),
             health: ClientConnectionHealth::Ready,
             generation: 0,
+            next_request_id: 0,
             outbound: config.outbound,
             stats: ClientWorkerStats::default(),
         }
@@ -439,6 +450,14 @@ impl ClientWorker {
             }
             ClientWorkerMessage::SessionInput { session_uuid, data } => {
                 self.route_session_input(session_uuid, data).await;
+                false
+            }
+            ClientWorkerMessage::PasteFile {
+                session_uuid,
+                filename,
+                data,
+            } => {
+                self.route_session_file(session_uuid, filename, data).await;
                 false
             }
             ClientWorkerMessage::SessionResize {
@@ -613,6 +632,58 @@ impl ClientWorker {
         };
 
         match tx.try_send(SessionIoRequest::PtyInput { data }) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.report_backpressure(
+                    super::session_io::SESSION_IO_WORKER_QUEUE.name,
+                    super::session_io::SESSION_IO_WORKER_QUEUE.capacity,
+                    Some(session_uuid),
+                )
+                .await;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.session_io_txs.remove(&session_uuid);
+            }
+        }
+    }
+
+    async fn route_session_file(
+        &mut self,
+        session_uuid: SessionUuid,
+        filename: String,
+        data: Vec<u8>,
+    ) {
+        let Some(subscription_id) = self
+            .subscriptions
+            .get(&session_uuid)
+            .map(|subscription| subscription.subscription_id.clone())
+        else {
+            return;
+        };
+
+        let Some(tx) = self.session_io_txs.get(&session_uuid).cloned() else {
+            self.try_deliver_egress(
+                TransportEgress::TerminalAttach {
+                    subscription_id,
+                    session_uuid: session_uuid.clone(),
+                    state: TerminalAttachState::NotReady,
+                },
+                Some(session_uuid.clone()),
+                DeliveryKind::Control,
+            )
+            .await;
+            self.report_backpressure(CLIENT_SESSION_IO_MISSING_SOURCE, 0, Some(session_uuid))
+                .await;
+            return;
+        };
+
+        self.next_request_id = self.next_request_id.wrapping_add(1);
+        let request_id = format!("client-file-{}-{}", self.client_id, self.next_request_id);
+        match tx.try_send(SessionIoRequest::PasteFile {
+            request_id,
+            filename,
+            data,
+        }) {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 self.report_backpressure(

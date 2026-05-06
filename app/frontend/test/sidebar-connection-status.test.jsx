@@ -114,7 +114,9 @@ describe('SidebarConnectionStatus', () => {
       snapshotSeq: 1,
     })
 
-    renderStatus()
+    renderStatus({
+      hubList: [{ id: 1, name: 'Test Hub', identifier: 'test-hub', active: false }],
+    })
 
     const toggle = screen.getByTestId('sidebar-connection-status')
     // null hubStatus → component renders 'connecting' on the data attr.
@@ -130,9 +132,18 @@ describe('SidebarConnectionStatus', () => {
       snapshotSeq: 1,
     })
 
-    renderStatus()
+    renderStatus({
+      hubList: [{ id: 1, name: 'Test Hub', identifier: 'test-hub', active: false }],
+    })
 
     const toggle = screen.getByTestId('sidebar-connection-status')
     expect(toggle.dataset.hubStatus).toBe('connecting')
+  })
+
+  it('uses the current Rails hub-list active flag to clear stale offline health', () => {
+    renderStatus()
+
+    const toggle = screen.getByTestId('sidebar-connection-status')
+    expect(toggle.dataset.hubStatus).toBe('online')
   })
 })

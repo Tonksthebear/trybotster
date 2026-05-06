@@ -146,9 +146,13 @@ The `Pipelines` surface shows tickets, runs, pipeline definitions, selected agen
 
 Project Pipelines is the reference plugin for Botster's entity-backed UI model.
 `project_pipelines/entities.lua` registers every dynamic workflow record family
-under the `project-pipelines.*` namespace, publishes subscribe-time baselines
+under the `project-pipelines.*` namespace, publishes targeted recovery baselines
 with `publish_snapshots()`, and exposes targeted `upsert` / `remove` helpers so
-repo mutators can update clients after persistence changes.
+repo mutators can update clients after persistence changes. Plugin-owned entity
+families are not part of the initial browser/TUI hub baseline; surfaces should
+request the specific plugin data they need. The browser does this by inspecting
+the opened surface tree for `ui.bind` / `ui.bind_list` sources and requesting
+those entity families on demand.
 
 Dynamic state is published as plugin-owned entities:
 

@@ -85,6 +85,7 @@ pub(crate) fn run_event_loop(
         .start_queue_forwarders(&hub.tokio_runtime, hub.hub_event_tx.clone());
     let mut worktree_result_rx = hub.worktree_result_rx.take();
     let mut tui_request_rx = hub.tui_request_rx.take();
+    let mut hub_event_high_priority_rx = hub.hub_event_high_priority_rx.take();
     let mut hub_event_rx = hub.hub_event_rx.take();
 
     // Spawn a cleanup interval task that sends CleanupTick every 5 seconds.
@@ -136,6 +137,16 @@ pub(crate) fn run_event_loop(
                     hub.handle_worktree_result(result);
                 }
 
+                // Latency-sensitive client/control events.
+                Some(event) = async {
+                    match hub_event_high_priority_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    dispatch_hub_event(hub, event);
+                }
+
                 // Unified event bus (all events including cleanup ticks)
                 Some(event) = async {
                     match hub_event_rx.as_mut() {
@@ -143,13 +154,7 @@ pub(crate) fn run_event_loop(
                         None => std::future::pending().await,
                     }
                 } => {
-                    let kind = event.kind();
-                    let bytes = event.approx_size_bytes();
-                    hub.hub_event_metrics.record_dequeue(kind, bytes);
-                    let started_at = Instant::now();
-                    hub.handle_hub_event(event);
-                    hub.hub_event_metrics
-                        .record_handler_time(kind, started_at.elapsed());
+                    dispatch_hub_event(hub, event);
                 }
 
                 // signal-hook only flips atomics; it does not wake this select loop.
@@ -157,9 +162,9 @@ pub(crate) fn run_event_loop(
             }
 
             // Fairness drain: biased select above keeps hub_event last.
-            // Under sustained load on higher-priority arms (typically
-            // webrtc_pty_output), hub events (cleanup ticks, lifecycle,
-            // shutdown propagation from hub.quit) can go unserved. Drain
+            // Under sustained load on higher-priority arms, hub events
+            // (cleanup ticks, lifecycle, shutdown propagation from hub.quit)
+            // can go unserved. Drain
             // a small bounded batch inline after each select iteration so
             // hub events make progress even when a high-volume arm is hot.
             //
@@ -167,17 +172,21 @@ pub(crate) fn run_event_loop(
             // keystroke fast path; 4 is small enough to be invisible and
             // large enough that a backlog clears quickly across iterations.
             const FAIRNESS_DRAIN_LIMIT: usize = 4;
+            if let Some(ref mut rx) = hub_event_high_priority_rx {
+                for _ in 0..FAIRNESS_DRAIN_LIMIT {
+                    match rx.try_recv() {
+                        Ok(event) => {
+                            dispatch_hub_event(hub, event);
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
             if let Some(ref mut rx) = hub_event_rx {
                 for _ in 0..FAIRNESS_DRAIN_LIMIT {
                     match rx.try_recv() {
                         Ok(event) => {
-                            let kind = event.kind();
-                            let bytes = event.approx_size_bytes();
-                            hub.hub_event_metrics.record_dequeue(kind, bytes);
-                            let started_at = Instant::now();
-                            hub.handle_hub_event(event);
-                            hub.hub_event_metrics
-                                .record_handler_time(kind, started_at.elapsed());
+                            dispatch_hub_event(hub, event);
                         }
                         Err(_) => break,
                     }
@@ -201,7 +210,19 @@ pub(crate) fn run_event_loop(
 
     hub.worktree_result_rx = worktree_result_rx;
     hub.tui_request_rx = tui_request_rx;
+    hub.hub_event_high_priority_rx = hub_event_high_priority_rx;
     hub.hub_event_rx = hub_event_rx;
 
     Ok(())
+}
+
+fn dispatch_hub_event(hub: &mut Hub, event: super::events::HubEvent) {
+    let kind = event.kind();
+    let bytes = event.approx_size_bytes();
+    hub.hub_event_metrics.record_dequeue(kind, bytes);
+    hub.hub_event_tx.mark_dequeued(&event);
+    let started_at = Instant::now();
+    hub.handle_hub_event(event);
+    hub.hub_event_metrics
+        .record_handler_time(kind, started_at.elapsed());
 }

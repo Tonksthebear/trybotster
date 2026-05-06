@@ -366,8 +366,8 @@ entity type.
 `entity_remove` only publish plugin-owned entity types. They reject built-in
 types, cross-plugin namespaces, unregistered plugin types, and records whose
 `id` is not a non-empty string. `entity_snapshot` is for replacing the client
-baseline after a plugin refresh; subscribe-time snapshots still come from the
-registered `all()` function.
+baseline after a plugin refresh or explicit client request; requested
+snapshots come from the registered `all()` function.
 
 Snapshot `all()` callbacks must return an array of entity tables. Records
 without a string `id` are logged and skipped. Patches merge only top-level
@@ -378,9 +378,11 @@ mutator path.
 Project Pipelines is the reference plugin for this pattern. It registers every
 workflow record family in
 `catalog/templates/plugins/project-pipelines/project_pipelines/entities.lua`,
-publishes subscribe-time baselines through `publish_snapshots()`, and lets repo
-mutators call `entities.upsert(...)` or `entities.remove(...)` after persistence
-changes. Its overview binds lists from `/project-pipelines.ticket`,
+publishes targeted recovery baselines through `publish_snapshots()`, and lets
+repo mutators call `entities.upsert(...)` or `entities.remove(...)` after
+persistence changes. Plugin-owned entity families are not part of the initial
+browser/TUI hub baseline; surfaces request the plugin data they need. Its
+overview binds lists from `/project-pipelines.ticket`,
 `/project-pipelines.project`, and `/project-pipelines.pipeline`; its project
 detail screen filters the shared ticket family with
 `ui.bind_list{ where = { project_id = project_id } }`. Its web actions return
@@ -397,8 +399,14 @@ webrtc.on_peer_disconnected(fn(peer_id))
 webrtc.on_message(fn(peer_id, msg_table))
 webrtc.send(peer_id, table)
 webrtc.send_binary(peer_id, data)
-webrtc.create_pty_forwarder(opts) -- opts: {session_uuid, subscription_id, peer_id, prefix, ...}
+webrtc.subscribe_terminal(opts) -- opts: {session_uuid, subscription_id, peer_id, prefix, ...}
 ```
+
+`subscribe_terminal` is the shared terminal attach primitive for transport
+adapters. WebRTC, TUI, and socket adapters use different framing at the edge,
+but all three create the same client-worker/session-I/O subscription: the hub
+authorizes and correlates attach work, while durable-session PTY bytes,
+scrollback, and raw input stay on the client/session actor data plane.
 
 ### `tui`
 ```lua
@@ -407,7 +415,7 @@ tui.on_disconnected(fn())
 tui.on_message(fn(msg_table))
 tui.send(msg)
 tui.send_binary(data)
-tui.create_pty_forwarder(opts)
+tui.subscribe_terminal(opts)
 ```
 
 ### `socket`
@@ -417,7 +425,7 @@ socket.on_client_disconnected(fn(client_id))
 socket.on_message(fn(client_id, msg_table))
 socket.send(client_id, msg)
 socket.send_binary(client_id, data)
-socket.create_pty_forwarder(opts)
+socket.subscribe_terminal(opts)
 ```
 
 ### `pty`

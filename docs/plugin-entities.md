@@ -80,10 +80,15 @@ Hub.get():entity_remove(ENTITY_TYPE, ticket.id, {
 })
 ```
 
-Use `entity_snapshot` when a plugin refreshes a whole family or sends a
-subscribe-time baseline. Use `entity_upsert` when a mutator creates or replaces
-one record. Use `entity_patch` for sparse top-level field changes. Use
-`entity_remove` when clients should drop one record.
+Use `entity_snapshot` when a plugin refreshes a whole family or answers an
+explicit client baseline request. Use `entity_upsert` when a mutator creates or
+replaces one record. Use `entity_patch` for sparse top-level field changes.
+Use `entity_remove` when clients should drop one record.
+
+Browser surfaces request their initial plugin baselines by inspecting the
+received UI tree for `$bind` and `bind_list` sources. A surface that binds
+`/project-pipelines.ticket` therefore pulls the `project-pipelines.ticket`
+snapshot when that surface is opened, not during hub subscribe.
 
 Patch semantics are intentionally shallow: nested tables replace the old nested
 value. Send the full nested value you want clients to keep.

@@ -1,9 +1,10 @@
 # Hub Hot-Path Observability
 
 The Rust hub records compact diagnostics for event-loop paths that can make a
-client look connected but stale: socket messages, WebRTC messages, PTY output,
-session-I/O worker batches, OSC/timer volume, terminal snapshots, manifest
-writes, socket repair, cleanup, and reconnect handling.
+client look connected but stale: socket messages, WebRTC messages, client
+terminal subscriptions, session-I/O control responses, OSC/timer volume,
+terminal snapshots, manifest writes, socket repair, cleanup, and reconnect
+handling.
 
 These diagnostics are intentionally local to the daemon. They use existing
 structured log lines and in-process `HubEventMetrics`; there is no external
@@ -47,7 +48,7 @@ The most useful span names are:
 | `webrtc_message.terminal_color_profile` | WebRTC color profile handler |
 | `webrtc_message.lua` | Lua fallback for WebRTC messages |
 | `webrtc_send.queue` | queued WebRTC send item byte accounting |
-| `pty_output.drain_batch` | PTY output batch drain and processing |
+| `client_worker.backpressure` | client worker queue rejected delivery/control work |
 | `cleanup.webrtc_scan` | periodic WebRTC channel cleanup scan |
 | `cleanup.webrtc_channel` | cleanup of one WebRTC channel |
 | `snapshot.rpc_get` | blocking terminal snapshot retrieval |
@@ -57,14 +58,14 @@ The most useful span names are:
 Hot socket/WebRTC subhandlers and cleanup scans are slow at 50ms. Snapshot RPC
 and gzip/queue spans are slow at 100ms. Manifest writes are slow at 10ms.
 
-Session-process PTY output now reaches the hub as
-`HubEvent::SessionIoBatch`. The worker coalesces durable-session output before
-delivery to reduce hub event volume. WebRTC transport queues are owned by
-`WebRtcPeerRegistry` forwarders and enter the hub as typed `HubEvent`
-variants; hub-side PTY output handling still uses the existing drain-batch
-span. Snapshot byte preparation has moved
-behind `worker::session_io` helpers, but the stable `snapshot.rpc_get` and
-`snapshot.gzip_queue` span names remain unchanged for operator playbooks.
+Session-process PTY output no longer reaches the hub as a hot-path byte event.
+The session I/O worker coalesces durable-session output and fans it to
+subscribed client workers; the hub records attach, detach, snapshot, lifecycle,
+and backpressure policy. WebRTC transport queues are owned by
+`WebRtcPeerRegistry` and enter the hub as typed control events or adapter
+commands. Snapshot byte preparation lives behind `worker::session_io` helpers,
+but the stable `snapshot.rpc_get` and `snapshot.gzip_queue` span names remain
+unchanged for operator playbooks.
 Backpressure recovery snapshot delivery records the same gzip queue span and
 the `snapshot.backpressure_recovery.*` counter family so recovery paths remain
 visible even when normal hot PTY delivery is congested.
@@ -86,9 +87,8 @@ largest observed value instead of summing every sample.
 | `webrtc_send.unknown_peer` | send targeted a peer with no active send task |
 | `webrtc_send.unknown_peer_burst` | unknown-peer burst guardrail fired |
 | `webrtc_channel.closed_after_connect` | channel closed shortly after connected/open |
-| `pty_output.messages` | PTY output messages processed |
-| `pty_output.bytes` | PTY output bytes processed |
-| `pty_output.batch_hwm` | largest PTY output batch drained in one tick |
+| `client_worker.backpressure` | terminal/client worker queue rejected work |
+| `client_worker.session_io_missing` | terminal input or resize arrived without a registered session I/O sender |
 | `pty_osc.title`, `pty_osc.cwd`, `pty_osc.prompt`, `pty_osc.cursor`, `pty_osc.other` | OSC subtype volume |
 | `pty_osc.volume_burst` | OSC volume guardrail fired |
 | `timer_fired.count` | timer events fired |
@@ -107,11 +107,11 @@ largest observed value instead of summing every sample.
 | `socket_path.repair_error` | socket path repair failed |
 | `manifest.write_error` | manifest refresh failed at a hub-owned call site |
 
-For session-process output, one `pty_output.messages` increment represents one
-coalesced `SessionIoBatch`, not necessarily one session protocol
-`FRAME_PTY_OUTPUT`. `pty_output.bytes` remains the total byte count processed.
-Lua `pty_output` observers receive those coalesced chunks for session-process
-output; byte order is preserved.
+For session-process output, observability is intentionally control-plane
+oriented: client-worker backpressure, missing session I/O sender counters,
+snapshot counters, reconnect counters, and WebRTC queue counters show where the
+system is congested without routing durable-session PTY bytes through hub event
+handlers.
 
 ## Guardrail Logs
 

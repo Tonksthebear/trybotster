@@ -8,11 +8,11 @@
 //!
 //! Frame types:
 //! - `0x01`: JSON message (UTF-8 `serde_json::Value`)
-//! - `0x02`: PTY output binary (hub→client) — `[u16 uuid_len][uuid][raw bytes]`
-//! - `0x03`: PTY input binary (client→hub) — `[u16 uuid_len][uuid][raw bytes]`
-//! - `0x04`: PTY scrollback (hub→client) — `[u16 uuid_len][uuid][u16 rows][u16 cols][u8 kitty][raw bytes]`
+//! - `0x02`: PTY output binary (server→client) — `[u16 uuid_len][uuid][raw bytes]`
+//! - `0x03`: PTY input binary (client→server) — `[u16 uuid_len][uuid][raw bytes]`
+//! - `0x04`: PTY scrollback (server→client) — `[u16 uuid_len][uuid][u16 rows][u16 cols][u8 kitty][raw bytes]`
 //!   (legacy v1 decode fallback: `[u16 uuid_len][uuid][u8 kitty][raw bytes]`)
-//! - `0x05`: Process exited (hub→client) — `[u16 uuid_len][uuid][i32 exit_code]`
+//! - `0x05`: Process exited (server→client) — `[u16 uuid_len][uuid][i32 exit_code]`
 //! - `0x06`: Raw binary (bidirectional) — `[raw bytes]`
 
 use anyhow::{anyhow, bail, Result};
@@ -24,13 +24,13 @@ const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 pub mod frame_type {
     /// JSON control message.
     pub const JSON: u8 = 0x01;
-    /// PTY output binary (hub → client).
+    /// PTY output binary (server → client).
     pub const PTY_OUTPUT: u8 = 0x02;
-    /// PTY input binary (client → hub).
+    /// PTY input binary (client → server).
     pub const PTY_INPUT: u8 = 0x03;
-    /// PTY scrollback (hub → client).
+    /// PTY scrollback (server → client).
     pub const SCROLLBACK: u8 = 0x04;
-    /// Process exited (hub → client).
+    /// Process exited (server → client).
     pub const PROCESS_EXITED: u8 = 0x05;
     /// Raw binary data (bidirectional, no PTY routing header).
     pub const BINARY: u8 = 0x06;
@@ -42,7 +42,7 @@ pub enum Frame {
     /// JSON control message.
     Json(serde_json::Value),
 
-    /// PTY output data (hub → client).
+    /// PTY output data (server → client).
     PtyOutput {
         /// Session UUID identifying the PTY.
         session_uuid: String,
@@ -225,7 +225,7 @@ fn decode_frame(frame_type: u8, payload: &[u8]) -> Result<Frame> {
                 let kitty_enabled = payload[consumed] != 0;
                 return Ok(Frame::Scrollback {
                     session_uuid,
-                    // Legacy payloads carry no source dimensions.
+                    // Dimensionless payloads carry no source dimensions.
                     // Callers should treat 0x0 as "use local panel dims".
                     rows: 0,
                     cols: 0,

@@ -51,9 +51,11 @@ function hubIsOnline(cliStatus) {
  *
  * @param {string|null|undefined} transportHubStatus - from hubBadgeStatus().
  * @param {boolean} entityReady - hubEntity?.state === "ready".
+ * @param {boolean} serverActive - current Rails hub list says this hub is active.
  * @returns {"online"|"offline"|null}
  */
-export function resolveHubStatus(transportHubStatus, entityReady) {
+export function resolveHubStatus(transportHubStatus, entityReady, serverActive = false) {
+  if (serverActive) return "online";
   if (transportHubStatus === "offline") return "offline";
   if (transportHubStatus === "online") return "online";
   if (entityReady) return "online";

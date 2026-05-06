@@ -28,7 +28,7 @@ local function render_session(view_state, ctx)
 end
 
 local function has_open_questions()
-    return #repo.open_questions() > 0
+    return repo.has_open_questions()
 end
 
 local function sidebar_button(attrs)
@@ -93,14 +93,13 @@ local function render_sidebar()
             })
         end
     end
-    local questions = repo.open_questions()
+    local questions = repo.open_questions_with_tickets()
     if #questions > 0 then
         table.insert(children, ui.text{ text = "Questions", size = "xs", weight = "semibold", tone = "muted" })
         for _, question in ipairs(questions) do
-            local ticket = repo.get_ticket(question.ticket_id)
             table.insert(children, sidebar_button{
                 id = "pipelines-sidebar-question-" .. question.id,
-                label = ticket and ticket.title or question.ticket_id,
+                label = question.ticket_title or question.ticket_id,
                 icon = question.kind == "agent" and "user-circle" or "question-mark-circle",
                 path = "/pipelines/tickets/" .. question.ticket_id,
                 badge = view.badge(question.blocking == 1 and "blocking" or "open", question.blocking == 1 and "danger" or "accent"),
@@ -108,8 +107,15 @@ local function render_sidebar()
         end
     end
     table.insert(children, ui.text{ text = "Tickets", size = "xs", weight = "semibold", tone = "muted" })
-    for _, ticket in ipairs(view.visible_tickets(repo)) do
-        local notifications = view.ticket_notification_count(ticket.id, repo)
+    local standalone_tickets = repo.standalone_tickets()
+    local ticket_ids = {}
+    for _, ticket in ipairs(standalone_tickets) do
+        table.insert(ticket_ids, ticket.id)
+    end
+    local notification_counts = view.ticket_notification_counts(repo, ticket_ids)
+    for _, ticket in ipairs(standalone_tickets) do
+        local notifications = notification_counts[ticket.id] or 0
+        if view.ticket_should_show(ticket, repo, notification_counts) then
         table.insert(children, sidebar_button{
             id = "pipelines-sidebar-ticket-" .. ticket.id,
             label = ticket.title,
@@ -117,6 +123,7 @@ local function render_sidebar()
             path = "/pipelines/tickets/" .. ticket.id,
             badge = view.notification_badge(notifications),
         })
+        end
     end
 
     return ui.stack{ direction = "vertical", gap = "3", children = children }

@@ -43,25 +43,21 @@
 
 local M = {}
 
--- Internal tool registry: name -> { name, description, input_schema, handler, source, proxy_id? }
+-- Internal tool registry: name -> { name, description, input_schema, handler, source, owner_plugin, proxy_id? }
 -- proxy_id is set for tools forwarded from a remote MCP server; handler is nil for these.
 local tools = {}
 
--- Internal prompt registry: name -> { name, description, arguments, handler, source }
+-- Internal prompt registry: name -> { name, description, arguments, handler, source, owner_plugin }
 local prompts = {}
 
 -- Internal resource template registry: uri_template -> { uri_template, name, description,
--- mimeType, handler, source, proxy_id?, _pattern, _param_names }
+-- mimeType, handler, source, owner_plugin, proxy_id?, _pattern, _param_names }
 -- proxy_id is set for resources forwarded from a remote MCP server; handler is nil for these.
 local resource_templates = {}
 
 -- Proxy registry: proxy_id (url) -> { url, token, source, tool_names = {}, on_auth_error = fn|nil }
 -- Tracks which remote MCP servers have been registered so we can clean up on reset/reload.
 local proxies = {}
-
--- Internal resource template registry: name -> { uri_template, name, description, mime_type, handler, source, proxy_id? }
--- proxy_id is set for resource templates forwarded from a remote MCP server; handler is nil for these.
-local resource_templates = {}
 
 -- Batch mode: when true, notifications are suppressed in tool(), prompt(),
 -- and reset(). end_batch() clears the flag and schedules only the notifications
@@ -138,12 +134,54 @@ local function caller_source()
     return _G._loading_plugin_source or "unknown"
 end
 
+--- Get the current plugin key.
+-- Reads _G._loading_plugin_key set by loader.lua during plugin load/reload.
+-- Registrations outside plugin load are builtin and execute in the hub VM.
+-- @return string|nil Plugin key, or nil if not inside a plugin load
+local function caller_plugin_key()
+    local key = rawget(_G, "_loading_plugin_key") or rawget(_G, "_loading_plugin_name")
+    if type(key) == "string" and key ~= "" then return key end
+    return nil
+end
+
 --- Get the current plugin name.
 -- Reads _G._loading_plugin_name set by loader.lua during plugin load/reload.
 -- Tools registered outside any plugin load get nil (treated as "builtin").
 -- @return string|nil Plugin name, or nil if not inside a plugin load
 local function caller_plugin_name()
     return _G._loading_plugin_name
+end
+
+local function mcp_handler_id(kind, name)
+    return tostring(kind) .. ":" .. tostring(name)
+end
+
+local function invoke_proxy_auth_error(proxy)
+    if type(proxy) ~= "table" or type(proxy.on_auth_error) ~= "function" then return end
+    if proxy.owner_plugin then
+        local ok, err = require("lib.plugin_supervisor").invoke(
+            proxy.owner_plugin,
+            "mcp_proxy_auth_error:" .. tostring(proxy.url),
+            proxy.on_auth_error,
+            {
+                timeout_ms = proxy.timeout_ms or 5000,
+                handler_kind = "mcp_proxy_auth_error",
+                handler_id = proxy.handler_id or mcp_handler_id("proxy_auth_error", proxy.url),
+                payload = { url = proxy.url },
+            })
+        if not ok then
+            log.warn(string.format(
+                "mcp.proxy: on_auth_error failed for %s: %s",
+                tostring(proxy.url), tostring(err)))
+        end
+    else
+        local ok, err = pcall(proxy.on_auth_error)
+        if not ok then
+            log.warn(string.format(
+                "mcp.proxy: on_auth_error failed for %s: %s",
+                tostring(proxy.url), tostring(err)))
+        end
+    end
 end
 
 --- Build HTTP headers for a remote MCP server request.
@@ -246,13 +284,17 @@ function M.tool(name, schema, handler)
         error("mcp.tool: handler must be a function")
     end
 
+    local owner_plugin = caller_plugin_key()
     tools[name] = {
         name = name,
         description = schema.description or "",
         input_schema = schema.input_schema or { type = "object", properties = {} },
         handler = handler,
         source = caller_source(),
+        owner_plugin = owner_plugin,
+        handler_id = owner_plugin and mcp_handler_id("tool", name) or nil,
         plugin_name = caller_plugin_name(),  -- nil = builtin (always available)
+        timeout_ms = schema.timeout_ms or 5000,
     }
 
     if not _batch then
@@ -515,7 +557,7 @@ function M.call_tool(name, params, context, callback)
 
             -- 401: token expired. Fire on_auth_error so the plugin can refresh, then report.
             if resp.status == 401 then
-                if proxy.on_auth_error then proxy.on_auth_error() end
+                invoke_proxy_auth_error(proxy)
                 if callback then
                     callback(nil, string.format("MCP token expired for %s (401)", proxy.url))
                 end
@@ -557,8 +599,23 @@ function M.call_tool(name, params, context, callback)
         return  -- async; result arrives via callback
     end
 
-    -- Local tool: invoke handler synchronously.
-    local ok, result = pcall(tool.handler, params or {}, context or {})
+    local ok, result
+    if tool.owner_plugin then
+        ok, result = require("lib.plugin_supervisor").invoke(
+            tool.owner_plugin,
+            "mcp_tool:" .. tostring(name),
+            tool.handler,
+            {
+                timeout_ms = tool.timeout_ms or 5000,
+                handler_kind = "mcp_tool",
+                handler_id = tool.handler_id or mcp_handler_id("tool", name),
+                payload = { name = name, params = params or {}, context = context or {} },
+            },
+            params or {},
+            context or {})
+    else
+        ok, result = pcall(tool.handler, params or {}, context or {})
+    end
     if not ok then
         local err = tostring(result)
         if callback then callback(nil, err) return end
@@ -568,6 +625,15 @@ function M.call_tool(name, params, context, callback)
     local content = normalize_result(result)
     if callback then callback(content, nil) return end
     return content, nil
+end
+
+function M._invoke_tool(handler_id, params, context)
+    for name, tool in pairs(tools) do
+        if tool.handler_id == handler_id then
+            return tool.handler(params or {}, context or {})
+        end
+    end
+    error("mcp tool handler not registered: " .. tostring(handler_id))
 end
 
 --- Get count of registered tools.
@@ -611,6 +677,7 @@ function M.proxy(url, opts)
     local token        = opts.token
     local on_auth_error = opts.on_auth_error
     local source       = caller_source()
+    local owner_plugin = caller_plugin_key()
     local plugin_name  = caller_plugin_name()  -- capture now; nil in async callbacks
     local proxy_id     = url
 
@@ -720,7 +787,8 @@ function M.proxy(url, opts)
         end
 
         -- Update proxy registry (preserve on_auth_error across refreshes if not re-supplied).
-        local prev_on_auth_error = proxies[proxy_id] and proxies[proxy_id].on_auth_error
+        local prev_proxy = proxies[proxy_id]
+        local prev_on_auth_error = prev_proxy and prev_proxy.on_auth_error
         proxies[proxy_id] = {
             url           = url,
             token         = token,
@@ -728,6 +796,11 @@ function M.proxy(url, opts)
             source        = registered_source,
             tool_names    = tool_names,
             on_auth_error = on_auth_error or prev_on_auth_error,
+            owner_plugin  = owner_plugin or (prev_proxy and prev_proxy.owner_plugin),
+            handler_id    = (owner_plugin or (prev_proxy and prev_proxy.owner_plugin))
+                and mcp_handler_id("proxy_auth_error", proxy_id)
+                or nil,
+            timeout_ms    = opts.timeout_ms or (prev_proxy and prev_proxy.timeout_ms) or 5000,
         }
 
         M.end_batch()
@@ -779,12 +852,16 @@ function M.prompt(name, schema, handler)
         error("mcp.prompt: handler must be a function")
     end
 
+    local owner_plugin = caller_plugin_key()
     prompts[name] = {
         name = name,
         description = schema.description or "",
         arguments = schema.arguments or {},
         handler = handler,
         source = caller_source(),
+        owner_plugin = owner_plugin,
+        handler_id = owner_plugin and mcp_handler_id("prompt", name) or nil,
+        timeout_ms = schema.timeout_ms or 5000,
     }
 
     if not _batch then
@@ -843,7 +920,22 @@ function M.get_prompt(name, args)
         return nil, "Unknown prompt: " .. name
     end
 
-    local ok, result = pcall(prompt.handler, args or {})
+    local ok, result
+    if prompt.owner_plugin then
+        ok, result = require("lib.plugin_supervisor").invoke(
+            prompt.owner_plugin,
+            "mcp_prompt:" .. tostring(name),
+            prompt.handler,
+            {
+                timeout_ms = prompt.timeout_ms or 5000,
+                handler_kind = "mcp_prompt",
+                handler_id = prompt.handler_id or mcp_handler_id("prompt", name),
+                payload = { name = name, args = args or {} },
+            },
+            args or {})
+    else
+        ok, result = pcall(prompt.handler, args or {})
+    end
     if not ok then
         return nil, tostring(result)
     end
@@ -861,6 +953,15 @@ function M.get_prompt(name, args)
     else
         return nil, "mcp.get_prompt: handler returned unexpected type: " .. type(result)
     end
+end
+
+function M._invoke_prompt(handler_id, args)
+    for name, prompt in pairs(prompts) do
+        if prompt.handler_id == handler_id then
+            return prompt.handler(args or {})
+        end
+    end
+    error("mcp prompt handler not registered: " .. tostring(handler_id))
 end
 
 --- Get count of registered prompts.
@@ -924,6 +1025,7 @@ function M.resource(uri_template, schema, handler)
 
     local pattern, param_names = compile_uri_template(uri_template)
 
+    local owner_plugin = caller_plugin_key()
     resource_templates[uri_template] = {
         uri_template = uri_template,
         name = schema.name or uri_template,
@@ -931,6 +1033,9 @@ function M.resource(uri_template, schema, handler)
         mimeType = schema.mimeType or "application/json",
         handler = handler,
         source = caller_source(),
+        owner_plugin = owner_plugin,
+        handler_id = owner_plugin and mcp_handler_id("resource", uri_template) or nil,
+        timeout_ms = schema.timeout_ms or 5000,
         _pattern = pattern,
         _param_names = param_names,
     }
@@ -1039,7 +1144,7 @@ function M.read_resource(uri, context, callback)
             end
 
             if resp.status == 401 then
-                if proxy.on_auth_error then proxy.on_auth_error() end
+                invoke_proxy_auth_error(proxy)
                 if callback then
                     callback(nil, string.format("MCP token expired for %s (401)", proxy.url))
                 end
@@ -1073,8 +1178,28 @@ function M.read_resource(uri, context, callback)
         return  -- async; result arrives via callback
     end
 
-    -- Local resource: invoke handler synchronously.
-    local ok, result = pcall(matched_template.handler, params or {}, context or {})
+    local ok, result
+    if matched_template.owner_plugin then
+        ok, result = require("lib.plugin_supervisor").invoke(
+            matched_template.owner_plugin,
+            "mcp_resource:" .. tostring(matched_template.uri_template),
+            matched_template.handler,
+            {
+                timeout_ms = matched_template.timeout_ms or 5000,
+                handler_kind = "mcp_resource",
+                handler_id = matched_template.handler_id or mcp_handler_id("resource", matched_template.uri_template),
+                payload = {
+                    uri = uri,
+                    uri_template = matched_template.uri_template,
+                    params = params or {},
+                    context = context or {},
+                },
+            },
+            params or {},
+            context or {})
+    else
+        ok, result = pcall(matched_template.handler, params or {}, context or {})
+    end
     if not ok then
         local err = tostring(result)
         if callback then callback(nil, err) return end
@@ -1097,12 +1222,71 @@ function M.read_resource(uri, context, callback)
     return contents, nil
 end
 
+function M._invoke_resource(handler_id, params, context)
+    for _, entry in pairs(resource_templates) do
+        if entry.handler_id == handler_id then
+            return entry.handler(params or {}, context or {})
+        end
+    end
+    error("mcp resource handler not registered: " .. tostring(handler_id))
+end
+
+function M._invoke_proxy_auth_error(handler_id)
+    for _, proxy in pairs(proxies) do
+        if proxy.handler_id == handler_id and type(proxy.on_auth_error) == "function" then
+            return proxy.on_auth_error()
+        end
+    end
+    error("mcp proxy auth-error handler not registered: " .. tostring(handler_id))
+end
+
 --- Get count of registered resource templates.
 -- @return number
 function M.count_resources()
     local n = 0
     for _ in pairs(resource_templates) do n = n + 1 end
     return n
+end
+
+function M.unregister_by_plugin(plugin_key)
+    if type(plugin_key) ~= "string" or plugin_key == "" then return 0 end
+    local removed = 0
+
+    for name, tool in pairs(tools) do
+        if tool.owner_plugin == plugin_key then
+            tools[name] = nil
+            removed = removed + 1
+        end
+    end
+
+    for name, prompt in pairs(prompts) do
+        if prompt.owner_plugin == plugin_key then
+            prompts[name] = nil
+            removed = removed + 1
+        end
+    end
+
+    for uri_template, resource in pairs(resource_templates) do
+        if resource.owner_plugin == plugin_key then
+            resource_templates[uri_template] = nil
+            removed = removed + 1
+        end
+    end
+
+    for proxy_id, proxy in pairs(proxies) do
+        if proxy.owner_plugin == plugin_key then
+            proxies[proxy_id] = nil
+            removed = removed + 1
+        end
+    end
+
+    if removed > 0 then
+        schedule_notify()
+        schedule_notify_prompts()
+        schedule_notify_resources()
+    end
+
+    return removed
 end
 
 -- =============================================================================

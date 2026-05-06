@@ -72,6 +72,98 @@ impl Hub {
         self.hub_event_metrics_last_log = Instant::now();
     }
 
+    pub(crate) fn debug_memory_diagnostics(&self) -> serde_json::Value {
+        let event_metrics = self.hub_event_metrics.snapshot();
+        let webrtc = {
+            let _guard = self.tokio_runtime.enter();
+            self.webrtc.diagnostics()
+        };
+        let mut pending_webrtc_output_snapshots = 0usize;
+        let mut pending_webrtc_recovery_snapshots = 0usize;
+        for pending in self.pending_session_io_snapshots.values() {
+            match pending.target {
+                crate::hub::PendingSessionIoSnapshotTarget::WebRtcOutput { .. } => {
+                    pending_webrtc_output_snapshots += 1;
+                }
+                crate::hub::PendingSessionIoSnapshotTarget::WebRtcPeerRecovery { .. } => {
+                    pending_webrtc_recovery_snapshots += 1;
+                }
+            }
+        }
+
+        let active_terminal_peers = self
+            .active_terminal_peers
+            .lock()
+            .map(|peers| peers.len())
+            .unwrap_or(0);
+        let tui_session_input_routes = self
+            .tui_session_input_routes
+            .lock()
+            .map(|routes| routes.len())
+            .unwrap_or(0);
+
+        serde_json::json!({
+            "type": "debug_memory",
+            "hub_id": self.hub_identifier,
+            "process": {
+                "pid": std::process::id(),
+                "allocator": "mimalloc",
+                "rust_heap_note": "precise Rust heap counters are not exposed by this build",
+                "platform_note": Self::memory_platform_note(),
+            },
+            "hub_event_queue": {
+                "pending": event_metrics.pending_total,
+                "pending_high_water": event_metrics.pending_high_water_total,
+                "bytes_pending": event_metrics.bytes_pending_total,
+                "bytes_high_water": event_metrics.bytes_high_water_total,
+                "enqueue_ok": event_metrics.enqueue_ok_total,
+                "enqueue_failed": event_metrics.enqueue_failed_total,
+                "dequeue": event_metrics.dequeue_total,
+                "counters": event_metrics.counters,
+            },
+            "webrtc": webrtc,
+            "workers": {
+                "browser_client_workers": self.browser_client_workers.len(),
+                "terminal_client_workers": self.terminal_client_workers.len(),
+                "socket_clients": self.socket_clients.len(),
+                "tui_session_input_routes": tui_session_input_routes,
+            },
+            "terminal_subscriptions": {
+                "pending_attaches": self.pending_terminal_attaches.len(),
+                "subscription_peers": self.terminal_subscription_peers.len(),
+                "session_peer_sets": self.terminal_session_peers.len(),
+                "active_terminal_peers": active_terminal_peers,
+                "client_color_profiles": self.terminal_client_profiles.len(),
+                "browser_attach_sizes": self.browser_terminal_attach_sizes.len(),
+            },
+            "snapshots": {
+                "pending_session_io_snapshots": self.pending_session_io_snapshots.len(),
+                "pending_webrtc_output_snapshots": pending_webrtc_output_snapshots,
+                "pending_webrtc_recovery_snapshots": pending_webrtc_recovery_snapshots,
+            },
+            "sessions": {
+                "handle_cache_sessions": self.handle_cache.len(),
+                "pending_reconnects": self.pending_reconnects.len(),
+            },
+            "io": {
+                "stream_muxes": self.stream_muxes.len(),
+                "paste_file_sessions": self.paste_files.len(),
+                "notification_watchers": self.notification_watcher_handles.len(),
+                "lua_action_cable_connections": self.lua_ac_connections.len(),
+                "lua_action_cable_channels": self.lua_ac_channels.len(),
+                "lua_hub_client_connections": self.lua_hub_client_connections.len(),
+            }
+        })
+    }
+
+    fn memory_platform_note() -> &'static str {
+        if cfg!(target_os = "macos") {
+            "macOS Activity Monitor can include mmap/native framework/IOAccelerator accounting; use this diagnostic with vmmap/leaks before treating RSS as Rust heap"
+        } else {
+            "RSS is platform-dependent; use these counts to separate retained Botster state from allocator/native memory accounting"
+        }
+    }
+
     fn retry_pending_session_reconnects(&mut self) {
         if self.pending_reconnects.is_empty() {
             return;

@@ -170,7 +170,7 @@ mod tests {
     async fn test_server_accepts_connection_and_fires_event() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("test.sock");
-        let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubEvent>();
+        let (hub_tx, mut hub_rx) = mpsc::channel::<HubEvent>(64);
 
         let server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
 
@@ -199,7 +199,7 @@ mod tests {
     async fn test_client_json_message_arrives_as_hub_event() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("test.sock");
-        let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubEvent>();
+        let (hub_tx, mut hub_rx) = mpsc::channel::<HubEvent>(64);
 
         let _server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
         let mut stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
@@ -240,10 +240,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_client_pty_input_arrives_as_hub_event() {
+    async fn test_client_pty_input_does_not_arrive_as_hub_event_without_direct_route() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("test.sock");
-        let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubEvent>();
+        let (hub_tx, mut hub_rx) = mpsc::channel::<HubEvent>(64);
 
         let _server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
         let mut stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
@@ -260,27 +260,19 @@ mod tests {
         };
         stream.write_all(&frame.encode()).await.unwrap();
 
-        let event = tokio::time::timeout(std::time::Duration::from_secs(2), hub_rx.recv())
-            .await
-            .expect("Timed out")
-            .expect("Channel closed");
-
-        match event {
-            HubEvent::SocketPtyInput {
-                session_uuid, data, ..
-            } => {
-                assert_eq!(session_uuid, "sess-abc-123");
-                assert_eq!(data, b"ls -la\n");
-            }
-            other => panic!("Expected SocketPtyInput, got: {other:?}"),
-        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), hub_rx.recv())
+                .await
+                .is_err(),
+            "PTY input must not be forwarded through HubEvent"
+        );
     }
 
     #[tokio::test]
     async fn test_server_sends_frame_to_client() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("test.sock");
-        let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubEvent>();
+        let (hub_tx, mut hub_rx) = mpsc::channel::<HubEvent>(64);
 
         let _server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
         let mut stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
@@ -325,7 +317,7 @@ mod tests {
     async fn test_client_disconnect_fires_event() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("test.sock");
-        let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubEvent>();
+        let (hub_tx, mut hub_rx) = mpsc::channel::<HubEvent>(64);
 
         let _server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
         let stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
@@ -360,7 +352,7 @@ mod tests {
     async fn test_multiple_clients_get_unique_ids() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("test.sock");
-        let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubEvent>();
+        let (hub_tx, mut hub_rx) = mpsc::channel::<HubEvent>(64);
 
         let _server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
 
@@ -392,7 +384,7 @@ mod tests {
     async fn test_unexpected_frame_type_from_client_ignored_not_fatal() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("test.sock");
-        let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubEvent>();
+        let (hub_tx, mut hub_rx) = mpsc::channel::<HubEvent>(64);
 
         let _server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
         let mut stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
@@ -403,7 +395,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        // Send PtyOutput (hub→client only, unexpected from client)
+        // Send PtyOutput (server-to-client only, unexpected from client)
         let bad = Frame::PtyOutput {
             session_uuid: "sess-bad".to_string(),
             data: b"bad".to_vec(),
@@ -430,7 +422,7 @@ mod tests {
     async fn test_server_sends_binary_frame_not_pty_output() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("test.sock");
-        let (hub_tx, mut hub_rx) = mpsc::unbounded_channel::<HubEvent>();
+        let (hub_tx, mut hub_rx) = mpsc::channel::<HubEvent>(64);
 
         let _server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
         let mut stream = tokio::net::UnixStream::connect(&sock_path).await.unwrap();
@@ -471,7 +463,7 @@ mod tests {
         let long_name = "a".repeat(200);
         let sock_path = tmp.path().join(long_name).join("test.sock");
 
-        let (hub_tx, _hub_rx) = mpsc::unbounded_channel::<HubEvent>();
+        let (hub_tx, _hub_rx) = mpsc::channel::<HubEvent>(64);
         let result = SocketServer::start(sock_path, hub_tx.into());
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
@@ -485,11 +477,11 @@ mod tests {
     async fn test_start_refuses_live_socket_instead_of_unlinking() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sock_path = tmp.path().join("test.sock");
-        let (hub_tx, _hub_rx) = mpsc::unbounded_channel::<HubEvent>();
+        let (hub_tx, _hub_rx) = mpsc::channel::<HubEvent>(64);
 
         let server = SocketServer::start(sock_path.clone(), hub_tx.into()).unwrap();
 
-        let (hub_tx2, _hub_rx2) = mpsc::unbounded_channel::<HubEvent>();
+        let (hub_tx2, _hub_rx2) = mpsc::channel::<HubEvent>(64);
         let err = SocketServer::start(sock_path.clone(), hub_tx2.into())
             .expect_err("second start must fail while first listener is alive");
         assert!(

@@ -144,6 +144,13 @@ export class TerminalConnection extends HubRoute {
     });
   }
 
+  sendFocusChanged(focused) {
+    return this.sendTelemetry("focus_changed", {
+      session_uuid: this.sessionUuid,
+      focused,
+    });
+  }
+
   sendResize(cols, rows) {
     // Keep local geometry in sync so requestSnapshot() sends current bounds.
     this.options.cols = cols;
@@ -151,11 +158,11 @@ export class TerminalConnection extends HubRoute {
     return this.sendCommand("resize", { session_uuid: this.sessionUuid, cols, rows });
   }
 
-  requestSnapshot() {
+  requestSnapshot(size = this.options) {
     return this.sendCommand("request_snapshot", {
       session_uuid: this.sessionUuid,
-      rows: this.options.rows,
-      cols: this.options.cols,
+      rows: size.rows,
+      cols: size.cols,
     });
   }
 

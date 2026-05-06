@@ -71,6 +71,43 @@ local function first(sql, ...)
     return util.first(rows(sql, ...))
 end
 
+local function placeholders(count)
+    local parts = {}
+    for index = 1, count do
+        parts[index] = "?"
+    end
+    return table.concat(parts, ",")
+end
+
+local function id_filter(field, ids)
+    if type(ids) ~= "table" or #ids == 0 then
+        return "", {}
+    end
+    return " AND " .. field .. " IN (" .. placeholders(#ids) .. ")", ids
+end
+
+local function group_by(items, key)
+    local out = {}
+    for _, item in ipairs(items or {}) do
+        local value = item[key]
+        if value then
+            out[value] = out[value] or {}
+            table.insert(out[value], item)
+        end
+    end
+    return out
+end
+
+local function index_by_id(items)
+    local out = {}
+    for _, item in ipairs(items or {}) do
+        if item.id then
+            out[item.id] = item
+        end
+    end
+    return out
+end
+
 local function event_exists(kind)
     local result = first("SELECT COUNT(*) AS count FROM events WHERE kind = ?", kind)
     return result and tonumber(result.count or 0) > 0
@@ -313,6 +350,45 @@ end
 
 function M.project_tickets(project_id)
     return rows("SELECT * FROM tickets WHERE project_id = ? ORDER BY updated_at DESC, created_at DESC", project_id)
+end
+
+function M.project_dependency_overview(project_id)
+    local tickets = M.project_tickets(project_id)
+    local dependencies_by_ticket = {}
+    for _, dependency in ipairs(rows([[SELECT td.*, t.title AS depends_on_title, t.status AS depends_on_status
+                                      FROM ticket_dependencies td
+                                      JOIN tickets owner ON owner.id = td.ticket_id
+                                      LEFT JOIN tickets t ON t.id = td.depends_on_ticket_id
+                                      WHERE owner.project_id = ?
+                                      ORDER BY td.created_at ASC, td.id ASC]], project_id)) do
+        local key = dependency.ticket_id
+        dependencies_by_ticket[key] = dependencies_by_ticket[key] or {}
+        table.insert(dependencies_by_ticket[key], dependency)
+    end
+
+    local latest_run_by_ticket = {}
+    local open_run_by_ticket = {}
+    for _, run in ipairs(rows([[SELECT r.*
+                                FROM runs r
+                                JOIN tickets t ON t.id = r.ticket_id
+                                WHERE t.project_id = ?
+                                ORDER BY r.ticket_id ASC, r.created_at DESC, r.id DESC]], project_id)) do
+        if not latest_run_by_ticket[run.ticket_id] then
+            latest_run_by_ticket[run.ticket_id] = run
+        end
+        if not open_run_by_ticket[run.ticket_id]
+            and (run.status == "active" or run.status == "blocked")
+        then
+            open_run_by_ticket[run.ticket_id] = run
+        end
+    end
+
+    return {
+        tickets = tickets,
+        dependencies_by_ticket = dependencies_by_ticket,
+        latest_run_by_ticket = latest_run_by_ticket,
+        open_run_by_ticket = open_run_by_ticket,
+    }
 end
 
 function M.visible_project_tickets(project_id)
@@ -1000,6 +1076,115 @@ function M.ticket_session_uuids(ticket_id)
     return uuids
 end
 
+function M.ticket_session_uuids_by_ticket(ticket_ids)
+    local ticket_filter, params = id_filter("r.ticket_id", ticket_ids)
+    local by_ticket = {}
+    local seen = {}
+    local all_uuids = {}
+
+    local function add(ticket_id, uuid)
+        if util.is_blank(ticket_id) or util.is_blank(uuid) then
+            return
+        end
+        seen[ticket_id] = seen[ticket_id] or {}
+        if seen[ticket_id][uuid] then
+            return
+        end
+        seen[ticket_id][uuid] = true
+        by_ticket[ticket_id] = by_ticket[ticket_id] or {}
+        table.insert(by_ticket[ticket_id], uuid)
+        all_uuids[uuid] = true
+    end
+
+    for _, row in ipairs(rows([[SELECT r.ticket_id, rs.agent_session_uuid
+                                FROM run_steps rs
+                                JOIN runs r ON r.id = rs.run_id
+                                WHERE rs.agent_session_uuid IS NOT NULL
+                                  AND rs.agent_session_uuid != '']] .. ticket_filter, params)) do
+        add(row.ticket_id, row.agent_session_uuid)
+    end
+
+    local event_filter, event_params = id_filter("ticket_id", ticket_ids)
+    for _, event in ipairs(rows([[SELECT ticket_id, payload
+                                  FROM events
+                                  WHERE ticket_id IS NOT NULL
+                                    AND kind IN ('ticket.merge_requested',
+                                                 'ticket.merge_agent_linked',
+                                                 'question.agent_linked')]] .. event_filter, event_params)) do
+        local payload = util.decode(event.payload, {})
+        add(event.ticket_id, payload.session_uuid)
+    end
+
+    return by_ticket, all_uuids
+end
+
+function M.ticket_detail_overview(ticket_id)
+    local runs = M.ticket_runs(ticket_id)
+    local latest_run = runs[1]
+    local open_run = nil
+    local run_ids = {}
+    local pipeline_ids = {}
+    for _, run in ipairs(runs) do
+        table.insert(run_ids, run.id)
+        pipeline_ids[run.pipeline_id] = true
+        if not open_run and (run.status == "active" or run.status == "blocked") then
+            open_run = run
+        end
+    end
+
+    local pipelines = M.list_pipelines()
+    local pipelines_by_id = index_by_id(pipelines)
+    local steps_by_id = index_by_id(rows("SELECT * FROM pipeline_steps"))
+
+    local run_steps = {}
+    if #run_ids > 0 then
+        run_steps = rows([[SELECT rs.*, r.ticket_id, r.pipeline_id, ps.name, ps.kind, ps.position, ps.agent_name, ps.prompt, ps.command
+                           FROM run_steps rs
+                           JOIN runs r ON r.id = rs.run_id
+                           JOIN pipeline_steps ps ON ps.id = rs.step_id
+                           WHERE rs.run_id IN (]] .. placeholders(#run_ids) .. [[)
+                           ORDER BY r.created_at DESC, COALESCE(rs.sequence, 0) ASC, rs.created_at ASC, rs.id ASC]], run_ids)
+    end
+    local run_steps_by_run = group_by(run_steps, "run_id")
+
+    local gate_results_by_run_step = {}
+    local reviews_by_run_step = {}
+    if #run_steps > 0 then
+        local run_step_ids = {}
+        for _, step in ipairs(run_steps) do
+            table.insert(run_step_ids, step.id)
+        end
+        gate_results_by_run_step = group_by(rows("SELECT * FROM gate_results WHERE run_step_id IN (" .. placeholders(#run_step_ids) .. ") ORDER BY created_at ASC, id ASC", run_step_ids), "run_step_id")
+        reviews_by_run_step = group_by(rows("SELECT * FROM reviews WHERE run_step_id IN (" .. placeholders(#run_step_ids) .. ") ORDER BY created_at DESC, id DESC", run_step_ids), "run_step_id")
+    end
+
+    local events = M.ticket_events(ticket_id, nil, 100)
+    local events_by_kind = group_by(events, "kind")
+    local session_uuids_by_ticket = M.ticket_session_uuids_by_ticket({ ticket_id })
+
+    return {
+        runs = runs,
+        latest_run = latest_run,
+        open_run = open_run,
+        pipelines = pipelines,
+        pipelines_by_id = pipelines_by_id,
+        steps_by_id = steps_by_id,
+        run_steps = run_steps,
+        run_steps_by_run = run_steps_by_run,
+        gate_results_by_run_step = gate_results_by_run_step,
+        reviews_by_run_step = reviews_by_run_step,
+        questions = M.ticket_questions(ticket_id),
+        open_questions = M.ticket_questions(ticket_id, "open"),
+        dependencies = M.ticket_dependencies(ticket_id),
+        visible_tickets = M.visible_tickets(),
+        events = events,
+        events_by_kind = events_by_kind,
+        merge_events = events_by_kind["ticket.merge_requested"] or {},
+        failed_merge_events = events_by_kind["ticket.merge_request_failed"] or {},
+        session_uuids = session_uuids_by_ticket[ticket_id] or {},
+    }
+end
+
 function M.get_run_step(run_id, step_id)
     return first([[SELECT * FROM run_steps
                    WHERE run_id = ? AND step_id = ?
@@ -1383,6 +1568,36 @@ end
 
 function M.open_questions()
     return rows("SELECT * FROM questions WHERE status = 'open' ORDER BY created_at DESC")
+end
+
+function M.has_open_questions()
+    local row = first("SELECT 1 AS found FROM questions WHERE status = 'open' LIMIT 1")
+    return row ~= nil
+end
+
+function M.open_questions_with_tickets()
+    return rows([[SELECT q.*, t.title AS ticket_title
+                  FROM questions q
+                  LEFT JOIN tickets t ON t.id = q.ticket_id
+                  WHERE q.status = 'open'
+                  ORDER BY q.created_at DESC]])
+end
+
+function M.run_detail_overview(run_id)
+    local run = M.get_run(run_id)
+    if not run then
+        return nil
+    end
+    return {
+        run = run,
+        ticket = M.get_ticket(run.ticket_id),
+        pipeline = M.get_pipeline(run.pipeline_id),
+        steps = M.run_steps(run.id),
+        reviews = M.run_reviews(run.id),
+        findings = M.run_findings(run.id),
+        artifacts = M.run_artifacts(run.id),
+        events = M.run_events(run.id, 12),
+    }
 end
 
 function M.run_events(run_id, limit)

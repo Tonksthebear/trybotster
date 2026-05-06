@@ -252,7 +252,7 @@ function Session._init(self, config)
     self.title = nil          -- window title from OSC 0/2 (set by pty_title_changed hook)
     self.cwd = nil            -- current working directory from OSC 7 (set by pty_cwd_changed hook)
     self.notification = false -- true when OSC notification fired, cleared by client
-    self.is_idle = true       -- idle until first PTY output (managed by pty_output hook)
+    self.output_activity = "idle" -- "active" when recent PTY output was observed
     self.session = nil        -- single PtySessionHandle
     self._session_config = session_config  -- original session config from creation
     self.session_dir = session_config.definition_dir
@@ -563,7 +563,7 @@ function Session._init_recovered(self, config)
     self.label           = config.label
     self.task            = config.task
     self.notification    = false
-    self.is_idle         = true
+    self.output_activity = "idle"
     self.session         = config.handle
     self._session_config = nil
     self._port           = nil
@@ -638,7 +638,7 @@ end
 -- @param fields table  Key-value pairs to update (e.g., { title = "foo", cwd = "/tmp" })
 -- Fields that are runtime-only and don't need manifest sync to disk.
 local RUNTIME_ONLY_FIELDS = {
-    is_idle = true,
+    output_activity = true,
     notification = true,
     plugin_state = true,
 }
@@ -671,6 +671,30 @@ function Session:update(fields)
         require("lib.entity_model").patch_session(self, changed_fields)
         require("lib.session_actions").publish_for_session(self)
     end
+end
+
+--- Derive output activity from the session process' last PTY output timestamp.
+-- The session process reports facts (`last_output_at`); the Lua session model
+-- owns the product-level active/idle threshold used by clients.
+-- @param active_window_ms number Milliseconds after output that count as active
+-- @param now_ms number Current epoch milliseconds
+-- @return string "active"|"idle"
+function Session:derive_output_activity(active_window_ms, now_ms)
+    if not self.session then
+        return "idle"
+    end
+
+    local ok, last_output_at = pcall(function()
+        return self.session:last_output_at()
+    end)
+    if not ok or type(last_output_at) ~= "number" or last_output_at <= 0 then
+        return "idle"
+    end
+
+    if (now_ms - last_output_at) <= active_window_ms then
+        return "active"
+    end
+    return "idle"
 end
 
 --- Publish the current client-facing session entity.
@@ -749,7 +773,7 @@ function Session:_sync_session_manifest()
     -- Strip runtime-only fields that shouldn't persist
     manifest.port           = nil
     manifest.notification   = nil
-    manifest.is_idle        = nil
+    manifest.output_activity = nil
 
     log.info(string.format("Session %s: writing manifest to %s/workspaces/%s/sessions/%s/manifest.json",
         self.session_uuid, tostring(self._data_dir), tostring(self._workspace_id), self.session_uuid))
@@ -1144,7 +1168,7 @@ function Session:info()
         created_at = self.created_at,
         label = self.label,
         task = self.task,
-        is_idle = self.is_idle or false,
+        output_activity = self.output_activity or "idle",
     }
 end
 

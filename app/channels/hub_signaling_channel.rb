@@ -34,7 +34,7 @@ class HubSignalingChannel < ApplicationCable::Channel
     stream_from "hub:#{@hub.id}:health"
 
     # Immediately tell browser current CLI status
-    transmit(HealthStatus.message(@hub.alive? ? HealthStatus::ONLINE : HealthStatus::OFFLINE))
+    transmit(HealthStatus.message(@hub.active? ? HealthStatus::ONLINE : HealthStatus::OFFLINE))
 
     # Paired browsers connect signaling with their long-term identity key.
     # Ask the CLI for a fresh signed bundle right away so the first offer can

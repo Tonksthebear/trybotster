@@ -11,7 +11,7 @@ pub(super) use crate::client::{ClientId, TuiOutput, TuiRequest};
 pub(super) use crate::config::Config;
 pub(super) use crate::hub::agent_handle::{PtyHandle, SessionHandle, SessionType};
 pub(super) use crate::hub::{Hub, PendingTerminalAttachRequest};
-pub(super) use crate::lua::CreateForwarderRequest;
+pub(super) use crate::lua::BrowserTerminalSubscriptionRequest;
 pub(super) use crate::relay::create_crypto_service;
 pub(super) use crate::socket::framing::{Frame, FrameDecoder};
 
@@ -72,22 +72,6 @@ pub(super) fn e2e_hub() -> (
     (hub, request_tx, output_rx)
 }
 
-pub(super) fn test_session_handle(session_uuid: &str) -> SessionHandle {
-    let pty_session = PtySession::new(24, 80);
-    let (shared_state, event_tx, kitty_enabled, cursor_visible, resize_pending) =
-        pty_session.get_direct_access();
-    std::mem::forget(pty_session);
-    let pty = PtyHandle::new(
-        event_tx,
-        shared_state,
-        kitty_enabled,
-        cursor_visible,
-        resize_pending,
-        None,
-    );
-    SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty)
-}
-
 pub(super) fn test_session_backed_handle(
     session_uuid: &str,
     rows: u16,
@@ -115,19 +99,6 @@ pub(super) fn test_session_backed_handle_with_mailbox(
 ) -> SessionHandle {
     let conn =
         crate::session::connection::SessionConnection::test_with_session_io_sender(session_io_tx);
-    test_session_backed_handle_with_connection(session_uuid, conn)
-}
-
-pub(super) fn test_session_backed_handle_with_mailbox_and_snapshot(
-    session_uuid: &str,
-    session_io_tx: tokio::sync::mpsc::Sender<crate::worker::session_io::SessionIoRequest>,
-    snapshot: Option<Vec<u8>>,
-) -> SessionHandle {
-    let conn =
-        crate::session::connection::SessionConnection::test_with_session_io_sender_and_snapshot(
-            session_io_tx,
-            snapshot,
-        );
     test_session_backed_handle_with_connection(session_uuid, conn)
 }
 
@@ -272,25 +243,6 @@ pub(super) fn read_test_socket_frames(
     })
 }
 
-pub(super) fn wait_for_receiver_count(
-    event_tx: &tokio::sync::broadcast::Sender<crate::agent::pty::PtyEvent>,
-    expected: usize,
-) {
-    shared_test_runtime().block_on(async {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            if event_tx.receiver_count() >= expected {
-                return;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for {expected} PTY subscribers"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    });
-}
-
 pub(super) fn settle_worker_subscription() {
     shared_test_runtime().block_on(async {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -321,6 +273,77 @@ where
             }
         }
     })
+}
+
+pub(super) fn recv_terminal_initial_snapshot_delivery(
+    rx: &mut tokio::sync::mpsc::Receiver<crate::worker::session_io::SessionIoRequest>,
+) -> crate::worker::session_io::TerminalInitialSnapshotDelivery {
+    match recv_session_io_request_matching(rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::GetInitialSnapshot { .. }
+        )
+    }) {
+        crate::worker::session_io::SessionIoRequest::GetInitialSnapshot { delivery } => delivery,
+        other => panic!("expected GetInitialSnapshot request, got {other:?}"),
+    }
+}
+
+pub(super) fn deliver_terminal_initial_snapshot(
+    delivery: crate::worker::session_io::TerminalInitialSnapshotDelivery,
+    snapshot: Vec<u8>,
+) {
+    delivery
+        .worker
+        .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+            crate::worker::client::ClientControlFrame::Scrollback {
+                session_uuid: delivery.session_uuid.clone(),
+                rows: delivery.rows,
+                cols: delivery.cols,
+                kitty_enabled: delivery.kitty_enabled,
+                data: snapshot,
+            },
+        ))
+        .expect("deliver initial snapshot to client worker");
+
+    if delivery.confirm_subscription {
+        delivery
+            .worker
+            .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::BoundaryJson(serde_json::json!({
+                    "type": "subscribed",
+                    "subscriptionId": delivery.subscription_id.clone(),
+                })),
+            ))
+            .expect("deliver subscription confirmation to client worker");
+    }
+
+    delivery
+        .worker
+        .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+            crate::worker::client::ClientControlFrame::TerminalAttach {
+                subscription_id: delivery.subscription_id,
+                session_uuid: delivery.session_uuid,
+                state: crate::worker::client::TerminalAttachState::Attached,
+            },
+        ))
+        .expect("deliver attached state to client worker");
+}
+
+pub(super) fn deliver_terminal_attach_state(
+    delivery: crate::worker::session_io::TerminalInitialSnapshotDelivery,
+    state: crate::worker::client::TerminalAttachState,
+) {
+    delivery
+        .worker
+        .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+            crate::worker::client::ClientControlFrame::TerminalAttach {
+                subscription_id: delivery.subscription_id,
+                session_uuid: delivery.session_uuid,
+                state,
+            },
+        ))
+        .expect("deliver terminal attach state to client worker");
 }
 
 pub(super) fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
@@ -379,57 +402,14 @@ pub(super) fn test_local_session_handle(session_uuid: &str) -> SessionHandle {
     test_local_session_handle_with_seed(session_uuid, b"cached-local-output\n")
 }
 
-pub(super) fn test_session_handle_with_snapshot(
-    session_uuid: &str,
-    snapshot: &[u8],
-) -> SessionHandle {
-    let pty_session = PtySession::new(24, 80);
-    let (shared_state, event_tx, kitty_enabled, cursor_visible, resize_pending) =
-        pty_session.get_direct_access();
-    std::mem::forget(pty_session);
+// Terminal probe caching is exercised via session-process paths.
 
-    let pty = PtyHandle::new_with_snapshot(
-        event_tx,
-        shared_state,
-        kitty_enabled,
-        cursor_visible,
-        resize_pending,
-        None,
-        snapshot.to_vec(),
-    );
-    SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty)
-}
-
-pub(super) fn test_session_handle_with_broadcast_capacity(
-    session_uuid: &str,
-    capacity: usize,
-) -> SessionHandle {
-    let (event_tx, _rx) = tokio::sync::broadcast::channel(capacity);
-    let pty = PtyHandle::new(
-        event_tx,
-        Arc::new(Mutex::new(crate::agent::pty::SharedPtyState {
-            master_pty: None,
-            writer: None,
-            dimensions: (24, 80),
-            last_human_input_ms: Arc::new(std::sync::atomic::AtomicI64::new(0)),
-        })),
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(true)),
-        Arc::new(AtomicBool::new(false)),
-        None,
-    );
-    SessionHandle::new(session_uuid, "test-agent", SessionType::Agent, None, pty)
-}
-
-// Legacy probe tests removed during the session-process migration.
-// Terminal probe caching is now exercised via session-process paths.
-
-pub(super) fn test_forwarder_request(
+pub(super) fn test_browser_subscription_request(
     peer_id: &str,
     session_uuid: &str,
     subscription_id: &str,
-) -> CreateForwarderRequest {
-    CreateForwarderRequest {
+) -> BrowserTerminalSubscriptionRequest {
+    BrowserTerminalSubscriptionRequest {
         peer_id: peer_id.to_string(),
         session_uuid: session_uuid.to_string(),
         prefix: Some(vec![0x01]),
@@ -449,35 +429,14 @@ pub(super) fn install_test_browser_worker(
     let command_rx = hub
         .webrtc
         .install_test_recovery_sender(peer_id, &hub.tokio_runtime);
-    let (hub_control_tx, _hub_control_rx) =
-        tokio::sync::mpsc::channel(crate::worker::hub_control::HUB_CONTROL_QUEUE.capacity);
-    let (outbound_tx, mut outbound_rx) =
-        tokio::sync::mpsc::channel::<crate::worker::transport::TransportEgress>(4096);
-    let hub_event_tx = hub.hub_event_tx.clone();
-    let browser_identity = peer_id.to_string();
     let _guard = hub.tokio_runtime.enter();
-    tokio::spawn(async move {
-        while let Some(egress) = outbound_rx.recv().await {
-            if hub_event_tx
-                .send(crate::hub::events::HubEvent::WebRtcClientWorkerEgress {
-                    browser_identity: browser_identity.clone(),
-                    egress,
-                })
-                .is_err()
-            {
-                break;
-            }
-        }
-    });
-    let mut config = crate::worker::client::ClientWorkerConfig::new(
-        crate::client::ClientId::browser(peer_id.to_string()),
-        hub_control_tx,
-        outbound_tx,
-        std::collections::HashMap::new(),
-    );
-    config.outbound =
-        crate::worker::BoundedQueueConfig::new("worker.client.webrtc.test.outbound", 4096);
-    let worker = crate::worker::client::ClientWorker::start(config);
+    let peer_command_tx = hub
+        .webrtc
+        .peer_command_sender(peer_id)
+        .expect("test recovery sender should install a peer command queue");
+    let worker = hub.spawn_webrtc_client_worker_adapter(peer_id.to_string(), peer_command_tx);
+    hub.webrtc
+        .register_client_worker_route(peer_id.to_string(), worker.clone());
     let _ = worker.try_send(
         crate::worker::client::ClientWorkerMessage::SubscribeSession {
             session_uuid: session_uuid.to_string(),
@@ -497,7 +456,13 @@ pub(super) fn install_test_browser_worker_unsubscribed(
         .webrtc
         .install_test_recovery_sender(peer_id, &hub.tokio_runtime);
     let _guard = hub.tokio_runtime.enter();
-    let worker = hub.spawn_webrtc_client_worker_adapter(peer_id.to_string());
+    let peer_command_tx = hub
+        .webrtc
+        .peer_command_sender(peer_id)
+        .expect("test recovery sender should install a peer command queue");
+    let worker = hub.spawn_webrtc_client_worker_adapter(peer_id.to_string(), peer_command_tx);
+    hub.webrtc
+        .register_client_worker_route(peer_id.to_string(), worker.clone());
     hub.browser_client_workers
         .insert(peer_id.to_string(), worker);
     command_rx

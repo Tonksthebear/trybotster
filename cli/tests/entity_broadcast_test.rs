@@ -288,7 +288,7 @@ fn patch_emits_entity_patch_frame_with_monotonic_seq() {
 
     let p2: Table = lua.create_table().unwrap();
     p2.set("title", "second").unwrap();
-    p2.set("is_idle", false).unwrap();
+    p2.set("output_activity", "active").unwrap();
     patch.call::<()>(("session", "sess-a", p2)).unwrap();
 
     let captured = frames_as_json(&lua, &frames);
@@ -305,7 +305,7 @@ fn patch_emits_entity_patch_frame_with_monotonic_seq() {
     let second = &captured[1];
     assert_eq!(second["snapshot_seq"], json!(2));
     assert_eq!(second["patch"]["title"], json!("second"));
-    assert_eq!(second["patch"]["is_idle"], json!(false));
+    assert_eq!(second["patch"]["output_activity"], json!("active"));
 }
 
 #[test]
@@ -468,6 +468,53 @@ fn send_snapshots_to_emits_one_snapshot_per_registered_type() {
     assert_eq!(json_frames[1]["entity_type"], json!("workspace"));
     assert_eq!(json_frames[1]["items"].as_array().unwrap().len(), 1);
     assert_eq!(json_frames[1]["items"][0]["workspace_id"], json!("ws-1"));
+}
+
+#[test]
+fn send_snapshots_to_core_scope_skips_plugin_types() {
+    let (lua, eb) = new_eb_lua();
+    register_session_type(&lua, &eb);
+
+    let register: Function = eb.get("register").unwrap();
+    let plugin_opts: Table = lua.create_table().unwrap();
+    plugin_opts.set("id_field", "id").unwrap();
+    plugin_opts.set("owner_plugin", "kanban").unwrap();
+    let plugin_all: Function = lua
+        .create_function(|lua, ()| {
+            let arr = lua.create_table()?;
+            let board = lua.create_table()?;
+            board.set("id", "board-1")?;
+            board.set("name", "Roadmap")?;
+            arr.set(1, board)?;
+            Ok(arr)
+        })
+        .unwrap();
+    plugin_opts.set("all", plugin_all).unwrap();
+    register.call::<()>(("kanban.board", plugin_opts)).unwrap();
+
+    let captured: Table = lua.create_table().unwrap();
+    let client: Table = lua.create_table().unwrap();
+    let captured_for_send = captured.clone();
+    let send: Function = lua
+        .create_function(move |_, (_self, frame): (Table, Table)| {
+            let next_idx = captured_for_send.raw_len() + 1;
+            captured_for_send.raw_set(next_idx, frame)?;
+            Ok(())
+        })
+        .unwrap();
+    client.set("send", send).unwrap();
+
+    let opts: Table = lua.create_table().unwrap();
+    opts.set("scope", "core").unwrap();
+    let send_snapshots_to: Function = eb.get("send_snapshots_to").unwrap();
+    send_snapshots_to
+        .call::<()>((client, "sub-core", opts))
+        .unwrap();
+
+    let frames = frames_as_json(&lua, &captured);
+    assert_eq!(frames.len(), 1, "core scope must omit plugin snapshots");
+    assert_eq!(frames[0]["entity_type"], json!("session"));
+    assert_eq!(frames[0]["subscriptionId"], json!("sub-core"));
 }
 
 #[test]

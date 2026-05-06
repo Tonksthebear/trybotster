@@ -34,6 +34,36 @@ describe('TerminalConnection', () => {
     ])
   })
 
+  it('can request a snapshot with explicit dimensions', async () => {
+    const terminal = terminalConnection()
+    terminal.sendCommand = vi.fn(async () => true)
+
+    await terminal.requestSnapshot({ cols: 140, rows: 45 })
+
+    expect(terminal.sendCommand).toHaveBeenCalledWith('request_snapshot', {
+      session_uuid: 'session-1',
+      rows: 45,
+      cols: 140,
+    })
+  })
+
+  it('includes session uuid in focus change telemetry', async () => {
+    const terminal = terminalConnection()
+    const telemetry = []
+    terminal.sendTelemetry = vi.fn(async (type, data) => {
+      telemetry.push([type, data])
+      return true
+    })
+
+    await terminal.sendFocusChanged(true)
+    await terminal.sendFocusChanged(false)
+
+    expect(telemetry).toEqual([
+      ['focus_changed', { session_uuid: 'session-1', focused: true }],
+      ['focus_changed', { session_uuid: 'session-1', focused: false }],
+    ])
+  })
+
   it('surfaces terminal_attach not_ready as a user-visible error event', () => {
     const terminal = terminalConnection()
     const attachEvents = []

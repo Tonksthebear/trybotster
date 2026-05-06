@@ -95,14 +95,13 @@ impl Hub {
     /// On success, a `SessionReconnectReady` event is sent back to the hub
     /// loop for reader installation and state seeding.
     /// Build a single-line preview for ICE candidate logging.
-    /// Legacy polling entrypoint — calls all poll functions + flush.
+    /// Test polling entrypoint: calls all poll functions and flushes state.
     ///
     /// Only available in tests. Production uses `run_event_loop()` which drives
     /// individual handlers via `tokio::select!` with zero polling.
     #[cfg(test)]
     pub fn tick(&mut self) {
         self.poll_tui_requests();
-        self.poll_pty_input();
         self.poll_outgoing_webrtc_signals();
         self.poll_stream_frames_incoming();
         self.poll_worktree_results();
@@ -123,6 +122,14 @@ impl Hub {
 
     #[cfg(test)]
     fn poll_hub_events(&mut self) {
+        let mut high_priority_rx = self.hub_event_high_priority_rx.take();
+        if let Some(ref mut rx) = high_priority_rx {
+            while let Ok(event) = rx.try_recv() {
+                self.handle_hub_event(event);
+            }
+        }
+        self.hub_event_high_priority_rx = high_priority_rx;
+
         let Some(ref mut rx) = self.hub_event_rx else {
             return;
         };
@@ -132,7 +139,7 @@ impl Hub {
         }
     }
 
-    /// Legacy periodic maintenance (test-only fallback).
+    /// Test periodic maintenance fallback.
     ///
     /// Production uses `HubEvent::CleanupTick` from a spawned interval task.
     #[cfg(test)]
@@ -180,14 +187,6 @@ impl Hub {
                 exit_code,
             } => {
                 self.handle_pty_process_exited(session_uuid, session_name, exit_code);
-            }
-            HubEvent::PtyOutputObserved { session_uuid, data } => {
-                self.handle_observed_pty_output(session_uuid, data);
-            }
-            HubEvent::SessionIoBatch(batch) => {
-                if let Some(output) = batch.output {
-                    self.handle_observed_pty_output(batch.session_uuid, output);
-                }
             }
             HubEvent::SessionIo(event) => {
                 self.handle_session_io_event(event);
@@ -241,20 +240,8 @@ impl Hub {
             } => {
                 self.handle_webrtc_message_event(browser_identity, payload);
             }
-            HubEvent::WebRtcPtyInput(input) => {
-                self.handle_pty_input(input);
-            }
-            HubEvent::WebRtcFileInput(file) => {
-                self.handle_file_input(file);
-            }
             HubEvent::WebRtcOutgoingSignal(signal) => {
                 self.handle_webrtc_signal(signal);
-            }
-            HubEvent::WebRtcClientWorkerEgress {
-                browser_identity,
-                egress,
-            } => {
-                self.process_webrtc_client_worker_egress(&browser_identity, egress);
             }
             HubEvent::WebRtcStreamFrame(frame) => {
                 self.handle_stream_frame(frame);
@@ -293,13 +280,6 @@ impl Hub {
             }
             HubEvent::SocketMessage { client_id, msg } => {
                 self.handle_socket_message_event(client_id, msg);
-            }
-            HubEvent::SocketPtyInput {
-                client_id,
-                session_uuid,
-                data,
-            } => {
-                self.handle_socket_pty_input_event(client_id, session_uuid, data);
             }
             HubEvent::SocketSend(send_req) => {
                 self.handle_socket_send_event(send_req);

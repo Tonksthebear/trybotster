@@ -14,7 +14,7 @@ import type {
   UiNode,
   UiViewport,
 } from './types'
-import { isConditional } from './types'
+import { isBindList, isConditional } from './types'
 import { matchesCondition, useViewport } from './viewport'
 import { resolveBindings, useBindingInvalidation } from './binding'
 
@@ -25,6 +25,9 @@ function renderChild(
 ): ReactNode {
   if (isConditional(child)) {
     return renderConditional(child, ctx, key)
+  }
+  if (isBindList(child)) {
+    return null
   }
   return renderInternal(child, ctx, key)
 }

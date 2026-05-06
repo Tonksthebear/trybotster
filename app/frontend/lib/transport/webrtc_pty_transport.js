@@ -24,15 +24,14 @@ export class WebRtcPtyTransport {
   #terminalConn = null;
   #callbacks = null;
   #unsubscribers = [];
-  #wasConnected = false;
   #awaitingReconnectSnapshot = false;
   #onReconnect = null;
   #onConnect = null;
   #onDisconnect = null;
   #onBinarySnapshot = null;
   #onFocusReportingChanged = null;
-  #pendingResize = null; // { cols, rows }
-  #pendingResizeTimer = null;
+  #desiredSize = null; // { cols, rows }
+  #resizeTimer = null;
 
   constructor({ hubId, sessionUuid }) {
     this.#hubId = hubId;
@@ -44,10 +43,12 @@ export class WebRtcPtyTransport {
    * (subscribing to the CLI's terminal channel) and wires up events.
    */
   async connect(options) {
+    const requestedSize = this.#connectSize(options);
     this.disconnect();
+    this.#desiredSize = requestedSize;
     this.#callbacks = options.callbacks;
     console.debug(
-      `[WebRtcPtyTransport] connect start hub=${this.#hubId} session=${this.#sessionUuid} size=${options.cols}x${options.rows}`,
+      `[WebRtcPtyTransport] connect start hub=${this.#hubId} session=${this.#sessionUuid} size=${requestedSize.cols}x${requestedSize.rows}`,
     );
 
     const termKey = TerminalConnection.key(this.#hubId, this.#sessionUuid);
@@ -60,15 +61,16 @@ export class WebRtcPtyTransport {
       {
         hubId: this.#hubId,
         sessionUuid: this.#sessionUuid,
-        rows: options.rows,
-        cols: options.cols,
+        rows: requestedSize.rows,
+        cols: requestedSize.cols,
       },
     );
 
     this.#awaitingReconnectSnapshot = hadSubscription;
     this.#wireEvents();
+    await this.#terminalConn.sendResize(requestedSize.cols, requestedSize.rows);
     if (hadSubscription) {
-      await this.#terminalConn.requestSnapshot();
+      await this.#terminalConn.requestSnapshot(requestedSize);
     }
     console.debug(
       `[WebRtcPtyTransport] connect ready hub=${this.#hubId} session=${this.#sessionUuid}`,
@@ -76,11 +78,7 @@ export class WebRtcPtyTransport {
   }
 
   disconnect() {
-    if (this.#pendingResizeTimer) {
-      clearTimeout(this.#pendingResizeTimer);
-      this.#pendingResizeTimer = null;
-      this.#pendingResize = null;
-    }
+    this.#clearResizeTimer();
     this.#awaitingReconnectSnapshot = false;
     this.#unsubscribers.forEach((unsub) => unsub());
     this.#unsubscribers = [];
@@ -99,6 +97,12 @@ export class WebRtcPtyTransport {
     return true;
   }
 
+  sendFocusChanged(focused) {
+    if (!this.#terminalConn?.isConnected()) return false;
+    this.#terminalConn.sendFocusChanged(focused);
+    return true;
+  }
+
   sendFile(data, filename) {
     if (!this.#terminalConn?.isConnected()) return false;
     this.#terminalConn.sendFile(data, filename);
@@ -106,19 +110,16 @@ export class WebRtcPtyTransport {
   }
 
   resize(cols, rows) {
-    if (!this.#terminalConn?.isConnected()) return false;
-    this.#pendingResize = { cols, rows };
+    this.#desiredSize = { cols, rows };
+    if (!this.#terminalConn?.isConnected()) return true;
 
-    if (this.#pendingResizeTimer) {
-      clearTimeout(this.#pendingResizeTimer);
-    }
+    this.#clearResizeTimer();
 
-    this.#pendingResizeTimer = setTimeout(() => {
-      const pending = this.#pendingResize;
-      this.#pendingResizeTimer = null;
-      this.#pendingResize = null;
-      if (!pending || !this.#terminalConn?.isConnected()) return;
-      this.#terminalConn.sendResize(pending.cols, pending.rows);
+    this.#resizeTimer = setTimeout(() => {
+      const size = this.#desiredSize;
+      this.#resizeTimer = null;
+      if (!size || !this.#terminalConn?.isConnected()) return;
+      this.#terminalConn.sendResize(size.cols, size.rows);
     }, WebRtcPtyTransport.#RESIZE_DEBOUNCE_MS);
     return true;
   }
@@ -140,6 +141,7 @@ export class WebRtcPtyTransport {
 
   destroy() {
     this.disconnect();
+    this.#desiredSize = null;
     this.#onReconnect = null;
     this.#onConnect = null;
     this.#onDisconnect = null;
@@ -194,7 +196,6 @@ export class WebRtcPtyTransport {
 
     this.#unsubscribers.push(
       this.#terminalConn.onConnected(() => {
-        this.#wasConnected = true;
         this.#onConnect?.();
         this.#callbacks?.onConnect?.();
       }),
@@ -217,5 +218,18 @@ export class WebRtcPtyTransport {
     if (this.#terminalConn.isConnected()) {
       this.#callbacks?.onConnect?.();
     }
+  }
+
+  #connectSize(options) {
+    return this.#desiredSize ?? {
+      cols: options.cols,
+      rows: options.rows,
+    };
+  }
+
+  #clearResizeTimer() {
+    if (!this.#resizeTimer) return;
+    clearTimeout(this.#resizeTimer);
+    this.#resizeTimer = null;
   }
 }

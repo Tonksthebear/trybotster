@@ -35,7 +35,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Result};
 use mlua::prelude::*;
 
-use super::pty::{CreateSocketForwarderRequest, PtyForwarder, PtyRequest};
+use super::pty::{PtyRequest, SocketTerminalSubscriptionRequest, TerminalSubscription};
 use super::HubEventSender;
 use crate::hub::events::HubEvent;
 
@@ -161,11 +161,11 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
         .set("send_binary", send_binary_fn)
         .map_err(|e| anyhow!("Failed to set socket.send_binary: {e}"))?;
 
-    // socket.create_pty_forwarder({ client_id, session_uuid, subscription_id, rows?, cols? })
+    // socket.subscribe_terminal({ client_id, session_uuid, subscription_id, rows?, cols? })
     //
-    // Creates a PTY forwarder that streams output as Frame::PtyOutput to a socket client.
+    // Creates a PTY subscription that streams output as Frame::PtyOutput to a socket client.
     let tx_fwd = hub_event_tx_for_pty.clone();
-    let create_forwarder_fn = lua
+    let subscribe_terminal_fn = lua
         .create_function(move |_lua, opts: LuaTable| {
             let client_id: String = opts
                 .get("client_id")
@@ -179,34 +179,34 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
             let rows: u16 = opts.get("rows").unwrap_or(24);
             let cols: u16 = opts.get("cols").unwrap_or(80);
 
-            let forwarder_id = format!("{}:{}", client_id, session_uuid);
+            let subscription_key = format!("{}:{}", client_id, session_uuid);
             let active_flag = Arc::new(Mutex::new(true));
 
             let guard = tx_fwd.lock().expect("HubEventSender mutex poisoned");
             if let Some(ref sender) = *guard {
-                let _ = sender.send(HubEvent::LuaPtyRequest(PtyRequest::CreateSocketForwarder(
-                    CreateSocketForwarderRequest {
+                let _ = sender.send(HubEvent::LuaPtyRequest(
+                    PtyRequest::SubscribeSocketTerminal(SocketTerminalSubscriptionRequest {
                         client_id: client_id.clone(),
                         session_uuid: session_uuid.clone(),
                         subscription_id,
                         rows,
                         cols,
                         active_flag: Arc::clone(&active_flag),
-                    },
-                )));
+                    }),
+                ));
             }
 
-            Ok(PtyForwarder {
-                id: forwarder_id,
+            Ok(TerminalSubscription {
+                id: subscription_key,
                 peer_id: client_id,
                 session_uuid,
                 active: active_flag,
             })
         })
-        .map_err(|e| anyhow!("Failed to create socket.create_pty_forwarder function: {e}"))?;
+        .map_err(|e| anyhow!("Failed to create socket.subscribe_terminal function: {e}"))?;
     socket_table
-        .set("create_pty_forwarder", create_forwarder_fn)
-        .map_err(|e| anyhow!("Failed to set socket.create_pty_forwarder: {e}"))?;
+        .set("subscribe_terminal", subscribe_terminal_fn)
+        .map_err(|e| anyhow!("Failed to set socket.subscribe_terminal: {e}"))?;
 
     // Register the table globally
     lua.globals()
@@ -228,11 +228,11 @@ mod tests {
         (lua, tx)
     }
 
-    fn setup_with_channel() -> (Lua, tokio::sync::mpsc::UnboundedReceiver<HubEvent>) {
+    fn setup_with_channel() -> (Lua, tokio::sync::mpsc::Receiver<HubEvent>) {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
         register(&lua, tx.clone()).expect("Should register socket primitives");
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
         *tx.lock().unwrap() = Some(sender.into());
         (lua, receiver)
     }

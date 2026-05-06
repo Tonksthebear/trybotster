@@ -148,7 +148,7 @@ impl Hub {
         self.cleanup_paste_files(&session_uuid);
         self.terminal_profiles.clear_session(&session_uuid);
         self.terminal_session_peers.remove(&session_uuid);
-        self.terminal_forwarder_peers
+        self.terminal_subscription_peers
             .retain(|_, (tracked_session, _)| tracked_session != &session_uuid);
         let suffix = format!(":{session_uuid}");
         let worker_keys: Vec<String> = self

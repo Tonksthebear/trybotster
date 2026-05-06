@@ -3,14 +3,15 @@
 class HubsController < ApplicationController
   include ApiKeyAuthenticatable
 
-  before_action :authenticate_user!, only: [ :index, :show ]
+  before_action :authenticate_index_request!, only: [ :index ]
+  before_action :authenticate_user!, only: [ :show ]
   before_action :authenticate_hub_request!, only: [ :create, :update, :destroy ]
   before_action :set_hub, only: [ :show, :update, :destroy ]
 
   # GET /hubs
   # Dashboard showing list of hubs with health status
   def index
-    @hubs = current_user.hubs.order(last_seen_at: :desc)
+    @hubs = current_hub_user.hubs.order(last_seen_at: :desc)
 
     respond_to do |format|
       format.html { render html: "", layout: "spa" }
@@ -61,8 +62,13 @@ class HubsController < ApplicationController
   # CLI registration: creates or finds hub and returns Rails ID
   # Called once at CLI startup before QR code generation
   def create
-    hub = current_hub_user.hubs.find_or_initialize_by(identifier: params[:identifier])
+    hub = Hub.registration_candidate_for(
+      current_hub_user,
+      identifier: params[:identifier],
+      fingerprint: params[:fingerprint]
+    ) || current_hub_user.hubs.build
     is_new = hub.new_record?
+    hub.identifier = params[:identifier]
     hub.last_seen_at = Time.current
     hub.alive = true
     if is_new && params[:repo].present?
@@ -111,6 +117,14 @@ class HubsController < ApplicationController
   end
 
   private
+
+  def authenticate_index_request!
+    if api_key_present?
+      authenticate_with_api_key!
+    else
+      authenticate_user!
+    end
+  end
 
   def authenticate_hub_request!
     if api_key_present?

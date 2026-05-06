@@ -81,7 +81,7 @@ impl Hub {
         watcher_key: String,
         session_uuid: String,
         session_name: String,
-        observe_output: bool,
+        _observe_output: bool,
         event_tx: tokio::sync::broadcast::Sender<crate::agent::pty::PtyEvent>,
     ) {
         // Abort any existing watcher for this key
@@ -134,20 +134,7 @@ impl Hub {
                         let _ = hub_tx.send(event);
                         break;
                     }
-                    Ok(PtyEvent::Output(data)) => {
-                        if observe_output {
-                            if hub_tx
-                                .send(crate::hub::events::HubEvent::PtyOutputObserved {
-                                    session_uuid: session_uuid.clone(),
-                                    data,
-                                })
-                                .is_err()
-                            {
-                                log::warn!("[NotifWatcher] Hub event channel closed for {}", key);
-                                break;
-                            }
-                        }
-                    }
+                    Ok(PtyEvent::Output(_)) => {}
                     Ok(event @ PtyEvent::TitleChanged(_))
                     | Ok(event @ PtyEvent::CwdChanged(_))
                     | Ok(event @ PtyEvent::PromptMark(_))

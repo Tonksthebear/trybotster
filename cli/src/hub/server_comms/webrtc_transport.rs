@@ -206,7 +206,17 @@ impl Hub {
             );
             // Spawn per-peer send task (same as production DcOpened handler)
             self.spawn_webrtc_peer_sender(&browser_identity);
-            let worker = self.spawn_webrtc_client_worker_adapter(browser_identity.clone());
+            let Some(peer_command_tx) = self.webrtc.peer_command_sender(&browser_identity) else {
+                log::warn!(
+                    "[WebRTC] Test DataChannel opened for {} but peer sender was unavailable",
+                    &browser_identity[..browser_identity.len().min(8)]
+                );
+                continue;
+            };
+            let worker =
+                self.spawn_webrtc_client_worker_adapter(browser_identity.clone(), peer_command_tx);
+            self.webrtc
+                .register_client_worker_route(browser_identity.clone(), worker.clone());
             self.browser_client_workers
                 .insert(browser_identity.clone(), worker);
             if let Err(e) = self.lua.call_peer_connected(&browser_identity) {
@@ -320,12 +330,27 @@ impl Hub {
             _ => crate::worker::hub_control::TransportDisconnectReason::ExplicitDisconnect,
         };
         let generation = self.webrtc.current_offer_generation(browser_identity);
-        let Some((cleanup, disconnected)) = self.webrtc.mark_data_channel_closed(
-            browser_identity,
-            generation,
-            disconnect_reason,
-            &self.tokio_runtime,
-        ) else {
+        let (cleanup, disconnected) = if let Some((cleanup, disconnected)) =
+            self.webrtc.mark_data_channel_closed(
+                browser_identity,
+                generation,
+                disconnect_reason,
+                &self.tokio_runtime,
+            ) {
+            (cleanup, Some(disconnected))
+        } else if self
+            .webrtc
+            .cleanup_peer_transport_state_only(browser_identity)
+        {
+            self.hub_event_metrics
+                .record_counter("cleanup.webrtc.orphan_state", 1);
+            (
+                crate::worker::webrtc::TransportCleanup {
+                    connected_age: None,
+                },
+                None,
+            )
+        } else {
             self.hub_event_metrics
                 .record_counter("cleanup.webrtc.duplicate_skipped", 1);
             log::debug!(
@@ -364,25 +389,26 @@ impl Hub {
             );
         }
 
-        // Abort any PTY forwarders for this browser.
-        // Forwarder keys are "{peer_id}:{session_uuid}" where peer_id = browser_identity
+        // Abort any terminal subscriptions for this browser.
+        // Subscription keys are "{peer_id}:{session_uuid}" where peer_id = browser_identity
         let peer_prefix = format!("{browser_identity}:");
         if let Some(worker) = self.browser_client_workers.remove(browser_identity) {
             let _ = worker.try_send(crate::worker::client::ClientWorkerMessage::Shutdown {
                 reason: reason.to_string(),
             });
         }
+        self.webrtc.unregister_client_worker_route(browser_identity);
         self.browser_terminal_attach_sizes
             .retain(|key, _| !key.starts_with(&peer_prefix));
-        self.pty_forwarders.retain(|key, task| {
-            if key.starts_with(&peer_prefix) {
-                task.abort();
-                log::debug!("[WebRTC] Aborted PTY forwarder: {}", key);
-                false
-            } else {
-                true
-            }
-        });
+        let subscription_keys: Vec<String> = self
+            .terminal_subscription_peers
+            .keys()
+            .filter(|key| key.starts_with(&peer_prefix))
+            .cloned()
+            .collect();
+        for key in subscription_keys {
+            self.stop_terminal_subscription(&key);
+        }
         let worker_keys: Vec<String> = self
             .terminal_client_workers
             .keys()
@@ -405,11 +431,17 @@ impl Hub {
         });
         self.unregister_terminal_client_peer(browser_identity, true);
 
-        self.handle_transport_control_message(disconnected);
+        if let Some(disconnected) = disconnected {
+            self.handle_transport_control_message(disconnected);
+        }
 
-        // Notify Lua of peer disconnection (Lua handles subscription cleanup)
-        if let Err(e) = self.lua.call_peer_disconnected(browser_identity) {
-            log::warn!("[WebRTC] Lua peer_disconnected callback error: {e}");
+        if reason != "send_failed" || cleanup.connected_age.is_some() {
+            // Notify Lua of peer disconnection (Lua handles subscription cleanup).
+            // Orphan state cleanup may run after an earlier disconnect already
+            // notified Lua, so only emit for real transport cleanup.
+            if let Err(e) = self.lua.call_peer_disconnected(browser_identity) {
+                log::warn!("[WebRTC] Lua peer_disconnected callback error: {e}");
+            }
         }
         self.hub_event_metrics.record_span_with_threshold(
             "cleanup.webrtc_channel",
@@ -542,7 +574,7 @@ impl Hub {
                     }
                     crate::worker::client::ClientWorkerMessage::SubscribeSession {
                         session_uuid,
-                        subscription_id,
+                        ..
                     } => {
                         let value = serde_json::from_slice::<serde_json::Value>(payload).ok();
                         let rows = value
@@ -559,17 +591,6 @@ impl Hub {
                             .clamp(1, u16::MAX as u64) as u16;
                         self.browser_terminal_attach_sizes
                             .insert(format!("{browser_identity}:{session_uuid}"), (rows, cols));
-                        let ack = crate::worker::client::ClientWorkerMessage::ControlFrame(
-                            crate::worker::client::ClientControlFrame::BoundaryJson(
-                                serde_json::json!({
-                                    "type": "subscribed",
-                                    "subscriptionId": subscription_id,
-                                }),
-                            ),
-                        );
-                        if let Some(worker) = self.browser_client_workers.get(browser_identity) {
-                            let _ = worker.try_send(ack);
-                        }
                     }
                     _ => {}
                 }
@@ -739,19 +760,6 @@ impl Hub {
     }
 
     #[cfg(test)]
-    pub(super) fn poll_pty_input(&mut self) {
-        let mut rx = self.webrtc.lease_pty_input_receiver_for_test();
-        let Some(ref mut rx_ref) = rx else {
-            return;
-        };
-        let inputs: Vec<_> = std::iter::from_fn(|| rx_ref.try_recv().ok()).collect();
-        self.webrtc.return_pty_input_receiver_for_test(rx);
-        for input in inputs {
-            self.handle_pty_input(input);
-        }
-    }
-
-    #[cfg(test)]
     pub(super) fn poll_stream_frames_incoming(&mut self) {
         use crate::relay::stream_mux::StreamMultiplexer;
 
@@ -806,100 +814,5 @@ impl Hub {
                 );
             }
         }
-    }
-
-    pub(super) fn process_webrtc_client_worker_egress(
-        &mut self,
-        browser_identity: &str,
-        egress: crate::worker::transport::TransportEgress,
-    ) {
-        use crate::worker::transport::TransportEgress;
-
-        let egress = match egress {
-            TransportEgress::TerminalBytes {
-                subscription_id,
-                session_uuid,
-                data,
-            } => {
-                let Some(data) =
-                    self.apply_webrtc_pty_output_hooks(browser_identity, &session_uuid, data)
-                else {
-                    return;
-                };
-                TransportEgress::TerminalBytes {
-                    subscription_id,
-                    session_uuid,
-                    data,
-                }
-            }
-            TransportEgress::Scrollback {
-                subscription_id,
-                session_uuid,
-                rows,
-                cols,
-                kitty_enabled,
-                data,
-            } => {
-                let Some(data) =
-                    self.apply_webrtc_pty_output_hooks(browser_identity, &session_uuid, data)
-                else {
-                    return;
-                };
-                TransportEgress::Scrollback {
-                    subscription_id,
-                    session_uuid,
-                    rows,
-                    cols,
-                    kitty_enabled,
-                    data,
-                }
-            }
-            other => other,
-        };
-
-        let Some(command) =
-            crate::worker::webrtc::WebRtcTransportAdapter::egress_to_command(egress)
-        else {
-            return;
-        };
-        self.queue_webrtc_peer_command(browser_identity, command);
-    }
-
-    pub(super) fn apply_webrtc_pty_output_hooks(
-        &mut self,
-        browser_identity: &str,
-        session_uuid: &str,
-        data: Vec<u8>,
-    ) -> Option<Vec<u8>> {
-        use crate::lua::primitives::PtyOutputContext;
-
-        self.hub_event_metrics
-            .record_counter("pty_output.messages", 1);
-        self.hub_event_metrics
-            .record_counter("pty_output.bytes", data.len() as u64);
-
-        let ctx = PtyOutputContext {
-            session_uuid: session_uuid.to_string(),
-            peer_id: browser_identity.to_string(),
-        };
-
-        let final_data = if self.lua.has_interceptors("pty_output") {
-            match self.lua.call_pty_output_interceptors(&ctx, &data) {
-                Ok(Some(transformed)) => transformed,
-                Ok(None) => return None,
-                Err(e) => {
-                    log::warn!("PTY interceptor error: {}", e);
-                    data
-                }
-            }
-        } else {
-            data
-        };
-
-        if self.lua.has_observers("pty_output") {
-            self.lua.notify_pty_output_observers(&ctx, &final_data);
-        }
-
-        Some(final_data)
     }
 }

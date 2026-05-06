@@ -14,6 +14,16 @@ const hubOperationWaiters = new Map() // hubId → Set<{ reject, cleanup }>
 let nextCallerId = 0
 const callerHub = new Map() // callerId → hubId
 
+const WORKSPACE_SHELL_ENTITY_TYPES = Object.freeze([
+  'hub',
+  'connection_code',
+  'session',
+  'session_action',
+  'workspace',
+  'spawn_target',
+  'worktree',
+])
+
 /**
  * Connect to a hub. Returns { hub, connectionId }.
  * Call disconnect(connectionId) when done.
@@ -73,9 +83,8 @@ async function doConnect(hubId, callerId) {
 
   const unsubscribers = []
 
-  // Wire protocol — seed + follow the hub-authored route registry. The
-  // hub sends `ui_route_registry` on hub-channel subscribe and on every
-  // `surfaces_changed` hook firing.
+  // Wire protocol — seed + follow the hub-authored route registry. The hub
+  // ships this only when requested or when `surfaces_changed` fires.
   const seedRoutes = () => {
     const transport = hub.transport
     if (transport && typeof transport.uiRouteRegistry === 'function') {
@@ -94,6 +103,16 @@ async function doConnect(hubId, callerId) {
       unsubscribers.push(off)
     }
   }
+  if (typeof hub.onConnected === 'function') {
+    const off = hub.onConnected(() => {
+      requestWorkspaceShellData(hub)
+    })
+    if (typeof off === 'function') {
+      unsubscribers.push(off)
+    }
+  } else {
+    requestWorkspaceShellData(hub)
+  }
 
   syncSelectionFromUrl()
 
@@ -101,6 +120,30 @@ async function doConnect(hubId, callerId) {
   hubState.set(hubId, state)
   notifyHubAvailable(hubId, hub)
   return { hub, connectionId: callerId }
+}
+
+function requestWorkspaceShellData(hub) {
+  const transport = hub?.transport
+  if (!transport) return
+
+  const request = (label, fn) => {
+    if (typeof fn !== 'function') return
+    try {
+      const result = fn.call(transport)
+      if (result && typeof result.catch === 'function') {
+        result.catch((err) => {
+          console.warn(`[hub-bridge] failed to request ${label}`, err)
+        })
+      }
+    } catch (err) {
+      console.warn(`[hub-bridge] failed to request ${label}`, err)
+    }
+  }
+
+  request('route registry', transport.requestRouteRegistry)
+  request('workspace shell entities', () =>
+    transport.requestEntitySnapshots(WORKSPACE_SHELL_ENTITY_TYPES),
+  )
 }
 
 /**

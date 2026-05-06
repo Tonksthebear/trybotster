@@ -447,6 +447,57 @@ fn web_layout_render_falls_back_to_surfaces_registry() {
 }
 
 #[test]
+fn web_layout_render_accepts_bind_list_children() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let json: String = lua
+        .load(
+            r#"
+            surfaces.register("bind_list_demo", {
+                render = function(_state)
+                    return ui.stack{
+                        direction = "vertical",
+                        children = {
+                            ui.bind_list{
+                                source = "/project-pipelines.pipeline",
+                                item_template = ui.list_item{
+                                    id = ui.bind("@/id"),
+                                    title = {
+                                        ui.text{ text = ui.bind("@/name") },
+                                    },
+                                },
+                            },
+                        },
+                    }
+                end,
+            })
+            return web_layout.render("bind_list_demo", {})
+            "#,
+        )
+        .eval()
+        .expect("render bind_list surface");
+
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse JSON");
+    assert_eq!(
+        parsed.pointer("/type").and_then(|v| v.as_str()),
+        Some("stack")
+    );
+    assert_eq!(
+        parsed.pointer("/children/0/$kind").and_then(|v| v.as_str()),
+        Some("bind_list"),
+        "bind_list child should survive web_layout UiNode validation"
+    );
+    assert_eq!(
+        parsed
+            .pointer("/children/0/item_template/id/$bind")
+            .and_then(|v| v.as_str()),
+        Some("@/id"),
+        "bound child ids must survive web_layout JSON transport"
+    );
+}
+
+#[test]
 fn workspace_panel_layout_keeps_pairing_out_of_main_surface() {
     let _lock = lock_env();
     let lua = new_test_lua();
@@ -1974,6 +2025,74 @@ fn surfaces_resolve_route_returns_matched_route_and_params() {
     assert_eq!(matched_id, "13");
     assert!(root_match, "root subpath must match the / route");
     assert!(unknown_match, "unknown subpath must return nil route");
+}
+
+#[test]
+fn tree_snapshot_core_scope_only_renders_builtin_surfaces() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let emitted: Vec<String> = lua
+        .load(
+            r#"
+            surfaces.register("workspace_panel", {
+                source = "builtin",
+                render = function(_s) return { type = "panel", props = { tag = "core" } } end,
+            })
+            surfaces.register("pipelines", {
+                source = "plugin:project-pipelines",
+                render = function(_s) return { type = "panel", props = { tag = "plugin" } } end,
+            })
+            local TreeSnapshot = require("lib.tree_snapshot")
+            TreeSnapshot._reset_for_tests()
+            local frames = TreeSnapshot.build_frames({
+                client = { surface_subpaths = {} },
+                force = true,
+                scope = "core",
+            })
+            local names = {}
+            for _, f in ipairs(frames) do names[#names + 1] = f.target_surface end
+            return names
+            "#,
+        )
+        .eval()
+        .expect("core tree snapshot scope");
+
+    assert_eq!(emitted, vec!["workspace_panel"]);
+}
+
+#[test]
+fn client_surface_subpath_rebroadcasts_even_when_path_is_unchanged() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let calls: i64 = lua
+        .load(
+            r#"
+            local Client = require("lib.client")
+            local calls = 0
+            local client = {
+                surface_subpaths = { workspace_sidebar = "/" },
+                subscriptions = {
+                    hub_sub = { channel = "hub" },
+                },
+                send_ui_tree_snapshots = function(_self, sub_id, opts)
+                    calls = calls + 1
+                    assert(sub_id == "hub_sub")
+                    assert(opts.only_surface == "workspace_sidebar")
+                    assert(opts.force == true)
+                    return 1
+                end,
+            }
+
+            Client.set_surface_subpath(client, "workspace_sidebar", "/")
+            return calls
+            "#,
+        )
+        .eval()
+        .expect("same-subpath surface request rebroadcast");
+
+    assert_eq!(calls, 1);
 }
 
 #[test]

@@ -15,6 +15,12 @@ local M = {}
 -- Command registry: cmd_type -> { handler, description }
 local registry = {}
 
+local function current_plugin_key()
+    local key = rawget(_G, "_loading_plugin_key") or rawget(_G, "_loading_plugin_name")
+    if type(key) == "string" and key ~= "" then return key end
+    return nil
+end
+
 local function send_failure_response(client, sub_id, command, err)
     if not client or not command or not command.request_id then return end
     client:send({
@@ -38,6 +44,8 @@ function M.register(cmd_type, handler, opts)
     registry[cmd_type] = {
         handler = handler,
         description = opts.description or "",
+        owner_plugin = opts.owner_plugin or current_plugin_key(),
+        timeout_ms = opts.timeout_ms or 5000,
     }
     log.debug(string.format("Command registered: %s", cmd_type))
 end
@@ -54,12 +62,32 @@ function M.unregister(cmd_type)
     return false
 end
 
+function M.unregister_by_plugin(plugin_key)
+    if type(plugin_key) ~= "string" or plugin_key == "" then return 0 end
+    local removed = 0
+    for cmd_type, entry in pairs(registry) do
+        if entry.owner_plugin == plugin_key then
+            registry[cmd_type] = nil
+            removed = removed + 1
+            log.debug(string.format("Command unregistered for plugin %s: %s", plugin_key, cmd_type))
+        end
+    end
+    return removed
+end
+
+function M._invoke_registered(cmd_type, command)
+    local entry = registry[cmd_type]
+    if not entry then error("command not registered: " .. tostring(cmd_type)) end
+    return entry.handler(nil, nil, command or {})
+end
+
 --- Dispatch a command to its registered handler.
 -- Fires hooks.notify("after_hub_command") after execution for observability.
 -- @param client The Client instance
 -- @param sub_id The subscription ID for responses
 -- @param command The command table (must have .type or .command)
 function M.dispatch(client, sub_id, command)
+    local hooks = require("hub.hooks")
     local cmd_type = command.type or command.command
 
     -- Interceptor: plugins can transform or block commands (return nil)
@@ -79,7 +107,24 @@ function M.dispatch(client, sub_id, command)
 
     local entry = registry[cmd_type]
     if entry then
-        local ok, err = pcall(entry.handler, client, sub_id, command)
+        local ok, err
+        if entry.owner_plugin then
+            ok, err = require("lib.plugin_supervisor").invoke(
+                entry.owner_plugin,
+                "command:" .. tostring(cmd_type),
+                entry.handler,
+                {
+                    timeout_ms = entry.timeout_ms or 5000,
+                    handler_kind = "command",
+                    handler_id = cmd_type,
+                    payload = { command = command },
+                },
+                client,
+                sub_id,
+                command)
+        else
+            ok, err = pcall(entry.handler, client, sub_id, command)
+        end
         if not ok then
             log.error(string.format("Command '%s' error: %s", cmd_type, tostring(err)))
             send_failure_response(client, sub_id, command, err)
@@ -91,8 +136,10 @@ function M.dispatch(client, sub_id, command)
             success = ok,
             error = not ok and err or nil,
         })
+        return ok, err
     else
         log.debug(string.format("Unknown hub command: %s", tostring(cmd_type)))
+        return false, "unknown command: " .. tostring(cmd_type)
     end
 end
 

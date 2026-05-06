@@ -1,80 +1,6 @@
 use super::test_support::*;
 
 #[test]
-pub(super) fn test_session_io_batch_preserves_output_metrics_and_probe_learning() {
-    let (mut hub, _request_tx, _output_rx) = e2e_hub();
-    let session_uuid = "sess-worker-batch-probe";
-
-    hub.handle_cache
-        .add_session(test_local_session_handle(session_uuid));
-
-    hub.handle_hub_event(crate::hub::events::HubEvent::SessionIoBatch(
-        crate::worker::session_io::SessionIoBatch {
-            session_uuid: session_uuid.to_string(),
-            output: Some(b"\x1b]11;?\x07payload".to_vec()),
-        },
-    ));
-
-    let snapshot = hub.hub_event_metrics.snapshot();
-    assert_eq!(snapshot.counters["pty_output.messages"], 1);
-    assert_eq!(snapshot.counters["pty_output.bytes"], 14);
-
-    hub.learn_terminal_probe_replies(session_uuid, "browser-a", b"\x1b]11;rgb:1234/5678/9abc\x07");
-
-    assert_eq!(
-        hub.terminal_profiles.headless_reply(
-            session_uuid,
-            crate::hub::terminal_profile::TerminalProbe::DefaultBackground
-        ),
-        None
-    );
-}
-
-#[test]
-pub(super) fn test_file_input_enqueues_paste_and_written_event_registers_cleanup() {
-    let (mut hub, _request_tx, _output_rx) = e2e_hub();
-    let session_uuid = "sess-file-paste-mailbox";
-    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(4);
-    hub.handle_cache
-        .add_session(test_session_backed_handle_with_mailbox(
-            session_uuid,
-            session_io_tx,
-        ));
-
-    hub.handle_file_input(crate::channel::webrtc::FileInputIncoming {
-        session_uuid: session_uuid.to_string(),
-        filename: "drop.PNG".to_string(),
-        data: b"image-bytes".to_vec(),
-    });
-
-    match session_io_rx.try_recv().expect("paste request") {
-        crate::worker::session_io::SessionIoRequest::PasteFile {
-            request_id,
-            filename,
-            data,
-        } => {
-            assert!(request_id.starts_with("paste-"));
-            assert_eq!(filename, "drop.PNG");
-            assert_eq!(data, b"image-bytes");
-            let path = std::path::PathBuf::from("/tmp/botster-paste-test.png");
-            hub.handle_session_io_event(
-                crate::worker::session_io::SessionIoEvent::PasteFileWritten {
-                    request_id,
-                    session_uuid: session_uuid.to_string(),
-                    path: path.clone(),
-                    bytes: 11,
-                },
-            );
-            assert_eq!(
-                hub.paste_files.get(session_uuid).expect("paste cleanup"),
-                &vec![path]
-            );
-        }
-        other => panic!("expected PasteFile request, got {other:?}"),
-    }
-}
-
-#[test]
 pub(super) fn test_queue_webrtc_terminal_snapshot_returns_false_when_mailbox_full() {
     let (hub, _request_tx, _output_rx) = e2e_hub();
     let session_uuid = "sess-snapshot-mailbox-full";
@@ -106,31 +32,33 @@ pub(super) fn test_queue_webrtc_terminal_snapshot_returns_false_when_mailbox_ful
 }
 
 #[test]
-pub(super) fn test_empty_initial_snapshot_cleans_pending_session_io_request() {
+pub(super) fn test_browser_initial_snapshot_uses_direct_session_io_delivery() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
-    let session_uuid = "sess-empty-initial-snapshot";
+    let session_uuid = "sess-browser-initial-direct-snapshot";
     let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(4);
     hub.handle_cache
-        .add_session(test_session_backed_handle_with_mailbox_and_snapshot(
+        .add_session(test_session_backed_handle_with_mailbox(
             session_uuid,
             session_io_tx,
-            Some(Vec::new()),
         ));
-    let mut req = test_forwarder_request(
-        "browser-empty-snapshot",
+    let mut req = test_browser_subscription_request(
+        "browser-direct-snapshot",
         session_uuid,
-        "terminal_empty_snapshot",
+        "terminal_direct_snapshot",
     );
     req.rows = 23;
     let _command_rx = install_test_browser_worker(
         &mut hub,
-        "browser-empty-snapshot",
+        "browser-direct-snapshot",
         session_uuid,
-        "terminal_empty_snapshot",
+        "terminal_direct_snapshot",
     );
 
-    assert!(hub.try_attach_terminal_forwarder(&req));
-    assert_eq!(hub.pending_session_io_snapshots.len(), 1);
+    assert!(hub.try_attach_browser_terminal_subscription(&req));
+    assert!(
+        hub.pending_session_io_snapshots.is_empty(),
+        "initial terminal scrollback must not allocate a hub pending snapshot"
+    );
 
     let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
         matches!(
@@ -138,36 +66,17 @@ pub(super) fn test_empty_initial_snapshot_cleans_pending_session_io_request() {
             crate::worker::session_io::SessionIoRequest::Resize { rows: 23, cols: 80 }
         )
     });
-    let request_id = match recv_session_io_request_matching(&mut session_io_rx, |request| {
-        matches!(
-            request,
-            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
-        )
-    }) {
-        crate::worker::session_io::SessionIoRequest::GetSnapshot { request_id } => request_id,
-        other => panic!("expected GetSnapshot request, got {other:?}"),
-    };
-
-    hub.handle_session_io_event(crate::worker::session_io::SessionIoEvent::Snapshot {
-        request_id,
-        session_uuid: session_uuid.to_string(),
-        payload: Vec::new(),
-    });
-
-    for _ in 0..20 {
-        hub.tokio_runtime.block_on(async {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        });
-        hub.poll_hub_events();
-        if hub.pending_session_io_snapshots.is_empty() {
-            break;
-        }
-    }
-
-    assert!(hub.pending_session_io_snapshots.is_empty());
-    let snapshot = hub.hub_event_metrics.snapshot();
-    assert_eq!(snapshot.counters["snapshot.empty"], 1);
-    hub.stop_lua_pty_forwarder("browser-empty-snapshot:sess-empty-initial-snapshot");
+    let delivery = recv_terminal_initial_snapshot_delivery(&mut session_io_rx);
+    assert_eq!(
+        delivery.subscription_key,
+        "browser-direct-snapshot:sess-browser-initial-direct-snapshot"
+    );
+    assert_eq!(delivery.subscription_id, "terminal_direct_snapshot");
+    assert!(matches!(
+        delivery.payload_mode,
+        crate::worker::session_io::TerminalSnapshotPayloadMode::PrefixedGzip
+    ));
+    hub.stop_terminal_subscription("browser-direct-snapshot:sess-browser-initial-direct-snapshot");
 }
 
 #[test]
@@ -194,7 +103,7 @@ pub(super) fn test_snapshot_enqueue_failure_cleans_existing_pending_request() {
                 rows: 24,
                 cols: 80,
                 kitty_enabled: false,
-                forwarder_key: Some("browser-cleanup:sess-snapshot-enqueue-cleanup".to_string()),
+                subscription_key: Some("browser-cleanup:sess-snapshot-enqueue-cleanup".to_string()),
                 active_flag: None,
             },
         },
@@ -236,7 +145,7 @@ pub(super) fn test_prepared_snapshot_routes_through_browser_worker_with_metrics(
                 rows: 24,
                 cols: 80,
                 kitty_enabled: false,
-                forwarder_key: None,
+                subscription_key: None,
                 active_flag: None,
             },
         },
@@ -273,13 +182,13 @@ pub(super) fn test_pending_session_io_snapshot_cleanup_paths() {
                 rows: 24,
                 cols: 80,
                 kitty_enabled: false,
-                forwarder_key: Some("browser-a:sess-a".to_string()),
+                subscription_key: Some("browser-a:sess-a".to_string()),
                 active_flag: None,
             },
         },
     );
     hub.insert_pending_session_io_snapshot(
-        "by-forwarder".to_string(),
+        "by-subscription".to_string(),
         crate::hub::PendingSessionIoSnapshot {
             session_uuid: "sess-b".to_string(),
             started_at: Instant::now(),
@@ -288,7 +197,7 @@ pub(super) fn test_pending_session_io_snapshot_cleanup_paths() {
                 rows: 24,
                 cols: 80,
                 kitty_enabled: false,
-                forwarder_key: Some("browser-b:sess-b".to_string()),
+                subscription_key: Some("browser-b:sess-b".to_string()),
                 active_flag: None,
             },
         },
@@ -311,10 +220,10 @@ pub(super) fn test_pending_session_io_snapshot_cleanup_paths() {
 
     hub.cleanup_pending_session_io_snapshots_for_peer("browser-a");
     assert!(!hub.pending_session_io_snapshots.contains_key("by-peer"));
-    hub.cleanup_pending_session_io_snapshots_for_forwarder("browser-b:sess-b");
+    hub.cleanup_pending_session_io_snapshots_for_subscription("browser-b:sess-b");
     assert!(!hub
         .pending_session_io_snapshots
-        .contains_key("by-forwarder"));
+        .contains_key("by-subscription"));
     hub.handle_hub_event(crate::hub::events::HubEvent::SessionUnregistered {
         session_uuid: "sess-c".to_string(),
     });
@@ -332,7 +241,7 @@ pub(super) fn test_pending_session_io_snapshot_cleanup_paths() {
                 rows: 24,
                 cols: 80,
                 kitty_enabled: false,
-                forwarder_key: None,
+                subscription_key: None,
                 active_flag: None,
             },
         },
@@ -341,130 +250,4 @@ pub(super) fn test_pending_session_io_snapshot_cleanup_paths() {
     assert!(!hub.pending_session_io_snapshots.contains_key("stale"));
     let snapshot = hub.hub_event_metrics.snapshot();
     assert_eq!(snapshot.counters["snapshot.pending_stale_drop"], 1);
-}
-
-#[test]
-pub(super) fn test_session_io_batch_notifies_lua_pty_output_observers_in_byte_order() {
-    let (mut hub, _request_tx, _output_rx) = e2e_hub();
-    let session_uuid = "sess-worker-batch-lua";
-
-    hub.handle_cache
-        .add_session(test_local_session_handle(session_uuid));
-
-    hub.lua
-        .lua()
-        .load(
-            r#"
-                _test_pty_output_chunks = {}
-                hooks.on("pty_output", "test.session_io_batch_order", function(ctx, data)
-                    table.insert(_test_pty_output_chunks, {
-                        session_uuid = ctx.session_uuid,
-                        data = data,
-                        len = #data,
-                    })
-                end)
-                "#,
-        )
-        .exec()
-        .expect("register test pty_output observer");
-
-    let chunks = [
-        b"coalesced-one-".to_vec(),
-        b"two-and-three-".to_vec(),
-        b"four".to_vec(),
-    ];
-    let expected = chunks.concat();
-
-    for chunk in chunks {
-        hub.handle_hub_event(crate::hub::events::HubEvent::SessionIoBatch(
-            crate::worker::session_io::SessionIoBatch {
-                session_uuid: session_uuid.to_string(),
-                output: Some(chunk),
-            },
-        ));
-    }
-
-    let observed: String = hub
-        .lua
-        .lua()
-        .load(
-            r#"
-                local out = {}
-                for _, chunk in ipairs(_test_pty_output_chunks) do
-                    table.insert(out, chunk.data)
-                end
-                return table.concat(out)
-                "#,
-        )
-        .eval()
-        .expect("read observed pty output bytes");
-    let observed_total: usize = hub
-        .lua
-        .lua()
-        .load(
-            r#"
-                local total = 0
-                for _, chunk in ipairs(_test_pty_output_chunks) do
-                    total = total + chunk.len
-                end
-                return total
-                "#,
-        )
-        .eval()
-        .expect("read observed pty output byte count");
-    let observed_count: usize = hub
-        .lua
-        .lua()
-        .load("return #_test_pty_output_chunks")
-        .eval()
-        .expect("read observed pty output chunk count");
-    let observed_session_uuid: String = hub
-        .lua
-        .lua()
-        .load("return _test_pty_output_chunks[1].session_uuid")
-        .eval()
-        .expect("read observed pty output context");
-
-    assert_eq!(observed.as_bytes(), expected.as_slice());
-    assert_eq!(observed_total, expected.len());
-    assert_eq!(observed_count, 3);
-    assert_eq!(observed_session_uuid, session_uuid);
-
-    let snapshot = hub.hub_event_metrics.snapshot();
-    assert_eq!(snapshot.counters["pty_output.messages"], 3);
-    assert_eq!(snapshot.counters["pty_output.bytes"], expected.len() as u64);
-}
-
-#[test]
-pub(super) fn test_browser_focus_input_updates_active_terminal_peer() {
-    let (mut hub, _request_tx, _output_rx) = e2e_hub();
-    let session_uuid = "sess-browser-focus";
-
-    hub.handle_pty_input(crate::channel::webrtc::PtyInputIncoming {
-        session_uuid: session_uuid.to_string(),
-        browser_identity: "browser-a".to_string(),
-        data: b"\x1b[I".to_vec(),
-    });
-
-    assert_eq!(
-        hub.active_terminal_peers
-            .lock()
-            .expect("active peers mutex")
-            .get(session_uuid)
-            .cloned(),
-        Some("browser-a".to_string())
-    );
-
-    hub.handle_pty_input(crate::channel::webrtc::PtyInputIncoming {
-        session_uuid: session_uuid.to_string(),
-        browser_identity: "browser-a".to_string(),
-        data: b"\x1b[O".to_vec(),
-    });
-
-    assert!(hub
-        .active_terminal_peers
-        .lock()
-        .expect("active peers mutex")
-        .get(session_uuid)
-        .is_none());
 }

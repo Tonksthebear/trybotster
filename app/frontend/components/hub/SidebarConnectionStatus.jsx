@@ -45,6 +45,7 @@ const HUB_LABEL = {
 
 export default function SidebarConnectionStatus() {
   const selectedHubId = useHubStore((s) => s.selectedHubId)
+  const hubList = useHubStore((s) => s.hubList)
   const hubMetaById = useHubMetaStore((s) => s.byId)
   const [browser, setBrowser] = useState('connecting')
   const [connection, setConnection] = useState('disconnected')
@@ -60,8 +61,12 @@ export default function SidebarConnectionStatus() {
   const entityKey = selectedHubId == null ? null : String(selectedHubId)
   const hubEntity = entityKey ? hubMetaById[entityKey] : null
   const entityReady = hubEntity?.state === 'ready'
+  const selectedHub = entityKey
+    ? hubList.find((hub) => String(hub.id) === entityKey)
+    : null
+  const serverActive = selectedHub?.active === true
 
-  const hubStatus = resolveHubStatus(transportHubStatus, entityReady)
+  const hubStatus = resolveHubStatus(transportHubStatus, entityReady, serverActive)
 
   useEffect(() => {
     if (!selectedHubId) return

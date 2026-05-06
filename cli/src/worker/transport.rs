@@ -345,9 +345,6 @@ impl TuiTransportAdapter {
     pub fn request_to_ingress(request: TuiRequest) -> TransportIngress {
         match request {
             TuiRequest::LuaMessage(value) => TransportIngress::BoundaryJson(value),
-            TuiRequest::PtyInput { session_uuid, data } => {
-                TransportIngress::TerminalInput { session_uuid, data }
-            }
             TuiRequest::FocusChanged {
                 session_uuid,
                 focused,

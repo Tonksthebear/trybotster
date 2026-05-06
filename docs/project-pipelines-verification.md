@@ -7,11 +7,15 @@ Scope:
 - `docs/worker-actor-contracts.md` aligned with production worker ownership
   instead of aspirational full-worker claims.
 - WebRTC receiver ownership guarded by source-backed static tests: production
-  hub code must use registry forwarders and typed `HubEvent` variants, while
-  raw receiver polling/leasing stays `#[cfg(test)]`.
+  code must use registry-owned queue tasks and typed adapter/control events,
+  while raw receiver polling/leasing stays `#[cfg(test)]`.
 - Browser WebRTC terminal subscribe/unsubscribe/focus ingress guarded so typed
   terminal controls cross the browser `ClientWorker` boundary instead of
   falling back to adapter-only or Lua routing.
+- Durable-session PTY bytes are explicitly outside hub hot-path events:
+  WebRTC/TUI/socket terminal streams route through `ClientWorker` and
+  `SessionIoWorker`; hub policy owns authorization, attach correlation, and
+  cleanup.
 - Session I/O documentation guarded against claiming mailbox ownership for
   `SessionIoRequest` variants unless the runtime has executable handling.
 - `BoundaryJson` guarded as a Lua/plugin/relay boundary exception, with the
@@ -49,8 +53,8 @@ Scope:
 - Deterministic workerized `SessionIoRuntime` output coalescing tests.
 - Explicit 4 ms age-based flush, 16-frame flush, and 32 KiB flush coverage.
 - Bell, OSC notification, and process-exit ordered flush boundaries.
-- Lua `pty_output` observer byte-order and total-byte assertions for
-  `SessionIoBatch` coalesced chunks.
+- Client-worker delivery assertions for coalesced terminal chunks without
+  routing durable-session PTY bytes through hub event handlers.
 
 Commands and results:
 
@@ -72,18 +76,17 @@ rg -n "sleep\\(Duration::from_millis|thread::sleep|tokio::time::sleep" cli/src/w
 # left out of this ticket's scope per plan review; server_comms matches are
 # unrelated existing retry/backoff and async fixture waits.
 
-rg -n "pty_output|SessionIoBatch|FRAME_BELL|FRAME_NOTIFICATION|FRAME_PROCESS_EXITED|output_age_flushes|output_thresholds_flush|output_flushes_before" cli/src/worker/session_io_runtime.rs cli/src/hub/server_comms.rs
+rg -n "terminal_subscription|FRAME_BELL|FRAME_NOTIFICATION|FRAME_PROCESS_EXITED|output_age_flushes|output_thresholds_flush|output_flushes_before" cli/src/worker/session_io_runtime.rs cli/src/hub/server_comms
 # Confirmed new regression coverage is wired to the worker output thresholds,
-# structured frame boundaries, SessionIoBatch handling, and Lua pty_output hook.
+# structured frame boundaries, and client subscription delivery.
 ```
 
 Notes:
 
 - CLI verification used `cli/test.sh`, not raw `cargo test`, so
   `BOTSTER_ENV=test` was set for all Rust/Lua slices.
-- The touched `coalesces_synthetic_output_burst_before_hub_delivery` test now
-  receives the hub batch through a bounded helper instead of draining after
-  writer shutdown with an immediate `try_recv`.
+- The touched burst/coalescing tests assert bounded worker delivery rather than
+  reintroducing a hub PTY-byte batch path.
 - The explicit 4 ms test keeps the stream open and stays below the 16-frame and
   32 KiB thresholds, so it exercises the age-triggered flush path without EOF.
 - No UI surface changed; `tmp/tailwind_plus_preview` was not applicable.
@@ -129,7 +132,7 @@ Notes:
   the WebRTC client-worker transport adapter changes already on main.
 - Static boundary checks confirmed `cli/src/worker/client.rs` has no concrete
   socket, TUI bridge, or WebRTC imports. Remaining `send_frame` matches are
-  outside the covered TUI/local-socket terminal forwarder path.
+  outside the covered TUI/local-socket terminal subscription path.
 - No browser UI surface was changed. `tmp/tailwind_plus_preview` was absent in
   this worktree, and no Catalyst/Elements comparison was required.
 
@@ -137,7 +140,7 @@ Notes:
 
 Scope:
 
-- Plugin entity subscribe-time snapshots and targeted deltas.
+- Plugin entity requested snapshots and targeted deltas.
 - Browser and TUI consumption of the same entity stream.
 - Row-scoped `ui_action_result` pending feedback cleanup.
 - Cold-turkey removal of Project Pipelines dynamic-list dependency on forced

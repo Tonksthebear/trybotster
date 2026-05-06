@@ -2,7 +2,8 @@
 //!
 //! This module provides:
 //! - `ClientId` — unique identifier for client sessions (TUI, browser, internal)
-//! - `TuiRequest` — messages from TuiRunner to Hub (JSON control + raw PTY input)
+//! - `TuiRequest` — control messages from TuiRunner to Hub
+//! - `TuiSessionInput` — raw terminal input from TuiRunner to the active transport
 //! - `TuiOutput` — messages from Hub to TuiRunner (PTY output, Lua events)
 //! - `CreateAgentRequest` / `DeleteAgentRequest` — client-layer agent operation types
 //!
@@ -12,9 +13,9 @@
 //! TuiRunner (rendering, keyboard)
 //!   │
 //!   ├── TuiRequest::LuaMessage ──► Hub ──► lua.call_tui_message() ──► client.lua
-//!   ├── TuiRequest::PtyInput   ──► Hub ──► ClientWorker ──► SessionIoWorker
+//!   ├── TuiSessionInput        ──► ClientWorker ──► SessionIoWorker
 //!   ◄── TuiOutput::Message     ◄── Lua tui.send() (events, subscriptions)
-//!   ◄── TuiOutput::Output      ◄── Lua PTY forwarder tasks
+//!   ◄── TuiOutput::Output      ◄── terminal subscription path
 //! ```
 //!
 //! Control operations (resize, subscriptions, agent lifecycle) flow as JSON
@@ -25,7 +26,7 @@
 mod tui;
 mod types;
 
-pub use tui::{TuiOutput, TuiRequest};
+pub use tui::{TuiOutput, TuiRequest, TuiSessionInput};
 pub use types::{CreateAgentRequest, DeleteAgentRequest};
 
 /// Unique identifier for a client session.

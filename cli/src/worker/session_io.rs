@@ -7,7 +7,9 @@
 //! lifecycle events.
 
 use super::{BoundedQueueConfig, RequestId, SessionUuid};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Default bounded mailbox config for session-I/O worker input.
 pub const SESSION_IO_WORKER_QUEUE: BoundedQueueConfig =
@@ -32,6 +34,21 @@ pub enum SessionIoRequest {
     GetSnapshot {
         /// Request identifier for correlating the response.
         request_id: RequestId,
+    },
+    /// Request and deliver an initial terminal snapshot directly to a client worker.
+    GetInitialSnapshot {
+        /// Client-worker delivery configuration.
+        delivery: TerminalInitialSnapshotDelivery,
+    },
+    /// Register a client-worker terminal output subscriber.
+    SubscribeTerminal {
+        /// Subscription delivery configuration.
+        subscription: TerminalOutputSubscription,
+    },
+    /// Remove a client-worker terminal output subscriber.
+    UnsubscribeTerminal {
+        /// Stable subscription route key.
+        subscription_key: String,
     },
     /// Write an already-authorized file paste/drop payload for this session
     /// and inject the resulting local path as PTY input.
@@ -74,6 +91,188 @@ pub enum SessionIoRequest {
         /// Human-readable reason for diagnostics.
         reason: String,
     },
+}
+
+/// Optional output transform for a terminal subscriber.
+#[derive(Debug, Clone)]
+pub enum TerminalOutputFilter {
+    /// Deliver bytes unchanged.
+    None,
+    /// Suppress OSC color-query bytes when another peer owns active focus for
+    /// the session. This prevents inactive clients from answering color probes.
+    StripOscQueriesWhenInactive {
+        /// Active peer per session UUID.
+        active_terminal_peers: Arc<Mutex<HashMap<String, String>>>,
+        /// Peer represented by this subscriber.
+        peer_id: String,
+    },
+}
+
+/// Client-worker terminal output subscriber owned by a session I/O actor.
+#[derive(Debug, Clone)]
+pub struct TerminalOutputSubscription {
+    /// Stable route key (`peer:session`, `tui:session`, `socket:session`).
+    pub subscription_key: String,
+    /// Transport-local subscription id.
+    pub subscription_id: String,
+    /// Client worker that owns transport-neutral delivery/backpressure.
+    pub worker: super::client::ClientWorkerHandle,
+    /// Optional bytes to prepend before transport encoding.
+    pub output_prefix: Vec<u8>,
+    /// Per-subscriber output transform.
+    pub filter: TerminalOutputFilter,
+}
+
+/// Transport payload preparation required for an initial snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalSnapshotPayloadMode {
+    /// Deliver the session snapshot bytes unchanged.
+    Raw,
+    /// Prefix as a binary terminal snapshot and gzip before delivery.
+    PrefixedGzip,
+}
+
+/// Initial scrollback target owned by the session I/O data plane.
+#[derive(Debug, Clone)]
+pub struct TerminalInitialSnapshotDelivery {
+    /// Request identifier for diagnostics and FIFO correlation.
+    pub request_id: RequestId,
+    /// Stable route key (`peer:session`, `tui:session`, `socket:session`).
+    pub subscription_key: String,
+    /// Session that produced the snapshot.
+    pub session_uuid: SessionUuid,
+    /// Transport-local subscription id.
+    pub subscription_id: String,
+    /// Client worker that owns transport delivery/backpressure.
+    pub worker: super::client::ClientWorkerHandle,
+    /// Authoritative terminal row count for the snapshot.
+    pub rows: u16,
+    /// Authoritative terminal column count for the snapshot.
+    pub cols: u16,
+    /// Whether kitty keyboard mode is enabled in the inner PTY.
+    pub kitty_enabled: bool,
+    /// Payload preparation expected by the transport adapter.
+    pub payload_mode: TerminalSnapshotPayloadMode,
+    /// Whether the transport needs a subscription confirmation after the
+    /// initial snapshot has been delivered.
+    pub confirm_subscription: bool,
+}
+
+impl TerminalOutputFilter {
+    /// Apply this filter to a chunk, preserving incomplete OSC query fragments
+    /// in `buffer` across calls.
+    #[must_use]
+    pub fn filter_chunk(&self, session_uuid: &str, buffer: &mut Vec<u8>, data: &[u8]) -> Vec<u8> {
+        match self {
+            Self::None => data.to_vec(),
+            Self::StripOscQueriesWhenInactive {
+                active_terminal_peers,
+                peer_id,
+            } => {
+                if active_terminal_peers
+                    .lock()
+                    .ok()
+                    .and_then(|active| active.get(session_uuid).cloned())
+                    .is_some_and(|active_peer| active_peer != peer_id.as_str())
+                {
+                    strip_osc_queries_from_output(buffer, data)
+                } else {
+                    buffer.clear();
+                    data.to_vec()
+                }
+            }
+        }
+    }
+}
+
+const OSC_ESC: u8 = 0x1b;
+const OSC_BEL: u8 = 0x07;
+const OSC_BUFFER_LIMIT: usize = 512;
+
+fn append_with_limit(buffer: &mut Vec<u8>, data: &[u8]) {
+    buffer.extend_from_slice(data);
+    if buffer.len() > OSC_BUFFER_LIMIT {
+        let drop_count = buffer.len() - OSC_BUFFER_LIMIT;
+        buffer.drain(..drop_count);
+    }
+}
+
+fn is_color_query_osc(seq: &[u8]) -> bool {
+    if seq.len() < 4 || seq[0] != OSC_ESC || seq[1] != b']' {
+        return false;
+    }
+
+    let body = if seq.ends_with(&[OSC_BEL]) {
+        &seq[2..seq.len() - 1]
+    } else if seq.len() >= 4 && seq.ends_with(&[OSC_ESC, b'\\']) {
+        &seq[2..seq.len() - 2]
+    } else {
+        return false;
+    };
+
+    matches!(
+        body,
+        [b'1', b'0', b';', b'?'] | [b'1', b'1', b';', b'?'] | [b'1', b'2', b';', b'?']
+    ) || body.starts_with(b"4;") && body.ends_with(b";?")
+}
+
+fn strip_osc_queries_from_output(buffer: &mut Vec<u8>, data: &[u8]) -> Vec<u8> {
+    append_with_limit(buffer, data);
+    if buffer.is_empty() {
+        return Vec::new();
+    }
+
+    let input = std::mem::take(buffer);
+    let mut output = Vec::with_capacity(input.len());
+    let mut idx = 0usize;
+
+    while idx < input.len() {
+        if input[idx] == OSC_ESC {
+            if idx + 1 >= input.len() {
+                buffer.extend_from_slice(&input[idx..]);
+                break;
+            }
+
+            if input[idx + 1] == b']' {
+                let mut scan = idx + 2;
+                let mut end = None;
+
+                while scan < input.len() {
+                    if input[scan] == OSC_BEL {
+                        end = Some(scan + 1);
+                        break;
+                    }
+                    if input[scan] == OSC_ESC {
+                        if scan + 1 >= input.len() {
+                            break;
+                        }
+                        if input[scan + 1] == b'\\' {
+                            end = Some(scan + 2);
+                            break;
+                        }
+                    }
+                    scan += 1;
+                }
+
+                let Some(end_idx) = end else {
+                    buffer.extend_from_slice(&input[idx..]);
+                    break;
+                };
+
+                let seq = &input[idx..end_idx];
+                if !is_color_query_osc(seq) {
+                    output.extend_from_slice(seq);
+                }
+                idx = end_idx;
+                continue;
+            }
+        }
+
+        output.push(input[idx]);
+        idx += 1;
+    }
+
+    output
 }
 
 /// Event emitted by a session I/O worker.
@@ -197,15 +396,6 @@ pub enum SessionIoEvent {
         /// Exit code when available.
         exit_code: Option<i32>,
     },
-}
-
-/// Compact hub-bound batch emitted by a session I/O worker.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct SessionIoBatch {
-    /// Session that produced this batch.
-    pub session_uuid: SessionUuid,
-    /// Coalesced raw terminal bytes. Byte order is preserved.
-    pub output: Option<Vec<u8>>,
 }
 
 /// Stable failure reasons for file paste/drop processing.

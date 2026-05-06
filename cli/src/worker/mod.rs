@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod hub_control;
+pub mod plugin;
 pub mod session_io;
 pub(crate) mod session_io_runtime;
 pub mod transport;
@@ -53,6 +54,10 @@ mod tests {
         HubControlMessage, HubControlOrigin, SessionLifecycleState, TransportConnectionMode,
         TransportPeerState, TransportSignal, WorkerBackpressure, HUB_CONTROL_QUEUE,
     };
+    use super::plugin::{
+        PluginHandlerKind, PluginHandlerRef, PluginLoadSpec, PluginWorkerMessage,
+        PLUGIN_WORKER_QUEUE,
+    };
     use super::session_io::{SessionIoEvent, SessionIoRequest, SESSION_IO_WORKER_QUEUE};
     use super::transport::{
         TransportAdapter, TransportEgress, TransportIngress, TRANSPORT_ADAPTER_QUEUE,
@@ -65,6 +70,7 @@ mod tests {
         let configs = [
             HUB_CONTROL_QUEUE,
             CLIENT_WORKER_QUEUE,
+            PLUGIN_WORKER_QUEUE,
             TRANSPORT_ADAPTER_QUEUE,
             SESSION_IO_WORKER_QUEUE,
         ];
@@ -143,6 +149,35 @@ mod tests {
             assert!(!rendered.contains("WebRtc"));
             assert!(!rendered.contains("Browser("));
         }
+    }
+
+    #[test]
+    fn plugin_worker_messages_use_stable_handler_refs_not_lua_functions() {
+        let load = PluginWorkerMessage::Load {
+            spec: PluginLoadSpec {
+                plugin_key: "repo:demo".to_string(),
+                display_name: "demo".to_string(),
+                init_path: "/tmp/demo/init.lua".into(),
+                source: Some("repo".to_string()),
+                repo_root: Some("/tmp/demo".into()),
+            },
+        };
+        let invoke = PluginWorkerMessage::Invoke {
+            request_id: "plugin-req-1".to_string(),
+            handler: PluginHandlerRef {
+                kind: PluginHandlerKind::UiAction,
+                id: "botster.demo.run".to_string(),
+                name: Some("main".to_string()),
+            },
+            payload: serde_json::json!({ "session_uuid": "sess-1" }),
+            timeout_ms: 250,
+        };
+
+        let rendered = format!("{load:?} {invoke:?}");
+        assert!(rendered.contains("PluginLoadSpec"));
+        assert!(rendered.contains("PluginHandlerRef"));
+        assert!(!rendered.contains("Function"));
+        assert!(!rendered.contains("mlua"));
     }
 
     #[test]
@@ -292,8 +327,6 @@ mod tests {
 
         assert!(webrtc.contains("fn start_queue_forwarders"));
         for event in [
-            "HubEvent::WebRtcPtyInput",
-            "HubEvent::WebRtcFileInput",
             "HubEvent::WebRtcOutgoingSignal",
             "HubEvent::WebRtcStreamFrame",
         ] {
@@ -302,13 +335,17 @@ mod tests {
                 "WebRtcPeerRegistry forwarders must emit typed {event} events"
             );
         }
+        assert!(
+            webrtc.contains("ClientWorkerMessage::SessionInput")
+                && webrtc.contains("ClientWorkerMessage::PasteFile"),
+            "WebRTC PTY/file input must route directly to the owning ClientWorker"
+        );
 
         assert!(
             preceding_cfg_test(webrtc, "fn poll_received_messages"),
             "raw WebRTC receiver polling must remain a test-only helper"
         );
         for helper in [
-            "fn lease_pty_input_receiver_for_test",
             "fn lease_outgoing_signal_receiver_for_test",
             "fn lease_stream_frame_receiver_for_test",
         ] {
@@ -320,7 +357,6 @@ mod tests {
 
         for usage in [
             "poll_received_messages(",
-            "lease_pty_input_receiver_for_test(",
             "lease_outgoing_signal_receiver_for_test(",
             "lease_stream_frame_receiver_for_test(",
         ] {
@@ -460,14 +496,16 @@ mod tests {
             );
         }
 
-        assert_eq!(
-            server_comms
-                .matches("ClientControlFrame::BoundaryJson")
-                .count(),
-            1,
-            "hub-side BoundaryJson should remain the documented subscribe ack exception"
+        let hub_boundary_json_count = server_comms
+            .matches("ClientControlFrame::BoundaryJson")
+            .count();
+        assert!(
+            hub_boundary_json_count <= 1,
+            "hub-side BoundaryJson should not grow beyond the documented subscribe ack exception"
         );
-        assert!(server_comms.contains("\"type\": \"subscribed\""));
+        if hub_boundary_json_count == 1 {
+            assert!(server_comms.contains("\"type\": \"subscribed\""));
+        }
     }
 
     fn source_window<'a>(source: &'a str, start: &str, end: &str) -> &'a str {

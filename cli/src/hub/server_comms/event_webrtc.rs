@@ -43,6 +43,13 @@ impl Hub {
             self.hub_event_tx.clone(),
         ) {
             self.spawn_webrtc_peer_sender(&browser_identity);
+            let Some(peer_command_tx) = self.webrtc.peer_command_sender(&browser_identity) else {
+                log::warn!(
+                    "[WebRTC] DataChannel opened for {} but peer sender was unavailable",
+                    &browser_identity[..browser_identity.len().min(8)]
+                );
+                return;
+            };
             self.queue_webrtc_peer_command(
                 &browser_identity,
                 crate::worker::webrtc::WebRtcAdapterCommand::Json {
@@ -52,7 +59,10 @@ impl Hub {
                     .expect("static JSON serialization cannot fail"),
                 },
             );
-            let worker = self.spawn_webrtc_client_worker_adapter(browser_identity.clone());
+            let worker =
+                self.spawn_webrtc_client_worker_adapter(browser_identity.clone(), peer_command_tx);
+            self.webrtc
+                .register_client_worker_route(browser_identity.clone(), worker.clone());
             self.browser_client_workers
                 .insert(browser_identity.clone(), worker);
 

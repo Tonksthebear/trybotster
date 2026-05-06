@@ -322,7 +322,12 @@ pub fn validate_token(server_url: &str, token: &str) -> bool {
     let url = format!("{}/hubs", server_url);
     println!("  Validating token against {}...", url);
 
-    match client.get(&url).bearer_auth(token).send() {
+    match client
+        .get(&url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .bearer_auth(token)
+        .send()
+    {
         Ok(response) => {
             let status = response.status();
             if status.is_success() {

@@ -2,7 +2,7 @@
 --
 -- Each Client instance tracks:
 -- - Subscriptions (HubChannel, TerminalRelayChannel, etc.)
--- - PTY forwarders for terminal streaming
+-- - Terminal subscription handles for PTY streaming
 -- - Connection metadata (peer_id, connected_at)
 -- - Transport for sending messages back to the peer
 --
@@ -15,7 +15,7 @@
 
 local state = require("hub.state")
 local Agent = require("lib.agent")
-local pty_clients = require("lib.pty_clients")
+local terminal_clients = require("lib.terminal_clients")
 
 local Client = state.class("client")
 
@@ -31,12 +31,12 @@ function Client.new(peer_id, transport)
         peer_id = peer_id,
         transport = transport,
         subscriptions = {},
-        forwarders = {},
+        terminal_subscriptions = {},
         connected_at = os.time(),
         -- Phase 4b: per-browser URL state. `{ [surface_name] = subpath }` —
-        -- the browser sends `botster.surface.subpath` actions (and primes
-        -- this map via the subscribe envelope) so tree_snapshot can thread
-        -- the right `state.path` into each surface's render dispatcher.
+        -- the browser sends `botster.surface.subpath` actions when a view
+        -- needs a surface tree so tree_snapshot can thread the right
+        -- `state.path` into each surface's render dispatcher.
         -- Unset entries default to "/".
         surface_subpaths = {},
         -- Wire protocol: `selected_session_uuid` is GONE. Selection
@@ -146,9 +146,13 @@ function Client:handle_subscribe(msg)
 
     session_uuid = params.session_uuid
 
+    if not self.terminal_subscriptions then
+        self.terminal_subscriptions = {}
+    end
+
     -- Idempotency: a reconnect race can deliver duplicate subscribe messages
     -- for the same subscription ID. Treat exact duplicates as no-op setup to
-    -- avoid creating two forwarders and replaying scrollback twice.
+    -- avoid creating two subscriptions and replaying scrollback twice.
     local existing = self.subscriptions[sub_id]
     if existing then
         if existing.channel == channel and existing.session_uuid == session_uuid then
@@ -156,20 +160,22 @@ function Client:handle_subscribe(msg)
             local cols = params.cols or 80
             local recreated = false
             if channel == "terminal" and session_uuid then
-                local existing_forwarder = self.forwarders[sub_id]
-                if (not existing_forwarder) or (not existing_forwarder:is_active()) then
-                    if existing_forwarder then
-                        existing_forwarder:stop()
+                local existing_terminal_subscription = self.terminal_subscriptions[sub_id]
+                if (not existing_terminal_subscription) or (not existing_terminal_subscription:is_active()) then
+                    if existing_terminal_subscription then
+                        existing_terminal_subscription:stop()
                     end
+                    terminal_clients.update(session_uuid, self.peer_id, rows, cols)
                     self:setup_terminal_subscription(sub_id, session_uuid, rows, cols)
                     recreated = true
+                else
+                    terminal_clients.update(session_uuid, self.peer_id, rows, cols)
                 end
-                pty_clients.update(session_uuid, self.peer_id, rows, cols)
             end
 
             if recreated then
                 log.info(string.format(
-                    "Duplicate subscribe recreated stale forwarder: %s (peer=%s)",
+                    "Duplicate subscribe recreated stale subscription: %s (peer=%s)",
                     sub_id:sub(1, 16), self.peer_id:sub(1, 8)))
             else
                 log.debug(string.format(
@@ -188,13 +194,13 @@ function Client:handle_subscribe(msg)
             "Replacing existing subscription: %s (%s -> %s)",
             sub_id:sub(1, 16), tostring(existing.channel), tostring(channel)))
 
-        local existing_forwarder = self.forwarders[sub_id]
-        if existing_forwarder then
-            existing_forwarder:stop()
-            self.forwarders[sub_id] = nil
+        local existing_terminal_subscription = self.terminal_subscriptions[sub_id]
+        if existing_terminal_subscription then
+            existing_terminal_subscription:stop()
+            self.terminal_subscriptions[sub_id] = nil
         end
         if existing.channel == "terminal" and existing.session_uuid then
-            pty_clients.unregister(existing.session_uuid, self.peer_id)
+            terminal_clients.unregister(existing.session_uuid, self.peer_id)
         end
     end
 
@@ -218,10 +224,9 @@ function Client:handle_subscribe(msg)
         })
     end
 
-    -- Terminal input must stay gated on subscription confirmation. Hub
-    -- subscriptions delay the ack until after baseline entity snapshots below
-    -- so browser readiness never races an empty entity store.
-    if channel ~= "hub" then
+    -- Terminal input must stay gated on terminal attach setup so dimensions
+    -- are authoritative before clients start sending PTY input.
+    if channel ~= "hub" and channel ~= "terminal" then
         send_subscribed_ack()
     end
 
@@ -250,54 +255,18 @@ function Client:handle_subscribe(msg)
         end
 
         if session_uuid then
-            -- Important ordering:
-            -- 1) create forwarder (captures authoritative snapshot)
-            -- 2) apply resize intent for this client
-            --
+            terminal_clients.register(session_uuid, self.peer_id, rows, cols)
             self:setup_terminal_subscription(sub_id, session_uuid, rows, cols)
-            pty_clients.register(session_uuid, self.peer_id, rows, cols)
+            send_subscribed_ack()
         end
     elseif channel == "hub" then
         log.info(string.format("Hub subscription from %s...", self.peer_id:sub(1, 8)))
 
-        -- Wire protocol — strict ordering per design brief §12.6:
-        --   1. ui_route_registry (so the client knows the surface set)
-        --   2. entity_snapshot per registered type (stores populated
-        --      BEFORE trees that reference them)
-        --   3. surface_subpaths priming (so cold-load deep links land on
-        --      the right sub-page on the first ui_tree_snapshot)
-        --   4. ui_tree_snapshot per surface (force=true for priming)
-        local reg_ok, reg_err = pcall(self.send_ui_route_registry, self, sub_id)
-        if not reg_ok then
-            log.warn(string.format(
-                "send_ui_route_registry failed for %s: %s",
-                self.peer_id:sub(1, 8), tostring(reg_err)))
-        end
-
-        local EB = require("lib.entity_broadcast")
-        local snap_ok, snap_err = pcall(EB.send_snapshots_to, self, sub_id)
-        if not snap_ok then
-            log.warn(string.format(
-                "EB.send_snapshots_to failed for %s: %s",
-                self.peer_id:sub(1, 8), tostring(snap_err)))
-        end
-
-        if type(params.surface_subpaths) == "table" then
-            for surface_name, subpath in pairs(params.surface_subpaths) do
-                if type(surface_name) == "string" and type(subpath) == "string" then
-                    self:set_surface_subpath(surface_name, subpath, { rebroadcast = false })
-                end
-            end
-        end
-
-        local ok, err = pcall(self.send_ui_tree_snapshots, self, sub_id, { force = true })
-        if not ok then
-            log.warn(string.format(
-                "send_ui_tree_snapshots failed for %s: %s",
-                self.peer_id:sub(1, 8), tostring(err)))
-        end
-
         send_subscribed_ack()
+
+        -- Hub subscribe establishes the channel only. Data hydration is
+        -- pull-based: clients request the route registry, entity snapshots, and
+        -- individual surface trees when a view actually needs them.
     elseif channel == "mcp" then
         -- MCP is pull-based: the client sends tools/list when ready.
         self.subscriptions[sub_id].caller_context = params.context or {}
@@ -309,13 +278,12 @@ function Client:handle_subscribe(msg)
     end
 end
 
--- Wire protocol: model priming goes through `EB.send_snapshots_to(self,
--- sub_id)` (see handle_subscribe), which ships one entity_snapshot per
--- registered type. Subsequent updates flow as entity_patch / entity_upsert /
--- entity_remove from lib.entity_model.
+-- Wire protocol: model hydration is pull-based. Clients request entity
+-- snapshots with `hub:entities`; subsequent updates flow as entity_patch /
+-- entity_upsert / entity_remove from lib.entity_broadcast.
 
---- Set up terminal subscription with PTY forwarder.
--- Creates a transport-agnostic forwarder that streams PTY output to the client.
+--- Set up the PTY data-plane subscription for a terminal channel.
+-- Creates a transport-agnostic terminal subscription handle owned by this client.
 --
 -- @param sub_id The subscription ID
 -- @param rows number|nil Requested rows from subscriber
@@ -329,7 +297,7 @@ function Client:setup_terminal_subscription(sub_id, session_uuid, rows, cols)
     rows = rows or 24
     cols = cols or 80
 
-    local forwarder = self.transport.create_pty_forwarder({
+    local subscription = self.transport.subscribe_terminal({
         session_uuid = session_uuid,
         subscription_id = sub_id,
         rows = rows,
@@ -337,7 +305,10 @@ function Client:setup_terminal_subscription(sub_id, session_uuid, rows, cols)
         prefix = "\x01",  -- Binary prefix for raw terminal data
     })
 
-    self.forwarders[sub_id] = forwarder
+    if not self.terminal_subscriptions then
+        self.terminal_subscriptions = {}
+    end
+    self.terminal_subscriptions[sub_id] = subscription
 
     log.info(string.format("Terminal subscription %s: session=%s (%dx%d)",
         sub_id:sub(1, 16), session_uuid:sub(1, 16), cols, rows))
@@ -361,6 +332,7 @@ function Client:send_ui_tree_snapshots(sub_id, opts)
         client = self,
         force = opts.force == true,
         only_surface = opts.only_surface,
+        scope = opts.scope,
     })
     if #frames == 0 then
         return 0
@@ -375,20 +347,16 @@ end
 
 --- Record the browser's current subpath for a surface and trigger a
 --- targeted re-render. Called from the `botster.surface.subpath` action
---- handler (action.lua) and from `handle_subscribe` when the initial
---- subscribe envelope carries `surface_subpaths` (cold-load priming).
+--- handler (action.lua) when a client explicitly requests a surface/subpath.
 --
 -- @param surface_name string
 -- @param subpath string Sub-path within the surface ("/" / "/board/42" / ...)
--- @param opts table? { rebroadcast = bool } — default true. Set false during
---        subscribe-time priming so we don't fire a broadcast before the
---        initial force-broadcast call runs.
+-- @param opts table? { rebroadcast = bool } — default true. Set false when a
+--        caller only wants to record URL state without sending a frame yet.
 function Client:set_surface_subpath(surface_name, subpath, opts)
     if type(surface_name) ~= "string" or surface_name == "" then return end
     if type(subpath) ~= "string" or subpath == "" then subpath = "/" end
     if not self.surface_subpaths then self.surface_subpaths = {} end
-    local previous = self.surface_subpaths[surface_name]
-    if previous == subpath then return end
     self.surface_subpaths[surface_name] = subpath
     opts = opts or {}
     if opts.rebroadcast == false then return end
@@ -396,7 +364,8 @@ function Client:set_surface_subpath(surface_name, subpath, opts)
     -- `force = true` guarantees the frame ships even if the surface's
     -- rendered tree happens to hash-match the previous one; otherwise the
     -- browser would stay in its loading state forever waiting for a
-    -- subpath-matched frame that dedup silently suppressed. Dedup remains
+    -- subpath-matched frame that dedup or same-subpath suppression silently
+    -- skipped. Dedup remains
     -- correct for ordinary data-change re-broadcasts because those use
     -- `send_ui_layout_trees(sub_id)` without `force`.
     for sub_id, sub in pairs(self.subscriptions or {}) do
@@ -432,9 +401,9 @@ function Client:send_ui_route_registry(sub_id)
     self:send(payload)
 end
 
--- Wire protocol: workspace, worktree, hub, and connection-code state ships as
--- entity_snapshot at subscribe time and entity_patch / entity_upsert /
--- entity_remove thereafter.
+-- Wire protocol: workspace, worktree, hub, connection-code, and plugin state
+-- ship as explicit entity snapshots on request, then entity_patch /
+-- entity_upsert / entity_remove thereafter.
 
 --- Handle unsubscribe message - remove virtual subscription.
 -- @param msg The unsubscribe message
@@ -451,17 +420,17 @@ function Client:handle_unsubscribe(msg)
         return
     end
 
-    -- Stop forwarder if this was a terminal subscription
-    local forwarder = self.forwarders[sub_id]
-    if forwarder then
-        forwarder:stop()
-        self.forwarders[sub_id] = nil
-        log.debug(string.format("Stopped forwarder for subscription: %s", sub_id:sub(1, 16)))
+    -- Stop terminal data-plane subscription if this was a terminal channel.
+    local terminal_subscription = self.terminal_subscriptions and self.terminal_subscriptions[sub_id]
+    if terminal_subscription then
+        terminal_subscription:stop()
+        self.terminal_subscriptions[sub_id] = nil
+        log.debug(string.format("Stopped terminal subscription: %s", sub_id:sub(1, 16)))
     end
 
-    -- Unregister from pty_clients (auto-resizes to next client if any)
+    -- Unregister from terminal_clients (auto-resizes to next client if any)
     if sub.channel == "terminal" and sub.session_uuid then
-        pty_clients.unregister(sub.session_uuid, self.peer_id)
+        terminal_clients.unregister(sub.session_uuid, self.peer_id)
     end
 
     hooks.notify("client_unsubscribed", {
@@ -472,9 +441,8 @@ function Client:handle_unsubscribe(msg)
 
     -- Wire protocol: tree_snapshot dedup is GLOBAL on (surface, subpath),
     -- not per-subscription, so unsubscribe leaves the dedup state alone.
-    -- A reconnecting browser receives a fresh entity_snapshot per type
-    -- (subscribe-time priming) plus the next ui_tree_snapshot if anything
-    -- changed.
+    -- Reconnecting clients explicitly request fresh entity snapshots and
+    -- surface trees for the views they open.
 
     self.subscriptions[sub_id] = nil
     log.info(string.format("Unsubscribed: %s (was %s)", sub_id:sub(1, 16), sub.channel))
@@ -533,7 +501,7 @@ function Client:handle_terminal_data(sub_id, sub, command)
         if session_uuid then
             log.info(string.format("Resize: peer=%s, session=%s, %dx%d",
                 self.peer_id:sub(1, 8), session_uuid:sub(1, 16), cols, rows))
-            pty_clients.update(session_uuid, self.peer_id, rows, cols)
+            terminal_clients.update(session_uuid, self.peer_id, rows, cols)
         end
     elseif cmd_type == "request_snapshot" then
         if session_uuid and self.transport.request_pty_snapshot then
@@ -696,27 +664,27 @@ function Client:count_subscriptions()
 end
 
 --- Clean up client on disconnect.
--- Stops all forwarders, unregisters from pty_clients, and clears subscriptions.
+-- Stops all terminal subscription handles, unregisters from terminal_clients, and clears subscriptions.
 function Client:disconnect()
     hooks.notify("before_client_disconnect", { peer_id = self.peer_id })
 
-    -- Stop all forwarders with error protection to prevent early exit
-    for sub_id, forwarder in pairs(self.forwarders) do
-        if forwarder and forwarder.stop then
-            local ok, err = pcall(forwarder.stop, forwarder)
+    -- Stop terminal data-plane subscriptions with error protection to prevent early exit.
+    for sub_id, subscription in pairs(self.terminal_subscriptions or {}) do
+        if subscription and subscription.stop then
+            local ok, err = pcall(subscription.stop, subscription)
             if not ok then
-                log.warn(string.format("Error stopping forwarder %s: %s", sub_id, tostring(err)))
+                log.warn(string.format("Error stopping terminal subscription %s: %s", sub_id, tostring(err)))
             end
         end
     end
-    self.forwarders = {}
+    self.terminal_subscriptions = {}
 
     -- Unregister from all terminal sessions (auto-resizes to next client).
     -- Wire protocol: tree_snapshot dedup is global on
     -- (surface, subpath), so disconnect leaves it alone.
     for _, sub in pairs(self.subscriptions) do
         if sub.channel == "terminal" and sub.session_uuid then
-            pty_clients.unregister(sub.session_uuid, self.peer_id)
+            terminal_clients.unregister(sub.session_uuid, self.peer_id)
         end
     end
     self.subscriptions = {}

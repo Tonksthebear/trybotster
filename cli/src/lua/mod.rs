@@ -49,17 +49,16 @@ pub mod runtime;
 
 pub use primitives::{
     // PTY primitives
-    CreateForwarderRequest,
+    BrowserTerminalSubscriptionRequest,
     // Event system primitives
     EventCallbackId,
     EventCallbacks,
     // Hub state primitives
     HubRequest,
-    PtyForwarder,
-    PtyOutputContext,
     PtyRequest,
     RefreshSnapshotRequest,
     SharedEventCallbacks,
+    TerminalSubscription,
     // WebRTC primitives
     WebRtcSendRequest,
     // Worktree primitives

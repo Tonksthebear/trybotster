@@ -36,6 +36,15 @@ requests. The worker emits structured terminal events and process-exit messages
 back to the hub. The Unix socket wire protocol in `cli/src/session/protocol.rs`
 remains the durable process boundary.
 
+Plugin workers own plugin execution. The hub may keep descriptor registries for
+discovery, routing, and UI state, but executable plugin code should be invoked
+through a per-plugin bounded mailbox, keyed by a stable `PluginHandlerRef`
+rather than by a Lua closure stored in hub state. Reloading a plugin means
+replacing that plugin's worker and republishing its descriptors; unloading a
+plugin means stopping that worker and removing only capabilities owned by that
+plugin key. A slow or broken plugin must be able to saturate or kill only its
+own worker, not the hub event loop, client workers, or session I/O workers.
+
 ## Session I/O Worker Runtime
 
 `SessionConnection::install_reader()` installs one `SessionIoWorker` per active
@@ -72,9 +81,13 @@ be routed, but the worker owns snapshot prefixing and gzip preparation through
 to map prepared output back to peer/subscription or Lua refresh state. Browser
 identities and WebRTC structs do not enter the worker contract.
 
-PTY output crosses into the hub as `HubEvent::SessionIoBatch`, not one hub
-event per `FRAME_PTY_OUTPUT`. The worker preserves byte order while coalescing
-output until any of these flush boundaries is reached:
+PTY output does not cross the hub as a hot-path event. The session I/O worker
+preserves byte order and publishes terminal bytes to subscribed client workers;
+the hub only owns attach policy, pending snapshot correlation, lifecycle
+events, and slow-path plugin/control decisions. Session I/O still uses short
+coalescing windows before fan-out so subscribers receive bounded chunks instead
+of one delivery per `FRAME_PTY_OUTPUT`. Coalescing flushes when any of these
+boundaries is reached:
 
 - 32 KiB of buffered output
 - 16 output frames
@@ -83,14 +96,17 @@ output until any of these flush boundaries is reached:
   process exit
 - EOF, protocol desync, or worker shutdown
 
-Sparse terminal metadata is coalesced in the same short window: mode fields
-merge with last value winning, title and CWD keep the last value, and prompt
-marks, bells, notifications, and process exits remain ordered boundaries.
+Sparse terminal metadata is coalesced in the same short window before delivery:
+mode fields merge with last value winning, title and CWD keep the last value,
+and prompt marks, bells, notifications, and process exits remain ordered
+boundaries.
 
-Browser and TUI clients still receive the existing `PtyEvent` payloads. Lua
-`pty_output` observers intentionally see the coalesced byte chunks emitted by
-`SessionIoBatch` rather than the session protocol's original frame boundaries;
-total bytes and byte order are preserved.
+Browser, TUI, and socket clients receive terminal bytes, scrollback, process
+exit, and terminal control frames through their transport-neutral
+`ClientWorker` subscription path. Raw PTY bytes are not exposed as hub Lua
+observer callbacks in the durable-session path; plugin code that needs stable
+state should observe typed lifecycle/entity events or request explicit
+snapshots.
 
 ## Data Flow
 
@@ -110,27 +126,61 @@ orchestration state and lifecycle policy.
 That diagram is the terminal data-plane contract, not a promise that every
 WebRTC JSON message enters the client worker. Hub-owned policy and synchronous
 compatibility work still exists where the hub must decide routing, capability,
-Lua callbacks, or legacy RPC response correlation. Browser terminal
+Lua callbacks, or RPC response correlation. Browser terminal
 subscribe/unsubscribe/focus and binary PTY/file frames are the workerized path;
 terminal color profile messages and unknown JSON are deliberately classified as
 Lua/plugin/relay boundary traffic until they have stable typed worker frames.
+
+The plugin execution contract follows the same shape, but for control-plane
+extension code:
+
+```text
+hub-owned descriptor registry
+  -> PluginHandlerRef
+  -> PluginWorkerMessage
+  -> per-plugin worker runtime
+  -> PluginWorkerEvent
+  -> hub-owned routing/state update
+```
+
+The hub should not pass `mlua::Function` values, raw closure pointers, or
+plugin-owned mutable execution state across this boundary. Plugin registration
+APIs may publish descriptors to hub-owned registries, but action handlers,
+session actions, command handlers, hooks, event subscriptions, timer callbacks,
+file watch callbacks, MCP handlers, surface route renderers, and asset message
+handlers belong behind the plugin worker mailbox.
+
+`lib.plugin_supervisor` is the Lua boundary for this path. Plugin-owned UI
+actions, session actions, hub commands, hooks, event subscriptions, timer
+callbacks, file watch callbacks, MCP tool/prompt/resource handlers, MCP proxy
+auth-error handlers, surface route renderers, and plugin asset iframe message
+handlers are loaded into the plugin worker VM and invoked by handler id through
+`__plugin_worker_invoke`; built-in hub handlers remain local hub VM functions.
+Hub-owned timer scheduling and MCP descriptor lists may keep descriptor state in
+the hub, but plugin-owned timer callbacks, event callbacks, and MCP handlers
+execute in the plugin worker. The plugin worker also pumps its local async HTTP,
+WebSocket, and file watch callback queues so callbacks created inside
+plugin-owned worker execution fire in that same worker. The hub-side closure
+captured during descriptor publication is not the execution source for
+plugin-owned handlers.
 
 `worker::client::ClientWorker::start` is the executable core for this boundary.
 It creates a bounded client mailbox, records subscriptions by session UUID,
 emits hub-owned attach/detach/reconnect/shutdown/backpressure requests, routes
 subscribed `SessionInput` frames to attached `SessionIoRequest::PtyInput`
 mailboxes, and forwards subscribed session output/control frames to the
-transport egress queue. TUI and local socket terminal streams are now
+transport egress queue. TUI and local socket terminal streams are
 production-wired through this actor: hub-owned Lua attach requests still decide
-when a session exists, when pending attach intents resolve, and when forwarder
+when a session exists, when pending attach intents resolve, and when subscription
 tasks are cleaned up, but snapshot, live PTY output, process-exit, typed control,
 plugin binary, and raw input traffic cross the client-worker boundary before a
-TUI or socket adapter encodes them. WebRTC production terminal control traffic
-enters the transport adapter boundary through
-`worker::webrtc::WebRtcPeerRegistry` and `WebRtcTransportRunner`; the adapter
-converts subscribe, unsubscribe, focus-change, heartbeat, PTY input, and file
-input ingress into typed worker or typed hub events before hub policy handles
-routing and Lua exceptions.
+TUI or socket adapter encodes them. WebRTC production terminal traffic enters
+the same boundary through `worker::webrtc::WebRtcPeerRegistry` and
+`WebRtcTransportRunner`; the adapter converts subscribe, unsubscribe,
+focus-change, heartbeat, PTY input, and file input ingress into typed
+`ClientWorkerMessage` or explicit hub-control messages. The hub may authorize
+and correlate terminal attach work, but it must not handle durable-session PTY
+bytes as hub events.
 
 ## WebRTC Transport Adapter
 
@@ -142,11 +192,14 @@ pending ICE queues, per-peer bounded send queues, DataChannel liveness pings,
 unknown-peer burst coalescing, backpressure recovery tracking, and peer cleanup
 bookkeeping stay inside the registry.
 
-The registry also owns the WebRTC data-plane queue receivers. Production code
-starts registry queue forwarders that translate PTY input, file input, outgoing
-signals, PTY output, and stream frames into typed `HubEvent` variants. Hub code
-may handle those typed events, but must not lease, take, restore, or poll raw
-WebRTC receivers.
+The registry also owns the WebRTC transport queue receivers. Production code
+starts registry queue tasks for control-plane and transport-plane queues:
+incoming browser frames, file ingress, outgoing signaling envelopes, stream
+multiplexer frames, and peer liveness/control messages. Terminal payloads read
+from those queues must enter `WebRtcTransportRunner` and the shared
+`ClientWorker`/`SessionIoWorker` data-plane path; they must not be converted
+into a hub hot-path PTY byte event. Hub code may handle typed control events,
+but must not lease, take, restore, or poll raw WebRTC receivers.
 
 The Hub must not recover the old escape hatch by reaching into a channel map or
 `WebRtcSender` directly. New WebRTC work should add a typed registry method or
@@ -164,11 +217,11 @@ browser DataChannel
 
 Outbound WebRTC delivery follows the reverse ownership boundary. Hub policy
 produces transport-neutral work or WebRTC adapter commands, then queues them
-through `WebRtcPeerRegistry::queue_command` or the narrower PTY helpers. The
-registry owns the bounded per-peer command channel and the async send task that
-serializes PTY, JSON, stream, binary, and bundle-refresh frames onto the
-DataChannel. Binary adapter commands must use the raw DataChannel send helper;
-JSON helpers are only for JSON frames.
+through `WebRtcPeerRegistry::queue_command`. The registry owns the bounded
+per-peer command channel and the async send task that serializes terminal
+bytes, JSON, stream, binary, and bundle-refresh frames onto the DataChannel.
+Binary adapter commands must use the raw DataChannel send helper; JSON helpers
+are only for JSON frames.
 
 WebRTC transport summaries cross back to the Hub through typed
 `HubControlMessage` variants:
@@ -214,7 +267,7 @@ generation drops, and typed recovery state cleanup at the worker boundary.
 browser/TUI/socket terminal attach wiring registers per-session
 `SessionIoRequest` senders with `ClientWorkerMessage::RegisterSessionIoSender`
 before `SubscribeSession`, and detaches them with
-`UnregisterSessionIoSender` when a forwarder stops, a WebRTC peer disconnects,
+`UnregisterSessionIoSender` when a terminal subscription stops, a WebRTC peer disconnects,
 a session unregisters, or a process exits. The worker removes closed senders on
 input delivery failures so stale session I/O channels do not keep accepting
 client input.

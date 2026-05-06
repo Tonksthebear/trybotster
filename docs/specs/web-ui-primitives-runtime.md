@@ -192,7 +192,7 @@ type SessionSummary = {
   branch_name?: string | null
   agent_name?: string | null
   notification?: boolean
-  is_idle?: boolean | null
+  output_activity?: "active" | "idle" | null
   port?: number | null
   plugin_state?: SessionActionState | null
   in_worktree?: boolean | null

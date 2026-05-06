@@ -1,9 +1,9 @@
 //! Unified event channel for the Hub event loop.
 //!
 //! All background producers (HTTP threads, WebSocket threads, tokio tasks,
-//! PTY watchers, timers, forwarding tasks) send events through a single
-//! `mpsc::UnboundedSender<HubEvent>`. The `select!` loop receives on the
-//! corresponding receiver and dispatches via `handle_hub_event()`.
+//! PTY watchers, timers, forwarding tasks) send events through bounded
+//! priority lanes. The `select!` loop receives on the corresponding receivers
+//! and dispatches via `handle_hub_event()`.
 
 // Rust guideline compliant 2026-02
 
@@ -19,16 +19,19 @@ use crate::lua::primitives::webrtc::WebRtcSendRequest;
 use crate::lua::primitives::websocket::WsEvent;
 use crate::lua::primitives::worktree::WorktreeRequest;
 use crate::socket::client_conn::SocketClientConn;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
+pub(crate) const HUB_EVENT_QUEUE_CAPACITY: usize = 65_536;
+pub(crate) const HUB_EVENT_HIGH_PRIORITY_QUEUE_CAPACITY: usize = 8_192;
+
 /// Event from a background producer delivered to the Hub event loop.
 ///
-/// Background threads and spawned tasks send events through a single
-/// `mpsc::UnboundedSender<HubEvent>`. The `select!` loop dispatches
-/// each variant via `handle_hub_event()`.
+/// Background threads and spawned tasks send events through bounded
+/// high-priority and bulk lanes. The `select!` loop dispatches each variant via
+/// `handle_hub_event()`.
 #[derive(Debug)]
 pub(crate) enum HubEvent {
     /// Completed HTTP response from a background thread.
@@ -67,25 +70,6 @@ pub(crate) enum HubEvent {
         /// Exit code if available (None if killed by signal or unknown).
         exit_code: Option<i32>,
     },
-
-    /// PTY output observed directly from the session PTY stream.
-    ///
-    /// Used to feed Lua `pty_output` hooks from the session itself, so
-    /// output-driven logic like idle detection does not depend on any client
-    /// transport being attached.
-    PtyOutputObserved {
-        /// Session UUID for hook context.
-        session_uuid: String,
-        /// Raw PTY bytes produced by the session.
-        data: Vec<u8>,
-    },
-
-    /// Compact session-I/O worker batch.
-    ///
-    /// Worker-origin batches preserve byte order while intentionally allowing
-    /// Lua `pty_output` observers to see coalesced chunks instead of the
-    /// session protocol's original frame boundaries.
-    SessionIoBatch(crate::worker::session_io::SessionIoBatch),
 
     /// Session-I/O worker result for non-output mailbox requests.
     SessionIo(crate::worker::session_io::SessionIoEvent),
@@ -154,22 +138,8 @@ pub(crate) enum HubEvent {
         payload: Vec<u8>,
     },
 
-    /// Binary PTY input frame from a WebRTC registry-owned queue forwarder.
-    WebRtcPtyInput(crate::channel::webrtc::PtyInputIncoming),
-
-    /// Browser file-transfer frame from a WebRTC registry-owned queue forwarder.
-    WebRtcFileInput(crate::channel::webrtc::FileInputIncoming),
-
     /// Outgoing signaling envelope from a WebRTC registry-owned queue forwarder.
     WebRtcOutgoingSignal(crate::channel::webrtc::OutgoingSignal),
-
-    /// Transport egress produced by a browser ClientWorker.
-    WebRtcClientWorkerEgress {
-        /// Browser identity key for the peer that owns the worker.
-        browser_identity: String,
-        /// Transport-neutral egress frame from the worker.
-        egress: crate::worker::transport::TransportEgress,
-    },
 
     /// Stream multiplexer frame from a WebRTC registry-owned queue forwarder.
     WebRtcStreamFrame(crate::channel::webrtc::StreamIncoming),
@@ -345,18 +315,6 @@ pub(crate) enum HubEvent {
         msg: serde_json::Value,
     },
 
-    /// Binary PTY input from a socket client.
-    ///
-    /// Raw keyboard bytes, written directly to the PTY (bypasses Lua).
-    SocketPtyInput {
-        /// Client identifier (for focus tracking).
-        client_id: String,
-        /// Session UUID identifying the target PTY.
-        session_uuid: String,
-        /// Raw input bytes.
-        data: Vec<u8>,
-    },
-
     /// Socket send request from a Lua callback.
     ///
     /// Lua's `socket.send(client_id, msg)` pushes this event.
@@ -456,8 +414,6 @@ impl HubEvent {
                 _ => "pty_osc_event",
             },
             Self::PtyProcessExited { .. } => "pty_process_exited",
-            Self::PtyOutputObserved { .. } => "pty_output_observed",
-            Self::SessionIoBatch(_) => "session_io_batch",
             Self::SessionIo(_) => "session_io",
             Self::DropPendingSessionIoSnapshot { .. } => "drop_pending_session_io_snapshot",
             Self::ClientWorkerControl(_) => "client_worker_control",
@@ -466,10 +422,7 @@ impl HubEvent {
             Self::TimerFired { .. } => "timer_fired",
             Self::AcChannelMessage { .. } => "ac_channel_message",
             Self::WebRtcMessage { .. } => "webrtc_message",
-            Self::WebRtcPtyInput(_) => "webrtc_pty_input",
-            Self::WebRtcFileInput(_) => "webrtc_file_input",
             Self::WebRtcOutgoingSignal(_) => "webrtc_outgoing_signal",
-            Self::WebRtcClientWorkerEgress { .. } => "webrtc_client_worker_egress",
             Self::WebRtcStreamFrame(_) => "webrtc_stream_frame",
             Self::UserFileWatch { .. } => "user_file_watch",
             Self::CleanupTick => "cleanup_tick",
@@ -492,7 +445,6 @@ impl HubEvent {
             Self::SocketClientConnected { .. } => "socket_client_connected",
             Self::SocketClientDisconnected { .. } => "socket_client_disconnected",
             Self::SocketMessage { .. } => "socket_message",
-            Self::SocketPtyInput { .. } => "socket_pty_input",
             Self::SocketSend(_) => "socket_send",
             Self::MessageDelivered { .. } => "message_delivered",
             Self::SessionProcessExited { .. } => "session_process_exited",
@@ -505,6 +457,112 @@ impl HubEvent {
     }
 
     #[must_use]
+    pub(crate) fn is_high_priority(&self) -> bool {
+        matches!(
+            self,
+            Self::AcChannelMessage { .. }
+                | Self::LuaActionCableRequest(_)
+                | Self::WebRtcOfferNegotiated(_)
+                | Self::WebRtcOutgoingSignal(_)
+                | Self::DcOpened { .. }
+                | Self::WebRtcMessage { .. }
+                | Self::WebRtcIngressBackpressure { .. }
+                | Self::BrowserPushControl { .. }
+                | Self::WebRtcSend(_)
+                | Self::CleanupTick
+                | Self::DropPendingSessionIoSnapshot { .. }
+                | Self::SessionProcessExited { .. }
+                | Self::SessionUnregistered { .. }
+                | Self::SessionReconnectReady { .. }
+                | Self::WorktreeDeleteCompleted { .. }
+                | Self::SocketClientConnected { .. }
+                | Self::SocketClientDisconnected { .. }
+                | Self::SocketMessage { .. }
+                | Self::SocketSend(_)
+        )
+    }
+
+    #[must_use]
+    fn is_repeatable_under_pressure(&self) -> bool {
+        match self {
+            Self::PtyOscEvent { .. }
+            | Self::TimerFired { .. }
+            | Self::WebRtcRecoverySnapshotReady { .. } => true,
+            Self::ClientWorkerControl(message) => matches!(
+                message,
+                crate::worker::hub_control::HubControlMessage::RequestSnapshot { .. }
+                    | crate::worker::hub_control::HubControlMessage::Backpressure(_)
+                    | crate::worker::hub_control::HubControlMessage::TransportBackpressure { .. }
+            ),
+            _ => false,
+        }
+    }
+
+    #[must_use]
+    fn coalescing_key(&self) -> Option<HubEventCoalescingKey> {
+        match self {
+            Self::PtyOscEvent {
+                session_uuid,
+                event,
+                ..
+            } => match event {
+                crate::agent::pty::PtyEvent::TitleChanged(_) => {
+                    Some(HubEventCoalescingKey::PtyOsc {
+                        session_uuid: session_uuid.clone(),
+                        kind: "title",
+                    })
+                }
+                crate::agent::pty::PtyEvent::CwdChanged(_) => Some(HubEventCoalescingKey::PtyOsc {
+                    session_uuid: session_uuid.clone(),
+                    kind: "cwd",
+                }),
+                crate::agent::pty::PtyEvent::CursorVisibilityChanged(_) => {
+                    Some(HubEventCoalescingKey::PtyOsc {
+                        session_uuid: session_uuid.clone(),
+                        kind: "cursor",
+                    })
+                }
+                _ => None,
+            },
+            Self::TimerFired { timer_id } => Some(HubEventCoalescingKey::Timer {
+                timer_id: timer_id.clone(),
+            }),
+            Self::ClientWorkerControl(message) => match message {
+                crate::worker::hub_control::HubControlMessage::RequestSnapshot {
+                    client_id,
+                    session_uuid,
+                    subscription_id,
+                    rows,
+                    cols,
+                } => Some(HubEventCoalescingKey::SnapshotRequest {
+                    client_id: client_id.clone(),
+                    session_uuid: session_uuid.clone(),
+                    subscription_id: subscription_id.clone(),
+                    rows: *rows,
+                    cols: *cols,
+                }),
+                crate::worker::hub_control::HubControlMessage::Backpressure(pressure) => {
+                    Some(HubEventCoalescingKey::Backpressure {
+                        source: pressure.source,
+                        session_uuid: pressure.session_uuid.clone(),
+                        client_id: pressure.client_id.clone(),
+                    })
+                }
+                crate::worker::hub_control::HubControlMessage::TransportBackpressure {
+                    pressure,
+                    ..
+                } => Some(HubEventCoalescingKey::Backpressure {
+                    source: pressure.source,
+                    session_uuid: pressure.session_uuid.clone(),
+                    client_id: pressure.client_id.clone(),
+                }),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    #[must_use]
     pub(crate) fn approx_size_bytes(&self) -> usize {
         const BASE: usize = 32;
         match self {
@@ -512,20 +570,9 @@ impl HubEvent {
                 browser_identity,
                 payload,
             } => BASE + browser_identity.len() + payload.len(),
-            Self::WebRtcPtyInput(input) => BASE + input.session_uuid.len() + input.data.len(),
-            Self::WebRtcFileInput(file) => {
-                BASE + file.session_uuid.len() + file.filename.len() + file.data.len()
-            }
-            Self::WebRtcClientWorkerEgress {
-                browser_identity,
-                egress,
-            } => BASE + browser_identity.len() + format!("{egress:?}").len(),
             Self::WebRtcStreamFrame(frame) => {
                 BASE + frame.browser_identity.len() + frame.payload.len()
             }
-            Self::SocketPtyInput {
-                client_id, data, ..
-            } => BASE + client_id.len() + data.len(),
             Self::SocketMessage { client_id, msg } => {
                 BASE + client_id.len() + msg.to_string().len()
             }
@@ -537,12 +584,6 @@ impl HubEvent {
                 channel_id,
                 message,
             } => BASE + channel_id.len() + message.to_string().len(),
-            Self::PtyOutputObserved { session_uuid, data } => {
-                BASE + session_uuid.len() + data.len()
-            }
-            Self::SessionIoBatch(batch) => {
-                BASE + batch.session_uuid.len() + batch.output.as_ref().map_or(0, Vec::len)
-            }
             Self::UserFileWatch { watch_id, events } => BASE + watch_id.len() + (events.len() * 48),
             Self::PushSubscriptionsExpired { identities } => {
                 BASE + identities
@@ -554,6 +595,29 @@ impl HubEvent {
             _ => BASE,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum HubEventCoalescingKey {
+    PtyOsc {
+        session_uuid: String,
+        kind: &'static str,
+    },
+    Timer {
+        timer_id: String,
+    },
+    SnapshotRequest {
+        client_id: crate::client::ClientId,
+        session_uuid: String,
+        subscription_id: String,
+        rows: u16,
+        cols: u16,
+    },
+    Backpressure {
+        source: &'static str,
+        session_uuid: Option<String>,
+        client_id: Option<crate::client::ClientId>,
+    },
 }
 
 #[derive(Clone, Debug, Default)]
@@ -887,33 +951,121 @@ impl HubEventMetrics {
 
 #[derive(Clone, Debug)]
 pub(crate) struct HubEventTx {
-    inner: mpsc::UnboundedSender<HubEvent>,
+    inner: mpsc::Sender<HubEvent>,
+    high_priority: mpsc::Sender<HubEvent>,
     metrics: Arc<HubEventMetrics>,
+    pending_coalesced: Arc<Mutex<HashSet<HubEventCoalescingKey>>>,
 }
 
 impl HubEventTx {
     #[must_use]
-    pub(crate) fn new(
-        inner: mpsc::UnboundedSender<HubEvent>,
+    pub(crate) fn new(inner: mpsc::Sender<HubEvent>, metrics: Arc<HubEventMetrics>) -> Self {
+        Self {
+            high_priority: inner.clone(),
+            inner,
+            metrics,
+            pending_coalesced: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn new_with_priority(
+        inner: mpsc::Sender<HubEvent>,
+        high_priority: mpsc::Sender<HubEvent>,
         metrics: Arc<HubEventMetrics>,
     ) -> Self {
-        Self { inner, metrics }
+        Self {
+            inner,
+            high_priority,
+            metrics,
+            pending_coalesced: Arc::new(Mutex::new(HashSet::new())),
+        }
     }
 
     pub(crate) fn send(&self, event: HubEvent) -> Result<(), mpsc::error::SendError<HubEvent>> {
         let kind = event.kind();
         let bytes = event.approx_size_bytes();
-        self.metrics.record_enqueue(kind, bytes);
-        if let Err(e) = self.inner.send(event) {
-            self.metrics.record_enqueue_failed(kind, bytes);
-            return Err(e);
+        let coalescing_key = event.coalescing_key();
+        if let Some(key) = &coalescing_key {
+            if let Ok(mut pending) = self.pending_coalesced.lock() {
+                if !pending.insert(key.clone()) {
+                    self.metrics.record_counter("hub_event.coalesced", 1);
+                    match kind {
+                        "client_worker_control" => self
+                            .metrics
+                            .record_counter("hub_event.coalesced.client_worker_control", 1),
+                        "pty_osc_title" | "pty_osc_cwd" | "pty_osc_cursor" => self
+                            .metrics
+                            .record_counter("hub_event.coalesced.pty_osc", 1),
+                        "timer_fired" => self
+                            .metrics
+                            .record_counter("hub_event.coalesced.timer_fired", 1),
+                        _ => {}
+                    }
+                    return Ok(());
+                }
+            }
         }
-        Ok(())
+        self.metrics.record_enqueue(kind, bytes);
+        let tx = if event.is_high_priority() {
+            &self.high_priority
+        } else {
+            &self.inner
+        };
+        match tx.try_send(event) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(event)) => {
+                self.clear_coalescing_key(coalescing_key.as_ref());
+                self.metrics.record_enqueue_failed(kind, bytes);
+                self.metrics.record_counter("hub_event.queue_full", 1);
+                if event.is_repeatable_under_pressure() {
+                    self.metrics
+                        .record_counter("hub_event.repeatable_rejected", 1);
+                    match kind {
+                        "client_worker_control" => self.metrics.record_counter(
+                            "hub_event.repeatable_rejected.client_worker_control",
+                            1,
+                        ),
+                        "pty_osc_title" | "pty_osc_cwd" | "pty_osc_prompt" | "pty_osc_cursor"
+                        | "pty_osc_event" => self
+                            .metrics
+                            .record_counter("hub_event.repeatable_rejected.pty_osc", 1),
+                        "timer_fired" => self
+                            .metrics
+                            .record_counter("hub_event.repeatable_rejected.timer_fired", 1),
+                        "webrtc_recovery_snapshot_ready" => self
+                            .metrics
+                            .record_counter("hub_event.repeatable_rejected.recovery_snapshot", 1),
+                        _ => {}
+                    }
+                }
+                Err(mpsc::error::SendError(event))
+            }
+            Err(mpsc::error::TrySendError::Closed(event)) => {
+                self.clear_coalescing_key(coalescing_key.as_ref());
+                self.metrics.record_enqueue_failed(kind, bytes);
+                Err(mpsc::error::SendError(event))
+            }
+        }
+    }
+
+    pub(crate) fn mark_dequeued(&self, event: &HubEvent) {
+        let key = event.coalescing_key();
+        self.clear_coalescing_key(key.as_ref());
+    }
+
+    fn clear_coalescing_key(&self, key: Option<&HubEventCoalescingKey>) {
+        let Some(key) = key else {
+            return;
+        };
+        if let Ok(mut pending) = self.pending_coalesced.lock() {
+            pending.remove(key);
+        }
     }
 }
 
-impl From<mpsc::UnboundedSender<HubEvent>> for HubEventTx {
-    fn from(inner: mpsc::UnboundedSender<HubEvent>) -> Self {
+impl From<mpsc::Sender<HubEvent>> for HubEventTx {
+    fn from(inner: mpsc::Sender<HubEvent>) -> Self {
         Self::new(inner, Arc::new(HubEventMetrics::default()))
     }
 }
@@ -961,8 +1113,8 @@ mod tests {
         let metrics = HubEventMetrics::default();
         metrics.record_counter("webrtc_send.queued", 2);
         metrics.record_counter("webrtc_send.queued", 3);
-        metrics.record_high_water("pty_output.batch_hwm", 5);
-        metrics.record_high_water("pty_output.batch_hwm", 3);
+        metrics.record_high_water("queue.batch_hwm", 5);
+        metrics.record_high_water("queue.batch_hwm", 3);
 
         metrics.record_span("webrtc_message.dc_ping", Duration::from_micros(200), 64);
         for i in 0..40 {
@@ -977,7 +1129,7 @@ mod tests {
 
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.counters["webrtc_send.queued"], 5);
-        assert_eq!(snapshot.counters["pty_output.batch_hwm"], 5);
+        assert_eq!(snapshot.counters["queue.batch_hwm"], 5);
         let span = snapshot.spans.get("socket_message.lua").unwrap();
         assert_eq!(span.count, 40);
         assert_eq!(span.slow_count, 40);
@@ -990,5 +1142,233 @@ mod tests {
             .iter()
             .all(|sample| sample.label.chars().count() <= 24));
         assert_eq!(snapshot.slow_samples[0].elapsed_us, 99_000);
+    }
+
+    #[test]
+    fn sender_routes_client_control_events_to_priority_queue() {
+        let (bulk_tx, mut bulk_rx) = mpsc::channel(8);
+        let (priority_tx, mut priority_rx) = mpsc::channel(8);
+        let metrics = Arc::new(HubEventMetrics::default());
+        let sender = HubEventTx::new_with_priority(bulk_tx, priority_tx, metrics);
+
+        sender
+            .send(HubEvent::PtyOscEvent {
+                session_uuid: "sess-1".to_string(),
+                session_name: "agent".to_string(),
+                event: crate::agent::pty::PtyEvent::title_changed("bulk"),
+            })
+            .expect("send bulk event");
+        sender
+            .send(HubEvent::SocketMessage {
+                client_id: "socket:test".to_string(),
+                msg: serde_json::json!({"type": "ping"}),
+            })
+            .expect("send priority event");
+
+        assert!(matches!(
+            bulk_rx.try_recv(),
+            Ok(HubEvent::PtyOscEvent { .. })
+        ));
+        assert!(matches!(
+            priority_rx.try_recv(),
+            Ok(HubEvent::SocketMessage { .. })
+        ));
+        assert!(bulk_rx.try_recv().is_err());
+        assert!(priority_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn sender_rejects_repeatable_events_when_bulk_lane_is_full() {
+        let (bulk_tx, mut bulk_rx) = mpsc::channel(1);
+        let (priority_tx, mut priority_rx) = mpsc::channel(1);
+        let metrics = Arc::new(HubEventMetrics::default());
+        let sender = HubEventTx::new_with_priority(bulk_tx, priority_tx, Arc::clone(&metrics));
+
+        sender
+            .send(HubEvent::PtyOscEvent {
+                session_uuid: "sess-1".to_string(),
+                session_name: "agent".to_string(),
+                event: crate::agent::pty::PtyEvent::title_changed("busy"),
+            })
+            .expect("prefill bulk lane");
+
+        let result = sender.send(HubEvent::ClientWorkerControl(
+            crate::worker::hub_control::HubControlMessage::RequestSnapshot {
+                client_id: crate::client::ClientId::Tui,
+                session_uuid: "sess-1".to_string(),
+                subscription_id: "sub-1".to_string(),
+                rows: 24,
+                cols: 80,
+            },
+        ));
+
+        assert!(result.is_err());
+        assert!(matches!(
+            bulk_rx.try_recv(),
+            Ok(HubEvent::PtyOscEvent { .. })
+        ));
+        assert!(priority_rx.try_recv().is_err());
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.enqueue_failed_total, 1);
+        assert_eq!(snapshot.counters["hub_event.queue_full"], 1);
+        assert_eq!(
+            snapshot.counters["hub_event.repeatable_rejected.client_worker_control"],
+            1
+        );
+    }
+
+    #[test]
+    fn sender_routes_cleanup_events_to_priority_lane() {
+        let (bulk_tx, mut bulk_rx) = mpsc::channel(1);
+        let (priority_tx, mut priority_rx) = mpsc::channel(1);
+        let metrics = Arc::new(HubEventMetrics::default());
+        let sender = HubEventTx::new_with_priority(bulk_tx, priority_tx, metrics);
+
+        sender
+            .send(HubEvent::DropPendingSessionIoSnapshot {
+                request_id: "snapshot-1".to_string(),
+            })
+            .expect("send cleanup event");
+
+        assert!(bulk_rx.try_recv().is_err());
+        assert!(matches!(
+            priority_rx.try_recv(),
+            Ok(HubEvent::DropPendingSessionIoSnapshot { .. })
+        ));
+    }
+
+    #[test]
+    fn sender_coalesces_duplicate_repeatable_events_until_dequeued() {
+        let (bulk_tx, mut bulk_rx) = mpsc::channel(8);
+        let (priority_tx, mut priority_rx) = mpsc::channel(8);
+        let metrics = Arc::new(HubEventMetrics::default());
+        let sender = HubEventTx::new_with_priority(bulk_tx, priority_tx, Arc::clone(&metrics));
+
+        let first = HubEvent::ClientWorkerControl(
+            crate::worker::hub_control::HubControlMessage::Backpressure(
+                crate::worker::hub_control::WorkerBackpressure {
+                    source: "worker.client.outbound",
+                    capacity: 8,
+                    session_uuid: Some("sess-1".to_string()),
+                    client_id: Some(crate::client::ClientId::Tui),
+                },
+            ),
+        );
+        let duplicate = HubEvent::ClientWorkerControl(
+            crate::worker::hub_control::HubControlMessage::Backpressure(
+                crate::worker::hub_control::WorkerBackpressure {
+                    source: "worker.client.outbound",
+                    capacity: 8,
+                    session_uuid: Some("sess-1".to_string()),
+                    client_id: Some(crate::client::ClientId::Tui),
+                },
+            ),
+        );
+
+        sender.send(first).expect("send first backpressure event");
+        sender
+            .send(duplicate)
+            .expect("coalesced duplicate is not an error");
+
+        let event = bulk_rx.try_recv().expect("one queued event");
+        assert!(bulk_rx.try_recv().is_err());
+        assert!(priority_rx.try_recv().is_err());
+        assert_eq!(metrics.snapshot().counters["hub_event.coalesced"], 1);
+
+        sender.mark_dequeued(&event);
+        sender
+            .send(HubEvent::ClientWorkerControl(
+                crate::worker::hub_control::HubControlMessage::Backpressure(
+                    crate::worker::hub_control::WorkerBackpressure {
+                        source: "worker.client.outbound",
+                        capacity: 8,
+                        session_uuid: Some("sess-1".to_string()),
+                        client_id: Some(crate::client::ClientId::Tui),
+                    },
+                ),
+            ))
+            .expect("event can be queued again after dequeue");
+
+        assert!(matches!(
+            bulk_rx.try_recv(),
+            Ok(HubEvent::ClientWorkerControl(_))
+        ));
+    }
+
+    #[test]
+    fn sender_bounds_repeatable_floods_and_preserves_cleanup_lane() {
+        let (bulk_tx, mut bulk_rx) = mpsc::channel(16);
+        let (priority_tx, mut priority_rx) = mpsc::channel(4);
+        let metrics = Arc::new(HubEventMetrics::default());
+        let sender = HubEventTx::new_with_priority(bulk_tx, priority_tx, Arc::clone(&metrics));
+
+        for _ in 0..1_000 {
+            sender
+                .send(HubEvent::TimerFired {
+                    timer_id: "fast-tick".to_string(),
+                })
+                .expect("coalesced timer flood should not fail");
+        }
+
+        for i in 0..15 {
+            sender
+                .send(HubEvent::UserFileWatch {
+                    watch_id: format!("watch-{i}"),
+                    events: Vec::new(),
+                })
+                .expect("fill remaining bulk capacity");
+        }
+
+        let rejected = sender.send(HubEvent::ClientWorkerControl(
+            crate::worker::hub_control::HubControlMessage::RequestSnapshot {
+                client_id: crate::client::ClientId::Tui,
+                session_uuid: "sess-1".to_string(),
+                subscription_id: "sub-1".to_string(),
+                rows: 24,
+                cols: 80,
+            },
+        ));
+        assert!(rejected.is_err());
+
+        sender
+            .send(HubEvent::CleanupTick)
+            .expect("cleanup tick must bypass saturated bulk lane");
+        sender
+            .send(HubEvent::SocketClientDisconnected {
+                client_id: "socket:stress".to_string(),
+            })
+            .expect("disconnect cleanup must bypass saturated bulk lane");
+
+        assert!(matches!(priority_rx.try_recv(), Ok(HubEvent::CleanupTick)));
+        assert!(matches!(
+            priority_rx.try_recv(),
+            Ok(HubEvent::SocketClientDisconnected { .. })
+        ));
+        assert!(priority_rx.try_recv().is_err());
+
+        let mut timer_count = 0;
+        let mut file_watch_count = 0;
+        while let Ok(event) = bulk_rx.try_recv() {
+            match event {
+                HubEvent::TimerFired { .. } => timer_count += 1,
+                HubEvent::UserFileWatch { .. } => file_watch_count += 1,
+                other => panic!("unexpected bulk event: {other:?}"),
+            }
+        }
+        assert_eq!(timer_count, 1);
+        assert_eq!(file_watch_count, 15);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.by_type["timer_fired"].pending_high_water, 1);
+        assert_eq!(snapshot.by_type["user_file_watch"].pending_high_water, 15);
+        assert_eq!(
+            snapshot.counters.get("hub_event.coalesced.timer_fired"),
+            Some(&999)
+        );
+        assert_eq!(snapshot.counters["hub_event.queue_full"], 1);
+        assert_eq!(
+            snapshot.counters["hub_event.repeatable_rejected.client_worker_control"],
+            1
+        );
     }
 }

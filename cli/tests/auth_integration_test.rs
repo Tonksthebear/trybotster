@@ -49,6 +49,9 @@ fn setup_test_env() -> (TempDir, std::sync::MutexGuard<'static, ()>) {
 
 mod validate_token_tests {
     use botster::auth;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::thread;
 
     #[test]
     fn returns_false_for_empty_token() {
@@ -61,6 +64,46 @@ mod validate_token_tests {
         // Use a port that's unlikely to have anything listening
         let result = auth::validate_token("http://127.0.0.1:59999", "btstr_some_token");
         assert!(!result, "Expected unreachable server to return false");
+    }
+
+    #[test]
+    fn sends_json_accept_header_to_authenticated_hubs_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0; 4096];
+            let bytes_read = stream.read(&mut buffer).unwrap();
+            let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n[]",
+                )
+                .unwrap();
+
+            request
+        });
+
+        let result = auth::validate_token(&format!("http://{addr}"), "btstr_some_token");
+        let request = server.join().unwrap();
+
+        assert!(result, "Expected 200 response to validate token");
+        assert!(
+            request.contains("GET /hubs HTTP/1.1"),
+            "Expected validation to request /hubs, got:\n{request}"
+        );
+        assert!(
+            request.contains("accept: application/json")
+                || request.contains("Accept: application/json"),
+            "Expected JSON Accept header, got:\n{request}"
+        );
+        assert!(
+            request.contains("authorization: Bearer btstr_some_token")
+                || request.contains("Authorization: Bearer btstr_some_token"),
+            "Expected bearer token header, got:\n{request}"
+        );
     }
 }
 

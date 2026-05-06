@@ -862,7 +862,6 @@ self.onconnect = (event) => {
   const portId = generatePortId()
 
   ports.set(portId, { port, lastPong: Date.now() })
-  port.postMessage({ event: "ready", portId })
 
   port.onmessage = (msgEvent) => {
     handleMessage(msgEvent, portId, (msg) => port.postMessage(msg))
@@ -873,17 +872,7 @@ self.onconnect = (event) => {
   }
 
   port.start()
-}
-
-// =============================================================================
-// Regular Worker Fallback
-// =============================================================================
-
-self.onmessage = (event) => {
-  if (typeof self.postMessage === "function") {
-    self.postMessage({ event: "ready", portId: "worker" })
-  }
-  handleMessage(event, null, (msg) => self.postMessage(msg))
+  port.postMessage({ event: "ready", portId })
 }
 
 // =============================================================================

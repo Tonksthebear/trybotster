@@ -22,7 +22,7 @@ local state = require("hub.state")
 local Agent = require("lib.agent")
 local EntityModel = require("lib.entity_model")
 local Session = require("lib.session")
-local pty_clients = require("lib.pty_clients")
+local terminal_clients = require("lib.terminal_clients")
 local EB = require("lib.entity_broadcast")
 local surfaces = require("lib.surfaces")
 
@@ -42,6 +42,9 @@ local last_connection_code = state.get("connections.last_connection_code", nil)
 local pending_osc_session_updates = state.get("connections.pending_osc_session_updates", {})
 
 local OSC_SESSION_UPDATE_DEBOUNCE_SECS = 0.5
+local OUTPUT_ACTIVITY_POLL_SECS = 0.5
+local OUTPUT_ACTIVITY_ACTIVE_WINDOW_MS = 3000
+local output_activity_timer_id = nil
 
 -- ============================================================================
 -- Client Registry
@@ -93,6 +96,20 @@ local function get_stats()
         total_messages = stats.total_messages,
         total_disconnections = stats.total_disconnections,
     }
+end
+
+local function now_ms()
+    return os.time() * 1000
+end
+
+local function refresh_session_output_activity()
+    local current_ms = now_ms()
+    for _, session in ipairs(Session.list()) do
+        local activity = session:derive_output_activity(OUTPUT_ACTIVITY_ACTIVE_WINDOW_MS, current_ms)
+        if session.output_activity ~= activity then
+            session:update({ output_activity = activity })
+        end
+    end
 end
 
 -- ============================================================================
@@ -245,7 +262,7 @@ end)
 -- Global callable by Rust to update per-client focus state.
 function _set_pty_focused(session_uuid, peer_id, focused)
     if session_uuid then
-        pty_clients.set_focused(session_uuid, peer_id, focused)
+        terminal_clients.set_focused(session_uuid, peer_id, focused)
     end
 end
 
@@ -254,10 +271,10 @@ hooks.on("client_disconnected", "unfocus_on_disconnect", function(info)
     local peer_id = info.peer_id
     if not peer_id then return end
 
-    local focused_sessions = pty_clients.get_focused_sessions(peer_id)
+    local focused_sessions = terminal_clients.get_focused_sessions(peer_id)
     for _, session_uuid in ipairs(focused_sessions) do
         hub.write_pty(session_uuid, "\x1b[O")
-        pty_clients.set_focused(session_uuid, peer_id, false)
+        terminal_clients.set_focused(session_uuid, peer_id, false)
         log.debug(string.format("Sent synthetic focus-out to %s on client %s disconnect",
             session_uuid:sub(1, 16), peer_id:sub(1, 8)))
     end
@@ -269,7 +286,7 @@ hooks.on("_pty_notification_raw", "enrich_and_dispatch", function(info)
     info.already_notified = agent and agent.notification or false
 
     info.has_focus = agent and agent.session_uuid
-        and pty_clients.is_any_focused(agent.session_uuid) or false
+        and terminal_clients.is_any_focused(agent.session_uuid) or false
 
     info.session_uuid = agent and agent.session_uuid or nil
 
@@ -434,32 +451,6 @@ hooks.on("pty_cursor_visibility", "update_agent_cursor", function(info)
     if agent then
         agent.cursor_visible = info.visible
     end
-end)
-
--- ============================================================================
--- Idle / Active Detection
--- ============================================================================
--- Idle detection: event-driven via timer.after_idle (no polling).
-
-local IDLE_THRESHOLD_SECS = 2
-
-hooks.on("pty_output", "idle_activity_reset", function(ctx, _data)
-    local uuid = ctx.session_uuid
-    if not uuid then return end
-
-    local session = Agent.get(uuid)
-    if not session then return end
-
-    if session.is_idle then
-        session:update({ is_idle = false })
-    end
-
-    timer.after_idle("idle:" .. uuid, IDLE_THRESHOLD_SECS, function()
-        local s = Agent.get(uuid)
-        if s and not s.is_idle then
-            s:update({ is_idle = true })
-        end
-    end)
 end)
 
 -- NOTE: the legacy `broadcast_session_updated` hook (which fanned out
@@ -653,13 +644,16 @@ function M._before_reload()
     hooks.off("pty_notification", "push_notification")
     hooks.off("pty_title_changed", "update_agent_title")
     hooks.off("pty_cwd_changed", "update_agent_cwd")
-    hooks.off("pty_output", "idle_activity_reset")
     hooks.off("pty_prompt", "update_agent_prompt")
     hooks.off("pty_cursor_visibility", "update_agent_cursor")
     hooks.off("client_disconnected", "unfocus_on_disconnect")
     hooks.off("surfaces_changed", "broadcast_ui_route_registry")
     hooks.off("workspace_closed", "broadcast_workspace_closed")
     timer.cancel("ui_route_registry_broadcast")
+    if output_activity_timer_id then
+        timer.cancel(output_activity_timer_id)
+        output_activity_timer_id = nil
+    end
     -- Wire protocol B6 fix: we DO NOT clear the broadcaster here. The
     -- top-level `EB.set_broadcaster(broadcast_frame_to_hub)` on reload
     -- replaces it atomically, and the old closure keeps working in the
@@ -677,6 +671,9 @@ end
 function M._after_reload()
     log.info(string.format("connections.lua reloaded, %d client(s) preserved", get_client_count()))
 end
+
+output_activity_timer_id = timer.every(OUTPUT_ACTIVITY_POLL_SECS, refresh_session_output_activity)
+refresh_session_output_activity()
 
 log.info(string.format("Connection registry loaded (%d existing clients)", get_client_count()))
 

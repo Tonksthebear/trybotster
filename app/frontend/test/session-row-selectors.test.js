@@ -90,18 +90,18 @@ describe('titleLine', () => {
 })
 
 describe('activityState', () => {
-  it('marks accessory regardless of is_idle', () => {
+  it('marks accessory regardless of output activity', () => {
     expect(
-      activityState({ session_type: 'accessory', is_idle: false }),
+      activityState({ session_type: 'accessory', output_activity: 'active' }),
     ).toBe('accessory')
   })
-  it('returns "active" only when is_idle === false', () => {
-    expect(activityState({ is_idle: false })).toBe('active')
+  it('returns "active" only when output_activity is active', () => {
+    expect(activityState({ output_activity: 'active' })).toBe('active')
   })
-  it('returns "idle" when is_idle is true', () => {
-    expect(activityState({ is_idle: true })).toBe('idle')
+  it('returns "idle" when output_activity is idle', () => {
+    expect(activityState({ output_activity: 'idle' })).toBe('idle')
   })
-  it('returns "idle" by default (missing is_idle)', () => {
+  it('returns "idle" by default (missing output_activity)', () => {
     expect(activityState({})).toBe('idle')
   })
   it('returns "idle" for null', () => {
@@ -119,7 +119,7 @@ describe('selectSessionRowProps', () => {
     target_name: 'backend',
     branch_name: 'feature/api',
     agent_name: 'codex',
-    is_idle: false,
+    output_activity: 'active',
     notification: true,
     session_type: 'agent',
     in_worktree: true,

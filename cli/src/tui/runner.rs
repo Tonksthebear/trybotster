@@ -57,7 +57,7 @@ use ratatui::Terminal;
 
 use ratatui::backend::CrosstermBackend;
 
-use crate::client::{TuiOutput, TuiRequest};
+use crate::client::{TuiOutput, TuiRequest, TuiSessionInput};
 use crate::hub::Hub;
 use crate::tui::layout::terminal_widget_inner_area;
 
@@ -83,14 +83,14 @@ use super::ColorCache;
 /// ```text
 /// Hub (main thread)
 /// ├── Lua runtime (client.lua) ──► tui.send() ──► TuiOutput::Message
-/// └── PTY forwarders ──────────────────────────► TuiOutput::Output
+/// └── terminal subscriptions ─────────────────► TuiOutput::Output
 ///                                                       │
 ///                                            TuiRunner (output_rx)
 ///                                            ──► panels[focused] ──► render
 /// ```
 ///
-/// TuiRunner sends `TuiRequest` messages through `request_tx`: control messages
-/// go through Lua `client.lua`, PTY keyboard input goes directly to the PTY.
+/// TuiRunner sends control messages through `request_tx` and PTY bytes through
+/// the session-input route owned by the active transport.
 pub struct TuiRunner<B: Backend> {
     // === Subsystems ===
     /// TUI-local terminal color cache learned from the outer terminal.
@@ -119,19 +119,26 @@ pub struct TuiRunner<B: Backend> {
     /// Request sender to Hub.
     ///
     /// Control messages (resize, subscriptions, agent lifecycle) are wrapped
-    /// in `TuiRequest::LuaMessage` and routed through Lua. PTY keyboard input
-    /// is sent as `TuiRequest::PtyInput` and written directly to the PTY.
+    /// in `TuiRequest::LuaMessage` and routed through Lua.
     pub(super) request_tx: tokio::sync::mpsc::UnboundedSender<TuiRequest>,
+    /// In-process session input routes keyed by session UUID.
+    pub(super) session_input_routes: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, crate::worker::client::ClientWorkerHandle>,
+        >,
+    >,
+    /// Transport session-input sender for socket-attached TUI.
+    pub(super) session_input_tx: Option<tokio::sync::mpsc::UnboundedSender<TuiSessionInput>>,
 
     // === Output Channel ===
     /// Receiver for PTY output and Lua events from Hub.
     ///
     /// Hub sends `TuiOutput` messages through this channel: binary PTY data
-    /// from Lua forwarder tasks and JSON events from `tui.send()` in Lua.
+    /// from client workers and JSON events from `tui.send()` in Lua.
     output_rx: tokio::sync::mpsc::UnboundedReceiver<TuiOutput>,
 
     // === Wake Pipe ===
-    /// Read end of the wake pipe. Hub/forwarders write 1 byte to the write
+    /// Read end of the wake pipe. Hub/client worker tasks write 1 byte to the write
     /// end after sending to `output_rx`, unblocking the TUI `libc::poll()`.
     wake_fd: Option<std::os::unix::io::RawFd>,
 
@@ -344,6 +351,38 @@ where
         wake_fd: Option<std::os::unix::io::RawFd>,
         color_cache: ColorCache,
     ) -> Self {
+        Self::new_with_color_cache_and_session_input(
+            terminal,
+            request_tx,
+            output_rx,
+            shutdown,
+            terminal_dims,
+            wake_fd,
+            color_cache,
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            None,
+        )
+    }
+
+    /// Create a TUI runner with explicit session-input transport.
+    ///
+    /// Hub mode passes a client-worker route map; attach mode passes a socket
+    /// transport sender.
+    pub fn new_with_color_cache_and_session_input(
+        terminal: Terminal<B>,
+        request_tx: tokio::sync::mpsc::UnboundedSender<TuiRequest>,
+        output_rx: tokio::sync::mpsc::UnboundedReceiver<TuiOutput>,
+        shutdown: Arc<AtomicBool>,
+        terminal_dims: (u16, u16),
+        wake_fd: Option<std::os::unix::io::RawFd>,
+        color_cache: ColorCache,
+        session_input_routes: Arc<
+            std::sync::Mutex<
+                std::collections::HashMap<String, crate::worker::client::ClientWorkerHandle>,
+            >,
+        >,
+        session_input_tx: Option<tokio::sync::mpsc::UnboundedSender<TuiSessionInput>>,
+    ) -> Self {
         Self {
             color_cache: Arc::clone(&color_cache),
             panel_pool: super::panel_pool::PanelPool::new_with_color_cache(
@@ -355,6 +394,8 @@ where
             connection_code: None,
             error_message: None,
             request_tx,
+            session_input_routes,
+            session_input_tx,
             output_rx,
             wake_fd,
             shutdown,
@@ -504,7 +545,7 @@ where
     /// expires. Replaces `thread::sleep(16ms)` with event-driven wakeup.
     ///
     /// When a wake pipe is configured, polls both stdin (fd 0) and the wake
-    /// pipe read end. Hub and forwarder tasks write 1 byte to the wake pipe
+    /// pipe read end. Hub and client worker tasks write 1 byte to the wake pipe
     /// after sending to `output_rx`, providing instant TUI wakeup.
     ///
     /// When stdin has a permanent error (`stdin_dead`), only polls the wake
@@ -1479,26 +1520,57 @@ where
     fn handle_pty_input(&mut self, data: &[u8]) {
         if let Some(uuid) = self.panel_pool.current_session_uuid.clone() {
             log::trace!(
-                "[PTY-FWD] Sending {} bytes to session={} (overlay={})",
+                "[TUI-SESSION] Sending {} bytes to session={} (overlay={})",
                 data.len(),
                 uuid,
                 self.has_overlay
             );
-            if let Err(e) = self.request_tx.send(TuiRequest::PtyInput {
-                session_uuid: uuid,
+            self.route_session_input(uuid, data);
+        } else {
+            log::warn!(
+                "[TUI-SESSION] Dropped {} bytes: no focused session",
+                data.len()
+            );
+        }
+    }
+
+    fn route_session_input(&self, session_uuid: String, data: &[u8]) {
+        let worker = self
+            .session_input_routes
+            .lock()
+            .ok()
+            .and_then(|routes| routes.get(&session_uuid).cloned());
+        if let Some(worker) = worker {
+            if let Err(e) =
+                worker.try_send(crate::worker::client::ClientWorkerMessage::SessionInput {
+                    session_uuid,
+                    data: data.to_vec(),
+                })
+            {
+                log::warn!("[TUI-SESSION] TUI session input queue rejected: {e}");
+            }
+            return;
+        }
+
+        if let Some(tx) = &self.session_input_tx {
+            if let Err(e) = tx.send(TuiSessionInput {
+                session_uuid,
                 data: data.to_vec(),
             }) {
-                log::error!("Failed to send PTY input: {e}");
+                log::warn!("[TUI-SESSION] TUI session input transport rejected: {e}");
             }
         } else {
-            log::warn!("[PTY-FWD] Dropped {} bytes: no focused session", data.len());
+            log::warn!(
+                "[TUI-SESSION] Dropped {} bytes: no session input route",
+                data.len()
+            );
         }
     }
 
     /// Notify the hub of focus state change for the current session.
     ///
     /// Always sent regardless of whether the child PTY requested focus
-    /// reporting. This ensures `pty_clients.focused` stays accurate for
+    /// reporting. This ensures `terminal_clients.focused` stays accurate for
     /// notification suppression even when the child app doesn't enable
     /// `CSI ? 1004 h`.
     fn send_focus_changed(&self, focused: bool) {
@@ -1531,7 +1603,7 @@ where
     ///
     /// Updates local state only. The next render cycle will call
     /// `sync_widget_dims()` which sends per-terminal resize through
-    /// terminal subscriptions → `pty_clients.update()`.
+    /// terminal subscriptions update terminal client dimensions.
     fn handle_resize(&mut self, rows: u16, cols: u16) {
         let (prev_rows, prev_cols) = self.panel_pool.terminal_dims();
         if (prev_rows, prev_cols) != (rows, cols) {
@@ -1549,7 +1621,7 @@ where
     /// Poll PTY output and Lua events from Hub output channel.
     ///
     /// Hub sends `TuiOutput` messages through the channel: binary PTY data
-    /// from Lua forwarder tasks and JSON events from `tui.send()`. TuiRunner
+    /// from terminal subscriptions and JSON events from `tui.send()`. TuiRunner
     /// processes them here (feeding to AlacrittyParser, handling Lua messages, etc.).
     fn poll_pty_events(&mut self, layout_lua: Option<&LayoutLua>) {
         use tokio::sync::mpsc::error::TryRecvError;
@@ -1664,7 +1736,12 @@ where
         // `patch`/`remove`) belong to TuiEntityStores. Lua owns workflow
         // state; it should not maintain a second entity cache.
         if super::entity_stores::TuiEntityStores::handles_frame(event_type) {
+            let is_connection_code =
+                msg.get("entity_type").and_then(|v| v.as_str()) == Some("connection_code");
             if self.entity_stores.apply_frame(&msg) {
+                if is_connection_code {
+                    self.sync_connection_code_from_entity_store();
+                }
                 self.dirty = true;
             }
             return;
@@ -1781,6 +1858,49 @@ where
         } else {
             log::warn!("Hub event '{event_type}' dropped: no layout_lua");
         }
+    }
+
+    fn sync_connection_code_from_entity_store(&mut self) {
+        let Some(entity) = self
+            .entity_stores
+            .store("connection_code")
+            .and_then(|store| store.iter().next().map(|(_, entity)| entity))
+        else {
+            self.connection_code = None;
+            return;
+        };
+
+        let Some(url) = entity
+            .get("url")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
+            self.connection_code = None;
+            return;
+        };
+
+        let qr_ascii: Vec<String> = entity
+            .get("qr_ascii")
+            .and_then(serde_json::Value::as_array)
+            .map(|lines| {
+                lines
+                    .iter()
+                    .filter_map(|line| line.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let qr_width = qr_ascii
+            .first()
+            .map(|line| line.chars().count() as u16)
+            .unwrap_or(0);
+        let qr_height = qr_ascii.len() as u16;
+
+        self.connection_code = Some(ConnectionCodeData {
+            url,
+            qr_ascii,
+            qr_width,
+            qr_height,
+        });
     }
 
     /// Render the TUI.
@@ -1933,8 +2053,8 @@ where
     /// `lua.call_tui_message()` — the same `Client:on_message()` path
     /// as browser clients. Used for resize, subscriptions, agent lifecycle.
     ///
-    /// For PTY keyboard input, use `handle_pty_input()` instead — it sends
-    /// raw bytes via `TuiRequest::PtyInput`, bypassing Lua.
+    /// For PTY keyboard input, use `handle_pty_input()` instead; it sends raw
+    /// bytes through direct client-worker routes.
     pub(super) fn send_msg(&self, msg: serde_json::Value) {
         if let Err(e) = self.request_tx.send(TuiRequest::LuaMessage(msg)) {
             log::error!("Failed to send Lua message: {}", e);
@@ -2051,7 +2171,7 @@ where
     /// Sends explicitly-targeted PTY inputs, Hub messages, and clears
     /// kitty state as needed.
     fn apply_focus_effects(&mut self, effects: super::panel_pool::FocusEffects) {
-        // Subscribe/unsubscribe before focus sequences so pty_clients
+        // Subscribe/unsubscribe before focus sequences so terminal_clients
         // has the "tui" entry registered before set_focused runs.
         for msg in effects.messages {
             self.send_msg(msg);
@@ -2077,12 +2197,7 @@ where
                 );
                 continue;
             }
-            if let Err(e) = self.request_tx.send(TuiRequest::PtyInput {
-                session_uuid: input.session_uuid.clone(),
-                data: input.data.to_vec(),
-            }) {
-                log::error!("Failed to send PTY input: {e}");
-            }
+            self.route_session_input(input.session_uuid.clone(), &input.data);
         }
         if effects.clear_kitty {
             self.terminal_modes.clear_inner_kitty();
@@ -2239,13 +2354,13 @@ pub fn run_with_hub(
     let output_rx = hub.register_tui_via_lua(request_rx);
 
     // Create wake pipe for event-driven TUI wakeup.
-    // Hub/forwarders write to wake_write_fd after sending to output_rx,
+    // Hub/client worker tasks write to wake_write_fd after sending to output_rx,
     // TuiRunner polls wake_read_fd alongside stdin.
     let mut pipe_fds = [0i32; 2];
     let pipe_ok = unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } == 0;
     let (wake_read_fd, wake_write_fd) = if pipe_ok {
         // Set both ends to non-blocking: read end so drain never blocks,
-        // write end so forwarder tasks never stall if pipe buffer is full.
+        // write end so worker tasks never stall if pipe buffer is full.
         unsafe {
             let flags = libc::fcntl(pipe_fds[0], libc::F_GETFL);
             libc::fcntl(pipe_fds[0], libc::F_SETFL, flags | libc::O_NONBLOCK);
@@ -2267,7 +2382,7 @@ pub fn run_with_hub(
     let shutdown = Arc::new(AtomicBool::new(false));
     let tui_shutdown = Arc::clone(&shutdown);
 
-    let mut tui_runner = TuiRunner::new_with_color_cache(
+    let mut tui_runner = TuiRunner::new_with_color_cache_and_session_input(
         terminal,
         request_tx,
         output_rx,
@@ -2275,6 +2390,8 @@ pub fn run_with_hub(
         terminal_dims,
         wake_read_fd,
         color_cache,
+        Arc::clone(&hub.tui_session_input_routes),
+        None,
     );
 
     // Load all Lua sources and create bootstrap (consumed once by run()).
@@ -2554,6 +2671,19 @@ mod tests {
         runner.local_color_probe_pending.insert(257usize, 1);
         runner.local_color_probe_pending.insert(258usize, 1);
         runner.local_color_probe_pending.insert(7usize, 1);
+        let (worker_tx, mut worker_rx) =
+            tokio::sync::mpsc::channel::<crate::worker::client::ClientWorkerMessage>(4);
+        runner
+            .session_input_routes
+            .lock()
+            .expect("session input routes")
+            .insert(
+                "sess-0".to_string(),
+                crate::worker::client::ClientWorkerHandle {
+                    client_id: crate::client::ClientId::Tui,
+                    tx: worker_tx,
+                },
+            );
 
         runner.flush_pending_focus_in();
         assert!(request_rx.try_recv().is_err());
@@ -2588,13 +2718,13 @@ mod tests {
             Some("sess-0")
         );
 
-        let focus_msg = request_rx.try_recv().expect("deferred focus input");
+        let focus_msg = worker_rx.try_recv().expect("deferred focus input");
         match focus_msg {
-            TuiRequest::PtyInput { session_uuid, data } => {
+            crate::worker::client::ClientWorkerMessage::SessionInput { session_uuid, data } => {
                 assert_eq!(session_uuid, "sess-0");
                 assert_eq!(data, b"\x1b[I");
             }
-            other => panic!("expected PtyInput, got {other:?}"),
+            other => panic!("expected SessionInput, got {other:?}"),
         }
         assert!(runner.local_color_probe_pending.contains_key(&7usize));
     }
@@ -2613,6 +2743,19 @@ mod tests {
         runner.panel_pool.panels.insert("sess-0".to_string(), panel);
         runner.local_color_probe_pending.insert(256usize, 1);
         runner.local_color_probe_pending.insert(257usize, 1);
+        let (worker_tx, mut worker_rx) =
+            tokio::sync::mpsc::channel::<crate::worker::client::ClientWorkerMessage>(4);
+        runner
+            .session_input_routes
+            .lock()
+            .expect("session input routes")
+            .insert(
+                "sess-0".to_string(),
+                crate::worker::client::ClientWorkerHandle {
+                    client_id: crate::client::ClientId::Tui,
+                    tx: worker_tx,
+                },
+            );
         runner.local_color_probe_pending.insert(258usize, 1);
 
         let (fg_index, fg_color) =
@@ -2652,13 +2795,13 @@ mod tests {
             Some(crate::terminal::Rgb::new(16, 15, 15))
         );
 
-        let second = request_rx.try_recv().expect("second request");
+        let second = worker_rx.try_recv().expect("second request");
         match second {
-            TuiRequest::PtyInput { session_uuid, data } => {
+            crate::worker::client::ClientWorkerMessage::SessionInput { session_uuid, data } => {
                 assert_eq!(session_uuid, "sess-0");
                 assert_eq!(data, b"\x1b[I");
             }
-            other => panic!("expected PtyInput second, got {other:?}"),
+            other => panic!("expected SessionInput second, got {other:?}"),
         }
     }
 
@@ -4363,6 +4506,49 @@ mod tests {
     }
 
     #[test]
+    fn connection_code_entity_frame_updates_legacy_render_cache() {
+        let (mut runner, _request_rx) = create_test_runner();
+
+        runner.dispatch_hub_event(
+            serde_json::json!({
+                "type": "entity_snapshot",
+                "entity_type": "connection_code",
+                "items": [{
+                    "hub_id": "device-test",
+                    "url": "https://trybotster.test/connect/abc",
+                    "qr_ascii": ["xxx", "yyy"]
+                }],
+                "snapshot_seq": 1
+            }),
+            None,
+        );
+
+        let code = runner
+            .connection_code
+            .as_ref()
+            .expect("connection code cache should sync from entity store");
+        assert_eq!(code.url, "https://trybotster.test/connect/abc");
+        assert_eq!(code.qr_ascii, vec!["xxx".to_string(), "yyy".to_string()]);
+        assert_eq!(code.qr_width, 3);
+        assert_eq!(code.qr_height, 2);
+
+        runner.dispatch_hub_event(
+            serde_json::json!({
+                "type": "entity_snapshot",
+                "entity_type": "connection_code",
+                "items": [],
+                "snapshot_seq": 2
+            }),
+            None,
+        );
+
+        assert!(
+            runner.connection_code.is_none(),
+            "empty connection_code snapshot should clear render cache"
+        );
+    }
+
+    #[test]
     fn terminal_attach_not_ready_renders_error_mode() {
         let (mut runner, _request_rx) = create_test_runner();
         let lua = make_test_layout_with_keybindings();
@@ -4521,7 +4707,7 @@ mod tests {
         // No terminal subscription (not connected to a PTY)
         runner.handle_resize(40, 120);
 
-        // Verify: no messages sent (PTY resize handled by pty_clients via terminal channel)
+        // Verify: no messages sent (terminal resize handled by terminal_clients via terminal channel)
         assert!(
             request_rx.try_recv().is_err(),
             "handle_resize should not send any messages"

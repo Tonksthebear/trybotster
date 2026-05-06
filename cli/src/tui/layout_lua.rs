@@ -2207,7 +2207,7 @@ mod tests {
                     display_name = "feature-auth",
                     branch_name = "feature-auth",
                     session_type = "agent",
-                    is_idle = true,
+                    output_activity = "idle",
                     status = "running",
                 }
             }
@@ -2242,7 +2242,7 @@ mod tests {
                     display_name = "feature-auth",
                     branch_name = "feature-auth",
                     session_type = "agent",
-                    is_idle = false,
+                    output_activity = "active",
                     status = "running",
                 }
             }
@@ -2278,7 +2278,7 @@ mod tests {
                     target_name = "trybotster",
                     agent_name = "codex",
                     session_type = "agent",
-                    is_idle = false,
+                    output_activity = "active",
                     status = "running",
                 }
             }

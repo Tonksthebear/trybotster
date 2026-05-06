@@ -8,6 +8,11 @@ import { WebRtcPtyTransport } from 'transport/webrtc_pty_transport'
 const CONNECT_DEBOUNCE_MS = 30
 const MAX_FILE_SIZE = 50 * 1024 * 1024
 const TEST_MODE = import.meta.env.MODE === 'test'
+const CLIENT_DEFAULT_COLORS = {
+  foreground: 0xffffff,
+  background: 0x000000,
+  cursor: 0xffffff,
+}
 
 function setTerminalTestHook(key, transport) {
   if (!TEST_MODE || typeof window === 'undefined') return
@@ -51,7 +56,7 @@ export default function TerminalView({ hubId, sessionUuid }) {
       backendReady: false,
       connectPtyRequested: false,
       connectPtyTimer: null,
-      pendingSize: null,
+      measuredSize: null,
       focused: false,
       connected: false,
       present: true,
@@ -105,16 +110,17 @@ export default function TerminalView({ hubId, sessionUuid }) {
     }
 
     function sendFocusState() {
-      state.transport?.sendInput(state.focused ? '\x1b[I' : '\x1b[O')
       if (state.focused) sendColorProfile()
+      state.transport?.sendFocusChanged(state.focused)
+      state.transport?.sendInput(state.focused ? '\x1b[I' : '\x1b[O')
     }
 
     function sendColorProfile() {
       if (!state.restty) return
       const colors = {}
-      const fg = state.restty.getColorForeground?.()
-      const bg = state.restty.getColorBackground?.()
-      const cursor = state.restty.getColorCursor?.()
+      const fg = CLIENT_DEFAULT_COLORS.foreground
+      const bg = CLIENT_DEFAULT_COLORS.background
+      const cursor = CLIENT_DEFAULT_COLORS.cursor
       if (fg != null)
         colors[256] = {
           r: (fg >> 16) & 0xff,
@@ -134,7 +140,7 @@ export default function TerminalView({ hubId, sessionUuid }) {
           b: cursor & 0xff,
         }
       const palette = state.restty.getPalette?.()
-      if (palette) {
+      if (palette?.length >= 256 * 3) {
         for (let i = 0; i < 256; i++) {
           colors[i] = {
             r: palette[i * 3],
@@ -158,15 +164,17 @@ export default function TerminalView({ hubId, sessionUuid }) {
     function onTermSize(cols, rows) {
       if (state.connectPtyRequested || state.destroyed || !state.backendReady)
         return
-      state.pendingSize = { cols, rows }
+      state.measuredSize = { cols, rows }
       if (state.connectPtyTimer) clearTimeout(state.connectPtyTimer)
       state.connectPtyTimer = setTimeout(() => {
         state.connectPtyTimer = null
         if (state.connectPtyRequested || state.destroyed || !state.backendReady)
           return
-        const size = state.pendingSize
+        const size = state.measuredSize
         if (!size || size.cols <= 1 || size.rows <= 1) return
         state.connectPtyRequested = true
+        state.transport?.resize(size.cols, size.rows)
+        state.restty?.updateSize(true)
         state.restty?.connectPty()
       }, CONNECT_DEBOUNCE_MS)
     }
