@@ -125,7 +125,7 @@ impl Hub {
                     Ok(()) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         log::warn!(
-                            "[Lua-Socket] Adapter writer queue full for {}, forcing reconnect",
+                            "[Socket] Adapter writer queue full for {}, forcing reconnect",
                             disconnect_client_id
                         );
                         let _ = hub_event_tx.send(
@@ -202,17 +202,19 @@ impl Hub {
     pub(super) fn spawn_webrtc_client_worker_adapter(
         &self,
         browser_identity: String,
+        peer_command_tx: tokio::sync::mpsc::Sender<crate::worker::webrtc::WebRtcAdapterCommand>,
     ) -> crate::worker::client::ClientWorkerHandle {
         use crate::worker::client::{ClientWorker, ClientWorkerConfig};
         use crate::worker::hub_control::HUB_CONTROL_QUEUE;
         use crate::worker::transport::TransportEgress;
+        use crate::worker::webrtc::WebRtcTransportAdapter;
 
         let (hub_control_tx, mut hub_control_rx) =
             tokio::sync::mpsc::channel(HUB_CONTROL_QUEUE.capacity);
         let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<TransportEgress>(4096);
         let hub_control_event_tx = self.hub_event_tx.clone();
-        let hub_event_tx = self.hub_event_tx.clone();
-        let peer_id = browser_identity.clone();
+        let backpressure_event_tx = self.hub_event_tx.clone();
+        let backpressure_peer_id = browser_identity.clone();
 
         tokio::spawn(async move {
             while let Some(message) = hub_control_rx.recv().await {
@@ -223,14 +225,21 @@ impl Hub {
 
         tokio::spawn(async move {
             while let Some(egress) = outbound_rx.recv().await {
-                if hub_event_tx
-                    .send(crate::hub::events::HubEvent::WebRtcClientWorkerEgress {
-                        browser_identity: peer_id.clone(),
-                        egress,
-                    })
-                    .is_err()
-                {
-                    break;
+                let Some(command) = WebRtcTransportAdapter::egress_to_command(egress) else {
+                    continue;
+                };
+                match peer_command_tx.try_send(command) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        let _ = backpressure_event_tx.send(
+                            crate::hub::events::HubEvent::WebRtcIngressBackpressure {
+                                browser_identity: backpressure_peer_id.clone(),
+                                source: "worker.client.webrtc.outbound",
+                            },
+                        );
+                        break;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                 }
             }
         });
@@ -260,7 +269,7 @@ impl Hub {
                 #[cfg(test)]
                 {
                     let _ = &e;
-                    Self::register_test_worker_direct_pty_sender(
+                    Self::register_test_worker_session_input_sender(
                         worker,
                         session_uuid,
                         pty_handle,
@@ -287,7 +296,7 @@ impl Hub {
     }
 
     #[cfg(test)]
-    fn register_test_worker_direct_pty_sender(
+    fn register_test_worker_session_input_sender(
         worker: &crate::worker::client::ClientWorkerHandle,
         session_uuid: &str,
         pty_handle: crate::hub::agent_handle::PtyHandle,
@@ -334,12 +343,22 @@ impl Hub {
 
     pub(super) fn remove_terminal_client_worker(
         &mut self,
-        forwarder_key: &str,
+        subscription_key: &str,
         session_uuid: &str,
         label: &'static str,
     ) {
-        if let Some(worker) = self.terminal_client_workers.remove(forwarder_key) {
+        if let Some(worker) = self.terminal_client_workers.remove(subscription_key) {
             Self::unregister_worker_session_io_sender(&worker, session_uuid, label);
+        }
+        if let Some((client_id, _)) = subscription_key.split_once(':') {
+            if let Some(conn) = self.socket_clients.get(client_id) {
+                conn.unregister_session_input_route(session_uuid);
+            }
+        }
+        if subscription_key.starts_with("tui:") {
+            if let Ok(mut routes) = self.tui_session_input_routes.lock() {
+                routes.remove(session_uuid);
+            }
         }
     }
 
@@ -402,16 +421,16 @@ impl Hub {
                 session_uuid,
                 subscription_id,
             } => {
-                let forwarder_key = match &client_id {
+                let subscription_key = match &client_id {
                     ClientId::Tui => format!("tui:{session_uuid}"),
                     ClientId::Socket(client_id) => format!("{client_id}:{session_uuid}"),
                     ClientId::Browser(browser_identity) => {
-                        let forwarder_key = format!("{browser_identity}:{session_uuid}");
+                        let subscription_key = format!("{browser_identity}:{session_uuid}");
                         let (rows, cols) = self
                             .browser_terminal_attach_sizes
-                            .remove(&forwarder_key)
+                            .remove(&subscription_key)
                             .unwrap_or((24, 80));
-                        let req = crate::lua::CreateForwarderRequest {
+                        let req = crate::lua::BrowserTerminalSubscriptionRequest {
                             peer_id: browser_identity.clone(),
                             session_uuid: session_uuid.clone(),
                             prefix: Some(vec![0x01]),
@@ -420,13 +439,13 @@ impl Hub {
                             cols,
                             active_flag: Arc::new(std::sync::Mutex::new(true)),
                         };
-                        self.create_lua_pty_forwarder(req);
+                        self.create_browser_terminal_subscription(req);
                         return;
                     }
                     ClientId::Internal => return,
                 };
-                self.register_terminal_forwarder_peer(
-                    &forwarder_key,
+                self.register_terminal_subscription_peer(
+                    &subscription_key,
                     &session_uuid,
                     &client_id.to_string(),
                 );
@@ -436,7 +455,7 @@ impl Hub {
                 session_uuid,
                 ..
             } => {
-                let forwarder_key = match client_id {
+                let subscription_key = match client_id {
                     ClientId::Tui => format!("tui:{session_uuid}"),
                     ClientId::Socket(client_id) => format!("{client_id}:{session_uuid}"),
                     ClientId::Browser(browser_identity) => {
@@ -444,7 +463,7 @@ impl Hub {
                     }
                     ClientId::Internal => return,
                 };
-                self.stop_lua_pty_forwarder(&forwarder_key);
+                self.stop_terminal_subscription(&subscription_key);
             }
             HubControlMessage::RequestSnapshot {
                 client_id: ClientId::Browser(browser_identity),

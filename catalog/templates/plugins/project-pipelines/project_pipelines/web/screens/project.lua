@@ -31,19 +31,19 @@ local function time_label(value)
     return os.date("%Y-%m-%d %H:%M", timestamp)
 end
 
-local function latest_run_badge(ticket)
-    local run = repo.latest_ticket_run(ticket.id)
+local function latest_run_badge(ticket, latest_run_by_ticket)
+    local run = latest_run_by_ticket and latest_run_by_ticket[ticket.id] or repo.latest_ticket_run(ticket.id)
     if run then
         return view.badge(run.status, view.status_tone(run.status))
     end
     return view.badge("not started", "muted")
 end
 
-local function ticket_status_badge(ticket)
+local function ticket_status_badge(ticket, open_run_by_ticket)
     if ticket.status == "closed" then
         return view.badge("closed", "success")
     end
-    local open_run = repo.open_ticket_run(ticket.id)
+    local open_run = open_run_by_ticket and open_run_by_ticket[ticket.id] or repo.open_ticket_run(ticket.id)
     if open_run then
         return view.badge(open_run.status == "blocked" and "blocked" or "in progress", open_run.status == "blocked" and "danger" or "accent")
     end
@@ -61,7 +61,7 @@ local function project_target_nodes(project_id)
     return nodes
 end
 
-local function dependency_levels(tickets)
+local function dependency_levels(tickets, dependencies_by_ticket)
     local by_id = {}
     for _, ticket in ipairs(tickets) do
         by_id[ticket.id] = ticket
@@ -78,7 +78,8 @@ local function dependency_levels(tickets)
         end
         visiting[ticket_id] = true
         local max_dependency_level = -1
-        for _, dependency in ipairs(repo.ticket_dependencies(ticket_id)) do
+        local dependencies = dependencies_by_ticket and dependencies_by_ticket[ticket_id] or repo.ticket_dependencies(ticket_id)
+        for _, dependency in ipairs(dependencies or {}) do
             if by_id[dependency.depends_on_ticket_id] then
                 max_dependency_level = math.max(max_dependency_level, level(dependency.depends_on_ticket_id))
             end
@@ -94,10 +95,11 @@ local function dependency_levels(tickets)
     return memo
 end
 
-local function dependency_tree_nodes(project_id, ctx)
+local function dependency_tree_nodes(project_id, ctx, overview)
     local nodes = {}
-    local tickets = sorted_project_tickets(project_id)
-    local levels = dependency_levels(tickets)
+    local tickets = overview and overview.tickets or sorted_project_tickets(project_id)
+    local dependencies_by_ticket = overview and overview.dependencies_by_ticket or nil
+    local levels = dependency_levels(tickets, dependencies_by_ticket)
     table.sort(tickets, function(a, b)
         local level_a = levels[a.id] or 0
         local level_b = levels[b.id] or 0
@@ -108,9 +110,9 @@ local function dependency_tree_nodes(project_id, ctx)
     end)
 
     for _, ticket in ipairs(tickets) do
-        local dependencies = repo.ticket_dependencies(ticket.id)
+        local dependencies = dependencies_by_ticket and dependencies_by_ticket[ticket.id] or repo.ticket_dependencies(ticket.id)
         local dependency_labels = {}
-        for _, dependency in ipairs(dependencies) do
+        for _, dependency in ipairs(dependencies or {}) do
             table.insert(dependency_labels, dependency.depends_on_title or dependency.depends_on_ticket_id)
         end
         local level = levels[ticket.id] or 0
@@ -123,8 +125,8 @@ local function dependency_tree_nodes(project_id, ctx)
                 view.row{
                     view.badge("stage " .. tostring(level + 1), "muted"),
                     ui.text{ text = title, size = "sm", weight = "semibold" },
-                    ticket_status_badge(ticket),
-                    latest_run_badge(ticket),
+                    ticket_status_badge(ticket, overview and overview.open_run_by_ticket),
+                    latest_run_badge(ticket, overview and overview.latest_run_by_ticket),
                 },
                 ui.text{ text = details, size = "xs", tone = "muted" },
                 ui.button{
@@ -178,6 +180,7 @@ function M.render(view_state, ctx)
     if not project then
         return view.panel{ ui.text{ text = "Project not found", tone = "danger" } }
     end
+    local overview = repo.project_dependency_overview(project.id)
 
     return ui.stack{ direction = "vertical", gap = "4", children = {
         view.page_header{
@@ -198,7 +201,7 @@ function M.render(view_state, ctx)
             description = project.description or "",
         },
         view.section("Project Targets", project_target_nodes(project.id)),
-        view.section("Dependency Tree", dependency_tree_nodes(project.id, ctx)),
+        view.section("Dependency Tree", dependency_tree_nodes(project.id, ctx, overview)),
         view.section("Chronological Timeline", timeline_nodes(project.id, ctx)),
     } }
 end

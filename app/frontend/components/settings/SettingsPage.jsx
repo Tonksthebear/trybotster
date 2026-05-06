@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react'
+import React, { useEffect, useMemo } from 'react'
 import { Link } from 'react-router-dom'
 import clsx from 'clsx'
 import { useSettingsStore } from '../../store/settings-store'
@@ -11,6 +11,7 @@ import {
   agentQuickSetupTemplates,
   groupedTemplatesByCategory,
 } from '../../store/selectors/settings-selectors'
+import { withHub } from '../../lib/hub-bridge'
 
 const TABS = [
   { id: 'config', label: 'Config' },
@@ -35,6 +36,15 @@ export default function SettingsPage({
   )
   const templates = groupedTemplatesByCategory(templateEntities)
   const agentTemplates = agentQuickSetupTemplates(templates)
+
+  useEffect(() => {
+    if (!hubId) return
+    withHub(hubId, (hub) =>
+      hub.transport?.requestEntitySnapshots?.(['template'])
+    ).catch((err) => {
+      console.warn('[SettingsPage] failed to request template entities', err)
+    })
+  }, [hubId])
 
   return (
     <div className="flex flex-col h-full overflow-hidden">

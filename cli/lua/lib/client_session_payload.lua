@@ -85,7 +85,7 @@ end
 ---   * agent_name    → { agent_name, display_name }
 ---   * branch_name   → { branch_name, display_name }
 ---   * notification  → { notification }
----   * is_idle       → { is_idle }
+---   * output_activity → { output_activity }
 ---   * cwd           → { cwd }
 ---   * status        → { status }
 ---   * plugin_state  → { plugin_state = { ...whole nested object... } }

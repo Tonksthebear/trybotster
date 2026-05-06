@@ -42,7 +42,7 @@ class HubSignalingChannelTest < ActionCable::Channel::TestCase
     assert_includes %w[online offline], health["cli"]
   end
 
-  test "transmits online when hub is alive" do
+  test "transmits online when hub is active" do
     @hub.update!(alive: true, last_seen_at: Time.current)
 
     subscribe hub_id: @hub.id, browser_identity: @browser_identity
@@ -51,8 +51,17 @@ class HubSignalingChannelTest < ActionCable::Channel::TestCase
     assert_equal "online", health["cli"]
   end
 
-  test "transmits offline when hub is not alive" do
+  test "transmits offline when hub is not active" do
     @hub.update!(alive: false)
+
+    subscribe hub_id: @hub.id, browser_identity: @browser_identity
+
+    health = transmissions.first
+    assert_equal "offline", health["cli"]
+  end
+
+  test "transmits offline when hub heartbeat is stale" do
+    @hub.update!(alive: true, last_seen_at: 3.minutes.ago)
 
     subscribe hub_id: @hub.id, browser_identity: @browser_identity
 

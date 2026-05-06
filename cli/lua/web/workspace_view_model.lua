@@ -82,11 +82,11 @@ function M.title_line(session)
 end
 
 --- Derive activity state: "accessory" for accessory sessions, otherwise
---- "idle" unless the session explicitly reports `is_idle = false`.
+--- "idle" unless the session explicitly reports recent output.
 function M.activity_state(session)
   if not session then return "idle" end
   if session.session_type == "accessory" then return "accessory" end
-  if session.is_idle == false then return "active" end
+  if session.output_activity == "active" then return "active" end
   return "idle"
 end
 

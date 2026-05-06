@@ -1,0 +1,128 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+const mocks = vi.hoisted(() => ({
+  acquire: vi.fn(),
+  get: vi.fn(),
+}))
+
+vi.mock('connections', () => ({
+  HubConnectionManager: { acquire: mocks.acquire, get: mocks.get },
+  TerminalConnection: {
+    key: vi.fn((hubId, sessionUuid) => `terminal:${hubId}:${sessionUuid}`),
+  },
+}))
+
+import { WebRtcPtyTransport } from '../lib/transport/webrtc_pty_transport'
+
+function fakeTerminalConnection() {
+  return {
+    isConnected: vi.fn(() => true),
+    hasSubscription: vi.fn(() => false),
+    sendResize: vi.fn(() => Promise.resolve(true)),
+    requestSnapshot: vi.fn(),
+    onSnapshotStart: vi.fn(() => vi.fn()),
+    onSnapshotComplete: vi.fn(() => vi.fn()),
+    onBinarySnapshot: vi.fn(() => vi.fn()),
+    on: vi.fn(() => vi.fn()),
+    onOutput: vi.fn(() => vi.fn()),
+    onConnected: vi.fn((callback) => {
+      callback()
+      return vi.fn()
+    }),
+    onDisconnected: vi.fn(() => vi.fn()),
+    onError: vi.fn(() => vi.fn()),
+  }
+}
+
+describe('WebRtcPtyTransport', () => {
+  afterEach(() => {
+    vi.useRealTimers()
+  })
+
+  beforeEach(() => {
+    mocks.acquire.mockReset()
+    mocks.get.mockReset()
+    mocks.get.mockReturnValue(null)
+    mocks.acquire.mockResolvedValue(fakeTerminalConnection())
+  })
+
+  it('uses the latest pre-connect resize as the terminal subscribe size', async () => {
+    const transport = new WebRtcPtyTransport({
+      hubId: 'hub-1',
+      sessionUuid: 'session-1',
+    })
+
+    expect(transport.resize(132, 37)).toBe(true)
+
+    await transport.connect({
+      rows: 24,
+      cols: 80,
+      callbacks: {},
+    })
+
+    expect(mocks.acquire).toHaveBeenCalledWith(
+      expect.objectContaining({ key: expect.any(Function) }),
+      'terminal:hub-1:session-1',
+      {
+        hubId: 'hub-1',
+        sessionUuid: 'session-1',
+        rows: 37,
+        cols: 132,
+      },
+    )
+    const conn = await mocks.acquire.mock.results[0].value
+    expect(conn.sendResize).toHaveBeenCalledWith(132, 37)
+  })
+
+  it('resizes an existing subscription before requesting a reconnect snapshot', async () => {
+    const existing = fakeTerminalConnection()
+    existing.hasSubscription.mockReturnValue(true)
+    mocks.get.mockReturnValue(existing)
+    mocks.acquire.mockResolvedValue(existing)
+    const transport = new WebRtcPtyTransport({
+      hubId: 'hub-1',
+      sessionUuid: 'session-1',
+    })
+
+    await transport.connect({
+      rows: 42,
+      cols: 120,
+      callbacks: {},
+    })
+
+    expect(existing.sendResize).toHaveBeenCalledWith(120, 42)
+    expect(existing.requestSnapshot).toHaveBeenCalledWith({
+      cols: 120,
+      rows: 42,
+    })
+    expect(existing.sendResize.mock.invocationCallOrder[0]).toBeLessThan(
+      existing.requestSnapshot.mock.invocationCallOrder[0],
+    )
+  })
+
+  it('coalesces live resizes to the latest desired size', async () => {
+    vi.useFakeTimers()
+    const conn = fakeTerminalConnection()
+    mocks.acquire.mockResolvedValue(conn)
+    const transport = new WebRtcPtyTransport({
+      hubId: 'hub-1',
+      sessionUuid: 'session-1',
+    })
+
+    await transport.connect({
+      rows: 24,
+      cols: 80,
+      callbacks: {},
+    })
+    conn.sendResize.mockClear()
+
+    transport.resize(100, 30)
+    transport.resize(101, 31)
+    transport.resize(102, 32)
+    vi.advanceTimersByTime(35)
+
+    expect(conn.sendResize).toHaveBeenCalledTimes(1)
+    expect(conn.sendResize).toHaveBeenCalledWith(102, 32)
+    vi.useRealTimers()
+  })
+})

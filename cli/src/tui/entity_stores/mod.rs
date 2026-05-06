@@ -443,7 +443,7 @@ mod tests {
             vec![json!({
                 "session_uuid": "sess-a",
                 "title": "alpha",
-                "is_idle": true,
+                "output_activity": "idle",
                 "plugin_state": { "example_provider": { "status": "starting", "url": null } },
             })],
             1,
@@ -452,12 +452,12 @@ mod tests {
         // Top-level field merge.
         stores.apply_frame(&patch_frame(
             "sess-a",
-            json!({ "title": "alpha2", "is_idle": false }),
+            json!({ "title": "alpha2", "output_activity": "active" }),
             2,
         ));
         let store = stores.store("session").expect("store");
         assert_eq!(store.by_id["sess-a"]["title"], json!("alpha2"));
-        assert_eq!(store.by_id["sess-a"]["is_idle"], json!(false));
+        assert_eq!(store.by_id["sess-a"]["output_activity"], json!("active"));
 
         // Nested object REPLACES wholesale (per §12.4 — even though `url`
         // was set in the prior nested object, the new patch's plugin_state

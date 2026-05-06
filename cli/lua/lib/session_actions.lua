@@ -10,6 +10,18 @@ local M = {}
 local registry = {}
 local published_by_id = {}
 
+local function current_plugin_key()
+    local key = rawget(_G, "_loading_plugin_key") or rawget(_G, "_loading_plugin_name")
+    if type(key) == "string" and key ~= "" then return key end
+    return nil
+end
+
+local function current_plugin_name()
+    local name = rawget(_G, "_loading_plugin_display_name") or rawget(_G, "_loading_plugin_name")
+    if type(name) == "string" and name ~= "" then return name end
+    return nil
+end
+
 local function copy_payload(source)
     local out = {}
     if type(source) ~= "table" then return out end
@@ -91,6 +103,7 @@ end
 --   label/status/icon/visibility/enabled = value|function(session, action_id),
 --   url/link_url/install_url/error = value|function(session, action_id),
 --   plugin = string?,
+--   timeout_ms = number?,
 -- }
 function M.register(action_id, opts)
     assert(type(action_id) == "string" and action_id ~= "",
@@ -106,6 +119,8 @@ function M.register(action_id, opts)
         visibility = true,
         enabled = true,
         plugin = true,
+        owner_plugin = true,
+        timeout_ms = true,
     }
     local descriptor_fields = {}
     for key, value in pairs(opts) do
@@ -122,11 +137,28 @@ function M.register(action_id, opts)
         icon = opts.icon,
         visibility = opts.visibility,
         enabled = opts.enabled,
-        plugin = opts.plugin,
+        plugin = opts.plugin or current_plugin_name(),
+        owner_plugin = opts.owner_plugin or current_plugin_key(),
+        timeout_ms = opts.timeout_ms or 5000,
         descriptor_fields = descriptor_fields,
     }
 
     M.publish_all_for_action(action_id)
+end
+
+function M.unregister_by_plugin(plugin_key)
+    if type(plugin_key) ~= "string" or plugin_key == "" then return 0 end
+    local removed = 0
+    local ids = {}
+    for action_id, entry in pairs(registry) do
+        if entry.owner_plugin == plugin_key then
+            ids[#ids + 1] = action_id
+        end
+    end
+    for _, action_id in ipairs(ids) do
+        if M.unregister(action_id) then removed = removed + 1 end
+    end
+    return removed
 end
 
 function M.unregister(action_id)
@@ -144,6 +176,16 @@ end
 
 function M.get(action_id)
     return registry[action_id]
+end
+
+function M._invoke_registered(action_id, session_uuid, payload)
+    local entry = registry[action_id]
+    if not entry then error("session action not registered: " .. tostring(action_id)) end
+    local result, err = entry.run(session_uuid, action_id, payload or {})
+    if (result == nil or result == false) and err ~= nil then
+        return { ok = false, error = tostring(err) }
+    end
+    return { ok = true, result = result }
 end
 
 function M.action_ids()
@@ -250,9 +292,30 @@ function M.run(session_uuid, action_id, context)
     local payload = copy_payload(context)
     payload.session = session
     payload.action = action
-    local ok, result, err = pcall(entry.run, session_uuid, action_id, payload)
+    local ok, result, err = require("lib.plugin_supervisor").invoke(
+        entry.owner_plugin,
+        "session_action:" .. action_id,
+        entry.run,
+        {
+            timeout_ms = entry.timeout_ms,
+            handler_kind = "session_action",
+            handler_id = action_id,
+            payload = {
+                session_uuid = session_uuid,
+                payload = payload,
+            },
+        },
+        session_uuid,
+        action_id,
+        payload)
     if not ok then
         return nil, result
+    end
+    if type(result) == "table" and result.ok == false then
+        return nil, result.error or "session action failed"
+    end
+    if type(result) == "table" and result.ok == true and result.result ~= nil then
+        return true, result.result
     end
     if (result == nil or result == false) and err ~= nil then
         return nil, err

@@ -4,6 +4,7 @@
 //! the read/write tasks and translates between frames and `HubEvent`s.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -22,6 +23,9 @@ pub struct SocketClientConn {
     frame_tx: Sender<Vec<u8>>,
     /// Hub event sender used to request disconnect/restart on queue overflow.
     hub_event_tx: crate::hub::events::HubEventTx,
+    /// Session input routes keyed by session UUID.
+    session_input_routes:
+        Arc<Mutex<std::collections::HashMap<String, crate::worker::client::ClientWorkerHandle>>>,
     /// Ensures we only request forced disconnect once per connection.
     disconnect_requested: AtomicBool,
     /// Handle to the read task (for cleanup).
@@ -56,12 +60,15 @@ impl SocketClientConn {
     ) -> Self {
         let (read_half, write_half) = stream.into_split();
         let (frame_tx, frame_rx) = mpsc::channel::<Vec<u8>>(Self::OUTBOUND_QUEUE_CAPACITY);
+        let session_input_routes = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
         let read_client_id = client_id.clone();
+        let read_session_input_routes = Arc::clone(&session_input_routes);
         let read_handle = tokio::spawn(Self::read_loop(
             read_client_id,
             read_half,
             hub_event_tx.clone(),
+            read_session_input_routes,
         ));
 
         let write_client_id = client_id.clone();
@@ -71,9 +78,28 @@ impl SocketClientConn {
             client_id,
             frame_tx,
             hub_event_tx,
+            session_input_routes,
             disconnect_requested: AtomicBool::new(false),
             read_handle,
             write_handle,
+        }
+    }
+
+    /// Register a session input route for this socket client's subscription.
+    pub(crate) fn register_session_input_route(
+        &self,
+        session_uuid: String,
+        worker: crate::worker::client::ClientWorkerHandle,
+    ) {
+        if let Ok(mut routes) = self.session_input_routes.lock() {
+            routes.insert(session_uuid, worker);
+        }
+    }
+
+    /// Remove a session input route for this socket client.
+    pub(crate) fn unregister_session_input_route(&self, session_uuid: &str) {
+        if let Ok(mut routes) = self.session_input_routes.lock() {
+            routes.remove(session_uuid);
         }
     }
 
@@ -87,7 +113,7 @@ impl SocketClientConn {
 
     /// Send pre-encoded bytes to this client.
     ///
-    /// Useful when the frame is already encoded (e.g., from a PTY forwarder).
+    /// Useful when the frame is already encoded by a client worker adapter.
     pub fn send_raw(&self, encoded: Vec<u8>) -> bool {
         self.try_send_encoded(encoded)
     }
@@ -97,7 +123,7 @@ impl SocketClientConn {
         &self.client_id
     }
 
-    /// Get a clone of the frame sender for direct use by forwarder tasks.
+    /// Get a clone of the frame sender for direct use by client worker adapters.
     ///
     /// The sender accepts pre-encoded frame bytes (from `Frame::encode()`).
     pub fn frame_sender(&self) -> Sender<Vec<u8>> {
@@ -142,6 +168,9 @@ impl SocketClientConn {
         client_id: String,
         mut reader: tokio::net::unix::OwnedReadHalf,
         hub_event_tx: crate::hub::events::HubEventTx,
+        session_input_routes: Arc<
+            Mutex<std::collections::HashMap<String, crate::worker::client::ClientWorkerHandle>>,
+        >,
     ) {
         let mut decoder = FrameDecoder::new();
         let mut buf = [0u8; 64 * 1024]; // 64KB read buffer
@@ -160,7 +189,12 @@ impl SocketClientConn {
                     match decoder.feed(&buf[..n]) {
                         Ok(frames) => {
                             for frame in frames {
-                                if !Self::dispatch_frame(&client_id, frame, &hub_event_tx) {
+                                if !Self::dispatch_frame(
+                                    &client_id,
+                                    frame,
+                                    &hub_event_tx,
+                                    &session_input_routes,
+                                ) {
                                     return; // Hub channel closed
                                 }
                             }
@@ -192,17 +226,43 @@ impl SocketClientConn {
         client_id: &str,
         frame: Frame,
         hub_event_tx: &crate::hub::events::HubEventTx,
+        session_input_routes: &Arc<
+            Mutex<std::collections::HashMap<String, crate::worker::client::ClientWorkerHandle>>,
+        >,
     ) -> bool {
         let event = match frame {
             Frame::Json(msg) => HubEvent::SocketMessage {
                 client_id: client_id.to_string(),
                 msg,
             },
-            Frame::PtyInput { session_uuid, data } => HubEvent::SocketPtyInput {
-                client_id: client_id.to_string(),
-                session_uuid,
-                data,
-            },
+            Frame::PtyInput { session_uuid, data } => {
+                let Some(worker) = session_input_routes
+                    .lock()
+                    .ok()
+                    .and_then(|routes| routes.get(&session_uuid).cloned())
+                else {
+                    log::warn!(
+                        "[Socket] No session input route for client={} session={}",
+                        client_id,
+                        session_uuid
+                    );
+                    return true;
+                };
+                match worker.try_send(crate::worker::client::ClientWorkerMessage::SessionInput {
+                    session_uuid,
+                    data,
+                }) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        let _ = hub_event_tx.send(HubEvent::SocketClientDisconnected {
+                            client_id: client_id.to_string(),
+                        });
+                        return false;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                }
+                return true;
+            }
             // Clients shouldn't send these frame types — ignore them
             Frame::PtyOutput { .. }
             | Frame::Scrollback { .. }

@@ -1,12 +1,12 @@
 -- Hook system: observers and interceptors
 --
 -- OBSERVERS: Async, safe, fire-and-forget. Cannot block or transform data.
---   hooks.on("pty_output", "my_logger", fn)
---   hooks.notify("pty_output", ctx, data)
+--   hooks.on("agent_created", "my_logger", fn)
+--   hooks.notify("agent_created", data)
 --
--- INTERCEPTORS: Sync, blocking, can transform/drop. Use sparingly.
---   hooks.intercept("pty_output", "my_filter", fn, { timeout_ms = 10 })
---   hooks.call("pty_output", ctx, data) -> transformed or nil
+-- INTERCEPTORS: Sync, blocking, can transform/drop control-plane data. Use sparingly.
+--   hooks.intercept("before_client_subscribe", "my_filter", fn, { timeout_ms = 10 })
+--   hooks.call("before_client_subscribe", data) -> transformed or nil
 --
 local M = {}
 
@@ -30,6 +30,12 @@ end
 
 local function invalidate_interceptor_cache(event)
     interceptor_cache[event] = nil
+end
+
+local function current_plugin_key()
+    local key = rawget(_G, "_loading_plugin_key") or rawget(_G, "_loading_plugin_name")
+    if type(key) == "string" and key ~= "" then return key end
+    return nil
 end
 
 local function get_sorted_observers(event)
@@ -94,6 +100,8 @@ function M.on(event, name, callback, opts)
         callback = callback,
         priority = opts.priority or 100,
         enabled = enabled,
+        owner_plugin = opts.owner_plugin or current_plugin_key(),
+        timeout_ms = opts.timeout_ms or 5000,
     }
     invalidate_observer_cache(event)
     log.debug(string.format("hooks.on: %s.%s", event, name))
@@ -108,6 +116,40 @@ function M.off(event, name)
         observers[event][name] = nil
         invalidate_observer_cache(event)
     end
+end
+
+function M.unregister_by_plugin(plugin_key)
+    if type(plugin_key) ~= "string" or plugin_key == "" then return 0 end
+    local prefix = plugin_key .. "::"
+    local removed = 0
+
+    for event, entries in pairs(observers) do
+        for name, hook in pairs(entries) do
+            if hook.owner_plugin == plugin_key or (type(name) == "string" and name:sub(1, #prefix) == prefix) then
+                if hook.enabled then
+                    observer_enabled_count[event] = (observer_enabled_count[event] or 1) - 1
+                end
+                entries[name] = nil
+                removed = removed + 1
+                invalidate_observer_cache(event)
+            end
+        end
+    end
+
+    for event, entries in pairs(interceptors) do
+        for name, hook in pairs(entries) do
+            if hook.owner_plugin == plugin_key or (type(name) == "string" and name:sub(1, #prefix) == prefix) then
+                if hook.enabled then
+                    interceptor_enabled_count[event] = (interceptor_enabled_count[event] or 1) - 1
+                end
+                entries[name] = nil
+                removed = removed + 1
+                invalidate_interceptor_cache(event)
+            end
+        end
+    end
+
+    return removed
 end
 
 --- Check if observers exist for an event.
@@ -126,7 +168,23 @@ function M.notify(event, ...)
     local count = 0
     local args = { ... }
     for _, entry in ipairs(sorted) do
-        local ok, err = pcall(entry.h.callback, table.unpack(args))
+        local ok, err
+        if entry.h.owner_plugin then
+            ok, err = require("lib.plugin_supervisor").invoke(
+                entry.h.owner_plugin,
+                "hook_observer:" .. tostring(event) .. ":" .. tostring(entry.name),
+                entry.h.callback,
+                {
+                    timeout_ms = entry.h.timeout_ms or 5000,
+                    handler_kind = "hook_observer",
+                    handler_id = event,
+                    handler_name = entry.name,
+                    payload = { args = args },
+                },
+                table.unpack(args))
+        else
+            ok, err = pcall(entry.h.callback, table.unpack(args))
+        end
         if not ok then
             log.error(string.format("hooks.notify %s.%s: %s", event, entry.name, err))
         end
@@ -168,6 +226,7 @@ function M.intercept(event, name, callback, opts)
         priority = opts.priority or 100,
         enabled = enabled,
         timeout_ms = opts.timeout_ms or 10,
+        owner_plugin = opts.owner_plugin or current_plugin_key(),
     }
     invalidate_interceptor_cache(event)
     log.debug(string.format("hooks.intercept: %s.%s (timeout=%dms)",
@@ -210,8 +269,24 @@ function M.call(event, ...)
     local result = table.pack(...)
     for _, entry in ipairs(sorted) do
         local timeout_ms = entry.h.timeout_ms or 10
-        local returns = table.pack(__hook_timed_pcall(
-            entry.h.callback, timeout_ms, table.unpack(result, 1, result.n)))
+        local returns
+        if entry.h.owner_plugin then
+            returns = table.pack(require("lib.plugin_supervisor").invoke(
+                entry.h.owner_plugin,
+                "hook_interceptor:" .. tostring(event) .. ":" .. tostring(entry.name),
+                entry.h.callback,
+                {
+                    timeout_ms = timeout_ms,
+                    handler_kind = "hook_interceptor",
+                    handler_id = event,
+                    handler_name = entry.name,
+                    payload = { args = { table.unpack(result, 1, result.n) } },
+                },
+                table.unpack(result, 1, result.n)))
+        else
+            returns = table.pack(__hook_timed_pcall(
+                entry.h.callback, timeout_ms, table.unpack(result, 1, result.n)))
+        end
 
         local ok = returns[1]
         if not ok then
@@ -224,6 +299,18 @@ function M.call(event, ...)
         end
     end
     return table.unpack(result, 1, result.n)
+end
+
+function M._invoke_observer(event, name, args)
+    local h = observers[event] and observers[event][name]
+    if not h then error("hook observer not registered: " .. tostring(event) .. ":" .. tostring(name)) end
+    return h.callback(table.unpack(args or {}))
+end
+
+function M._invoke_interceptor(event, name, args)
+    local h = interceptors[event] and interceptors[event][name]
+    if not h then error("hook interceptor not registered: " .. tostring(event) .. ":" .. tostring(name)) end
+    return h.callback(table.unpack(args or {}))
 end
 
 -- =============================================================================
@@ -268,6 +355,7 @@ function M.list(event)
                 type = "observer",
                 priority = h.priority,
                 enabled = h.enabled,
+                owner_plugin = h.owner_plugin,
             })
         end
     end
@@ -279,6 +367,7 @@ function M.list(event)
                 priority = h.priority,
                 enabled = h.enabled,
                 timeout_ms = h.timeout_ms,
+                owner_plugin = h.owner_plugin,
             })
         end
     end

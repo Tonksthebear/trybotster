@@ -97,6 +97,7 @@ impl TerminalProfileStore {
         )
     }
 
+    #[cfg(test)]
     fn store_hub_reply(&mut self, probe: TerminalProbe, reply: Vec<u8>) {
         self.hub_profile.store_reply(probe, reply);
         log::info!(
@@ -178,6 +179,7 @@ impl TerminalProfileStore {
         learned
     }
 
+    #[cfg(test)]
     pub(crate) fn observe_input(&mut self, session_uuid: &str, peer_id: &str, data: &[u8]) {
         let key = format!("{session_uuid}:{peer_id}");
         let has_hub_pending = !self.hub_pending.is_empty();
@@ -629,6 +631,7 @@ fn osc_payload(seq: &[u8]) -> Option<&[u8]> {
 
 /// Strip OSC 10/11/12 query bytes from PTY output while preserving all other
 /// output and buffering incomplete query fragments across chunks.
+#[cfg(test)]
 pub(crate) fn strip_osc_queries_from_output(buffer: &mut Vec<u8>, data: &[u8]) -> Vec<u8> {
     append_with_limit(buffer, data);
     if buffer.is_empty() {

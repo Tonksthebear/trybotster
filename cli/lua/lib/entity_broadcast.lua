@@ -1,7 +1,7 @@
 -- Entity broadcast registry — wire protocol (delta) source of truth.
 --
 -- Replaces the current "rebuild + broadcast every UiNode tree on any state
--- change" pattern with "snapshot once on subscribe, ship per-entity field
+-- change" pattern with "snapshot on explicit request, ship per-entity field
 -- deltas thereafter." Each entity type (`session`, `workspace`,
 -- `spawn_target`, `worktree`, `hub`, `connection_code`, plus plugin types
 -- namespaced as `<plugin>.<type>`) registers its `id_field` and an `all()`
@@ -17,9 +17,9 @@
 -- `snapshot_seq` is monotonic per entity type per hub process, seeded from a
 -- wall-clock boot epoch so a reboot does not restart at 0 and trip older
 -- reconnecting clients that still gate snapshots by sequence. Clients keep
--- their own `last_snapshot_seq` per type and drop out-of-order deltas. On
--- subscribe, the hub re-ships an `entity_snapshot` for every registered
--- type (see `send_snapshots_to`), which resets the client's baseline.
+-- their own `last_snapshot_seq` per type and drop out-of-order deltas. When a
+-- client needs a baseline, it requests the relevant type(s) through
+-- `send_snapshots_to`, which sends authoritative `entity_snapshot` frames.
 --
 -- The module owns NO transport — `set_broadcaster(fn)` injects the per-frame
 -- send hook (wired up by `cli/lua/handlers/connections.lua` at load time).
@@ -281,8 +281,8 @@ end
 ---
 --- The value is persisted in hub.state across Lua hot-reloads, but recomputed
 --- on a real hub process reboot. Using an epoch-sized floor keeps fresh
---- subscribe snapshots greater than any ordinary pre-reboot delta sequence,
---- which protects clients that have not yet learned that snapshots are
+--- snapshots greater than any ordinary pre-reboot delta sequence, which
+--- protects clients that have not yet learned that snapshots are
 --- authoritative resyncs.
 function M.seq_epoch()
     local n = state.get("entity_broadcast.seq_epoch")
@@ -298,7 +298,7 @@ end
 --- @param entity_type string Wire identifier (e.g. "session", "kanban.board").
 --- @param opts table {
 ---   id_field = string,        -- payload field that supplies the entity id
----   all = function -> array,  -- snapshot source called on subscribe
+---   all = function -> array,  -- snapshot source called on request
 ---   filter = function? -> bool, -- optional per-item gate (true = include)
 ---   owner_plugin = string?,   -- required for plugin types outside plugin load
 --- }
@@ -343,12 +343,24 @@ end
 
 --- Drop all entity types owned by a plugin. Used by plugin unload/hot reload.
 function M.unregister_plugin(owner_plugin)
-    if type(owner_plugin) ~= "string" or owner_plugin == "" then return end
+    if type(owner_plugin) ~= "string" or owner_plugin == "" then return 0 end
+    local removed = 0
     for entity_type, entry in pairs(registry) do
         if entry.owner_plugin == owner_plugin then
             registry[entity_type] = nil
+            removed = removed + 1
         end
     end
+    return removed
+end
+
+function M.unregister_by_plugin(plugin_key, metadata)
+    metadata = metadata or {}
+    local display_name = metadata.name or metadata.plugin_name
+    if type(display_name) == "string" and display_name ~= "" then
+        return M.unregister_plugin(display_name)
+    end
+    return M.unregister_plugin(plugin_key)
 end
 
 -- -------------------------------------------------------------------------
@@ -458,12 +470,29 @@ function M.assert_plugin_publish_owner(entity_type, owner_plugin, op_label)
 end
 
 -- -------------------------------------------------------------------------
--- Subscribe-time priming
+-- Snapshot request helpers
 -- -------------------------------------------------------------------------
 
-local function registered_type_names()
+local function registered_type_names(opts)
+    opts = opts or {}
+    local scope = opts.scope or "all"
+    local requested = nil
+    if type(opts.types) == "table" then
+        requested = {}
+        for _, name in ipairs(opts.types) do
+            if type(name) == "string" and name ~= "" then
+                requested[name] = true
+            end
+        end
+    end
     local names = {}
-    for name in pairs(registry) do names[#names + 1] = name end
+    for name in pairs(registry) do
+        if (requested == nil or requested[name])
+            and (scope ~= "core" or BUILTIN_ENTITY_TYPES[name])
+        then
+            names[#names + 1] = name
+        end
+    end
     -- Stable order so test assertions and on-the-wire logs are reproducible.
     table.sort(names)
     return names
@@ -501,15 +530,19 @@ local function snapshot_items(entry, entity_type)
     return kept
 end
 
---- Send one `entity_snapshot` per registered type to a single subscriber.
---- Called from `Client:handle_subscribe` on the hub channel BEFORE the
---- structural `ui_tree_snapshot` frames so trees may safely reference
---- entities (the client store will already be populated).
-function M.send_snapshots_to(client, sub_id)
+--- Send `entity_snapshot` frames to a single subscriber.
+---
+--- `opts.scope = "core"` restricts snapshots to built-in runtime entity
+--- types. Browser and attach-mode TUI can use this for a lightweight hub
+--- index so plugin-owned historical stores do not block connect or consume
+--- per-client memory before a plugin surface asks for them.
+---
+--- `opts.types = { ... }` restricts the snapshot to an explicit client request.
+function M.send_snapshots_to(client, sub_id, opts)
     assert(client and type(client.send) == "function",
         "entity_broadcast.send_snapshots_to: client must support :send(msg)")
     local sent = 0
-    for _, entity_type in ipairs(registered_type_names()) do
+    for _, entity_type in ipairs(registered_type_names(opts)) do
         local entry = registry[entity_type]
         local items = snapshot_items(entry, entity_type)
         local frame = {

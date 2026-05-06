@@ -1,5 +1,32 @@
 use super::test_support::*;
 
+fn drain_initial_terminal_attach_requests(
+    rx: &mut tokio::sync::mpsc::Receiver<crate::worker::session_io::SessionIoRequest>,
+) -> (
+    crate::worker::session_io::TerminalOutputSubscription,
+    crate::worker::session_io::TerminalInitialSnapshotDelivery,
+) {
+    let _ = recv_session_io_request_matching(rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::Resize { .. }
+        )
+    });
+    let subscription = match recv_session_io_request_matching(rx, |request| {
+        matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::SubscribeTerminal { .. }
+        )
+    }) {
+        crate::worker::session_io::SessionIoRequest::SubscribeTerminal { subscription } => {
+            subscription
+        }
+        other => panic!("expected SubscribeTerminal request, got {other:?}"),
+    };
+    let delivery = recv_terminal_initial_snapshot_delivery(rx);
+    (subscription, delivery)
+}
+
 #[test]
 pub(super) fn test_tui_focus_request_updates_active_terminal_peer() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
@@ -37,26 +64,26 @@ pub(super) fn test_tui_attach_intent_resolves_when_session_appears() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let key = "tui:sess-tui-attach".to_string();
 
-    let req = crate::lua::primitives::CreateTuiForwarderRequest {
+    let req = crate::lua::primitives::TuiTerminalSubscriptionRequest {
         session_uuid: "sess-tui-attach".to_string(),
         subscription_id: "tui:sess-tui-attach".to_string(),
-        active_flag: Arc::new(Mutex::new(true)),
         rows: 24,
         cols: 80,
+        active_flag: Arc::new(Mutex::new(true)),
     };
-    hub.create_lua_tui_pty_forwarder(req);
+    hub.create_tui_terminal_subscription(req);
 
     assert!(
         hub.pending_terminal_attaches.contains_key(&key),
         "missing session should create pending TUI attach intent"
     );
-    assert!(
-        !hub.pty_forwarders.contains_key(&key),
-        "TUI forwarder should not start until session is registered"
-    );
 
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
     hub.handle_cache
-        .add_session(test_session_handle("sess-tui-attach"));
+        .add_session(test_session_backed_handle_with_mailbox(
+            "sess-tui-attach",
+            session_io_tx,
+        ));
     hub.tick();
 
     assert!(
@@ -64,9 +91,11 @@ pub(super) fn test_tui_attach_intent_resolves_when_session_appears() {
         "pending TUI attach should clear once session exists"
     );
     assert!(
-        hub.pty_forwarders.contains_key(&key),
-        "TUI forwarder should start after session registration"
+        hub.terminal_client_workers.contains_key(&key),
+        "TUI subscription should register a ClientWorker after session registration"
     );
+    let (subscription, _delivery) = drain_initial_terminal_attach_requests(&mut session_io_rx);
+    assert_eq!(subscription.subscription_key, key);
 }
 
 #[test]
@@ -80,19 +109,28 @@ pub(super) fn test_tui_input_routes_through_client_worker_to_session_io_mailbox(
             session_io_tx,
         ));
 
-    hub.create_lua_tui_pty_forwarder(crate::lua::primitives::CreateTuiForwarderRequest {
+    hub.create_tui_terminal_subscription(crate::lua::primitives::TuiTerminalSubscriptionRequest {
         session_uuid: session_uuid.to_string(),
         subscription_id: format!("tui:{session_uuid}"),
-        active_flag: Arc::new(Mutex::new(true)),
         rows: 24,
         cols: 80,
+        active_flag: Arc::new(Mutex::new(true)),
     });
     settle_worker_subscription();
 
-    hub.handle_tui_request(crate::client::TuiRequest::PtyInput {
-        session_uuid: session_uuid.to_string(),
-        data: b"mailbox\n".to_vec(),
-    });
+    let worker = hub
+        .tui_session_input_routes
+        .lock()
+        .expect("tui client routes")
+        .get(session_uuid)
+        .cloned()
+        .expect("tui session input route");
+    worker
+        .try_send(crate::worker::client::ClientWorkerMessage::SessionInput {
+            session_uuid: session_uuid.to_string(),
+            data: b"mailbox\n".to_vec(),
+        })
+        .expect("direct tui input enqueue");
 
     let mut routed = None;
     for _ in 0..20 {
@@ -129,40 +167,25 @@ pub(super) fn test_tui_initial_scrollback_routes_snapshot_through_session_io_mai
             session_io_tx,
         ));
 
-    hub.create_lua_tui_pty_forwarder(crate::lua::primitives::CreateTuiForwarderRequest {
+    hub.create_tui_terminal_subscription(crate::lua::primitives::TuiTerminalSubscriptionRequest {
         session_uuid: session_uuid.to_string(),
         subscription_id: format!("tui:{session_uuid}"),
-        active_flag: Arc::new(Mutex::new(true)),
         rows: 30,
         cols: 100,
+        active_flag: Arc::new(Mutex::new(true)),
     });
 
+    let (_subscription, delivery) = drain_initial_terminal_attach_requests(&mut session_io_rx);
+    assert_eq!(delivery.subscription_key, format!("tui:{session_uuid}"));
+    assert_eq!(delivery.rows, 30);
+    assert_eq!(delivery.cols, 100);
     assert!(matches!(
-        recv_session_io_request_matching(&mut session_io_rx, |request| matches!(
-            request,
-            crate::worker::session_io::SessionIoRequest::Resize {
-                rows: 30,
-                cols: 100
-            }
-        )),
-        crate::worker::session_io::SessionIoRequest::Resize { .. }
+        delivery.payload_mode,
+        crate::worker::session_io::TerminalSnapshotPayloadMode::Raw
     ));
-    let request_id = match recv_session_io_request_matching(&mut session_io_rx, |request| {
-        matches!(
-            request,
-            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
-        )
-    }) {
-        crate::worker::session_io::SessionIoRequest::GetSnapshot { request_id } => request_id,
-        other => panic!("expected GetSnapshot request, got {other:?}"),
-    };
 
     settle_worker_subscription();
-    hub.handle_session_io_event(crate::worker::session_io::SessionIoEvent::Snapshot {
-        request_id,
-        session_uuid: session_uuid.to_string(),
-        payload: snapshot.clone(),
-    });
+    deliver_terminal_initial_snapshot(delivery, snapshot.clone());
 
     let scrollback = shared_test_runtime()
         .block_on(async {
@@ -195,12 +218,12 @@ pub(super) fn test_tui_snapshot_mailbox_failure_emits_not_ready() {
     hub.handle_cache
         .add_session(test_session_backed_handle(session_uuid, 24, 80));
 
-    hub.create_lua_tui_pty_forwarder(crate::lua::primitives::CreateTuiForwarderRequest {
+    hub.create_tui_terminal_subscription(crate::lua::primitives::TuiTerminalSubscriptionRequest {
         session_uuid: session_uuid.to_string(),
         subscription_id: format!("tui:{session_uuid}"),
-        active_flag: Arc::new(Mutex::new(true)),
         rows: 24,
         cols: 80,
+        active_flag: Arc::new(Mutex::new(true)),
     });
 
     let outputs = shared_test_runtime().block_on(async {
@@ -244,15 +267,15 @@ pub(super) fn test_tui_attach_intent_times_out_to_not_found() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let key = "tui:sess-tui-timeout".to_string();
 
-    let req = crate::lua::primitives::CreateTuiForwarderRequest {
+    let req = crate::lua::primitives::TuiTerminalSubscriptionRequest {
         session_uuid: "sess-tui-timeout".to_string(),
         subscription_id: "tui:sess-tui-timeout".to_string(),
-        active_flag: Arc::new(Mutex::new(true)),
         rows: 24,
         cols: 80,
+        active_flag: Arc::new(Mutex::new(true)),
     };
     let active_flag = Arc::clone(&req.active_flag);
-    hub.create_lua_tui_pty_forwarder(req);
+    hub.create_tui_terminal_subscription(req);
 
     {
         let intent = hub
@@ -272,8 +295,8 @@ pub(super) fn test_tui_attach_intent_times_out_to_not_found() {
     assert!(
         !*active_flag
             .lock()
-            .expect("Forwarder active_flag mutex poisoned"),
-        "not_found transition should deactivate TUI forwarder handle"
+            .expect("Subscription active_flag mutex poisoned"),
+        "not_found transition should deactivate TUI subscription handle"
     );
 }
 
@@ -282,16 +305,16 @@ pub(super) fn test_socket_attach_intent_times_out_to_not_found() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let key = "socket:dead:sess-socket-timeout".to_string();
 
-    let req = crate::lua::primitives::CreateSocketForwarderRequest {
+    let req = crate::lua::primitives::SocketTerminalSubscriptionRequest {
         client_id: "socket:dead".to_string(),
         session_uuid: "sess-socket-timeout".to_string(),
         subscription_id: "socket:sess-socket-timeout".to_string(),
-        active_flag: Arc::new(Mutex::new(true)),
         rows: 24,
         cols: 80,
+        active_flag: Arc::new(Mutex::new(true)),
     };
     let active_flag = Arc::clone(&req.active_flag);
-    hub.create_lua_socket_pty_forwarder(req);
+    hub.create_socket_terminal_subscription(req);
 
     assert!(
         hub.pending_terminal_attaches.contains_key(&key),
@@ -316,8 +339,8 @@ pub(super) fn test_socket_attach_intent_times_out_to_not_found() {
     assert!(
         !*active_flag
             .lock()
-            .expect("Forwarder active_flag mutex poisoned"),
-        "not_found transition should deactivate socket forwarder handle"
+            .expect("Subscription active_flag mutex poisoned"),
+        "not_found transition should deactivate socket subscription handle"
     );
 }
 
@@ -327,28 +350,28 @@ pub(super) fn test_socket_attach_intent_resolves_when_session_and_client_appear(
     let client_id = "socket:live";
     let key = format!("{client_id}:sess-socket-attach");
 
-    let req = crate::lua::primitives::CreateSocketForwarderRequest {
+    let req = crate::lua::primitives::SocketTerminalSubscriptionRequest {
         client_id: client_id.to_string(),
         session_uuid: "sess-socket-attach".to_string(),
         subscription_id: "socket:sess-socket-attach".to_string(),
-        active_flag: Arc::new(Mutex::new(true)),
         rows: 24,
         cols: 80,
+        active_flag: Arc::new(Mutex::new(true)),
     };
-    hub.create_lua_socket_pty_forwarder(req);
+    hub.create_socket_terminal_subscription(req);
 
     assert!(
         hub.pending_terminal_attaches.contains_key(&key),
         "missing socket client/session should create pending socket attach intent"
     );
-    assert!(
-        !hub.pty_forwarders.contains_key(&key),
-        "socket forwarder should not start until session and client are ready"
-    );
 
     let _client_stream = register_test_socket_client(&mut hub, client_id);
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
     hub.handle_cache
-        .add_session(test_session_handle("sess-socket-attach"));
+        .add_session(test_session_backed_handle_with_mailbox(
+            "sess-socket-attach",
+            session_io_tx,
+        ));
     hub.tick();
 
     assert!(
@@ -356,9 +379,11 @@ pub(super) fn test_socket_attach_intent_resolves_when_session_and_client_appear(
         "pending socket attach should clear once session and client exist"
     );
     assert!(
-        hub.pty_forwarders.contains_key(&key),
-        "socket forwarder should start after prerequisites are available"
+        hub.terminal_client_workers.contains_key(&key),
+        "socket subscription should register a ClientWorker after prerequisites are available"
     );
+    let (subscription, _delivery) = drain_initial_terminal_attach_requests(&mut session_io_rx);
+    assert_eq!(subscription.subscription_key, key);
 }
 
 #[test]
@@ -375,40 +400,31 @@ pub(super) fn test_socket_initial_scrollback_routes_snapshot_through_session_io_
         ));
     let mut client_stream = register_test_socket_client(&mut hub, client_id);
 
-    hub.create_lua_socket_pty_forwarder(crate::lua::primitives::CreateSocketForwarderRequest {
-        client_id: client_id.to_string(),
-        session_uuid: session_uuid.to_string(),
-        subscription_id: format!("socket:{session_uuid}"),
-        active_flag: Arc::new(Mutex::new(true)),
-        rows: 31,
-        cols: 101,
-    });
+    hub.create_socket_terminal_subscription(
+        crate::lua::primitives::SocketTerminalSubscriptionRequest {
+            client_id: client_id.to_string(),
+            session_uuid: session_uuid.to_string(),
+            subscription_id: format!("socket:{session_uuid}"),
+            rows: 31,
+            cols: 101,
+            active_flag: Arc::new(Mutex::new(true)),
+        },
+    );
 
-    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
-        matches!(
-            request,
-            crate::worker::session_io::SessionIoRequest::Resize {
-                rows: 31,
-                cols: 101
-            }
-        )
-    });
-    let request_id = match recv_session_io_request_matching(&mut session_io_rx, |request| {
-        matches!(
-            request,
-            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
-        )
-    }) {
-        crate::worker::session_io::SessionIoRequest::GetSnapshot { request_id } => request_id,
-        other => panic!("expected GetSnapshot request, got {other:?}"),
-    };
+    let (_subscription, delivery) = drain_initial_terminal_attach_requests(&mut session_io_rx);
+    assert_eq!(
+        delivery.subscription_key,
+        format!("{client_id}:{session_uuid}")
+    );
+    assert_eq!(delivery.rows, 31);
+    assert_eq!(delivery.cols, 101);
+    assert!(matches!(
+        delivery.payload_mode,
+        crate::worker::session_io::TerminalSnapshotPayloadMode::Raw
+    ));
 
     settle_worker_subscription();
-    hub.handle_session_io_event(crate::worker::session_io::SessionIoEvent::Snapshot {
-        request_id,
-        session_uuid: session_uuid.to_string(),
-        payload: snapshot.clone(),
-    });
+    deliver_terminal_initial_snapshot(delivery, snapshot.clone());
 
     let socket_scrollback =
         read_test_socket_frame_matching(&mut client_stream, Duration::from_secs(2), |frame| {
@@ -431,85 +447,93 @@ pub(super) fn test_socket_initial_scrollback_routes_snapshot_through_session_io_
 }
 
 #[test]
-pub(super) fn test_tui_worker_handle_registered_and_removed_with_forwarder() {
+pub(super) fn test_tui_worker_handle_registered_and_removed_with_subscription() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let session_uuid = "sess-tui-worker-lifecycle";
     let key = format!("tui:{session_uuid}");
 
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
     hub.handle_cache
-        .add_session(test_session_handle(session_uuid));
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
 
-    let req = crate::lua::primitives::CreateTuiForwarderRequest {
+    let req = crate::lua::primitives::TuiTerminalSubscriptionRequest {
         session_uuid: session_uuid.to_string(),
         subscription_id: format!("tui:{session_uuid}"),
-        active_flag: Arc::new(Mutex::new(true)),
         rows: 24,
         cols: 80,
+        active_flag: Arc::new(Mutex::new(true)),
     };
-    hub.create_lua_tui_pty_forwarder(req);
+    hub.create_tui_terminal_subscription(req);
     hub.tick();
 
     assert!(
         hub.terminal_client_workers.contains_key(&key),
-        "TUI forwarder should register a ClientWorker handle"
+        "TUI subscription should register a ClientWorker handle"
     );
     assert!(
-        hub.pty_forwarders.contains_key(&key),
-        "TUI forwarder task should be tracked by the hub"
+        matches!(
+            drain_initial_terminal_attach_requests(&mut session_io_rx).0,
+            crate::worker::session_io::TerminalOutputSubscription { subscription_key, .. }
+                if subscription_key == key
+        ),
+        "TUI terminal subscription should be registered with SessionIo"
     );
 
-    hub.stop_lua_pty_forwarder(&key);
+    hub.stop_terminal_subscription(&key);
 
     assert!(
         !hub.terminal_client_workers.contains_key(&key),
-        "stopping the forwarder should remove the ClientWorker handle"
-    );
-    assert!(
-        !hub.pty_forwarders.contains_key(&key),
-        "stopping the forwarder should remove the task"
+        "stopping the subscription should remove the ClientWorker handle"
     );
 }
 
 #[test]
-pub(super) fn test_socket_worker_handle_registered_and_removed_with_forwarder() {
+pub(super) fn test_socket_worker_handle_registered_and_removed_with_subscription() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let session_uuid = "sess-socket-worker-lifecycle";
     let client_id = "socket:worker-lifecycle";
     let key = format!("{client_id}:{session_uuid}");
 
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
     hub.handle_cache
-        .add_session(test_session_handle(session_uuid));
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
     let _client_stream = register_test_socket_client(&mut hub, client_id);
 
-    let req = crate::lua::primitives::CreateSocketForwarderRequest {
+    let req = crate::lua::primitives::SocketTerminalSubscriptionRequest {
         client_id: client_id.to_string(),
         session_uuid: session_uuid.to_string(),
         subscription_id: format!("socket:{session_uuid}"),
-        active_flag: Arc::new(Mutex::new(true)),
         rows: 24,
         cols: 80,
+        active_flag: Arc::new(Mutex::new(true)),
     };
-    hub.create_lua_socket_pty_forwarder(req);
+    hub.create_socket_terminal_subscription(req);
     hub.tick();
 
     assert!(
         hub.terminal_client_workers.contains_key(&key),
-        "socket forwarder should register a ClientWorker handle"
+        "socket subscription should register a ClientWorker handle"
     );
     assert!(
-        hub.pty_forwarders.contains_key(&key),
-        "socket forwarder task should be tracked by the hub"
+        matches!(
+            drain_initial_terminal_attach_requests(&mut session_io_rx).0,
+            crate::worker::session_io::TerminalOutputSubscription { subscription_key, .. }
+                if subscription_key == key
+        ),
+        "socket terminal subscription should be registered with SessionIo"
     );
 
-    hub.stop_lua_pty_forwarder(&key);
+    hub.stop_terminal_subscription(&key);
 
     assert!(
         !hub.terminal_client_workers.contains_key(&key),
-        "stopping the socket forwarder should remove the ClientWorker handle"
-    );
-    assert!(
-        !hub.pty_forwarders.contains_key(&key),
-        "stopping the socket forwarder should remove the task"
+        "stopping the socket subscription should remove the ClientWorker handle"
     );
 }
 
@@ -520,45 +544,38 @@ pub(super) fn test_socket_workerized_live_output_reaches_socket_frame() {
     let client_id = "socket:worker-output".to_string();
     let key = format!("{client_id}:{session_uuid}");
 
-    let session = test_session_handle(&session_uuid);
-    let event_tx = session.pty().event_tx_clone();
-    hub.handle_cache.add_session(session);
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            &session_uuid,
+            session_io_tx,
+        ));
     let mut client_stream = register_test_socket_client(&mut hub, &client_id);
 
-    let req = crate::lua::primitives::CreateSocketForwarderRequest {
+    let req = crate::lua::primitives::SocketTerminalSubscriptionRequest {
         client_id,
         session_uuid: session_uuid.to_string(),
         subscription_id: format!("socket:{session_uuid}"),
-        active_flag: Arc::new(Mutex::new(true)),
         rows: 24,
         cols: 80,
+        active_flag: Arc::new(Mutex::new(true)),
     };
-    hub.create_lua_socket_pty_forwarder(req);
+    hub.create_socket_terminal_subscription(req);
     hub.tick();
 
     assert!(
         hub.terminal_client_workers.contains_key(&key),
-        "socket forwarder should register a ClientWorker handle"
+        "socket subscription should register a ClientWorker handle"
     );
 
-    let subscribed = hub.tokio_runtime.block_on(async {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            if event_tx.receiver_count() > 0 {
-                break true;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                break false;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    });
-    assert!(
-        subscribed,
-        "socket forwarder should subscribe to PTY output before test emits live bytes"
-    );
-
-    let _ = event_tx.send(crate::agent::pty::PtyEvent::Output(b"worker-live".to_vec()));
+    let (subscription, _delivery) = drain_initial_terminal_attach_requests(&mut session_io_rx);
+    subscription
+        .worker
+        .try_send(crate::worker::client::ClientWorkerMessage::TerminalBytes {
+            session_uuid: session_uuid.clone(),
+            data: b"worker-live".to_vec(),
+        })
+        .expect("send live terminal bytes through client worker");
 
     let found =
         read_test_socket_frame_matching(&mut client_stream, Duration::from_secs(5), |frame| {
@@ -582,25 +599,38 @@ pub(super) fn test_terminal_stream_forwards_equivalent_scrollback_to_tui_and_soc
     let socket_client_id = "socket:shared-scrollback".to_string();
     let snapshot = b"non-empty shared scrollback snapshot".to_vec();
 
+    let (tui_session_io_tx, mut tui_session_io_rx) = tokio::sync::mpsc::channel(8);
     hub.handle_cache
-        .add_session(test_session_handle_with_snapshot(&session_uuid, &snapshot));
+        .add_session(test_session_backed_handle_with_mailbox(
+            &session_uuid,
+            tui_session_io_tx,
+        ));
     let mut client_stream = register_test_socket_client(&mut hub, &socket_client_id);
 
-    hub.create_lua_tui_pty_forwarder(crate::lua::primitives::CreateTuiForwarderRequest {
+    hub.create_tui_terminal_subscription(crate::lua::primitives::TuiTerminalSubscriptionRequest {
         session_uuid: session_uuid.clone(),
         subscription_id: format!("tui:{session_uuid}"),
-        active_flag: Arc::new(Mutex::new(true)),
         rows: 24,
         cols: 80,
-    });
-    hub.create_lua_socket_pty_forwarder(crate::lua::primitives::CreateSocketForwarderRequest {
-        client_id: socket_client_id.clone(),
-        session_uuid: session_uuid.clone(),
-        subscription_id: format!("socket:{session_uuid}"),
         active_flag: Arc::new(Mutex::new(true)),
-        rows: 24,
-        cols: 80,
     });
+    hub.create_socket_terminal_subscription(
+        crate::lua::primitives::SocketTerminalSubscriptionRequest {
+            client_id: socket_client_id.clone(),
+            session_uuid: session_uuid.clone(),
+            subscription_id: format!("socket:{session_uuid}"),
+            rows: 24,
+            cols: 80,
+            active_flag: Arc::new(Mutex::new(true)),
+        },
+    );
+    let (_tui_subscription, tui_delivery) =
+        drain_initial_terminal_attach_requests(&mut tui_session_io_rx);
+    let (_socket_subscription, socket_delivery) =
+        drain_initial_terminal_attach_requests(&mut tui_session_io_rx);
+    settle_worker_subscription();
+    deliver_terminal_initial_snapshot(tui_delivery, snapshot.clone());
+    deliver_terminal_initial_snapshot(socket_delivery, snapshot.clone());
 
     let tui_scrollback = shared_test_runtime()
         .block_on(async {
@@ -667,34 +697,18 @@ pub(super) fn test_tui_first_scrollback_latency_budget_session_backed() {
             ));
 
         let started = Instant::now();
-        hub.create_lua_tui_pty_forwarder(crate::lua::primitives::CreateTuiForwarderRequest {
-            session_uuid: session_uuid.clone(),
-            subscription_id: format!("tui:{session_uuid}"),
-            active_flag: Arc::new(Mutex::new(true)),
-            rows: 24,
-            cols: 80,
-        });
-        let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
-            matches!(
-                request,
-                crate::worker::session_io::SessionIoRequest::Resize { .. }
-            )
-        });
-        let request_id = match recv_session_io_request_matching(&mut session_io_rx, |request| {
-            matches!(
-                request,
-                crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
-            )
-        }) {
-            crate::worker::session_io::SessionIoRequest::GetSnapshot { request_id } => request_id,
-            other => panic!("expected GetSnapshot request, got {other:?}"),
-        };
+        hub.create_tui_terminal_subscription(
+            crate::lua::primitives::TuiTerminalSubscriptionRequest {
+                session_uuid: session_uuid.clone(),
+                subscription_id: format!("tui:{session_uuid}"),
+                rows: 24,
+                cols: 80,
+                active_flag: Arc::new(Mutex::new(true)),
+            },
+        );
+        let (_subscription, delivery) = drain_initial_terminal_attach_requests(&mut session_io_rx);
         settle_worker_subscription();
-        hub.handle_session_io_event(crate::worker::session_io::SessionIoEvent::Snapshot {
-            request_id,
-            session_uuid: session_uuid.clone(),
-            payload: snapshot.clone(),
-        });
+        deliver_terminal_initial_snapshot(delivery, snapshot.clone());
 
         let received = shared_test_runtime().block_on(async {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -747,34 +761,73 @@ pub(super) fn test_terminal_stream_forwards_live_modes_and_exit_to_tui_and_socke
     let session_uuid = "sess-shared-terminal-runtime".to_string();
     let socket_client_id = "socket:shared-runtime".to_string();
 
-    let session = test_session_handle(&session_uuid);
-    let event_tx = session.pty().event_tx_clone();
-    hub.handle_cache.add_session(session);
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(16);
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            &session_uuid,
+            session_io_tx,
+        ));
     let mut client_stream = register_test_socket_client(&mut hub, &socket_client_id);
 
-    hub.create_lua_tui_pty_forwarder(crate::lua::primitives::CreateTuiForwarderRequest {
+    hub.create_tui_terminal_subscription(crate::lua::primitives::TuiTerminalSubscriptionRequest {
         session_uuid: session_uuid.clone(),
         subscription_id: format!("tui:{session_uuid}"),
-        active_flag: Arc::new(Mutex::new(true)),
         rows: 24,
         cols: 80,
-    });
-    hub.create_lua_socket_pty_forwarder(crate::lua::primitives::CreateSocketForwarderRequest {
-        client_id: socket_client_id.clone(),
-        session_uuid: session_uuid.clone(),
-        subscription_id: format!("socket:{session_uuid}"),
         active_flag: Arc::new(Mutex::new(true)),
-        rows: 24,
-        cols: 80,
     });
-    wait_for_receiver_count(&event_tx, 2);
+    hub.create_socket_terminal_subscription(
+        crate::lua::primitives::SocketTerminalSubscriptionRequest {
+            client_id: socket_client_id.clone(),
+            session_uuid: session_uuid.clone(),
+            subscription_id: format!("socket:{session_uuid}"),
+            rows: 24,
+            cols: 80,
+            active_flag: Arc::new(Mutex::new(true)),
+        },
+    );
+    let (tui_subscription, _tui_delivery) =
+        drain_initial_terminal_attach_requests(&mut session_io_rx);
+    let (socket_subscription, _socket_delivery) =
+        drain_initial_terminal_attach_requests(&mut session_io_rx);
     settle_worker_subscription();
 
-    let _ = event_tx.send(crate::agent::pty::PtyEvent::Output(b"one".to_vec()));
-    let _ = event_tx.send(crate::agent::pty::PtyEvent::kitty_changed(true));
-    let _ = event_tx.send(crate::agent::pty::PtyEvent::focus_reporting_changed(true));
-    let _ = event_tx.send(crate::agent::pty::PtyEvent::Output(b"two".to_vec()));
-    let _ = event_tx.send(crate::agent::pty::PtyEvent::process_exited(Some(7)));
+    for subscription in [&tui_subscription, &socket_subscription] {
+        subscription
+            .worker
+            .try_send(crate::worker::client::ClientWorkerMessage::TerminalBytes {
+                session_uuid: session_uuid.clone(),
+                data: b"one".to_vec(),
+            })
+            .expect("send terminal bytes");
+        subscription
+            .worker
+            .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::KittyChanged {
+                    session_uuid: session_uuid.clone(),
+                    enabled: true,
+                },
+            ))
+            .expect("send kitty change");
+        subscription
+            .worker
+            .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::FocusReportingChanged {
+                    session_uuid: session_uuid.clone(),
+                    enabled: true,
+                },
+            ))
+            .expect("send focus change");
+        subscription
+            .worker
+            .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::ProcessExited {
+                    session_uuid: session_uuid.clone(),
+                    exit_code: Some(7),
+                },
+            ))
+            .expect("send process exit");
+    }
 
     let tui_outputs = shared_test_runtime().block_on(async {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -881,40 +934,50 @@ pub(super) fn test_terminal_stream_forwards_live_modes_and_exit_to_tui_and_socke
 }
 
 #[test]
-pub(super) fn test_terminal_stream_continues_after_broadcast_lag_for_tui_and_socket() {
+pub(super) fn test_terminal_stream_continues_after_sessionio_delivery_for_tui_and_socket() {
     let (mut hub, _request_tx, mut output_rx) = e2e_hub();
     let session_uuid = "sess-shared-lag".to_string();
     let socket_client_id = "socket:shared-lag".to_string();
 
-    let session = test_session_handle_with_broadcast_capacity(&session_uuid, 1);
-    let event_tx = session.pty().event_tx_clone();
-    hub.handle_cache.add_session(session);
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(16);
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            &session_uuid,
+            session_io_tx,
+        ));
     let mut client_stream = register_test_socket_client(&mut hub, &socket_client_id);
 
-    hub.create_lua_tui_pty_forwarder(crate::lua::primitives::CreateTuiForwarderRequest {
+    hub.create_tui_terminal_subscription(crate::lua::primitives::TuiTerminalSubscriptionRequest {
         session_uuid: session_uuid.clone(),
         subscription_id: format!("tui:{session_uuid}"),
-        active_flag: Arc::new(Mutex::new(true)),
         rows: 24,
         cols: 80,
-    });
-    hub.create_lua_socket_pty_forwarder(crate::lua::primitives::CreateSocketForwarderRequest {
-        client_id: socket_client_id.clone(),
-        session_uuid: session_uuid.clone(),
-        subscription_id: format!("socket:{session_uuid}"),
         active_flag: Arc::new(Mutex::new(true)),
-        rows: 24,
-        cols: 80,
     });
-    wait_for_receiver_count(&event_tx, 2);
-
-    for i in 0..128 {
-        let _ = event_tx.send(crate::agent::pty::PtyEvent::Output(
-            format!("dropped-{i}").into_bytes(),
-        ));
-    }
+    hub.create_socket_terminal_subscription(
+        crate::lua::primitives::SocketTerminalSubscriptionRequest {
+            client_id: socket_client_id.clone(),
+            session_uuid: session_uuid.clone(),
+            subscription_id: format!("socket:{session_uuid}"),
+            rows: 24,
+            cols: 80,
+            active_flag: Arc::new(Mutex::new(true)),
+        },
+    );
+    let (tui_subscription, _tui_delivery) =
+        drain_initial_terminal_attach_requests(&mut session_io_rx);
+    let (socket_subscription, _socket_delivery) =
+        drain_initial_terminal_attach_requests(&mut session_io_rx);
     settle_worker_subscription();
-    let _ = event_tx.send(crate::agent::pty::PtyEvent::Output(b"after-lag".to_vec()));
+    for subscription in [&tui_subscription, &socket_subscription] {
+        subscription
+            .worker
+            .try_send(crate::worker::client::ClientWorkerMessage::TerminalBytes {
+                session_uuid: session_uuid.clone(),
+                data: b"after-lag".to_vec(),
+            })
+            .expect("send post-lag terminal bytes");
+    }
 
     let tui_seen = shared_test_runtime().block_on(async {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -945,11 +1008,11 @@ pub(super) fn test_terminal_stream_continues_after_broadcast_lag_for_tui_and_soc
 
     assert!(
         tui_seen,
-        "TUI shared runtime should continue forwarding after a broadcast lag"
+        "TUI shared runtime should continue forwarding after SessionIo delivery"
     );
     assert!(
         socket_seen,
-        "socket shared runtime should continue forwarding after a broadcast lag"
+        "socket shared runtime should continue forwarding after SessionIo delivery"
     );
 }
 
@@ -959,29 +1022,51 @@ pub(super) fn test_socket_shared_runtime_batches_outputs_but_filters_osc_queries
     let session_uuid = "sess-socket-filter-batch".to_string();
     let client_id = "socket:filter-batch".to_string();
 
-    let session = test_session_handle(&session_uuid);
-    let event_tx = session.pty().event_tx_clone();
-    hub.handle_cache.add_session(session);
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            &session_uuid,
+            session_io_tx,
+        ));
     let mut client_stream = register_test_socket_client(&mut hub, &client_id);
     hub.active_terminal_peers
         .lock()
         .expect("active terminal peers")
         .insert(session_uuid.clone(), "socket:owner".to_string());
 
-    hub.create_lua_socket_pty_forwarder(crate::lua::primitives::CreateSocketForwarderRequest {
-        client_id: client_id.clone(),
-        session_uuid: session_uuid.clone(),
-        subscription_id: format!("socket:{session_uuid}"),
-        active_flag: Arc::new(Mutex::new(true)),
-        rows: 24,
-        cols: 80,
-    });
-    wait_for_receiver_count(&event_tx, 1);
+    hub.create_socket_terminal_subscription(
+        crate::lua::primitives::SocketTerminalSubscriptionRequest {
+            client_id: client_id.clone(),
+            session_uuid: session_uuid.clone(),
+            subscription_id: format!("socket:{session_uuid}"),
+            rows: 24,
+            cols: 80,
+            active_flag: Arc::new(Mutex::new(true)),
+        },
+    );
+    let (subscription, _delivery) = drain_initial_terminal_attach_requests(&mut session_io_rx);
     settle_worker_subscription();
 
-    let _ = event_tx.send(crate::agent::pty::PtyEvent::Output(b"A\x1b]11;?".to_vec()));
-    let _ = event_tx.send(crate::agent::pty::PtyEvent::Output(b"\x07B".to_vec()));
-    let _ = event_tx.send(crate::agent::pty::PtyEvent::Output(b"C".to_vec()));
+    let mut filter_buffer = Vec::new();
+    for chunk in [
+        b"A\x1b]11;?".as_slice(),
+        b"\x07B".as_slice(),
+        b"C".as_slice(),
+    ] {
+        let filtered = subscription
+            .filter
+            .filter_chunk(&session_uuid, &mut filter_buffer, chunk);
+        if filtered.is_empty() {
+            continue;
+        }
+        subscription
+            .worker
+            .try_send(crate::worker::client::ClientWorkerMessage::TerminalBytes {
+                session_uuid: session_uuid.clone(),
+                data: filtered,
+            })
+            .expect("send filtered terminal bytes");
+    }
 
     let frames = read_test_socket_frames(&mut client_stream, 8, Duration::from_secs(2));
     let mut chunks = Vec::new();

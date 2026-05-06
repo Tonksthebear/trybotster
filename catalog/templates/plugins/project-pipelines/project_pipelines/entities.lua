@@ -80,6 +80,138 @@ local function target_label(view, target_id, target_path)
     return target_id or target_path or "No target"
 end
 
+local function index_by_id(items)
+    local out = {}
+    for _, item in ipairs(items or {}) do
+        if item.id then
+            out[item.id] = item
+        end
+    end
+    return out
+end
+
+local function grouped_by(items, key)
+    local out = {}
+    for _, item in ipairs(items or {}) do
+        local value = item[key]
+        if value then
+            out[value] = out[value] or {}
+            table.insert(out[value], item)
+        end
+    end
+    return out
+end
+
+local function build_ticket_notification_counts(repo, view)
+    if not repo or not view then
+        return {}
+    end
+
+    local uuid_by_ticket = {}
+    local seen_by_ticket = {}
+    local all_uuids = {}
+
+    local function add(ticket_id, uuid)
+        if not ticket_id or not uuid or uuid == "" then
+            return
+        end
+        local seen = seen_by_ticket[ticket_id]
+        if not seen then
+            seen = {}
+            seen_by_ticket[ticket_id] = seen
+        end
+        if seen[uuid] then
+            return
+        end
+        seen[uuid] = true
+        uuid_by_ticket[ticket_id] = uuid_by_ticket[ticket_id] or {}
+        table.insert(uuid_by_ticket[ticket_id], uuid)
+        all_uuids[uuid] = true
+    end
+
+    for _, row in ipairs(rows([[SELECT r.ticket_id, rs.agent_session_uuid
+                                FROM run_steps rs
+                                JOIN runs r ON r.id = rs.run_id
+                                WHERE rs.agent_session_uuid IS NOT NULL
+                                  AND rs.agent_session_uuid != '']])) do
+        add(row.ticket_id, row.agent_session_uuid)
+    end
+
+    for _, event in ipairs(rows([[SELECT ticket_id, kind, payload
+                                  FROM events
+                                  WHERE ticket_id IS NOT NULL
+                                    AND kind IN ('ticket.merge_requested',
+                                                 'ticket.merge_agent_linked',
+                                                 'question.agent_linked')]])) do
+        local payload = decode(event.payload, {})
+        add(event.ticket_id, payload.session_uuid)
+    end
+
+    local Agent = nil
+    local ok, mod = pcall(require, "lib.agent")
+    if ok then
+        Agent = mod
+    end
+
+    local notified = {}
+    if Agent then
+        for uuid in pairs(all_uuids) do
+            if view.session_has_notification then
+                notified[uuid] = view.session_has_notification(uuid) == true
+            else
+                local session = Agent.get(uuid)
+                if session and session.info then
+                    local ok_info, info = pcall(session.info, session)
+                    notified[uuid] = ok_info and info and info.notification == true
+                end
+            end
+        end
+    end
+
+    local counts = {}
+    for ticket_id, uuids in pairs(uuid_by_ticket) do
+        local count = 0
+        for _, uuid in ipairs(uuids) do
+            if notified[uuid] then
+                count = count + 1
+            end
+        end
+        counts[ticket_id] = count
+    end
+    return counts
+end
+
+local function ticket_entities(tickets)
+    local repo = with_repo()
+    local view = with_view()
+    local runs_by_ticket = grouped_by(rows("SELECT * FROM runs ORDER BY ticket_id ASC, created_at DESC, id DESC"), "ticket_id")
+    local steps_by_id = index_by_id(rows("SELECT * FROM pipeline_steps"))
+    local notification_counts = build_ticket_notification_counts(repo, view)
+    local out = {}
+    for _, ticket in ipairs(tickets or {}) do
+        local entity = copy(ticket)
+        local runs = runs_by_ticket[ticket.id] or {}
+        local latest = runs[1]
+        local current_step = latest and latest.current_step_id and steps_by_id[latest.current_step_id] or nil
+        local notifications = notification_counts[ticket.id] or 0
+        entity.target_label = target_label(view, ticket.target_id, ticket.target_path)
+        entity.run_count = #runs
+        entity.run_count_label = string.format("%d run%s", #runs, #runs == 1 and "" or "s")
+        entity.latest_run_id = latest and latest.id or nil
+        entity.latest_run_status = latest and latest.status or nil
+        entity.latest_run_badge = latest and (latest.status == "done" and "complete" or latest.status == "blocked" and "blocked" or "in progress") or "ready"
+        entity.latest_run_tone = latest and (latest.status == "done" and "success" or latest.status == "blocked" and "danger" or "accent") or "muted"
+        entity.tail_label = latest and (current_step and ("Working: " .. current_step.name) or "In pipeline") or "No runs yet"
+        entity.notification_count = notifications
+        entity.notification_label = tostring(notifications) .. " notification"
+        entity.secondary_badge = notifications > 0 and (tostring(notifications) .. " notification") or entity.target_label
+        entity.secondary_badge_tone = notifications > 0 and "danger" or "muted"
+        entity.path = "/pipelines/tickets/" .. ticket.id
+        out[#out + 1] = entity
+    end
+    return out
+end
+
 local function ticket_entity(ticket)
     local entity = copy(ticket)
     local repo = with_repo()
@@ -121,6 +253,40 @@ local function pipeline_entity(pipeline)
     return entity
 end
 
+local function pipeline_entities(pipelines)
+    local counts = {}
+    for _, row in ipairs(rows("SELECT pipeline_id, COUNT(*) AS count FROM pipeline_steps GROUP BY pipeline_id")) do
+        counts[row.pipeline_id] = tonumber(row.count or 0) or 0
+    end
+    local out = {}
+    for _, pipeline in ipairs(pipelines or {}) do
+        local entity = copy(pipeline)
+        local step_count = counts[pipeline.id] or 0
+        entity.step_count = step_count
+        entity.step_count_label = string.format("%d step%s", step_count, step_count == 1 and "" or "s")
+        entity.edit_path = "/pipelines/pipelines/" .. pipeline.id .. "/edit"
+        out[#out + 1] = entity
+    end
+    return out
+end
+
+local function run_entities(runs)
+    local tickets_by_id = index_by_id(rows("SELECT id, title FROM tickets"))
+    local pipelines_by_id = index_by_id(rows("SELECT id, name FROM pipelines"))
+    local out = {}
+    for _, run in ipairs(runs or {}) do
+        local entity = copy(run)
+        local ticket = tickets_by_id[run.ticket_id]
+        local pipeline = pipelines_by_id[run.pipeline_id]
+        entity.ticket_title = ticket and ticket.title or run.ticket_id
+        entity.pipeline_name = pipeline and pipeline.name or run.pipeline_id
+        entity.label = entity.ticket_title .. " - " .. entity.pipeline_name .. " (" .. tostring(run.status) .. ")"
+        entity.path = "/pipelines/runs/" .. run.id
+        out[#out + 1] = entity
+    end
+    return out
+end
+
 local function run_entity(run)
     local entity = copy(run)
     local ticket = rows("SELECT * FROM tickets WHERE id = ? LIMIT 1", run.ticket_id)[1]
@@ -151,6 +317,31 @@ local function run_step_entity(run_step)
     return entity
 end
 
+local function run_step_entities(run_steps)
+    local steps_by_id = index_by_id(rows("SELECT * FROM pipeline_steps"))
+    local runs_by_id = index_by_id(rows("SELECT id, ticket_id, pipeline_id FROM runs"))
+    local out = {}
+    for _, run_step in ipairs(run_steps or {}) do
+        local entity = copy(run_step)
+        local step = steps_by_id[run_step.step_id]
+        local run = runs_by_id[run_step.run_id]
+        if step then
+            entity.name = step.name
+            entity.kind = step.kind
+            entity.position = step.position
+            entity.agent_name = step.agent_name
+            entity.prompt = step.prompt
+            entity.command = step.command
+        end
+        if run then
+            entity.ticket_id = run.ticket_id
+            entity.pipeline_id = run.pipeline_id
+        end
+        out[#out + 1] = entity
+    end
+    return out
+end
+
 local function pipeline_gate_entity(gate)
     local entity = copy(gate)
     entity.required_fields = decode(gate.required_fields, {})
@@ -178,12 +369,7 @@ end
 local ENTITY = {
     [M.types.ticket] = {
         all = function()
-            local out = {}
-            local tickets = rows("SELECT * FROM tickets ORDER BY updated_at DESC, created_at DESC")
-            for _, ticket in ipairs(tickets) do
-                out[#out + 1] = ticket_entity(ticket)
-            end
-            return out
+            return ticket_entities(rows("SELECT * FROM tickets ORDER BY updated_at DESC, created_at DESC"))
         end,
         one = ticket_entity,
     },
@@ -212,11 +398,7 @@ local ENTITY = {
     },
     [M.types.pipeline] = {
         all = function()
-            local out = {}
-            for _, pipeline in ipairs(rows("SELECT * FROM pipelines ORDER BY created_at ASC, id ASC")) do
-                out[#out + 1] = pipeline_entity(pipeline)
-            end
-            return out
+            return pipeline_entities(rows("SELECT * FROM pipelines ORDER BY created_at ASC, id ASC"))
         end,
         one = pipeline_entity,
     },
@@ -236,21 +418,13 @@ local ENTITY = {
     },
     [M.types.run] = {
         all = function()
-            local out = {}
-            for _, run in ipairs(rows("SELECT * FROM runs ORDER BY updated_at DESC, created_at DESC, id DESC")) do
-                out[#out + 1] = run_entity(run)
-            end
-            return out
+            return run_entities(rows("SELECT * FROM runs ORDER BY updated_at DESC, created_at DESC, id DESC"))
         end,
         one = run_entity,
     },
     [M.types.run_step] = {
         all = function()
-            local out = {}
-            for _, run_step in ipairs(rows("SELECT * FROM run_steps ORDER BY run_id ASC, COALESCE(sequence, 0) ASC, created_at ASC, id ASC")) do
-                out[#out + 1] = run_step_entity(run_step)
-            end
-            return out
+            return run_step_entities(rows("SELECT * FROM run_steps ORDER BY run_id ASC, COALESCE(sequence, 0) ASC, created_at ASC, id ASC"))
         end,
         one = run_step_entity,
     },

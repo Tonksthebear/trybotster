@@ -171,6 +171,7 @@ impl SessionConnection {
         let (session_io_tx, request_rx) =
             tokio::sync::mpsc::channel(SESSION_IO_WORKER_QUEUE.capacity);
         let (response_tx, response_rx) = std::sync::mpsc::channel::<Frame>();
+        let terminal_subscriptions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         self.response_rx = Some(response_rx);
         self.session_io_tx = Some(session_io_tx);
         self.reader_alive.store(true, Ordering::Release);
@@ -189,6 +190,7 @@ impl SessionConnection {
             hub_event_tx,
             reader_alive: Arc::clone(&self.reader_alive),
             pending_snapshot_requests: Arc::new(Mutex::new(VecDeque::new())),
+            terminal_subscriptions,
         })?;
 
         Ok(())

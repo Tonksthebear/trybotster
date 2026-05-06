@@ -4,6 +4,7 @@ require "test_helper"
 
 class HubsControllerTest < ActionDispatch::IntegrationTest
   include Devise::Test::IntegrationHelpers
+  include ApiTestHelper
 
   setup do
     @user = users(:primary_user)
@@ -35,6 +36,28 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
 
     assert_equal @active_hub.identifier, active["identifier"]
     assert_equal @active_hub.fingerprint, active["fingerprint"]
+  end
+
+  test "index json accepts valid hub token for CLI auth validation" do
+    get hubs_path, headers: auth_headers_for(:primary_user)
+
+    assert_response :success
+    json = JSON.parse(response.body)
+
+    assert_kind_of Array, json
+    assert json.any? { |hub| hub["identifier"] == @active_hub.identifier }
+  end
+
+  test "index json rejects invalid hub token" do
+    get hubs_path, headers: {
+      "Authorization" => "Bearer btstr_invalid_token",
+      "Accept" => "application/json"
+    }
+
+    assert_response :unauthorized
+    json = JSON.parse(response.body)
+
+    assert_equal "Invalid API key", json["error"]
   end
 
   # === Show HTML Tests ===

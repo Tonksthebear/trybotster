@@ -681,12 +681,9 @@ mod tests {
     use super::*;
 
     /// Create a test sender with a wired-up channel for event capture.
-    fn setup_with_channel() -> (
-        HubEventSender,
-        tokio::sync::mpsc::UnboundedReceiver<HubEvent>,
-    ) {
+    fn setup_with_channel() -> (HubEventSender, tokio::sync::mpsc::Receiver<HubEvent>) {
         let tx = new_hub_event_sender();
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
         *tx.lock().unwrap() = Some(sender.into());
         (tx, receiver)
     }

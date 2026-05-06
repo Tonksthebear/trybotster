@@ -9,18 +9,21 @@
 
 local Client = require("lib.client")
 local connections = require("handlers.connections")
+local state = require("hub.state")
+
+local active_peers = state.get("webrtc.active_peers", {})
 
 --- Create a WebRTC transport for a given peer.
 -- @param peer_id The peer identifier for routing messages
--- @return Transport table with send(), send_binary(), create_pty_forwarder(), and type
+-- @return Transport table with send(), send_binary(), subscribe_terminal(), and type
 local function make_webrtc_transport(peer_id)
     return {
         type = "webrtc",
         send = function(msg) webrtc.send(peer_id, msg) end,
         send_binary = function(data) webrtc.send_binary(peer_id, data) end,
-        create_pty_forwarder = function(opts)
+        subscribe_terminal = function(opts)
             opts.peer_id = peer_id
-            return webrtc.create_pty_forwarder(opts)
+            return webrtc.subscribe_terminal(opts)
         end,
         request_pty_snapshot = function(opts)
             opts.peer_id = peer_id
@@ -36,6 +39,7 @@ end
 -- Called when WebRTC peer connects (ICE complete, DataChannel ready)
 webrtc.on_peer_connected(function(peer_id)
     log.info(string.format("WebRTC peer connected: %s...", peer_id:sub(1, 8)))
+    active_peers[peer_id] = true
 
     local client = Client.new(peer_id, make_webrtc_transport(peer_id))
     connections.register_client(peer_id, client)
@@ -49,6 +53,7 @@ end)
 -- Called when WebRTC peer disconnects
 webrtc.on_peer_disconnected(function(peer_id)
     log.info(string.format("WebRTC peer disconnected: %s...", peer_id:sub(1, 8)))
+    active_peers[peer_id] = nil
     connections.unregister_client(peer_id)
 end)
 
@@ -57,6 +62,12 @@ webrtc.on_message(function(peer_id, msg)
     local client = connections.get_client(peer_id)
 
     if not client then
+        if not active_peers[peer_id] then
+            log.warn(string.format("Dropping message from disconnected WebRTC peer %s...",
+                peer_id:sub(1, 8)))
+            return
+        end
+
         -- Client not found. Can happen if:
         -- 1. Peer connected before Lua callbacks were registered (startup race)
         -- 2. Browser refresh where disconnect/reconnect happens quickly

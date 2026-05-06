@@ -982,6 +982,7 @@ mod tests {
     )]
 
     use super::*;
+    use crate::ui_contract::node::{UiBindList, UiChild, UiNode};
     use mlua::LuaSerdeExt;
     use serde_json::json;
 
@@ -1888,6 +1889,37 @@ mod tests {
             v["item_template"]["props"]["text"],
             json!({ "$bind": "@/title" })
         );
+    }
+
+    #[test]
+    fn bind_list_round_trips_as_typed_child() {
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.stack{
+                direction = "vertical",
+                children = {
+                    ui.bind_list{
+                        source = "/project-pipelines.pipeline",
+                        item_template = ui.text{ text = ui.bind("@/name") },
+                    },
+                },
+            }"#,
+        );
+
+        let typed: UiNode = serde_json::from_value(v).expect("typed deserialize");
+        assert_eq!(typed.children.len(), 1);
+        match &typed.children[0] {
+            UiChild::BindList(UiBindList::BindList {
+                source,
+                item_template,
+                ..
+            }) => {
+                assert_eq!(source, "/project-pipelines.pipeline");
+                assert_eq!(item_template.node_type, "text");
+            }
+            other => panic!("expected bind_list child, got {other:?}"),
+        }
     }
 
     #[test]

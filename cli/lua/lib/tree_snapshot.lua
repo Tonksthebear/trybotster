@@ -145,10 +145,15 @@ function M.build_frames(opts)
         only_surface = opts.only_surface
     end
 
+    local scope = opts.scope or "all"
     local frames = {}
     for _, summary in ipairs(surfaces_mod.list()) do
         local surface_name = summary.name
-        if only_surface == nil or only_surface == surface_name then
+        local include_surface = only_surface == nil or only_surface == surface_name
+        if include_surface and scope == "core" then
+            include_surface = summary.source == "builtin"
+        end
+        if include_surface then
             local entry = surfaces_mod.get(surface_name)
             if entry then
                 local subpath = resolve_subpath(opts.client, surface_name)

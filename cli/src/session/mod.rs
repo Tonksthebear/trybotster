@@ -510,7 +510,7 @@ fn run_session(
         })
         .context("spawn writer thread")?;
 
-    // Reader thread: reads PTY output, feeds parser, forwards to hub
+    // Reader thread: reads PTY output, feeds parser, forwards to the session socket
     let parser_for_reader = Arc::clone(&parser);
     let last_output_reader = Arc::clone(&last_output_at);
     let tee_for_reader = Arc::clone(&tee);
@@ -612,7 +612,7 @@ fn run_session(
             break;
         }
 
-        // Forward PTY output / child exit to hub
+        // Forward PTY output / child exit to the parent process over the session socket.
         while let Ok(msg) = output_rx.try_recv() {
             let frame = match msg {
                 SessionOutput::PtyData(data) => encode_frame(FRAME_PTY_OUTPUT, &data),
@@ -929,7 +929,7 @@ fn semantic_prompt_name(action: crate::ghostty_vt::GhosttySemanticPromptAction) 
     }
 }
 
-/// Read PTY output, feed parser, forward to hub via channel.
+/// Read PTY output, feed parser, forward to the session socket via channel.
 /// Terminal state change events are driven entirely by ghostty callbacks —
 /// no byte scanning or mode diffing in Rust.
 fn reader_loop(

@@ -91,6 +91,26 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     assert_equal original_id, json["id"]
   end
 
+  test "POST /hubs finds existing hub by fingerprint and updates identifier" do
+    hub = hubs(:active_hub)
+    new_identifier = "device-#{SecureRandom.hex(8)}"
+    original_id = hub.id
+    headers = auth_headers_for(:primary_user)
+
+    assert_no_difference -> { Hub.count } do
+      post hubs_url,
+        params: { identifier: new_identifier, fingerprint: hub.fingerprint }.to_json,
+        headers: headers
+    end
+
+    assert_response :ok
+    json = assert_json_keys(:id, :identifier)
+
+    assert_equal original_id, json["id"]
+    assert_equal new_identifier, json["identifier"]
+    assert_equal new_identifier, hub.reload.identifier
+  end
+
   # ==========================================================================
   # PUT /hubs/:id - Update Hub
   # ==========================================================================

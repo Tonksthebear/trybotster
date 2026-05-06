@@ -61,6 +61,19 @@ fn new_loader_lua() -> Lua {
                 end
                 return count
             end,
+            unregister_by_plugin = function(plugin_key)
+                local prefix = plugin_key .. "::"
+                local removed = 0
+                for _, entries in pairs(_G.hooks._observers) do
+                    for name in pairs(entries) do
+                        if name:sub(1, #prefix) == prefix then
+                            entries[name] = nil
+                            removed = removed + 1
+                        end
+                    end
+                end
+                return removed
+            end,
         }
         package.loaded["hub.hooks"] = _G.hooks
         _G.mcp = {
@@ -224,4 +237,75 @@ fn repo_plugins_with_same_name_load_as_distinct_instances() {
     ))
     .exec()
     .expect("same-name repo plugins should be scoped by repo");
+}
+
+#[test]
+fn reload_plugin_removes_capabilities_that_new_version_no_longer_registers() {
+    let _lock = lock_env();
+    let tmp = TempDir::new().unwrap();
+    let device_root = tmp.path().join(".botster-dev");
+    let plugin_dir = device_root.join("plugins").join("reload-cleanup");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    let init_path = plugin_dir.join("init.lua");
+    fs::write(
+        &init_path,
+        r#"
+        local hooks = require("hub.hooks")
+        hooks.on("worktree_created", "stale-hook", function()
+            _G.reload_cleanup_hook_called = true
+        end)
+        require("lib.commands").register("reload_cleanup_command", function() end)
+        local action = require("lib.action")
+        action.on("reload.cleanup", "stale-action", function()
+            return action.HANDLED
+        end)
+        require("lib.surfaces").register("reload_cleanup_surface", {
+            routes = {
+                { path = "/", render = function() return { type = "text", text = "v1" } end },
+            },
+        })
+        return { version = 1 }
+        "#,
+    )
+    .unwrap();
+
+    fs::create_dir_all(&device_root).unwrap();
+    set_config_dir(&device_root);
+
+    let lua = new_loader_lua();
+    lua.load(format!(
+        r#"
+        local loader = require("hub.loader")
+        local ok, err = loader.load_plugin({init_path}, "reload-cleanup", {{ source = "device" }})
+        assert(ok, tostring(err))
+
+        assert(hooks.notify("worktree_created", {{}}) == 1, "v1 hook should be registered")
+        assert(_G.reload_cleanup_hook_called == true, "v1 hook should run")
+        assert(require("lib.commands").has("reload_cleanup_command"), "v1 command should be registered")
+        assert(require("lib.surfaces").get("reload_cleanup_surface") ~= nil, "v1 surface should be registered")
+        assert(#require("lib.action").registered_ids() == 1, "v1 action should be registered")
+        "#,
+        init_path = lua_string(&init_path),
+    ))
+    .exec()
+    .expect("v1 plugin should register capabilities");
+
+    fs::write(&init_path, "return { version = 2 }\n").unwrap();
+
+    lua.load(
+        r#"
+        _G.reload_cleanup_hook_called = false
+        local loader = require("hub.loader")
+        local ok, err = loader.reload_plugin("reload-cleanup")
+        assert(ok, tostring(err))
+
+        assert(hooks.notify("worktree_created", {}) == 0, "stale hook should be removed")
+        assert(_G.reload_cleanup_hook_called == false, "stale hook must not run")
+        assert(not require("lib.commands").has("reload_cleanup_command"), "stale command should be removed")
+        assert(require("lib.surfaces").get("reload_cleanup_surface") == nil, "stale surface should be removed")
+        assert(#require("lib.action").registered_ids() == 0, "stale action should be removed")
+        "#,
+    )
+    .exec()
+    .expect("reload should remove stale plugin-owned capabilities");
 }

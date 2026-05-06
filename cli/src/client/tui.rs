@@ -1,7 +1,8 @@
 //! TUI communication types.
 //!
 //! Defines the message types for TuiRunner <-> Hub communication:
-//! - TuiRunner → Hub: [`TuiRequest`] (JSON for Lua protocol, raw bytes for PTY input)
+//! - TuiRunner → Hub: [`TuiRequest`] (JSON/control protocol)
+//! - TuiRunner → terminal transport: [`TuiSessionInput`] (raw PTY bytes)
 //! - Hub → TuiRunner: [`TuiOutput`] (PTY output, Lua events)
 //!
 //! # Message Format
@@ -9,8 +10,8 @@
 //! Control messages (resize, agent lifecycle, etc.) flow as JSON through
 //! the Lua `client.lua` protocol, shared with browser clients.
 //!
-//! PTY keyboard input bypasses Lua entirely — raw bytes go directly from
-//! TuiRunner to the workerized session I/O path via [`TuiRequest::PtyInput`].
+//! PTY keyboard input bypasses Lua and the hub request channel entirely; raw
+//! bytes go from TuiRunner to the terminal transport/session input route.
 //!
 //! JSON message types:
 //! - Resize: `{subscriptionId: "tui:{session_uuid}", data: {type: "resize", rows, cols}}`
@@ -22,10 +23,7 @@
 
 /// Request messages sent from TuiRunner to Hub.
 ///
-/// Two variants separate control messages (routed through Lua) from
-/// PTY keyboard input (written directly to the PTY, bypassing Lua).
-/// This mirrors [`crate::lua::primitives::TuiSendRequest`] which has
-/// the same `Json`/`Binary` split for the Hub → TUI direction.
+/// Control messages from the TUI to the hub.
 #[derive(Debug, Clone)]
 pub enum TuiRequest {
     /// JSON message routed through Lua `client.lua` protocol.
@@ -34,18 +32,8 @@ pub enum TuiRequest {
     /// control operations that need Lua processing.
     LuaMessage(serde_json::Value),
 
-    /// Raw PTY input bytes — bypasses Lua and routes through ClientWorker.
-    ///
-    /// No JSON serialization, no `from_utf8_lossy`, no Lua round-trip.
-    PtyInput {
-        /// Session UUID identifying the target PTY.
-        session_uuid: String,
-        /// Raw input bytes to write to the PTY.
-        data: Vec<u8>,
-    },
-
     /// Focus state change — always sent regardless of whether the child
-    /// PTY requested focus reporting. Updates `pty_clients.focused` in
+    /// PTY requested focus reporting. Updates terminal client focus state in
     /// Lua so notification suppression works even when the child app
     /// doesn't enable `CSI ? 1004 h`.
     FocusChanged {
@@ -54,6 +42,15 @@ pub enum TuiRequest {
         /// Whether the session is now focused.
         focused: bool,
     },
+}
+
+/// Raw PTY bytes from the TUI to a terminal session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiSessionInput {
+    /// Session UUID identifying the target PTY.
+    pub session_uuid: String,
+    /// Raw input bytes to write to the PTY.
+    pub data: Vec<u8>,
 }
 
 /// Output messages sent from Hub to TuiRunner.
@@ -98,7 +95,7 @@ pub enum TuiOutput {
         data: Vec<u8>,
     },
 
-    /// Batched PTY output — multiple chunks coalesced by the forwarder.
+    /// Batched PTY output — multiple chunks coalesced by the subscription path.
     ///
     /// Reduces wake pipe writes from one-per-4KB-chunk to one-per-batch.
     OutputBatch {
@@ -168,12 +165,12 @@ mod tests {
     #[test]
     fn test_tui_request_debug() {
         let lua_msg = TuiRequest::LuaMessage(serde_json::json!({"type": "resize"}));
-        let pty_input = TuiRequest::PtyInput {
+
+        assert!(format!("{:?}", lua_msg).contains("LuaMessage"));
+        let session_input = TuiSessionInput {
             session_uuid: "sess-0".into(),
             data: vec![b'h', b'i'],
         };
-
-        assert!(format!("{:?}", lua_msg).contains("LuaMessage"));
-        assert!(format!("{:?}", pty_input).contains("PtyInput"));
+        assert!(format!("{:?}", session_input).contains("TuiSessionInput"));
     }
 }

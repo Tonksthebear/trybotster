@@ -9,6 +9,17 @@ local M = {}
 local ConfigResolver = require("lib.config_resolver")
 local Agent = require("lib.agent")
 
+local targets_cache = {
+    loaded_at = 0,
+    values = nil,
+    by_id = nil,
+}
+
+local session_info_cache = {
+    loaded_at = 0,
+    by_uuid = {},
+}
+
 function M.status_tone(status)
     if status == "done" or status == "approved" or status == "passed" or status == "resolved" then
         return "success"
@@ -150,17 +161,29 @@ function M.agent_options(current)
 end
 
 function M.targets()
+    local now = os.time()
+    if targets_cache.values and (now - targets_cache.loaded_at) <= 1 then
+        return targets_cache.values
+    end
+
     local targets = {}
+    local by_id = {}
     if spawn_targets and spawn_targets.list then
         for _, target in ipairs(spawn_targets.list() or {}) do
             if target.enabled ~= false then
                 table.insert(targets, target)
+                if target.id then
+                    by_id[target.id] = target
+                end
             end
         end
     end
     table.sort(targets, function(a, b)
         return tostring(a.name or a.id) < tostring(b.name or b.id)
     end)
+    targets_cache.loaded_at = now
+    targets_cache.values = targets
+    targets_cache.by_id = by_id
     return targets
 end
 
@@ -183,12 +206,8 @@ function M.target_options(current_target_id)
 end
 
 function M.target_by_id(target_id)
-    for _, target in ipairs(M.targets()) do
-        if target.id == target_id then
-            return target
-        end
-    end
-    return nil
+    M.targets()
+    return targets_cache.by_id and targets_cache.by_id[target_id] or nil
 end
 
 function M.target_label(target_id, target_path)
@@ -203,13 +222,22 @@ function M.session_info(session_uuid)
     if not session_uuid or session_uuid == "" then
         return nil
     end
+    local now = os.time()
+    if now - session_info_cache.loaded_at > 1 then
+        session_info_cache.loaded_at = now
+        session_info_cache.by_uuid = {}
+    elseif session_info_cache.by_uuid[session_uuid] ~= nil then
+        return session_info_cache.by_uuid[session_uuid] or nil
+    end
     local session = Agent.get(session_uuid)
     if session and session.info then
         local ok, info = pcall(session.info, session)
         if ok then
+            session_info_cache.by_uuid[session_uuid] = info or false
             return info
         end
     end
+    session_info_cache.by_uuid[session_uuid] = false
     return nil
 end
 
@@ -235,23 +263,62 @@ function M.ticket_notification_count(ticket_id, repo)
     return count
 end
 
-function M.ticket_should_show(ticket, repo)
+function M.ticket_notification_counts(repo, ticket_ids)
+    if not repo or not repo.ticket_session_uuids_by_ticket then
+        return {}
+    end
+    local uuids_by_ticket, all_uuids = repo.ticket_session_uuids_by_ticket(ticket_ids)
+    local notified = {}
+    for uuid in pairs(all_uuids or {}) do
+        notified[uuid] = M.session_has_notification(uuid) == true
+    end
+    local counts = {}
+    for ticket_id, uuids in pairs(uuids_by_ticket or {}) do
+        local count = 0
+        for _, uuid in ipairs(uuids) do
+            if notified[uuid] then
+                count = count + 1
+            end
+        end
+        counts[ticket_id] = count
+    end
+    return counts
+end
+
+function M.notification_count_for_uuids(uuids)
+    local count = 0
+    local seen = {}
+    for _, uuid in ipairs(uuids or {}) do
+        if uuid and uuid ~= "" and not seen[uuid] then
+            seen[uuid] = true
+            if M.session_has_notification(uuid) then
+                count = count + 1
+            end
+        end
+    end
+    return count
+end
+
+function M.ticket_should_show(ticket, repo, notification_counts)
     if not ticket then
         return false
     end
     if ticket.status ~= "closed" then
         return true
     end
+    if notification_counts then
+        return tonumber(notification_counts[ticket.id] or 0) > 0
+    end
     return M.ticket_notification_count(ticket.id, repo) > 0
 end
 
-function M.visible_tickets(repo)
+function M.visible_tickets(repo, notification_counts)
     local tickets = {}
     if not repo then
         return tickets
     end
     for _, ticket in ipairs(repo.standalone_tickets()) do
-        if M.ticket_should_show(ticket, repo) then
+        if M.ticket_should_show(ticket, repo, notification_counts) then
             table.insert(tickets, ticket)
         end
     end

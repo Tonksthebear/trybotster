@@ -7,7 +7,7 @@
 //!
 //! - `log` - Logging functions (info, warn, error, debug)
 //! - `webrtc` - WebRTC peer connection and messaging
-//! - `pty` - PTY terminal operations (forwarders, input, resize)
+//! - `pty` - PTY terminal operations (subscriptions, input, resize)
 //! - `fs` - File system operations (read, write, copy, exists, listdir, is_dir)
 //! - `hub` - Hub state queries and operations (agents, worktrees)
 //! - `hub_discovery` - Discover running hubs on this machine (list, is_running, socket_path)
@@ -43,6 +43,7 @@ pub mod hub_client;
 pub mod hub_discovery;
 pub mod json;
 pub mod log;
+pub mod plugin_worker;
 pub mod pty;
 pub mod push;
 pub mod secrets;
@@ -94,9 +95,10 @@ pub use hub_client::{
     new_hub_client_pending_requests, HubClientCallbackRegistry, HubClientFrameSenders,
     HubClientPendingRequests, HubClientRequest, LuaHubClientConn,
 };
+pub(crate) use plugin_worker::{new_plugin_worker_registry, PluginWorkerRegistry};
 pub use pty::{
-    CreateForwarderRequest, CreateSocketForwarderRequest, CreateTuiForwarderRequest, PtyForwarder,
-    PtyOutputContext, PtyRequest, PtySessionHandle, RefreshSnapshotRequest,
+    BrowserTerminalSubscriptionRequest, PtyRequest, PtySessionHandle, RefreshSnapshotRequest,
+    SocketTerminalSubscriptionRequest, TerminalSubscription, TuiTerminalSubscriptionRequest,
 };
 pub use socket::SocketSendRequest;
 pub use timer::{new_timer_registry, TimerRegistry};
@@ -128,6 +130,15 @@ pub fn register_all(lua: &Lua) -> Result<()> {
     hook_timeout::register(lua)?;
     crate::ui_contract::lua::register(lua)?;
     web_layout::register(lua)?;
+    Ok(())
+}
+
+/// Register plugin worker primitives with a shared registry.
+///
+/// These are registered separately because the registry is owned by
+/// `LuaRuntime`, not by the Lua VM itself.
+pub(crate) fn register_plugin_worker(lua: &Lua, registry: PluginWorkerRegistry) -> Result<()> {
+    plugin_worker::register(lua, registry)?;
     Ok(())
 }
 
@@ -354,7 +365,7 @@ pub fn register_timer(lua: &Lua, registry: TimerRegistry) -> Result<()> {
 /// Register file watch primitives with a watcher registry.
 ///
 /// Call this after `register_all()` to set up user-facing file watching.
-/// Each watch spawns a blocking forwarder that sends `HubEvent::UserFileWatch`.
+/// Each watch spawns a blocking subscription that sends `HubEvent::UserFileWatch`.
 ///
 /// # Arguments
 ///

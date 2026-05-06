@@ -23,18 +23,21 @@ local function actor_label(session_uuid, fallback)
     return session_uuid
 end
 
-local function pipeline_start_controls(ticket, ctx)
+local function pipeline_start_controls(ticket, ctx, overview)
     local children = {}
-    local open_run = repo.open_ticket_run(ticket.id)
-    local latest_run = repo.latest_ticket_run(ticket.id)
+    local open_run = overview and overview.open_run or repo.open_ticket_run(ticket.id)
+    local latest_run = overview and overview.latest_run or repo.latest_ticket_run(ticket.id)
 
     if ticket.status == "closed" then
         return { ui.text{ text = "This ticket is closed.", size = "sm", tone = "muted" } }
     end
 
     if open_run and latest_run and open_run.id == latest_run.id then
-        local pipeline = repo.get_pipeline(open_run.pipeline_id)
-        local step = open_run.current_step_id and repo.get_step(open_run.current_step_id) or nil
+        local pipeline = overview and overview.pipelines_by_id and overview.pipelines_by_id[open_run.pipeline_id] or repo.get_pipeline(open_run.pipeline_id)
+        local step = open_run.current_step_id and overview and overview.steps_by_id and overview.steps_by_id[open_run.current_step_id] or nil
+        if not step and open_run.current_step_id then
+            step = repo.get_step(open_run.current_step_id)
+        end
         return {
             view.panel{
                 ui.stack{ direction = "vertical", gap = "2", children = {
@@ -82,7 +85,7 @@ local function pipeline_start_controls(ticket, ctx)
         return { ui.text{ text = "This older ticket has no spawn target. Create a target-bound ticket to start a pipeline.", size = "sm", tone = "danger" } }
     end
 
-    for _, pipeline in ipairs(repo.list_pipelines()) do
+    for _, pipeline in ipairs(overview and overview.pipelines or repo.list_pipelines()) do
         table.insert(children, view.panel{
             ui.stack{
                 direction = "vertical",
@@ -117,7 +120,7 @@ local function pipeline_start_controls(ticket, ctx)
     return children
 end
 
-local function session_rows(ticket_id, ctx)
+local function session_rows(ticket_id, ctx, overview)
     local children = {}
     local seen = {}
 
@@ -161,10 +164,10 @@ local function session_rows(ticket_id, ctx)
         end
     end
 
-    for _, step in ipairs(repo.ticket_run_steps(ticket_id)) do
+    for _, step in ipairs(overview and overview.run_steps or repo.ticket_run_steps(ticket_id)) do
         add_session(step.agent_session_uuid, step.name .. " - " .. (step.agent_name or step.agent_session_uuid), step.status)
     end
-    for _, event in ipairs(repo.ticket_events(ticket_id, nil, 100)) do
+    for _, event in ipairs(overview and overview.events or repo.ticket_events(ticket_id, nil, 100)) do
         if event.kind == "ticket.merge_requested" or event.kind == "ticket.merge_agent_linked" then
             local payload = util.decode(event.payload, {})
             add_session(payload.session_uuid, "Merge agent", "merge")
@@ -180,11 +183,20 @@ local function session_rows(ticket_id, ctx)
     return children
 end
 
-local function active_session_button(run, ctx)
+local function active_session_button(run, ctx, overview)
     if not run or not run.current_run_step_id then
         return nil
     end
-    local current = repo.get_run_step_visit(run.current_run_step_id)
+    local current = nil
+    if overview and overview.run_steps then
+        for _, step in ipairs(overview.run_steps) do
+            if step.id == run.current_run_step_id then
+                current = step
+                break
+            end
+        end
+    end
+    current = current or repo.get_run_step_visit(run.current_run_step_id)
     if not current or not current.agent_session_uuid or current.agent_session_uuid == "" then
         return nil
     end
@@ -203,8 +215,8 @@ local function active_session_button(run, ctx)
     }
 end
 
-local function current_state_panel(ticket, ctx)
-    local run = repo.latest_ticket_run(ticket.id)
+local function current_state_panel(ticket, ctx, overview)
+    local run = overview and overview.latest_run or repo.latest_ticket_run(ticket.id)
     if not run then
         return view.panel{
             ui.stack{ direction = "vertical", gap = "2", children = {
@@ -217,8 +229,11 @@ local function current_state_panel(ticket, ctx)
         }
     end
 
-    local pipeline = repo.get_pipeline(run.pipeline_id)
-    local step = run.current_step_id and repo.get_step(run.current_step_id) or nil
+    local pipeline = overview and overview.pipelines_by_id and overview.pipelines_by_id[run.pipeline_id] or repo.get_pipeline(run.pipeline_id)
+    local step = run.current_step_id and overview and overview.steps_by_id and overview.steps_by_id[run.current_step_id] or nil
+    if not step and run.current_step_id then
+        step = repo.get_step(run.current_step_id)
+    end
     local status_label = run.status == "blocked" and "blocked" or (run.status == "done" and "complete" or "in progress")
     local tone = run.status == "blocked" and "danger" or (run.status == "done" and "success" or "accent")
     local children = {
@@ -231,22 +246,22 @@ local function current_state_panel(ticket, ctx)
     if step and step.prompt and step.prompt ~= "" then
         table.insert(children, ui.text{ text = step.prompt, size = "xs", tone = "muted" })
     end
-    local terminal = active_session_button(run, ctx)
+    local terminal = active_session_button(run, ctx, overview)
     if terminal then
         table.insert(children, terminal)
     end
     return view.panel{ ui.stack{ direction = "vertical", gap = "2", children = children } }
 end
 
-local function handoff_rows(run, ctx)
+local function handoff_rows(run, ctx, overview)
     if not run then
         return { ui.text{ text = "No timeline yet.", size = "sm", tone = "muted" } }
     end
 
     local children = {}
-    local steps = repo.run_steps(run.id)
+    local steps = overview and overview.run_steps_by_run and overview.run_steps_by_run[run.id] or repo.run_steps(run.id)
     local questions_by_run_step = {}
-    for _, question in ipairs(repo.ticket_questions(run.ticket_id)) do
+    for _, question in ipairs(overview and overview.questions or repo.ticket_questions(run.ticket_id)) do
         local key = question.run_step_id
         if not util.is_blank(key) then
             questions_by_run_step[key] = questions_by_run_step[key] or {}
@@ -283,7 +298,8 @@ local function handoff_rows(run, ctx)
         table.insert(children, view.panel{ ui.stack{ direction = "vertical", gap = "2", children = step_children } })
 
         local handoffs = {}
-        for _, result in ipairs(repo.run_step_gate_results(step.id)) do
+        local gate_results = overview and overview.gate_results_by_run_step and overview.gate_results_by_run_step[step.id] or repo.run_step_gate_results(step.id)
+        for _, result in ipairs(gate_results) do
             table.insert(handoffs, {
                 label = "Gate",
                 status = result.status,
@@ -291,7 +307,8 @@ local function handoff_rows(run, ctx)
                 evidence = util.decode(result.evidence, {}),
             })
         end
-        for _, review in ipairs(repo.run_step_reviews(step.id)) do
+        local reviews = overview and overview.reviews_by_run_step and overview.reviews_by_run_step[step.id] or repo.run_step_reviews(step.id)
+        for _, review in ipairs(reviews) do
             table.insert(handoffs, {
                 label = "Review",
                 status = review.verdict,
@@ -353,8 +370,8 @@ local function handoff_rows(run, ctx)
     return children
 end
 
-local function question_rows(ticket, ctx)
-    local questions = repo.ticket_questions(ticket.id, "open")
+local function question_rows(ticket, ctx, overview)
+    local questions = overview and overview.open_questions or repo.ticket_questions(ticket.id, "open")
     local children = {}
     for _, question in ipairs(questions) do
         local header = {
@@ -403,9 +420,9 @@ local function question_rows(ticket, ctx)
     return children
 end
 
-local function dependency_rows(ticket, ctx)
+local function dependency_rows(ticket, ctx, overview)
     local children = {}
-    local dependencies = repo.ticket_dependencies(ticket.id)
+    local dependencies = overview and overview.dependencies or repo.ticket_dependencies(ticket.id)
     for _, dependency in ipairs(dependencies) do
         table.insert(children, view.panel{
             view.row{
@@ -432,7 +449,7 @@ local function dependency_rows(ticket, ctx)
             existing[dependency.depends_on_ticket_id] = true
         end
         local options = {}
-        for _, candidate in ipairs(repo.visible_tickets()) do
+        for _, candidate in ipairs(overview and overview.visible_tickets or repo.visible_tickets()) do
             if candidate.id ~= ticket.id and not existing[candidate.id] then
                 table.insert(options, {
                     value = candidate.id,
@@ -470,14 +487,14 @@ local function dependency_rows(ticket, ctx)
     return children
 end
 
-local function merge_controls(ticket, ctx)
-    local run = repo.latest_ticket_run(ticket.id)
+local function merge_controls(ticket, ctx, overview)
+    local run = overview and overview.latest_run or repo.latest_ticket_run(ticket.id)
     if not run or run.status ~= "done" or ticket.status == "closed" then
         return {}
     end
-    local merge_events = repo.ticket_events(ticket.id, "ticket.merge_requested", 1)
-    local failed_events = repo.ticket_events(ticket.id, "ticket.merge_request_failed", 1)
-    local pipeline = repo.get_pipeline(run.pipeline_id) or {}
+    local merge_events = overview and overview.merge_events or repo.ticket_events(ticket.id, "ticket.merge_requested", 1)
+    local failed_events = overview and overview.failed_merge_events or repo.ticket_events(ticket.id, "ticket.merge_request_failed", 1)
+    local pipeline = overview and overview.pipelines_by_id and overview.pipelines_by_id[run.pipeline_id] or repo.get_pipeline(run.pipeline_id) or {}
     local merge_policy = pipeline.merge_policy or "direct"
     local policy_label = merge_policy == "pr" and "PR via Botster MCP" or "direct merge to main"
     local children = {
@@ -501,10 +518,10 @@ local function merge_controls(ticket, ctx)
     return children
 end
 
-local function run_rows(ticket_id, ctx)
+local function run_rows(ticket_id, ctx, overview)
     local children = {}
-    for _, run in ipairs(repo.ticket_runs(ticket_id)) do
-        local pipeline = repo.get_pipeline(run.pipeline_id)
+    for _, run in ipairs(overview and overview.runs or repo.ticket_runs(ticket_id)) do
+        local pipeline = overview and overview.pipelines_by_id and overview.pipelines_by_id[run.pipeline_id] or repo.get_pipeline(run.pipeline_id)
         table.insert(children, ui.button{
             id = "ticket-" .. ticket_id .. "-run-" .. run.id,
             label = (pipeline and pipeline.name or run.pipeline_id) .. " - " .. run.status,
@@ -526,7 +543,8 @@ function M.render(view_state, ctx)
         return view.panel{ ui.text{ text = "Ticket not found", tone = "danger" } }
     end
 
-    local latest_run = repo.latest_ticket_run(ticket.id)
+    local overview = repo.ticket_detail_overview(ticket.id)
+    local latest_run = overview.latest_run
     local open_run = latest_run and (latest_run.status == "active" or latest_run.status == "blocked") and latest_run or nil
 
     local meta = {
@@ -539,13 +557,13 @@ function M.render(view_state, ctx)
     else
         table.insert(meta, view.badge("ready", "muted"))
     end
-    local notification = view.notification_badge(view.ticket_notification_count(ticket.id, repo))
+    local notification = view.notification_badge(view.notification_count_for_uuids(overview.session_uuids))
     if notification then
         table.insert(meta, notification)
     end
     local header_actions = {}
     if ticket.status ~= "closed" and latest_run and latest_run.status == "done" then
-        local merge_events = repo.ticket_events(ticket.id, "ticket.merge_requested", 1)
+        local merge_events = overview.merge_events
         table.insert(header_actions, view.badge(#merge_events > 0 and "merge running" or "merge queued", #merge_events > 0 and "accent" or "muted"))
     elseif ticket.status ~= "closed" then
         table.insert(header_actions, ui.button{
@@ -566,18 +584,18 @@ function M.render(view_state, ctx)
             actions = header_actions,
             description = ticket.description or "",
         },
-        current_state_panel(ticket, ctx),
-        view.section("Questions", question_rows(ticket, ctx)),
-        view.section("Dependencies", dependency_rows(ticket, ctx)),
+        current_state_panel(ticket, ctx, overview),
+        view.section("Questions", question_rows(ticket, ctx, overview)),
+        view.section("Dependencies", dependency_rows(ticket, ctx, overview)),
     }
-    local merge_children = merge_controls(ticket, ctx)
+    local merge_children = merge_controls(ticket, ctx, overview)
     if #merge_children > 0 then
         table.insert(children, view.section("Merge", merge_children))
     end
-    table.insert(children, view.section(open_run and "Pipeline" or "Move Into Pipeline", pipeline_start_controls(ticket, ctx)))
-    table.insert(children, view.section("Timeline", handoff_rows(latest_run, ctx)))
-    table.insert(children, view.section("Runs", run_rows(ticket.id, ctx)))
-    table.insert(children, view.section("Agent Terminals", session_rows(ticket.id, ctx)))
+    table.insert(children, view.section(open_run and "Pipeline" or "Move Into Pipeline", pipeline_start_controls(ticket, ctx, overview)))
+    table.insert(children, view.section("Timeline", handoff_rows(latest_run, ctx, overview)))
+    table.insert(children, view.section("Runs", run_rows(ticket.id, ctx, overview)))
+    table.insert(children, view.section("Agent Terminals", session_rows(ticket.id, ctx, overview)))
 
     return ui.stack{ direction = "vertical", gap = "4", children = children }
 end

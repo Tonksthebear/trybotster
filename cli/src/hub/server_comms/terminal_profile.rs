@@ -35,13 +35,15 @@ impl Hub {
             .ok()
             .and_then(|active| active.get(session_uuid).cloned());
 
+        let mut colors = self.boot_terminal_colors();
+
         if let Some(peer_id) = active_peer {
-            if let Some(colors) = self.terminal_client_profiles.get(&peer_id) {
-                return colors.clone();
+            if let Some(peer_colors) = self.terminal_client_profiles.get(&peer_id) {
+                colors.extend(peer_colors.iter().map(|(k, v)| (*k, *v)));
             }
         }
 
-        self.boot_terminal_colors()
+        colors
     }
 
     pub(super) fn sync_session_terminal_profile(&mut self, session_uuid: &str) {
@@ -106,18 +108,20 @@ impl Hub {
             shared.extend(colors.iter().map(|(k, v)| (*k, *v)));
         }
         self.terminal_client_profiles
-            .insert(peer_id.to_string(), colors);
+            .entry(peer_id.to_string())
+            .or_default()
+            .extend(colors);
         self.sync_active_sessions_for_terminal_peer(peer_id);
     }
 
-    pub(super) fn register_terminal_forwarder_peer(
+    pub(super) fn register_terminal_subscription_peer(
         &mut self,
-        forwarder_id: &str,
+        subscription_key: &str,
         session_uuid: &str,
         peer_id: &str,
     ) {
-        self.terminal_forwarder_peers.insert(
-            forwarder_id.to_string(),
+        self.terminal_subscription_peers.insert(
+            subscription_key.to_string(),
             (session_uuid.to_string(), peer_id.to_string()),
         );
         self.terminal_session_peers
@@ -126,13 +130,14 @@ impl Hub {
             .insert(peer_id.to_string());
     }
 
-    pub(super) fn unregister_terminal_forwarder_peer(
+    pub(super) fn unregister_terminal_subscription_peer(
         &mut self,
-        forwarder_id: &str,
+        subscription_key: &str,
         promote_next: bool,
     ) {
-        self.cleanup_pending_session_io_snapshots_for_forwarder(forwarder_id);
-        let Some((session_uuid, peer_id)) = self.terminal_forwarder_peers.remove(forwarder_id)
+        self.cleanup_pending_session_io_snapshots_for_subscription(subscription_key);
+        let Some((session_uuid, peer_id)) =
+            self.terminal_subscription_peers.remove(subscription_key)
         else {
             return;
         };
@@ -172,16 +177,16 @@ impl Hub {
     pub(super) fn unregister_terminal_client_peer(&mut self, peer_id: &str, promote_next: bool) {
         self.terminal_client_profiles.remove(peer_id);
 
-        let forwarder_ids: Vec<String> = self
-            .terminal_forwarder_peers
+        let subscription_keys: Vec<String> = self
+            .terminal_subscription_peers
             .iter()
-            .filter_map(|(forwarder_id, (_, owner_peer))| {
-                (owner_peer == peer_id).then(|| forwarder_id.clone())
+            .filter_map(|(subscription_key, (_, owner_peer))| {
+                (owner_peer == peer_id).then(|| subscription_key.clone())
             })
             .collect();
 
-        for forwarder_id in forwarder_ids {
-            self.unregister_terminal_forwarder_peer(&forwarder_id, promote_next);
+        for subscription_key in subscription_keys {
+            self.unregister_terminal_subscription_peer(&subscription_key, promote_next);
         }
     }
 
@@ -240,6 +245,7 @@ impl Hub {
         self.sync_session_terminal_profile(session_uuid);
     }
 
+    #[cfg(test)]
     pub(super) fn learn_terminal_probe_replies(
         &mut self,
         session_uuid: &str,
@@ -257,26 +263,5 @@ impl Hub {
         }
         self.terminal_profiles
             .observe_input(session_uuid, peer_id, data);
-    }
-
-    pub(super) fn handle_observed_pty_output(&mut self, session_uuid: String, data: Vec<u8>) {
-        self.hub_event_metrics
-            .record_counter("pty_output.messages", 1);
-        self.hub_event_metrics
-            .record_counter("pty_output.bytes", data.len() as u64);
-        // Learn terminal probes from raw session output (headless-safe).
-        // Without this, probe responses are only learned through client
-        // input paths (TUI/WebRTC/socket), missing headless sessions.
-        self.learn_terminal_probe_replies(&session_uuid, "session", &data);
-
-        if self.lua.has_observers("pty_output") {
-            let ctx = crate::lua::primitives::PtyOutputContext {
-                peer_id: format!("session:{session_uuid}"),
-                session_uuid,
-            };
-            // SessionIoWorker intentionally hands coalesced chunks to Lua
-            // observers; byte order and total bytes remain unchanged.
-            self.lua.notify_pty_output_observers(&ctx, &data);
-        }
     }
 }

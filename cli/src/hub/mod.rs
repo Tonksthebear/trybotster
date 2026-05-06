@@ -72,9 +72,9 @@ const WORKTREE_RESULT_QUEUE_CAPACITY: usize = 256;
 /// Pending terminal attach request across all client transports.
 #[derive(Debug, Clone)]
 pub(crate) enum PendingTerminalAttachRequest {
-    WebRtc(crate::lua::primitives::CreateForwarderRequest),
-    Tui(crate::lua::primitives::CreateTuiForwarderRequest),
-    Socket(crate::lua::primitives::CreateSocketForwarderRequest),
+    WebRtc(crate::lua::primitives::BrowserTerminalSubscriptionRequest),
+    Tui(crate::lua::primitives::TuiTerminalSubscriptionRequest),
+    Socket(crate::lua::primitives::SocketTerminalSubscriptionRequest),
 }
 
 impl PendingTerminalAttachRequest {
@@ -94,7 +94,9 @@ impl PendingTerminalAttachRequest {
             Self::Tui(req) => &req.active_flag,
             Self::Socket(req) => &req.active_flag,
         };
-        *flag.lock().expect("Forwarder active_flag mutex poisoned")
+        *flag
+            .lock()
+            .expect("terminal subscription active_flag mutex poisoned")
     }
 
     pub(crate) fn deactivate(&self) {
@@ -103,7 +105,9 @@ impl PendingTerminalAttachRequest {
             Self::Tui(req) => &req.active_flag,
             Self::Socket(req) => &req.active_flag,
         };
-        *flag.lock().expect("Forwarder active_flag mutex poisoned") = false;
+        *flag
+            .lock()
+            .expect("terminal subscription active_flag mutex poisoned") = false;
     }
 }
 
@@ -114,7 +118,7 @@ impl PendingTerminalAttachRequest {
 /// appears (`attached`) or the intent expires (`not_found`).
 #[derive(Debug, Clone)]
 pub(crate) struct PendingTerminalAttach {
-    /// Original forwarder request from Lua.
+    /// Original terminal subscription request.
     pub request: PendingTerminalAttachRequest,
     /// Timestamp when the attach intent was first recorded.
     pub requested_at: Instant,
@@ -238,20 +242,11 @@ pub(crate) enum PendingSessionIoSnapshotTarget {
         rows: u16,
         cols: u16,
         kitty_enabled: bool,
-        forwarder_key: Option<String>,
+        subscription_key: Option<String>,
         active_flag: Option<std::sync::Arc<std::sync::Mutex<bool>>>,
     },
     WebRtcPeerRecovery {
         request: crate::worker::webrtc::WebRtcRecoverySnapshotRequest,
-    },
-    TerminalClientInitial {
-        worker: crate::worker::client::ClientWorkerHandle,
-        forwarder_key: String,
-        subscription_id: String,
-        rows: u16,
-        cols: u16,
-        kitty_enabled: bool,
-        pty_handle: crate::hub::agent_handle::PtyHandle,
     },
 }
 
@@ -295,14 +290,9 @@ pub struct Hub {
     /// Bounded OSC/timer volume guardrail state.
     volume_bursts: std::sync::Mutex<VolumeBurstState>,
 
-    /// Active PTY forwarder task handles for cleanup on unsubscribe.
-    ///
-    /// Maps subscriptionId -> JoinHandle for the forwarder task.
-    pty_forwarders: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
-
     /// Pending terminal attach intents waiting for session registration.
     ///
-    /// Keyed by forwarder ID (`{peer_id}:{session_uuid}` / `tui:{session_uuid}` /
+    /// Keyed by subscription route (`{peer_id}:{session_uuid}` / `tui:{session_uuid}` /
     /// `{client_id}:{session_uuid}`) so re-subscribe replaces stale intent
     /// atomically (idempotent reattach) across all transport clients.
     pending_terminal_attaches: std::collections::HashMap<String, PendingTerminalAttach>,
@@ -325,17 +315,23 @@ pub struct Hub {
     /// stale boot defaults.
     terminal_client_profiles:
         std::collections::HashMap<String, std::collections::HashMap<usize, crate::terminal::Rgb>>,
+    /// TUI session input routes keyed by session UUID.
+    pub(crate) tui_session_input_routes: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<String, crate::worker::client::ClientWorkerHandle>,
+        >,
+    >,
     /// Connected terminal peers per session.
     ///
-    /// Tracks which peers currently have a terminal forwarder attached for a
+    /// Tracks which peers currently have a terminal subscription attached for a
     /// given session so disconnect/unsubscribe can promote another client or
     /// fall back to the boot profile deterministically.
     terminal_session_peers: std::collections::HashMap<String, std::collections::HashSet<String>>,
-    /// Reverse lookup for terminal forwarder ownership.
+    /// Reverse lookup for terminal subscription ownership.
     ///
-    /// Keyed by forwarder ID (`peer:session`, `tui:session`) so forwarder
-    /// teardown can cleanly remove session peer registrations.
-    terminal_forwarder_peers: std::collections::HashMap<String, (String, String)>,
+    /// Keyed by subscription route (`peer:session`, `tui:session`) so teardown
+    /// can cleanly remove session peer registrations.
+    terminal_subscription_peers: std::collections::HashMap<String, (String, String)>,
     /// Focused terminal owner per session.
     ///
     /// Used to ensure OSC color queries are only forwarded to the active
@@ -418,7 +414,7 @@ pub struct Hub {
     socket_server: Option<crate::socket::server::SocketServer>,
     /// Connected socket clients, keyed by client_id.
     socket_clients: std::collections::HashMap<String, crate::socket::client_conn::SocketClientConn>,
-    /// Workerized terminal clients, keyed by terminal forwarder id.
+    /// Workerized terminal clients, keyed by terminal subscription id.
     terminal_client_workers:
         std::collections::HashMap<String, crate::worker::client::ClientWorkerHandle>,
     /// Workerized browser clients, keyed by WebRTC browser identity.
@@ -466,9 +462,14 @@ pub struct Hub {
     pub(crate) hub_event_metrics: Arc<events::HubEventMetrics>,
     /// Last time hub event bus metrics were emitted to logs.
     pub(crate) hub_event_metrics_last_log: Instant,
+    /// Receiver for latency-sensitive client/control events.
+    ///
+    /// Kept separate from the high-volume event bus so recovered PTY output
+    /// and observer batches cannot starve browser/TUI connection lifecycle.
+    hub_event_high_priority_rx: Option<tokio::sync::mpsc::Receiver<events::HubEvent>>,
     /// Receiver for the unified event bus. Extracted into the `select!`
     /// loop by `run_event_loop()`.
-    hub_event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<events::HubEvent>>,
+    hub_event_rx: Option<tokio::sync::mpsc::Receiver<events::HubEvent>>,
 }
 
 impl std::fmt::Debug for Hub {
@@ -524,10 +525,18 @@ impl Hub {
         let (worktree_result_tx, worktree_result_rx) =
             tokio::sync::mpsc::channel(WORKTREE_RESULT_QUEUE_CAPACITY);
         // Unified event bus for background producers (HTTP, WS, timers, etc.)
-        let (hub_event_raw_tx, hub_event_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Latency-sensitive client control events use a separate receiver so
+        // recovered PTY output cannot block browser/TUI connection bootstrap.
+        let (hub_event_raw_tx, hub_event_rx) =
+            tokio::sync::mpsc::channel(events::HUB_EVENT_QUEUE_CAPACITY);
+        let (hub_event_high_priority_tx, hub_event_high_priority_rx) =
+            tokio::sync::mpsc::channel(events::HUB_EVENT_HIGH_PRIORITY_QUEUE_CAPACITY);
         let hub_event_metrics = Arc::new(events::HubEventMetrics::default());
-        let hub_event_tx =
-            events::HubEventTx::new(hub_event_raw_tx, Arc::clone(&hub_event_metrics));
+        let hub_event_tx = events::HubEventTx::new_with_priority(
+            hub_event_raw_tx,
+            hub_event_high_priority_tx,
+            Arc::clone(&hub_event_metrics),
+        );
 
         // Initialize Lua scripting runtime
         let mut lua = LuaRuntime::new()?;
@@ -551,15 +560,17 @@ impl Hub {
             handle_cache,
             webrtc,
             volume_bursts: std::sync::Mutex::new(VolumeBurstState::default()),
-            pty_forwarders: std::collections::HashMap::new(),
             pending_terminal_attaches: std::collections::HashMap::new(),
             terminal_profiles: terminal_profile::TerminalProfileStore::default(),
             shared_color_cache: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
             terminal_client_profiles: std::collections::HashMap::new(),
+            tui_session_input_routes: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             terminal_session_peers: std::collections::HashMap::new(),
-            terminal_forwarder_peers: std::collections::HashMap::new(),
+            terminal_subscription_peers: std::collections::HashMap::new(),
             active_terminal_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             stream_muxes: std::collections::HashMap::new(),
             paste_files: std::collections::HashMap::new(),
@@ -589,6 +600,7 @@ impl Hub {
             hub_event_tx,
             hub_event_metrics,
             hub_event_metrics_last_log: Instant::now(),
+            hub_event_high_priority_rx: Some(hub_event_high_priority_rx),
             hub_event_rx: Some(hub_event_rx),
         };
         Ok(hub)
@@ -1061,10 +1073,6 @@ impl Hub {
         // never complete (the senders drop AFTER the runtime in struct field order).
         self.lua.stop_all_watchers();
 
-        // Abort all PTY forwarder tasks
-        for (_key, task) in self.pty_forwarders.drain() {
-            task.abort();
-        }
         for (_key, intent) in self.pending_terminal_attaches.drain() {
             intent.request.deactivate();
         }
@@ -1496,502 +1504,12 @@ mod tests {
         let _ = std::fs::remove_file(daemon::lock_file_path(&test_hub_id).unwrap());
         let _ = std::fs::remove_dir(daemon::hub_dir(&test_hub_id).unwrap());
     }
-
-    /// Full hub reboot cycle with real socket I/O and bidirectional PTY data.
-    ///
-    /// Proves the complete data path survives a hub restart:
-    /// 1. Hub boots with real socket server, full Lua handlers
-    /// 2. Real socket client connects, subscribes (hub + terminal channels)
-    /// 3. PTY input sent via socket → routed to session handle
-    /// 4. PTY output injected via reader thread → forwarder → client reads Frame::PtyOutput
-    /// 5. Hub shuts down (simulates reboot)
-    /// 6. New hub boots, new client connects, repeat — both directions work
-    ///
-    /// Agent creation is not exercised in this test. Sessions are registered
-    /// directly in handle_cache; output path is still a real PTY round-trip
-    /// across hub reboot.
-    ///
-    /// This test uses NO mocks:
-    /// - Real bash process spawned via PtySession::spawn()
-    /// - Real master FD reader thread inside the PTY session
-    /// - Real socket client (same protocol the TUI uses)
-    /// - Real Lua handler processing for subscriptions
-    ///
-    /// Flow per phase:
-    ///   1. Spawn bash → reader thread reads master FD → broadcast output
-    ///   2. Socket client subscribes to terminal channel
-    ///   3. Send "echo MARKER\n" via PtyInput frame → hub routes → bash
-    ///   4. bash echoes MARKER → reader thread → broadcast → forwarder → PtyOutput frame
-    ///   5. Client reads PtyOutput, asserts MARKER present in output
-    ///   6. Hub shuts down, bash killed, reader exits
-    ///   7. New hub boots, repeat with fresh bash
-    #[test]
-    fn test_hub_reboot_cycle_with_socket_pty_roundtrip() {
-        use crate::agent::pty::{PtySession, PtySpawnConfig};
-        use crate::hub::agent_handle::{PtyHandle, SessionHandle, SessionType};
-        use crate::relay::create_crypto_service;
-        use crate::socket::framing::{Frame, FrameDecoder};
-        use std::collections::HashMap;
-        use std::io::{Read, Write};
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let test_hub_id = format!("_test_reboot_pty_{}", std::process::id());
-
-        // --- Helpers ---
-
-        fn init_hub_with_lua(hub: &mut Hub) {
-            let crypto_service = create_crypto_service("test-reboot");
-            hub.browser.crypto_service = Some(crypto_service);
-            hub.lua
-                .register_hub_primitives(
-                    Arc::clone(&hub.handle_cache),
-                    hub.config.worktree_base.clone(),
-                    hub.hub_identifier.clone(),
-                    Arc::clone(&hub.shared_server_id),
-                    Arc::clone(&hub.state),
-                    Arc::clone(&hub.shared_color_cache),
-                )
-                .expect("register hub primitives");
-            hub.load_lua_init();
-        }
-
-        /// Spawn a real bash process and return:
-        /// - SessionHandle with real PTY writer
-        /// - PtySession (must stay alive to keep child process running)
-        /// - Stop flag for the reader thread
-        fn spawn_real_session(
-            uuid: &str,
-            pty_handle_ref: &Arc<std::sync::Mutex<Option<PtyHandle>>>,
-        ) -> (SessionHandle, PtySession, Arc<AtomicBool>) {
-            let mut pty_session = PtySession::new(24, 80);
-            let tmpdir = std::env::temp_dir();
-            pty_session
-                .spawn(PtySpawnConfig {
-                    worktree_path: tmpdir,
-                    command: "bash".to_string(),
-                    args: vec!["--norc".to_string(), "--noprofile".to_string()],
-                    env: {
-                        let mut env = HashMap::new();
-                        env.insert("PS1".to_string(), "$ ".to_string());
-                        env.insert("TERM".to_string(), "dumb".to_string());
-                        env
-                    },
-                    init_commands: vec![],
-                    detect_notifications: false,
-                    port: None,
-                    context: String::new(),
-                })
-                .expect("spawn bash");
-
-            let (shared_state, event_tx, kitty_enabled, cursor_visible, resize_pending) =
-                pty_session.get_direct_access();
-
-            let pty = PtyHandle::new(
-                event_tx,
-                Arc::clone(&shared_state),
-                kitty_enabled,
-                cursor_visible,
-                resize_pending,
-                None,
-            );
-
-            // Store the pty handle for the reader thread to use
-            *pty_handle_ref.lock().unwrap() = Some(pty.clone());
-
-            // Start a reader thread that reads from the master FD and
-            // broadcasts output — hub is a router, no local parsing.
-            let stop_flag = Arc::new(AtomicBool::new(false));
-            let stop_clone = Arc::clone(&stop_flag);
-            let reader_event_tx = pty.event_tx_clone();
-
-            // Get a reader from the master PTY FD
-            let reader = {
-                let state = shared_state.lock().expect("shared_state lock");
-                state
-                    .master_pty
-                    .as_ref()
-                    .expect("master_pty should exist after spawn")
-                    .try_clone_reader()
-                    .expect("try_clone_reader")
-            };
-
-            std::thread::spawn(move || {
-                let mut reader = reader;
-                let mut buf = [0u8; 4096];
-                loop {
-                    if stop_clone.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    match reader.read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            // Broadcast output to subscribers (no local parsing)
-                            let _ = reader_event_tx.send(
-                                crate::agent::pty::events::PtyEvent::output(buf[..n].to_vec()),
-                            );
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                        Err(_) => break, // EIO = child exited
-                    }
-                }
-            });
-
-            let session = SessionHandle::new(uuid, "test-real-bash", SessionType::Agent, None, pty);
-            (session, pty_session, stop_flag)
-        }
-
-        /// Drain pending hub events and dispatch them.
-        fn drain_hub_events(hub: &mut Hub) {
-            let mut rx = hub.hub_event_rx.take();
-            if let Some(ref mut rx) = rx {
-                while let Ok(event) = rx.try_recv() {
-                    hub.handle_hub_event(event);
-                }
-            }
-            hub.hub_event_rx = rx;
-        }
-
-        /// Give async tasks time to fire events, then drain.
-        fn settle(hub: &mut Hub, ms: u64) {
-            std::thread::sleep(std::time::Duration::from_millis(ms));
-            drain_hub_events(hub);
-        }
-
-        /// Read all available frames from a socket with a read timeout.
-        fn read_frames(stream: &mut std::os::unix::net::UnixStream) -> Vec<Frame> {
-            let mut buf = [0u8; 16384];
-            let mut decoder = FrameDecoder::new();
-            let mut all_frames = Vec::new();
-
-            loop {
-                match stream.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if let Ok(frames) = decoder.feed(&buf[..n]) {
-                            all_frames.extend(frames);
-                        }
-                    }
-                    Err(ref e)
-                        if e.kind() == std::io::ErrorKind::WouldBlock
-                            || e.kind() == std::io::ErrorKind::TimedOut =>
-                    {
-                        break;
-                    }
-                    Err(_) => break,
-                }
-            }
-            all_frames
-        }
-
-        /// Wait until PtyOutput frames contain the expected marker string.
-        /// Retries up to `max_attempts` times with `interval_ms` between.
-        fn wait_for_output_containing(
-            stream: &mut std::os::unix::net::UnixStream,
-            hub: &mut Hub,
-            marker: &str,
-            max_attempts: usize,
-            interval_ms: u64,
-        ) -> bool {
-            for _ in 0..max_attempts {
-                settle(hub, interval_ms);
-                let frames = read_frames(stream);
-                for frame in &frames {
-                    if let Frame::PtyOutput { data, .. } = frame {
-                        let text = String::from_utf8_lossy(data);
-                        if text.contains(marker) {
-                            return true;
-                        }
-                    }
-                }
-            }
-            false
-        }
-
-        /// Wait for the terminal scrollback frame for `session_uuid`.
-        fn wait_for_scrollback(
-            stream: &mut std::os::unix::net::UnixStream,
-            hub: &mut Hub,
-            session_uuid: &str,
-            max_attempts: usize,
-            interval_ms: u64,
-        ) -> Option<Frame> {
-            for _ in 0..max_attempts {
-                settle(hub, interval_ms);
-                let frames = read_frames(stream);
-                for frame in frames {
-                    if let Frame::Scrollback {
-                        session_uuid: got, ..
-                    } = &frame
-                    {
-                        if got == session_uuid {
-                            return Some(frame);
-                        }
-                    }
-                }
-            }
-            None
-        }
-
-        // ============================================================
-        // Phase 1: Hub A — real bash, real I/O
-        // ============================================================
-
-        let mut hub_a = Hub::with_runtime(test_config(), shared_test_runtime()).unwrap();
-        hub_a.hub_identifier = test_hub_id.clone();
-        init_hub_with_lua(&mut hub_a);
-        hub_a
-            .start_socket_server()
-            .expect("Hub A should start socket server");
-
-        let sock_path = daemon::socket_path(&test_hub_id).unwrap();
-
-        let pty_handle_a = Arc::new(std::sync::Mutex::new(None));
-        let (session_a, _pty_session_a, stop_a) =
-            spawn_real_session("sess-reboot-001", &pty_handle_a);
-        hub_a.handle_cache.add_session(session_a);
-
-        // Wait for bash to start and produce its initial prompt
-        settle(&mut hub_a, 300);
-
-        // Connect socket client
-        let mut client_a =
-            std::os::unix::net::UnixStream::connect(&sock_path).expect("[Phase 1] connect failed");
-        client_a
-            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
-            .unwrap();
-        settle(&mut hub_a, 100);
-
-        assert!(
-            !hub_a.socket_clients.is_empty(),
-            "[Phase 1] no socket client after connect"
-        );
-
-        // Subscribe to hub channel
-        client_a
-            .write_all(
-                &Frame::Json(serde_json::json!({
-                    "type": "subscribe",
-                    "channel": "hub",
-                    "subscriptionId": "tui_hub"
-                }))
-                .encode(),
-            )
-            .unwrap();
-        settle(&mut hub_a, 100);
-
-        // Subscribe to terminal channel — Lua creates the socket PTY forwarder
-        client_a
-            .write_all(
-                &Frame::Json(serde_json::json!({
-                    "type": "subscribe",
-                    "channel": "terminal",
-                    "subscriptionId": "tui:sess-reboot-001",
-                    "params": {
-                        "session_uuid": "sess-reboot-001",
-                        "rows": 24,
-                        "cols": 80
-                    }
-                }))
-                .encode(),
-            )
-            .unwrap();
-        settle(&mut hub_a, 200);
-
-        let scrollback_a =
-            wait_for_scrollback(&mut client_a, &mut hub_a, "sess-reboot-001", 20, 100)
-                .expect("[Phase 1] expected terminal scrollback after subscribe");
-        match scrollback_a {
-            Frame::Scrollback {
-                rows, cols, data, ..
-            } => {
-                assert_eq!(
-                    (rows, cols),
-                    (24, 80),
-                    "[Phase 1] unexpected scrollback dims"
-                );
-                // Scrollback is empty: test PtyHandle has no session process,
-                // so get_snapshot() returns empty bytes. Live output still
-                // flows through the broadcast channel.
-                let _ = data;
-            }
-            other => panic!("[Phase 1] expected Scrollback frame, got {other:?}"),
-        }
-
-        // Send real input to bash: echo a unique marker
-        let marker_a = format!("REBOOT_TEST_{}", std::process::id());
-        client_a
-            .write_all(
-                &Frame::PtyInput {
-                    session_uuid: "sess-reboot-001".to_string(),
-                    data: format!("echo {marker_a}\n").into_bytes(),
-                }
-                .encode(),
-            )
-            .unwrap();
-
-        // Wait for bash to echo our marker back through the full pipeline:
-        // bash output → master FD → reader thread → broadcast →
-        // PtyEvent::Output broadcast → socket forwarder → Frame::PtyOutput → client
-        let found_a = wait_for_output_containing(
-            &mut client_a,
-            &mut hub_a,
-            &marker_a,
-            20,  // up to 20 attempts
-            100, // 100ms between
-        );
-        assert!(
-            found_a,
-            "[Phase 1] never received marker '{marker_a}' in PtyOutput frames \
-             — real bash echo did not round-trip through hub"
-        );
-
-        // Verify input was registered on the PTY handle
-        let session_handle_a = hub_a
-            .handle_cache
-            .get_session("sess-reboot-001")
-            .expect("[Phase 1] session not in handle_cache");
-        assert!(
-            session_handle_a.pty().last_human_input_ms() > 0,
-            "[Phase 1] last_human_input_ms should be > 0 after real input"
-        );
-
-        // ============================================================
-        // Phase 2: Hub A shuts down (reboot)
-        // ============================================================
-
-        drop(client_a);
-        stop_a.store(true, Ordering::Relaxed);
-        drop(session_handle_a);
-        hub_a.shutdown();
-        drop(hub_a);
-
-        assert!(
-            !sock_path.exists(),
-            "Socket should be cleaned up after shutdown"
-        );
-
-        // ============================================================
-        // Phase 3: Hub B boots — fresh bash, same flow
-        // ============================================================
-
-        let mut hub_b = Hub::with_runtime(test_config(), shared_test_runtime()).unwrap();
-        hub_b.hub_identifier = test_hub_id.clone();
-        init_hub_with_lua(&mut hub_b);
-        hub_b
-            .start_socket_server()
-            .expect("Hub B should start after reboot");
-
-        let pty_handle_b = Arc::new(std::sync::Mutex::new(None));
-        let (session_b, _pty_session_b, stop_b) =
-            spawn_real_session("sess-reboot-002", &pty_handle_b);
-        hub_b.handle_cache.add_session(session_b);
-
-        settle(&mut hub_b, 300);
-
-        let mut client_b =
-            std::os::unix::net::UnixStream::connect(&sock_path).expect("[Phase 2] connect failed");
-        client_b
-            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
-            .unwrap();
-        settle(&mut hub_b, 100);
-
-        assert!(
-            !hub_b.socket_clients.is_empty(),
-            "[Phase 2] no socket client after connect"
-        );
-
-        client_b
-            .write_all(
-                &Frame::Json(serde_json::json!({
-                    "type": "subscribe",
-                    "channel": "hub",
-                    "subscriptionId": "tui_hub"
-                }))
-                .encode(),
-            )
-            .unwrap();
-        settle(&mut hub_b, 100);
-
-        client_b
-            .write_all(
-                &Frame::Json(serde_json::json!({
-                    "type": "subscribe",
-                    "channel": "terminal",
-                    "subscriptionId": "tui:sess-reboot-002",
-                    "params": {
-                        "session_uuid": "sess-reboot-002",
-                        "rows": 24,
-                        "cols": 80
-                    }
-                }))
-                .encode(),
-            )
-            .unwrap();
-        settle(&mut hub_b, 200);
-
-        let scrollback_b =
-            wait_for_scrollback(&mut client_b, &mut hub_b, "sess-reboot-002", 20, 100)
-                .expect("[Phase 2] expected terminal scrollback after subscribe");
-        match scrollback_b {
-            Frame::Scrollback {
-                rows, cols, data, ..
-            } => {
-                assert_eq!(
-                    (rows, cols),
-                    (24, 80),
-                    "[Phase 2] unexpected scrollback dims"
-                );
-                // Scrollback is empty: test PtyHandle has no session process.
-                let _ = data;
-            }
-            other => panic!("[Phase 2] expected Scrollback frame, got {other:?}"),
-        }
-
-        let marker_b = format!("REBOOT_PHASE2_{}", std::process::id());
-        client_b
-            .write_all(
-                &Frame::PtyInput {
-                    session_uuid: "sess-reboot-002".to_string(),
-                    data: format!("echo {marker_b}\n").into_bytes(),
-                }
-                .encode(),
-            )
-            .unwrap();
-
-        let found_b = wait_for_output_containing(&mut client_b, &mut hub_b, &marker_b, 20, 100);
-        assert!(
-            found_b,
-            "[Phase 2] never received marker '{marker_b}' in PtyOutput frames \
-             — real bash echo did not round-trip through hub after reboot"
-        );
-
-        let session_handle_b = hub_b
-            .handle_cache
-            .get_session("sess-reboot-002")
-            .expect("[Phase 2] session not in handle_cache");
-        assert!(
-            session_handle_b.pty().last_human_input_ms() > 0,
-            "[Phase 2] last_human_input_ms should be > 0 after real input"
-        );
-
-        // ============================================================
-        // Cleanup
-        // ============================================================
-
-        drop(client_b);
-        stop_b.store(true, Ordering::Relaxed);
-        drop(session_handle_b);
-        hub_b.shutdown();
-        drop(hub_b);
-        let _ = std::fs::remove_file(daemon::lock_file_path(&test_hub_id).unwrap());
-        let _ = std::fs::remove_dir(daemon::hub_dir(&test_hub_id).unwrap());
-    }
 }
 
 /// Write 1 byte to a wake pipe fd to unblock a `libc::poll()` waiter.
 ///
 /// Pipe writes ≤ PIPE_BUF bytes are atomic per POSIX, so this is safe
-/// to call from any thread (Hub main thread or tokio forwarder tasks).
+/// to call from any thread (Hub main thread or client/session worker tasks).
 pub(crate) fn wake_tui_pipe(fd: std::os::unix::io::RawFd) {
     unsafe {
         libc::write(fd, [1u8].as_ptr() as *const libc::c_void, 1);

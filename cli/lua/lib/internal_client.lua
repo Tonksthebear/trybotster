@@ -21,7 +21,7 @@ local function make_transport(holder)
         send_binary = function(data)
             holder.binary[#holder.binary + 1] = data
         end,
-        create_pty_forwarder = function()
+        subscribe_terminal = function()
             return {
                 stop = function() end,
                 is_active = function() return false end,

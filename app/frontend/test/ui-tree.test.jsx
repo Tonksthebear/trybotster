@@ -39,6 +39,7 @@ class FakeTransport {
   constructor() {
     this._listeners = new Map()
     this.sendCommand = vi.fn(async () => true)
+    this.requestEntitySnapshots = vi.fn(async () => true)
     this.send = this.sendCommand
   }
   on(event, callback) {
@@ -115,6 +116,33 @@ describe('<UiTree>', () => {
       })
     })
     expect(await screen.findByText('hello world')).toBeInTheDocument()
+  })
+
+  it('requests entity snapshots named by surface bindings', async () => {
+    const boundTree = {
+      type: 'list',
+      children: [{
+        $kind: 'bind_list',
+        source: '/project-pipelines.ticket',
+        item_template: {
+          type: 'text',
+          props: { text: { $bind: '@/title' } },
+        },
+      }],
+    }
+
+    render(<UiTree hubId="hub-1" targetSurface="pipelines" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'pipelines',
+        tree: boundTree,
+      })
+    })
+
+    expect(fakeTransport.requestEntitySnapshots).toHaveBeenCalledWith([
+      'project-pipelines.ticket',
+    ])
   })
 
   it('hydrates from the cached tree when a surface remounts', async () => {
@@ -546,12 +574,10 @@ describe('<UiTree> interceptor context', () => {
 describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
   it('sends surface.subpath on first mount', async () => {
     // UiTree always announces its current (surface, subpath) to the hub on
-    // mount. The subscribe envelope also primes `surface_subpaths` server-
-    // side, so repeating the value is a no-op on the hub
-    // (`set_surface_subpath` early-returns on identical subpath). The fresh
-    // mount send is what keeps cross-Route boundary navigation correct —
-    // HubShow → DynamicSurface mounts a NEW UiTree instance for a new
-    // surface, and the hub must hear about it.
+    // mount. This is the explicit surface-tree request path; hub subscribe
+    // only opens the channel. The fresh mount send is what keeps cross-Route
+    // boundary navigation correct — HubShow → DynamicSurface mounts a NEW
+    // UiTree instance for a new surface, and the hub must hear about it.
     render(
       <UiTree hubId="hub-1" targetSurface="kanban" subpath="/board/42" />,
     )
@@ -576,8 +602,8 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
   // transport.sendCommand returns a rejecting Promise when the DataChannel isn't
   // open yet. `void transport.sendCommand(...)` swallows the return value but the
   // rejection still fires as an unhandled rejection. UiTree must attach a
-  // .catch handler so the rejection is consumed — the subscribe envelope
-  // already primed the hub and the next nav will re-fire.
+  // .catch handler so the rejection is consumed; the next nav will re-fire the
+  // explicit surface request.
   it('handles a rejecting transport command without raising unhandled rejection', async () => {
     const rejected = Promise.reject(new Error('DataChannel closed'))
     // Keep the rejection plumbing: attach a noop catch to the PROMISE WE

@@ -19,6 +19,7 @@ fn lua_src_dir() -> PathBuf {
 fn new_lua() -> Lua {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
+    botster::lua::primitives::hook_timeout::register(&lua).expect("register hook timeout");
 
     let dir = lua_src_dir();
     lua.load(format!(
@@ -103,6 +104,43 @@ fn handler_exception_is_reported_while_other_handlers_continue() {
         )
         .eval()
         .expect("handler exception should be isolated");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn plugin_owned_handler_timeout_is_reported_while_other_handlers_continue() {
+    let lua = new_lua();
+
+    let result: String = lua
+        .load(
+            r#"
+            local action = require("lib.action")
+            action._reset_for_tests()
+
+            _G._loading_plugin_key = "slow-plugin"
+            action.on("demo.timeout", "slow", function()
+              while true do end
+            end, { timeout_ms = 5 })
+            _G._loading_plugin_key = nil
+
+            local ran_after = false
+            action.on("demo.timeout", "after", function()
+              ran_after = true
+              return action.HANDLED
+            end)
+
+            local result = action.dispatch({ id = "demo.timeout" }, {})
+            assert(ran_after == true)
+            assert(result.handled == true)
+            assert(result.ok == false)
+            assert(result.via == "handler")
+            assert(string.find(result.error, "timeout", 1, true) ~= nil)
+            return "ok"
+            "#,
+        )
+        .eval()
+        .expect("plugin handler timeout should be isolated");
 
     assert_eq!(result, "ok");
 }

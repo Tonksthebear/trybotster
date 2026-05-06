@@ -16,6 +16,7 @@ let instance = null
 // WebRTC transport (lazily imported)
 let webrtcTransport = null
 const CRYPTO_INIT_TIMEOUT_MS = 30000
+const CRYPTO_WORKER_VERSION = "20260505-shared-ready-v2"
 
 class WorkerBridge {
   // Crypto SharedWorker
@@ -64,16 +65,11 @@ class WorkerBridge {
       // This stays a SharedWorker so tabs share one encryption chain. Keep it
       // in classic mode: the worker has no static imports, and Safari has been
       // more reliable booting classic SharedWorkers than module workers here.
-      this.#cryptoWorker = new SharedWorker(cryptoWorkerUrl, { name: "vodozemac-crypto" })
-      this.#cryptoWorkerPort = this.#cryptoWorker.port
-      this.#cryptoWorkerPort.onmessage = (e) => this.#handleCryptoMessage(e)
-      this.#cryptoWorkerPort.onmessageerror = (e) => {
-        console.error("[WorkerBridge] Crypto worker message error:", e)
+      if (typeof SharedWorker !== "function") {
+        throw new Error("SharedWorker is required for crypto ratchet coordination")
       }
-      this.#cryptoWorker.onerror = (e) => {
-        console.error("[WorkerBridge] Crypto worker error:", e)
-      }
-      this.#cryptoWorkerPort.start()
+
+      this.#attachCryptoWorker(cryptoWorkerUrl)
       this.#cryptoReadyPromise = this.#waitForCryptoReady()
       await this.#cryptoReadyPromise
 
@@ -113,9 +109,49 @@ class WorkerBridge {
       this.#initialized = true
     } catch (error) {
       console.error("[WorkerBridge] Failed to initialize:", error)
+      this.#disposeCryptoWorker()
       this.#initPromise = null
       throw error
     }
+  }
+
+  #attachCryptoWorker(cryptoWorkerUrl) {
+    const versionedUrl = this.#versionedCryptoWorkerUrl(cryptoWorkerUrl)
+    this.#cryptoWorker = new SharedWorker(versionedUrl, {
+      name: `vodozemac-crypto-${CRYPTO_WORKER_VERSION}`,
+    })
+    this.#cryptoWorkerPort = this.#cryptoWorker.port
+    this.#installCryptoMessageHandlers()
+    this.#cryptoWorkerPort.start()
+  }
+
+  #versionedCryptoWorkerUrl(cryptoWorkerUrl) {
+    const url = new URL(cryptoWorkerUrl, window.location.href)
+    url.searchParams.set("v", CRYPTO_WORKER_VERSION)
+    return url.toString()
+  }
+
+  #installCryptoMessageHandlers() {
+    this.#cryptoWorkerPort.onmessage = (e) => this.#handleCryptoMessage(e)
+    this.#cryptoWorkerPort.onmessageerror = (e) => {
+      console.error("[WorkerBridge] Crypto SharedWorker message error:", e)
+    }
+    this.#cryptoWorker.onerror = (e) => {
+      console.error("[WorkerBridge] Crypto SharedWorker error:", e)
+    }
+  }
+
+  #disposeCryptoWorker() {
+    try {
+      this.#cryptoWorkerPort?.close?.()
+    } catch (_) {}
+
+    this.#cryptoWorker = null
+    this.#cryptoWorkerPort = null
+    this.#cryptoReadyPromise = null
+    this.#cryptoReady = false
+    this.#cryptoReadyInfo = null
+    this.#cryptoReadyResolvers.clear()
   }
 
   /**

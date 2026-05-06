@@ -353,7 +353,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_panel_is_idle() {
+    fn new_panel_has_no_active_session() {
         let panel = TerminalPanel::new(24, 80);
         assert_eq!(panel.state(), PanelState::Idle);
         assert_eq!(panel.dims(), (24, 80));

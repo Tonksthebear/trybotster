@@ -1,8 +1,13 @@
 # Shadow Screen Removal Refactor Plan
 
 **Date**: 2026-03-10
-**Status**: Draft
+**Status**: Historical draft; not the current terminal data-plane contract
 **Author**: Refactoring analysis
+
+Current Botster terminal ownership is defined in
+[`../worker-actor-contracts.md`](../worker-actor-contracts.md). Treat this file
+as historical context for shadow-screen removal only; do not infer current hub,
+client-worker, or session-I/O routing rules from its data-flow diagrams.
 
 ## Executive Summary
 
@@ -42,7 +47,7 @@ PtyHandle::feed_broker_output()
     |         +---> event_tx.send(PtyEvent::Output(data))
     |
     v
-Clients (TUI panel, WebRTC forwarder, socket forwarder)
+Clients (TUI panel, WebRTC terminal subscription, socket terminal subscription)
 each receive PtyEvent::Output and parse bytes independently
 ```
 

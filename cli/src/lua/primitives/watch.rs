@@ -48,6 +48,15 @@ struct WatchEntry {
     watcher: FileWatcher,
     /// Lua registry key for the callback function.
     callback_key: LuaRegistryKey,
+    /// Plugin that owns this callback, when registered during plugin load.
+    owner_plugin: Option<String>,
+    /// Stable per-plugin handler id used to invoke this callback in a worker VM.
+    handler_id: Option<String>,
+    /// Whether the callback should cross the plugin worker bridge when fired.
+    ///
+    /// Hub-side plugin registrations route through the bridge. Worker-side
+    /// registrations keep the same stable handler id but execute locally.
+    route_to_worker: bool,
     /// Optional glob pattern for filtering events.
     glob: Option<GlobMatcher>,
     /// Blocking forwarder task handle (event-driven mode).
@@ -74,6 +83,9 @@ pub struct WatcherEntries {
     entries: HashMap<String, WatchEntry>,
     /// Counter for generating unique watch IDs.
     next_id: u64,
+    /// Per-plugin stable handler id counters. Kept separate from `next_id`
+    /// so hub and worker VMs derive matching handler ids while loading a plugin.
+    plugin_handler_counters: HashMap<String, u64>,
     /// Hub event channel for event-driven delivery.
     ///
     /// When set, new watches spawn a blocking forwarder task that sends
@@ -123,6 +135,53 @@ impl WatcherEntries {
             // entry.watcher drops here, closing the sender
         }
     }
+
+    fn next_plugin_handler_id(&mut self, owner: &str) -> String {
+        let next = self
+            .plugin_handler_counters
+            .entry(owner.to_string())
+            .or_insert(0);
+        let handler_id = format!("{owner}:watch_{next}");
+        *next += 1;
+        handler_id
+    }
+
+    fn unregister_by_plugin(&mut self, lua: &Lua, plugin_key: &str) -> usize {
+        if plugin_key.is_empty() {
+            return 0;
+        }
+
+        let mut removed = Vec::new();
+        let ids: Vec<String> = self
+            .entries
+            .iter()
+            .filter_map(|(id, entry)| {
+                (entry.owner_plugin.as_deref() == Some(plugin_key)).then(|| id.clone())
+            })
+            .collect();
+
+        for id in ids {
+            if let Some(entry) = self.entries.remove(&id) {
+                if let Some(handle) = entry.forwarder_handle {
+                    handle.abort();
+                }
+                removed.push((id, entry.callback_key));
+            }
+        }
+
+        let count = removed.len();
+        for (id, key) in removed {
+            if let Err(e) = lua.remove_registry_value(key) {
+                log::warn!("[watch] Failed to remove callback for {}: {}", id, e);
+            }
+            log::debug!(
+                "[watch] Unregistered watch '{}' for plugin '{}'",
+                id,
+                plugin_key
+            );
+        }
+        count
+    }
 }
 
 /// Thread-safe handle to the watcher registry.
@@ -143,6 +202,49 @@ fn kind_to_str(kind: FileEventKind) -> &'static str {
         FileEventKind::Delete => "delete",
         FileEventKind::Other => "other",
     }
+}
+
+fn current_plugin_key(lua: &Lua) -> Option<String> {
+    let globals = lua.globals();
+    globals
+        .get::<Option<String>>("_loading_plugin_key")
+        .ok()
+        .flatten()
+        .or_else(|| {
+            globals
+                .get::<Option<String>>("_loading_plugin_name")
+                .ok()
+                .flatten()
+        })
+        .filter(|key| !key.is_empty())
+}
+
+fn is_plugin_worker_load(lua: &Lua) -> bool {
+    lua.globals()
+        .get::<Option<bool>>("_loading_plugin_worker")
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
+fn invoke_plugin_watch(
+    lua: &Lua,
+    owner_plugin: &str,
+    handler_id: &str,
+    event_table: LuaTable,
+) -> LuaResult<()> {
+    let invoke: LuaFunction = lua.globals().get("__plugin_worker_invoke")?;
+    let payload = lua.create_table()?;
+    payload.set("event", event_table)?;
+    invoke.call::<LuaValue>((
+        owner_plugin.to_string(),
+        "watch".to_string(),
+        handler_id.to_string(),
+        Option::<String>::None,
+        payload,
+        5000_u64,
+    ))?;
+    Ok(())
 }
 
 /// Register watch primitives with the Lua state.
@@ -245,6 +347,11 @@ pub fn register(lua: &Lua, registry: WatcherRegistry) -> Result<()> {
             let mut entries = reg.lock().expect("WatcherEntries mutex poisoned");
             let id = format!("watch_{}", entries.next_id);
             entries.next_id += 1;
+            let owner_plugin = current_plugin_key(lua);
+            let handler_id = owner_plugin
+                .as_deref()
+                .map(|owner| entries.next_plugin_handler_id(owner));
+            let route_to_worker = owner_plugin.is_some() && !is_plugin_worker_load(lua);
 
             // Spawn a blocking forwarder task if the event channel and tokio
             // handle are available. Uses the stored handle because this may
@@ -289,6 +396,9 @@ pub fn register(lua: &Lua, registry: WatcherRegistry) -> Result<()> {
                 WatchEntry {
                     watcher,
                     callback_key,
+                    owner_plugin,
+                    handler_id,
+                    route_to_worker,
                     glob,
                     forwarder_handle,
                 },
@@ -311,7 +421,7 @@ pub fn register(lua: &Lua, registry: WatcherRegistry) -> Result<()> {
         .map_err(|e| anyhow!("Failed to set watch.directory: {e}"))?;
 
     // watch.unwatch(watch_id) -> boolean
-    let reg2 = registry;
+    let reg2 = Arc::clone(&registry);
     let unwatch_fn = lua
         .create_function(move |lua, watch_id: String| {
             let mut entries = reg2.lock().expect("WatcherEntries mutex poisoned");
@@ -338,6 +448,52 @@ pub fn register(lua: &Lua, registry: WatcherRegistry) -> Result<()> {
         .set("unwatch", unwatch_fn)
         .map_err(|e| anyhow!("Failed to set watch.unwatch: {e}"))?;
 
+    // watch._unregister_by_plugin(plugin_key) -> removed count
+    let reg3 = Arc::clone(&registry);
+    let unregister_by_plugin_fn = lua
+        .create_function(move |lua, plugin_key: String| {
+            let mut entries = reg3.lock().expect("WatcherEntries mutex poisoned");
+            Ok(entries.unregister_by_plugin(lua, &plugin_key))
+        })
+        .map_err(|e| anyhow!("Failed to create watch._unregister_by_plugin function: {e}"))?;
+
+    watch_table
+        .set("_unregister_by_plugin", unregister_by_plugin_fn)
+        .map_err(|e| anyhow!("Failed to set watch._unregister_by_plugin: {e}"))?;
+
+    // watch._invoke_registered(handler_id, event) invokes a callback inside a
+    // plugin worker VM by stable handler id.
+    let reg4 = Arc::clone(&registry);
+    let invoke_registered_fn = lua
+        .create_function(move |lua, (handler_id, event): (String, LuaValue)| {
+            let callback_key = {
+                let entries = reg4.lock().expect("WatcherEntries mutex poisoned");
+                let Some(entry) = entries
+                    .entries
+                    .values()
+                    .find(|entry| entry.handler_id.as_deref() == Some(handler_id.as_str()))
+                else {
+                    return Err(LuaError::external(format!(
+                        "watch handler not registered: {handler_id}"
+                    )));
+                };
+                let callback: LuaFunction = lua.registry_value(&entry.callback_key)?;
+                lua.create_registry_value(callback)?
+            };
+
+            let result = (|| {
+                let callback: LuaFunction = lua.registry_value(&callback_key)?;
+                callback.call::<()>(event)
+            })();
+            let _ = lua.remove_registry_value(callback_key);
+            result
+        })
+        .map_err(|e| anyhow!("Failed to create watch._invoke_registered function: {e}"))?;
+
+    watch_table
+        .set("_invoke_registered", invoke_registered_fn)
+        .map_err(|e| anyhow!("Failed to set watch._invoke_registered: {e}"))?;
+
     lua.globals()
         .set("watch", watch_table)
         .map_err(|e| anyhow!("Failed to register watch table globally: {e}"))?;
@@ -349,9 +505,19 @@ pub fn register(lua: &Lua, registry: WatcherRegistry) -> Result<()> {
 /// dispatch after the lock is released.
 struct PendingEvent {
     watch_id: String,
-    callback_key_index: usize,
+    callback: PendingWatchCallback,
     path: String,
     kind: &'static str,
+}
+
+enum PendingWatchCallback {
+    Local {
+        callback_key_index: usize,
+    },
+    Plugin {
+        owner_plugin: String,
+        handler_id: String,
+    },
 }
 
 /// Poll all user file watches, fire Lua callbacks, and notify hook observers.
@@ -386,19 +552,32 @@ pub fn poll_user_watches(lua: &Lua, registry: &WatcherRegistry) -> usize {
                 continue;
             }
 
-            // Clone the callback registry key once per watch that has events.
-            // We store the index into `keys` so PendingEvent stays lightweight.
-            let key_index = keys.len();
-            // Create a Lua reference to the same callback function
-            if let Ok(callback) = lua.registry_value::<LuaFunction>(&entry.callback_key) {
-                if let Ok(key) = lua.create_registry_value(callback) {
+            let callback = match (
+                &entry.owner_plugin,
+                &entry.handler_id,
+                entry.route_to_worker,
+            ) {
+                (Some(owner_plugin), Some(handler_id), true) => PendingWatchCallback::Plugin {
+                    owner_plugin: owner_plugin.clone(),
+                    handler_id: handler_id.clone(),
+                },
+                _ => {
+                    // Clone the callback registry key once per watch that has events.
+                    // We store the index into `keys` so PendingEvent stays lightweight.
+                    let key_index = keys.len();
+                    let Ok(callback) = lua.registry_value::<LuaFunction>(&entry.callback_key)
+                    else {
+                        continue;
+                    };
+                    let Ok(key) = lua.create_registry_value(callback) else {
+                        continue;
+                    };
                     keys.push(key);
-                } else {
-                    continue;
+                    PendingWatchCallback::Local {
+                        callback_key_index: key_index,
+                    }
                 }
-            } else {
-                continue;
-            }
+            };
 
             for event in events {
                 if event.kind == FileEventKind::Other {
@@ -418,7 +597,20 @@ pub fn poll_user_watches(lua: &Lua, registry: &WatcherRegistry) -> usize {
 
                 pending.push(PendingEvent {
                     watch_id: watch_id.clone(),
-                    callback_key_index: key_index,
+                    callback: match &callback {
+                        PendingWatchCallback::Local { callback_key_index } => {
+                            PendingWatchCallback::Local {
+                                callback_key_index: *callback_key_index,
+                            }
+                        }
+                        PendingWatchCallback::Plugin {
+                            owner_plugin,
+                            handler_id,
+                        } => PendingWatchCallback::Plugin {
+                            owner_plugin: owner_plugin.clone(),
+                            handler_id: handler_id.clone(),
+                        },
+                    },
                     path: event.path.to_string_lossy().to_string(),
                     kind: kind_to_str(event.kind),
                 });
@@ -439,9 +631,19 @@ pub fn poll_user_watches(lua: &Lua, registry: &WatcherRegistry) -> usize {
             event_table.set("kind", event.kind)?;
             event_table.set("watch_id", event.watch_id.clone())?;
 
-            let callback: LuaFunction =
-                lua.registry_value(&callback_keys[event.callback_key_index])?;
-            callback.call::<()>(event_table.clone())?;
+            match &event.callback {
+                PendingWatchCallback::Local { callback_key_index } => {
+                    let callback: LuaFunction =
+                        lua.registry_value(&callback_keys[*callback_key_index])?;
+                    callback.call::<()>(event_table.clone())?;
+                }
+                PendingWatchCallback::Plugin {
+                    owner_plugin,
+                    handler_id,
+                } => {
+                    invoke_plugin_watch(lua, owner_plugin, handler_id, event_table.clone())?;
+                }
+            }
 
             // Also fire hooks.notify("file_changed", event) for the hook system
             let hooks_result: LuaResult<()> = (|| {
@@ -497,22 +699,32 @@ pub fn fire_user_watch_events(
     events: Vec<crate::file_watcher::FileEvent>,
 ) -> usize {
     // Phase 1: read glob + clone callback key under lock.
-    let (glob, callback_key) = {
+    let (glob, owner_plugin, handler_id, route_to_worker, callback_key) = {
         let entries = registry.lock().expect("WatcherEntries mutex poisoned");
         let Some(entry) = entries.entries.get(watch_id) else {
             return 0; // Watch was removed between event and dispatch
         };
 
         let glob = entry.glob.as_ref().map(|g| g.clone());
-        let key = match lua.registry_value::<LuaFunction>(&entry.callback_key) {
-            Ok(cb) => match lua.create_registry_value(cb) {
-                Ok(k) => k,
+        let callback_key = if entry.route_to_worker {
+            None
+        } else {
+            match lua.registry_value::<LuaFunction>(&entry.callback_key) {
+                Ok(cb) => match lua.create_registry_value(cb) {
+                    Ok(k) => Some(k),
+                    Err(_) => return 0,
+                },
                 Err(_) => return 0,
-            },
-            Err(_) => return 0,
+            }
         };
 
-        (glob, key)
+        (
+            glob,
+            entry.owner_plugin.clone(),
+            entry.handler_id.clone(),
+            entry.route_to_worker,
+            callback_key,
+        )
     };
     // Lock released — safe to call Lua.
 
@@ -541,8 +753,16 @@ pub fn fire_user_watch_events(
             event_table.set("kind", kind_to_str(event.kind))?;
             event_table.set("watch_id", watch_id)?;
 
-            let callback: LuaFunction = lua.registry_value(&callback_key)?;
-            callback.call::<()>(event_table.clone())?;
+            match (&owner_plugin, &handler_id, route_to_worker, &callback_key) {
+                (Some(owner_plugin), Some(handler_id), true, _) => {
+                    invoke_plugin_watch(lua, owner_plugin, handler_id, event_table.clone())?;
+                }
+                (_, _, _, Some(callback_key)) => {
+                    let callback: LuaFunction = lua.registry_value(callback_key)?;
+                    callback.call::<()>(event_table.clone())?;
+                }
+                _ => {}
+            }
 
             // Fire hooks.notify("file_changed", event) for the hook system.
             let hooks_result: LuaResult<()> = (|| {
@@ -573,7 +793,9 @@ pub fn fire_user_watch_events(
     }
 
     // Clean up temporary registry key.
-    let _ = lua.remove_registry_value(callback_key);
+    if let Some(callback_key) = callback_key {
+        let _ = lua.remove_registry_value(callback_key);
+    }
 
     fired
 }

@@ -320,13 +320,13 @@ mod tests {
                 json!({
                     "session_uuid": "sess-a",
                     "title": "alpha",
-                    "is_idle": false,
+                    "output_activity": "active",
                     "plugin_state": { "example_provider": { "status": "running", "url": "https://x" } }
                 }),
                 json!({
                     "session_uuid": "sess-b",
                     "title": "beta",
-                    "is_idle": true
+                    "output_activity": "idle"
                 }),
             ],
             "session_uuid",
@@ -367,7 +367,7 @@ mod tests {
         let mut value = json!({ "$bind": "/session/sess-a" });
         resolve_bindings(&mut value, &stores);
         assert_eq!(value["title"], json!("alpha"));
-        assert_eq!(value["is_idle"], json!(false));
+        assert_eq!(value["output_activity"], json!("active"));
         assert_eq!(
             value["plugin_state"]["example_provider"]["status"],
             json!("running")

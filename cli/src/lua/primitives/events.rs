@@ -41,7 +41,23 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
-use mlua::prelude::*;
+use mlua::{prelude::*, Value};
+
+#[derive(Debug)]
+struct EventCallbackEntry {
+    id: EventCallbackId,
+    callback_key: LuaRegistryKey,
+    owner_plugin: Option<String>,
+    handler_id: Option<String>,
+}
+
+pub(crate) enum FiredEvent {
+    Local(LuaRegistryKey),
+    Plugin {
+        owner_plugin: String,
+        handler_id: String,
+    },
+}
 
 /// Unique identifier for an event subscription.
 pub type EventCallbackId = String;
@@ -52,10 +68,13 @@ pub type EventCallbackId = String;
 /// Each event name maps to a list of (callback_id, registry_key) pairs.
 #[derive(Default)]
 pub struct EventCallbacks {
-    /// Map of event name -> list of (callback_id, registry_key).
-    callbacks: HashMap<String, Vec<(EventCallbackId, LuaRegistryKey)>>,
+    /// Map of event name -> callback entries.
+    callbacks: HashMap<String, Vec<EventCallbackEntry>>,
     /// Counter for generating unique callback IDs.
     next_id: u64,
+    /// Per-plugin stable handler id counters. Kept separate from `next_id`
+    /// so hub and worker VMs derive the same handler ids while loading a plugin.
+    plugin_handler_counters: HashMap<String, u64>,
 }
 
 impl std::fmt::Debug for EventCallbacks {
@@ -95,9 +114,13 @@ impl EventCallbacks {
         lua: &Lua,
         event: &str,
         callback: LuaFunction,
+        owner_plugin: Option<String>,
     ) -> Result<EventCallbackId> {
         let id = format!("evt_{}", self.next_id);
         self.next_id += 1;
+        let handler_id = owner_plugin
+            .as_deref()
+            .map(|owner| self.next_plugin_handler_id(owner));
 
         let key = lua
             .create_registry_value(callback)
@@ -106,7 +129,12 @@ impl EventCallbacks {
         self.callbacks
             .entry(event.to_string())
             .or_default()
-            .push((id.clone(), key));
+            .push(EventCallbackEntry {
+                id: id.clone(),
+                callback_key: key,
+                owner_plugin,
+                handler_id,
+            });
 
         log::debug!("Registered event callback '{}' for '{}'", id, event);
         Ok(id)
@@ -126,10 +154,13 @@ impl EventCallbacks {
         let mut keys_to_remove = Vec::new();
         for callbacks in self.callbacks.values_mut() {
             // Find index of matching callback
-            if let Some(idx) = callbacks.iter().position(|(id, _)| id == subscription_id) {
+            if let Some(idx) = callbacks
+                .iter()
+                .position(|entry| entry.id == subscription_id)
+            {
                 // Remove from Vec and collect the key
-                let (id, key) = callbacks.remove(idx);
-                keys_to_remove.push((id, key));
+                let entry = callbacks.remove(idx);
+                keys_to_remove.push((entry.id, entry.callback_key));
             }
         }
 
@@ -149,8 +180,57 @@ impl EventCallbacks {
     pub fn get_callbacks(&self, event: &str) -> Vec<&LuaRegistryKey> {
         self.callbacks
             .get(event)
-            .map(|v| v.iter().map(|(_, k)| k).collect())
+            .map(|v| v.iter().map(|entry| &entry.callback_key).collect())
             .unwrap_or_default()
+    }
+
+    fn get_entries(&self, event: &str) -> &[EventCallbackEntry] {
+        self.callbacks
+            .get(event)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    fn next_plugin_handler_id(&mut self, owner: &str) -> String {
+        let next = self
+            .plugin_handler_counters
+            .entry(owner.to_string())
+            .or_insert(0);
+        let handler_id = format!("{owner}:event_{next}");
+        *next += 1;
+        handler_id
+    }
+
+    fn unregister_by_plugin(&mut self, lua: &Lua, plugin_key: &str) -> usize {
+        if plugin_key.is_empty() {
+            return 0;
+        }
+
+        let mut removed = Vec::new();
+        for callbacks in self.callbacks.values_mut() {
+            let mut idx = 0;
+            while idx < callbacks.len() {
+                if callbacks[idx].owner_plugin.as_deref() == Some(plugin_key) {
+                    let entry = callbacks.remove(idx);
+                    removed.push((entry.id, entry.callback_key));
+                } else {
+                    idx += 1;
+                }
+            }
+        }
+
+        let count = removed.len();
+        for (id, key) in removed {
+            if let Err(e) = lua.remove_registry_value(key) {
+                log::warn!("Failed to remove registry value for {}: {}", id, e);
+            }
+            log::debug!(
+                "Unregistered event callback '{}' for plugin '{}'",
+                id,
+                plugin_key
+            );
+        }
+        count
     }
 
     /// Check if any callbacks are registered for an event.
@@ -174,6 +254,105 @@ impl EventCallbacks {
             .map(|(k, _)| k.as_str())
             .collect()
     }
+}
+
+fn current_plugin_key(lua: &Lua) -> Option<String> {
+    let globals = lua.globals();
+    globals
+        .get::<Option<String>>("_loading_plugin_key")
+        .ok()
+        .flatten()
+        .or_else(|| {
+            globals
+                .get::<Option<String>>("_loading_plugin_name")
+                .ok()
+                .flatten()
+        })
+        .filter(|key| !key.is_empty())
+}
+
+fn invoke_plugin_event(
+    lua: &Lua,
+    owner_plugin: &str,
+    handler_id: &str,
+    event: &str,
+    data: Value,
+) -> LuaResult<()> {
+    let invoke: LuaFunction = lua.globals().get("__plugin_worker_invoke")?;
+    let payload = lua.create_table()?;
+    payload.set("event", event)?;
+    payload.set("data", data)?;
+    invoke.call::<Value>((
+        owner_plugin.to_string(),
+        "event".to_string(),
+        handler_id.to_string(),
+        Option::<String>::None,
+        payload,
+        5000_u64,
+    ))?;
+    Ok(())
+}
+
+pub(crate) fn collect_event_callbacks(
+    lua: &Lua,
+    callbacks: &SharedEventCallbacks,
+    event: &str,
+) -> Vec<FiredEvent> {
+    let cbs = callbacks.lock().expect("Event callbacks mutex poisoned");
+    cbs.get_entries(event)
+        .iter()
+        .filter_map(|entry| match (&entry.owner_plugin, &entry.handler_id) {
+            (Some(owner_plugin), Some(handler_id)) => Some(FiredEvent::Plugin {
+                owner_plugin: owner_plugin.clone(),
+                handler_id: handler_id.clone(),
+            }),
+            _ => {
+                let callback = lua
+                    .registry_value::<LuaFunction>(&entry.callback_key)
+                    .ok()?;
+                let key = lua.create_registry_value(callback).ok()?;
+                Some(FiredEvent::Local(key))
+            }
+        })
+        .collect()
+}
+
+pub(crate) fn fire_collected_events(
+    lua: &Lua,
+    event: &str,
+    callbacks_to_call: Vec<FiredEvent>,
+    data: Value,
+) -> usize {
+    let mut invoked = 0;
+    let mut local_keys = Vec::new();
+
+    for fired in callbacks_to_call {
+        let result = match fired {
+            FiredEvent::Local(key) => {
+                let result = (|| {
+                    let callback: LuaFunction = lua.registry_value(&key)?;
+                    callback.call::<()>(data.clone())
+                })();
+                local_keys.push(key);
+                result
+            }
+            FiredEvent::Plugin {
+                owner_plugin,
+                handler_id,
+            } => invoke_plugin_event(lua, &owner_plugin, &handler_id, event, data.clone()),
+        };
+
+        match result {
+            Ok(()) => invoked += 1,
+            Err(e) => log::warn!("Event callback for '{}' failed: {}", event, e),
+        }
+    }
+
+    for key in local_keys {
+        let _ = lua.remove_registry_value(key);
+    }
+
+    invoked
 }
 
 /// Shared reference to event callbacks for thread-safe access.
@@ -210,9 +389,10 @@ pub fn register(lua: &Lua, callbacks: SharedEventCallbacks) -> Result<()> {
     let cb = Arc::clone(&callbacks);
     let on_fn = lua
         .create_function(move |lua, (event, callback): (String, LuaFunction)| {
+            let owner_plugin = current_plugin_key(lua);
             let mut cbs = cb.lock().expect("Event callbacks mutex poisoned");
             let id = cbs
-                .register(lua, &event, callback)
+                .register(lua, &event, callback, owner_plugin)
                 .map_err(LuaError::external)?;
             Ok(id)
         })
@@ -249,29 +429,59 @@ pub fn register(lua: &Lua, callbacks: SharedEventCallbacks) -> Result<()> {
         .set("has", has_fn)
         .map_err(|e| anyhow!("Failed to set events.has: {e}"))?;
 
+    // events._unregister_by_plugin(plugin_key) -> removed count
+    let cb_plugin = Arc::clone(&callbacks);
+    let unregister_by_plugin_fn = lua
+        .create_function(move |lua, plugin_key: String| {
+            let mut cbs = cb_plugin.lock().expect("Event callbacks mutex poisoned");
+            Ok(cbs.unregister_by_plugin(lua, &plugin_key))
+        })
+        .map_err(|e| anyhow!("Failed to create events._unregister_by_plugin function: {e}"))?;
+
+    events
+        .set("_unregister_by_plugin", unregister_by_plugin_fn)
+        .map_err(|e| anyhow!("Failed to set events._unregister_by_plugin: {e}"))?;
+
+    // events._invoke_registered(handler_id, data) invokes a callback inside a
+    // plugin worker VM by stable handler id.
+    let cb_invoke = Arc::clone(&callbacks);
+    let invoke_registered_fn = lua
+        .create_function(move |lua, (handler_id, data): (String, Value)| {
+            let callback_key = {
+                let cbs = cb_invoke.lock().expect("Event callbacks mutex poisoned");
+                let Some(entry) = cbs
+                    .callbacks
+                    .values()
+                    .flat_map(|entries| entries.iter())
+                    .find(|entry| entry.handler_id.as_deref() == Some(handler_id.as_str()))
+                else {
+                    return Err(LuaError::external(format!(
+                        "event handler not registered: {handler_id}"
+                    )));
+                };
+                let callback: LuaFunction = lua.registry_value(&entry.callback_key)?;
+                lua.create_registry_value(callback)?
+            };
+
+            let result = (|| {
+                let callback: LuaFunction = lua.registry_value(&callback_key)?;
+                callback.call::<()>(data)
+            })();
+            let _ = lua.remove_registry_value(callback_key);
+            result
+        })
+        .map_err(|e| anyhow!("Failed to create events._invoke_registered function: {e}"))?;
+
+    events
+        .set("_invoke_registered", invoke_registered_fn)
+        .map_err(|e| anyhow!("Failed to set events._invoke_registered: {e}"))?;
+
     // events.emit(event_name, data) -> number of callbacks invoked
     let cb4 = callbacks;
     let emit_fn = lua
         .create_function(move |lua, (event, data): (String, LuaValue)| {
-            // Get callback functions while holding the lock
-            let functions: Vec<LuaFunction> = {
-                let cbs = cb4.lock().expect("Event callbacks mutex poisoned");
-                cbs.get_callbacks(&event)
-                    .iter()
-                    .filter_map(|key| lua.registry_value::<LuaFunction>(*key).ok())
-                    .collect()
-            };
-            // Lock released here
-
-            let mut invoked = 0;
-            for callback in functions {
-                match callback.call::<()>(data.clone()) {
-                    Ok(()) => invoked += 1,
-                    Err(e) => log::warn!("Event callback for '{}' failed: {}", event, e),
-                }
-            }
-
-            Ok(invoked)
+            let callbacks_to_call = collect_event_callbacks(lua, &cb4, &event);
+            Ok(fire_collected_events(lua, &event, callbacks_to_call, data))
         })
         .map_err(|e| anyhow!("Failed to create events.emit function: {e}"))?;
 
@@ -303,7 +513,7 @@ mod tests {
         let mut callbacks = EventCallbacks::new();
 
         let func = lua.create_function(|_, ()| Ok(())).unwrap();
-        let id = callbacks.register(&lua, "test_event", func).unwrap();
+        let id = callbacks.register(&lua, "test_event", func, None).unwrap();
 
         assert!(id.starts_with("evt_"));
         assert_eq!(callbacks.callback_count(), 1);
@@ -317,7 +527,7 @@ mod tests {
         let mut callbacks = EventCallbacks::new();
 
         let func = lua.create_function(|_, ()| Ok(())).unwrap();
-        let id = callbacks.register(&lua, "test_event", func).unwrap();
+        let id = callbacks.register(&lua, "test_event", func, None).unwrap();
 
         assert_eq!(callbacks.callback_count(), 1);
 
@@ -347,9 +557,9 @@ mod tests {
         let func2 = lua.create_function(|_, ()| Ok(())).unwrap();
         let func3 = lua.create_function(|_, ()| Ok(())).unwrap();
 
-        callbacks.register(&lua, "event_a", func1).unwrap();
-        callbacks.register(&lua, "event_b", func2).unwrap();
-        callbacks.register(&lua, "event_a", func3).unwrap();
+        callbacks.register(&lua, "event_a", func1, None).unwrap();
+        callbacks.register(&lua, "event_b", func2, None).unwrap();
+        callbacks.register(&lua, "event_a", func3, None).unwrap();
 
         assert_eq!(callbacks.callback_count(), 3);
         assert_eq!(callbacks.get_callbacks("event_a").len(), 2);
@@ -365,8 +575,8 @@ mod tests {
         let func1 = lua.create_function(|_, ()| Ok(())).unwrap();
         let func2 = lua.create_function(|_, ()| Ok(())).unwrap();
 
-        callbacks.register(&lua, "event_a", func1).unwrap();
-        callbacks.register(&lua, "event_b", func2).unwrap();
+        callbacks.register(&lua, "event_a", func1, None).unwrap();
+        callbacks.register(&lua, "event_b", func2, None).unwrap();
 
         let events = callbacks.registered_events();
         assert!(events.contains(&"event_a"));

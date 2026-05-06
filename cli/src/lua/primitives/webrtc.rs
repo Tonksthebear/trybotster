@@ -189,11 +189,11 @@ mod tests {
     }
 
     /// Wire up an actual channel so send() events are captured.
-    fn setup_with_channel() -> (Lua, tokio::sync::mpsc::UnboundedReceiver<HubEvent>) {
+    fn setup_with_channel() -> (Lua, tokio::sync::mpsc::Receiver<HubEvent>) {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
         register(&lua, tx.clone()).expect("Should register webrtc primitives");
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
         *tx.lock().unwrap() = Some(sender.into());
         (lua, receiver)
     }

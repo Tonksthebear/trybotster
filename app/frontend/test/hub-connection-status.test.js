@@ -9,6 +9,12 @@ describe('resolveHubStatus', () => {
     expect(resolveHubStatus('offline', false)).toBe('offline')
   })
 
+  it('returns "online" when the current Rails hub list says the hub is active', () => {
+    // A stale browser health event can briefly disagree with Rails after
+    // ActionCable reconnects. The current hub list is the server projection.
+    expect(resolveHubStatus('offline', false, true)).toBe('online')
+  })
+
   it('returns "online" when transport reports online', () => {
     expect(resolveHubStatus('online', false)).toBe('online')
     expect(resolveHubStatus('online', true)).toBe('online')

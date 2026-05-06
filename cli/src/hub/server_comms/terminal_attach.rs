@@ -1,4 +1,6 @@
-use super::terminal_stream::TerminalStreamFilter;
+use super::terminal_stream::{
+    TerminalClientSubscription, TerminalInitialSnapshot, TerminalStreamFilter,
+};
 use super::*;
 
 impl Hub {
@@ -66,11 +68,11 @@ impl Hub {
             );
         }
     }
-    pub(super) fn try_attach_terminal_forwarder(
+    pub(super) fn try_attach_browser_terminal_subscription(
         &mut self,
-        req: &crate::lua::CreateForwarderRequest,
+        req: &crate::lua::BrowserTerminalSubscriptionRequest,
     ) -> bool {
-        let forwarder_key = format!("{}:{}", req.peer_id, req.session_uuid);
+        let subscription_key = format!("{}:{}", req.peer_id, req.session_uuid);
 
         let Some(session_handle) = self.handle_cache.get_session(&req.session_uuid) else {
             return false;
@@ -78,11 +80,16 @@ impl Hub {
 
         let pty_handle = session_handle.pty().clone();
 
-        // Abort any existing forwarder for this key.
-        if let Some(old_task) = self.pty_forwarders.remove(&forwarder_key) {
-            old_task.abort();
-            self.unregister_terminal_forwarder_peer(&forwarder_key, false);
-            log::debug!("[Lua] Aborted existing PTY forwarder for {}", forwarder_key);
+        // Stop any existing subscription for this key.
+        if self
+            .terminal_subscription_peers
+            .contains_key(&subscription_key)
+        {
+            self.stop_terminal_subscription(&subscription_key);
+            log::debug!(
+                "[WebRTC] Replaced terminal subscription for {}",
+                subscription_key
+            );
         }
 
         let peer_id = req.peer_id.clone();
@@ -90,34 +97,8 @@ impl Hub {
         let target_rows = req.rows;
         let target_cols = req.cols;
         let prefix = req.prefix.clone().unwrap_or_else(|| vec![0x01]);
-        let active_flag = req.active_flag.clone();
         let active_terminal_peers = Arc::clone(&self.active_terminal_peers);
-        let hub_event_tx = self.hub_event_tx.clone();
-
         let subscription_id = req.subscription_id.clone();
-        let snapshot_request_id = if pty_handle.is_session_backed() {
-            let request_id = Self::next_session_io_request_id("snapshot");
-            if !self.insert_pending_session_io_snapshot(
-                request_id.clone(),
-                crate::hub::PendingSessionIoSnapshot {
-                    session_uuid: session_uuid.clone(),
-                    started_at: Instant::now(),
-                    target: crate::hub::PendingSessionIoSnapshotTarget::WebRtcOutput {
-                        peer_id: peer_id.clone(),
-                        rows: target_rows,
-                        cols: target_cols,
-                        kitty_enabled: pty_handle.kitty_enabled(),
-                        forwarder_key: Some(forwarder_key.clone()),
-                        active_flag: Some(active_flag.clone()),
-                    },
-                },
-            ) {
-                return false;
-            }
-            Some(request_id)
-        } else {
-            None
-        };
 
         let _guard = self.tokio_runtime.enter();
         let Some(worker) = self.browser_client_workers.get(&peer_id).cloned() else {
@@ -127,34 +108,34 @@ impl Hub {
             );
             return false;
         };
-        Self::register_worker_session_io_sender(
-            &worker,
-            &req.session_uuid,
-            pty_handle.clone(),
-            "WebRTC",
-        );
-        let task = Self::spawn_terminal_client_forwarder_runtime(
-            pty_handle,
+        let attached = self.start_terminal_client_subscription(TerminalClientSubscription {
+            pty_handle: pty_handle.clone(),
             worker,
             session_uuid,
             subscription_id,
-            target_rows,
-            target_cols,
-            active_flag,
-            snapshot_request_id,
-            hub_event_tx,
-            "WebRTC",
-            peer_id.clone(),
-            prefix,
-            TerminalStreamFilter::StripOscQueriesWhenInactive {
+            rows: target_rows,
+            cols: target_cols,
+            log_prefix: "WebRTC",
+            client_label: peer_id.clone(),
+            output_prefix: prefix,
+            filter: TerminalStreamFilter::StripOscQueriesWhenInactive {
                 active_terminal_peers,
-                peer_id,
+                peer_id: peer_id.clone(),
             },
-        );
+            initial_snapshot: TerminalInitialSnapshot::PrefixedGzip {
+                subscription_key: subscription_key.clone(),
+            },
+            confirm_subscription: true,
+        });
 
-        self.register_terminal_forwarder_peer(&forwarder_key, &req.session_uuid, &req.peer_id);
-        self.pty_forwarders.insert(forwarder_key, task);
-        true
+        if attached {
+            self.register_terminal_subscription_peer(
+                &subscription_key,
+                &req.session_uuid,
+                &req.peer_id,
+            );
+        }
+        attached
     }
 
     pub(super) fn process_pending_terminal_attaches(&mut self) {
@@ -218,10 +199,14 @@ impl Hub {
         request: &PendingTerminalAttachRequest,
     ) -> bool {
         match request {
-            PendingTerminalAttachRequest::WebRtc(req) => self.try_attach_terminal_forwarder(req),
-            PendingTerminalAttachRequest::Tui(req) => self.try_attach_tui_terminal_forwarder(req),
+            PendingTerminalAttachRequest::WebRtc(req) => {
+                self.try_attach_browser_terminal_subscription(req)
+            }
+            PendingTerminalAttachRequest::Tui(req) => {
+                self.try_attach_tui_terminal_subscription(req)
+            }
             PendingTerminalAttachRequest::Socket(req) => {
-                self.try_attach_socket_terminal_forwarder(req)
+                self.try_attach_socket_terminal_subscription(req)
             }
         }
     }
@@ -241,8 +226,8 @@ impl Hub {
                 );
             }
             PendingTerminalAttachRequest::Tui(req) => {
-                let forwarder_key = format!("tui:{}", req.session_uuid);
-                if let Some(worker) = self.terminal_client_workers.get(&forwarder_key) {
+                let subscription_key = format!("tui:{}", req.session_uuid);
+                if let Some(worker) = self.terminal_client_workers.get(&subscription_key) {
                     Self::send_worker_terminal_attach_state(
                         worker,
                         &req.subscription_id,
@@ -252,8 +237,8 @@ impl Hub {
                 }
             }
             PendingTerminalAttachRequest::Socket(req) => {
-                let forwarder_key = format!("{}:{}", req.client_id, req.session_uuid);
-                if let Some(worker) = self.terminal_client_workers.get(&forwarder_key) {
+                let subscription_key = format!("{}:{}", req.client_id, req.session_uuid);
+                if let Some(worker) = self.terminal_client_workers.get(&subscription_key) {
                     Self::send_worker_terminal_attach_state(
                         worker,
                         &req.subscription_id,
@@ -267,15 +252,15 @@ impl Hub {
 
     pub(super) fn replace_pending_terminal_attach(
         &mut self,
-        forwarder_key: &str,
+        subscription_key: &str,
         request: PendingTerminalAttachRequest,
     ) {
-        if let Some(prev) = self.pending_terminal_attaches.remove(forwarder_key) {
+        if let Some(prev) = self.pending_terminal_attaches.remove(subscription_key) {
             prev.request.deactivate();
         }
 
         self.pending_terminal_attaches.insert(
-            forwarder_key.to_string(),
+            subscription_key.to_string(),
             PendingTerminalAttach {
                 request,
                 requested_at: Instant::now(),
@@ -283,21 +268,18 @@ impl Hub {
         );
     }
 
-    pub(super) fn create_lua_pty_forwarder(&mut self, req: crate::lua::CreateForwarderRequest) {
-        let forwarder_key = format!("{}:{}", req.peer_id, req.session_uuid);
+    pub(super) fn create_browser_terminal_subscription(
+        &mut self,
+        req: crate::lua::BrowserTerminalSubscriptionRequest,
+    ) {
+        let subscription_key = format!("{}:{}", req.peer_id, req.session_uuid);
 
-        if self.try_attach_terminal_forwarder(&req) {
-            self.send_terminal_attach_state(
-                &req.peer_id,
-                &req.subscription_id,
-                &req.session_uuid,
-                "attached",
-            );
+        if self.try_attach_browser_terminal_subscription(&req) {
             return;
         }
 
         self.replace_pending_terminal_attach(
-            &forwarder_key,
+            &subscription_key,
             PendingTerminalAttachRequest::WebRtc(req.clone()),
         );
         self.send_terminal_attach_state(

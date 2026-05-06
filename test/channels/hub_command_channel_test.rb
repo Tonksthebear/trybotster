@@ -20,6 +20,13 @@ class HubCommandChannelTest < ActionCable::Channel::TestCase
     assert_has_stream "hub_command:#{@hub.id}"
   end
 
+  test "subscribes with hub identifier and streams from rails id channel" do
+    subscribe hub_id: @hub.identifier
+
+    assert subscription.confirmed?
+    assert_has_stream "hub_command:#{@hub.id}"
+  end
+
   test "rejects subscription without hub_id" do
     subscribe
 

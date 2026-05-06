@@ -287,4 +287,26 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn webrtc_handler_drops_messages_from_disconnected_peers() {
+        let manifest =
+            std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR should be set");
+        let path = std::path::Path::new(&manifest).join("lua/handlers/webrtc.lua");
+        let content = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+
+        assert!(
+            content.contains("active_peers[peer_id] = true"),
+            "WebRTC peer_connected must mark the peer active"
+        );
+        assert!(
+            content.contains("active_peers[peer_id] = nil"),
+            "WebRTC peer_disconnected must clear active state"
+        );
+        assert!(
+            content.contains("Dropping message from disconnected WebRTC peer"),
+            "late messages from a disconnected peer must be dropped instead of recreating a ghost client"
+        );
+    }
 }

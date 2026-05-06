@@ -78,7 +78,8 @@ class HubCommandChannel < ApplicationCable::Channel
   private
 
   def find_hub
-    current_user.hubs.find_by(id: params[:hub_id])
+    current_user.hubs.find_by(id: params[:hub_id]) ||
+      current_user.hubs.find_by(identifier: params[:hub_id])
   end
 
   # Hub-wide health stream (all browsers for this hub)

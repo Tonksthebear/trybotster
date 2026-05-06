@@ -15,7 +15,7 @@ cli/lua/
     commands.lua     # Command registry
     config_resolver.lua  # 2-layer .botster/ config resolution
     mcp.lua          # MCP tool registry (plugins register tools here)
-    pty_clients.lua  # PTY focus tracking
+    terminal_clients.lua  # terminal focus tracking
   handlers/
     agents.lua       # Agent lifecycle orchestration
     connections.lua  # Client registry, notification routing

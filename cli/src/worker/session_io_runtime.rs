@@ -2,9 +2,9 @@
 //!
 //! This worker owns the blocking read side of a single per-session Unix socket.
 //! It preserves the session-process wire protocol while coalescing hot-path
-//! output before crossing back into the hub event loop.
+//! output before publishing to the terminal event broadcast.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
@@ -26,7 +26,8 @@ use crate::session::protocol::{
 };
 
 use super::session_io::{
-    prepare_snapshot_payload, write_paste_file, SessionIoBatch, SessionIoEvent, SessionIoRequest,
+    prepare_snapshot_payload, write_paste_file, SessionIoEvent, SessionIoRequest,
+    TerminalInitialSnapshotDelivery, TerminalOutputSubscription,
 };
 
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;
@@ -47,7 +48,18 @@ pub(crate) struct SessionIoWorkerConfig {
     pub response_tx: std::sync::mpsc::Sender<Frame>,
     pub hub_event_tx: HubEventTx,
     pub reader_alive: Arc<AtomicBool>,
-    pub pending_snapshot_requests: Arc<Mutex<VecDeque<String>>>,
+    pub pending_snapshot_requests: Arc<Mutex<VecDeque<PendingSnapshotRequest>>>,
+    pub terminal_subscriptions: Arc<Mutex<HashMap<String, TerminalOutputSubscription>>>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PendingSnapshotRequest {
+    Hub {
+        request_id: String,
+    },
+    Initial {
+        delivery: TerminalInitialSnapshotDelivery,
+    },
 }
 
 pub(crate) struct SessionIoWorkerHandle {
@@ -77,6 +89,7 @@ impl SessionIoWorker {
             reader_alive: Arc::clone(&config.reader_alive),
             last_human_input_ms: Arc::clone(&config.last_human_input_ms),
             pending_snapshot_requests: Arc::clone(&config.pending_snapshot_requests),
+            terminal_subscriptions: Arc::clone(&config.terminal_subscriptions),
         };
         let request_thread_name = format!(
             "session-io-requests-{}",
@@ -111,7 +124,8 @@ struct SessionIoRequestProcessorConfig {
     hub_event_tx: HubEventTx,
     reader_alive: Arc<AtomicBool>,
     last_human_input_ms: Arc<AtomicI64>,
-    pending_snapshot_requests: Arc<Mutex<VecDeque<String>>>,
+    pending_snapshot_requests: Arc<Mutex<VecDeque<PendingSnapshotRequest>>>,
+    terminal_subscriptions: Arc<Mutex<HashMap<String, TerminalOutputSubscription>>>,
 }
 
 fn run_request_processor(config: SessionIoRequestProcessorConfig) {
@@ -123,6 +137,7 @@ fn run_request_processor(config: SessionIoRequestProcessorConfig) {
         reader_alive: config.reader_alive,
         last_human_input_ms: config.last_human_input_ms,
         pending_snapshot_requests: config.pending_snapshot_requests,
+        terminal_subscriptions: config.terminal_subscriptions,
     };
     processor.run();
 }
@@ -134,7 +149,8 @@ struct SessionIoRequestProcessor {
     hub_event_tx: HubEventTx,
     reader_alive: Arc<AtomicBool>,
     last_human_input_ms: Arc<AtomicI64>,
-    pending_snapshot_requests: Arc<Mutex<VecDeque<String>>>,
+    pending_snapshot_requests: Arc<Mutex<VecDeque<PendingSnapshotRequest>>>,
+    terminal_subscriptions: Arc<Mutex<HashMap<String, TerminalOutputSubscription>>>,
 }
 
 impl SessionIoRequestProcessor {
@@ -168,11 +184,19 @@ impl SessionIoRequestProcessor {
             }
             SessionIoRequest::GetSnapshot { request_id } => {
                 if let Ok(mut pending) = self.pending_snapshot_requests.lock() {
-                    pending.push_back(request_id.clone());
+                    pending.push_back(PendingSnapshotRequest::Hub {
+                        request_id: request_id.clone(),
+                    });
                 }
                 if let Err(e) = self.write_frame(encode_empty(FRAME_GET_SNAPSHOT)) {
                     if let Ok(mut pending) = self.pending_snapshot_requests.lock() {
-                        pending.retain(|pending_id| pending_id != &request_id);
+                        pending.retain(|pending| {
+                            !matches!(
+                                pending,
+                                PendingSnapshotRequest::Hub { request_id: pending_id }
+                                    if pending_id == &request_id
+                            )
+                        });
                     }
                     log::warn!("[session-io] snapshot RPC request failed: {e}");
                     let _ = self
@@ -182,6 +206,40 @@ impl SessionIoRequestProcessor {
                             session_uuid: self.session_uuid.clone(),
                             payload: Vec::new(),
                         }));
+                }
+            }
+            SessionIoRequest::GetInitialSnapshot { delivery } => {
+                if let Ok(mut pending) = self.pending_snapshot_requests.lock() {
+                    pending.push_back(PendingSnapshotRequest::Initial {
+                        delivery: delivery.clone(),
+                    });
+                }
+                if let Err(e) = self.write_frame(encode_empty(FRAME_GET_SNAPSHOT)) {
+                    if let Ok(mut pending) = self.pending_snapshot_requests.lock() {
+                        pending.retain(|pending| {
+                            !matches!(
+                                pending,
+                                PendingSnapshotRequest::Initial { delivery: pending_delivery }
+                                    if pending_delivery.request_id == delivery.request_id
+                            )
+                        });
+                    }
+                    log::warn!("[session-io] initial snapshot RPC request failed: {e}");
+                    Self::deliver_initial_attach_state(
+                        &delivery,
+                        crate::worker::client::TerminalAttachState::NotReady,
+                    );
+                    Self::unregister_initial_snapshot(&delivery, &self.terminal_subscriptions);
+                }
+            }
+            SessionIoRequest::SubscribeTerminal { subscription } => {
+                if let Ok(mut subscriptions) = self.terminal_subscriptions.lock() {
+                    subscriptions.insert(subscription.subscription_key.clone(), subscription);
+                }
+            }
+            SessionIoRequest::UnsubscribeTerminal { subscription_key } => {
+                if let Ok(mut subscriptions) = self.terminal_subscriptions.lock() {
+                    subscriptions.remove(&subscription_key);
                 }
             }
             SessionIoRequest::PasteFile {
@@ -266,6 +324,35 @@ impl SessionIoRequestProcessor {
         }
     }
 
+    fn deliver_initial_attach_state(
+        delivery: &TerminalInitialSnapshotDelivery,
+        state: crate::worker::client::TerminalAttachState,
+    ) {
+        let _ = delivery
+            .worker
+            .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::TerminalAttach {
+                    subscription_id: delivery.subscription_id.clone(),
+                    session_uuid: delivery.session_uuid.clone(),
+                    state,
+                },
+            ));
+    }
+
+    fn unregister_initial_snapshot(
+        delivery: &TerminalInitialSnapshotDelivery,
+        subscriptions: &Arc<Mutex<HashMap<String, TerminalOutputSubscription>>>,
+    ) {
+        if let Ok(mut subscriptions) = subscriptions.lock() {
+            subscriptions.remove(&delivery.subscription_key);
+        }
+        let _ = delivery.worker.try_send(
+            crate::worker::client::ClientWorkerMessage::UnregisterSessionIoSender {
+                session_uuid: delivery.session_uuid.clone(),
+            },
+        );
+    }
+
     fn stamp_human_input(last_human_input_ms: &AtomicI64, data: &[u8]) {
         if data == b"\x1b[I" || data == b"\x1b[O" {
             return;
@@ -296,7 +383,9 @@ struct SessionIoRuntime {
     response_tx: std::sync::mpsc::Sender<Frame>,
     hub_event_tx: HubEventTx,
     reader_alive: Arc<AtomicBool>,
-    pending_snapshot_requests: Arc<Mutex<VecDeque<String>>>,
+    pending_snapshot_requests: Arc<Mutex<VecDeque<PendingSnapshotRequest>>>,
+    terminal_subscriptions: Arc<Mutex<HashMap<String, TerminalOutputSubscription>>>,
+    terminal_filter_buffers: HashMap<String, Vec<u8>>,
     coalescer: SessionIoCoalescer,
     saw_process_exit: bool,
 }
@@ -316,6 +405,8 @@ impl SessionIoRuntime {
             hub_event_tx: config.hub_event_tx,
             reader_alive: config.reader_alive,
             pending_snapshot_requests: config.pending_snapshot_requests,
+            terminal_subscriptions: config.terminal_subscriptions,
+            terminal_filter_buffers: HashMap::new(),
             coalescer: SessionIoCoalescer::default(),
             saw_process_exit: false,
         }
@@ -381,12 +472,7 @@ impl SessionIoRuntime {
     fn handle_frame(&mut self, frame: Frame) -> bool {
         match frame.frame_type {
             FRAME_PTY_OUTPUT => {
-                self.coalescer.flush_metadata(
-                    &self.session_uuid,
-                    &self.event_tx,
-                    &self.kitty_enabled,
-                    &self.cursor_visible,
-                );
+                self.flush_metadata();
                 self.resize_pending.store(false, Ordering::Release);
                 self.last_output_at.store(now_millis(), Ordering::Relaxed);
                 self.coalescer.push_output(frame.payload);
@@ -443,6 +529,12 @@ impl SessionIoRuntime {
                     .and_then(|v| v["exit_code"].as_i64())
                     .map(|c| c as i32);
                 self.saw_process_exit = true;
+                self.deliver_terminal_control(
+                    crate::worker::client::ClientControlFrame::ProcessExited {
+                        session_uuid: self.session_uuid.clone(),
+                        exit_code,
+                    },
+                );
                 let _ = self.hub_event_tx.send(HubEvent::SessionProcessExited {
                     session_uuid: self.session_uuid.clone(),
                     exit_code,
@@ -451,22 +543,29 @@ impl SessionIoRuntime {
             }
             FRAME_SNAPSHOT => {
                 self.flush_pending();
-                let request_id = self
+                let pending_request = self
                     .pending_snapshot_requests
                     .lock()
                     .ok()
                     .and_then(|mut pending| pending.pop_front());
-                if let Some(request_id) = request_id {
-                    let _ = self
-                        .hub_event_tx
-                        .send(HubEvent::SessionIo(SessionIoEvent::Snapshot {
-                            request_id,
-                            session_uuid: self.session_uuid.clone(),
-                            payload: frame.payload,
-                        }));
-                } else if self.response_tx.send(frame).is_err() {
-                    log::debug!("[session-io] response channel closed");
-                    return false;
+                match pending_request {
+                    Some(PendingSnapshotRequest::Hub { request_id }) => {
+                        let _ =
+                            self.hub_event_tx
+                                .send(HubEvent::SessionIo(SessionIoEvent::Snapshot {
+                                    request_id,
+                                    session_uuid: self.session_uuid.clone(),
+                                    payload: frame.payload,
+                                }));
+                    }
+                    Some(PendingSnapshotRequest::Initial { delivery }) => {
+                        self.deliver_initial_snapshot(delivery, frame.payload);
+                    }
+                    None if self.response_tx.send(frame).is_err() => {
+                        log::debug!("[session-io] response channel closed");
+                        return false;
+                    }
+                    None => {}
                 }
             }
             _ => {
@@ -480,6 +579,130 @@ impl SessionIoRuntime {
         true
     }
 
+    fn deliver_initial_snapshot(
+        &mut self,
+        delivery: TerminalInitialSnapshotDelivery,
+        snapshot: Vec<u8>,
+    ) {
+        if snapshot.is_empty() {
+            if crate::session::session_process_is_live(&self.session_uuid) {
+                if delivery.confirm_subscription {
+                    let _ = delivery.worker.try_send(
+                        crate::worker::client::ClientWorkerMessage::ControlFrame(
+                            crate::worker::client::ClientControlFrame::BoundaryJson(
+                                serde_json::json!({
+                                    "type": "subscribed",
+                                    "subscriptionId": delivery.subscription_id.clone(),
+                                }),
+                            ),
+                        ),
+                    );
+                }
+                let _ = delivery.worker.try_send(
+                    crate::worker::client::ClientWorkerMessage::ControlFrame(
+                        crate::worker::client::ClientControlFrame::TerminalAttach {
+                            subscription_id: delivery.subscription_id,
+                            session_uuid: self.session_uuid.clone(),
+                            state: crate::worker::client::TerminalAttachState::Reconnecting,
+                        },
+                    ),
+                );
+            } else {
+                let _ = delivery.worker.try_send(
+                    crate::worker::client::ClientWorkerMessage::ControlFrame(
+                        crate::worker::client::ClientControlFrame::ProcessExited {
+                            session_uuid: self.session_uuid.clone(),
+                            exit_code: None,
+                        },
+                    ),
+                );
+                let _ = delivery.worker.try_send(
+                    crate::worker::client::ClientWorkerMessage::UnregisterSessionIoSender {
+                        session_uuid: self.session_uuid.clone(),
+                    },
+                );
+                if let Ok(mut subscriptions) = self.terminal_subscriptions.lock() {
+                    subscriptions.remove(&delivery.subscription_key);
+                }
+            }
+            return;
+        }
+
+        let data = match delivery.payload_mode {
+            crate::worker::session_io::TerminalSnapshotPayloadMode::Raw => snapshot,
+            crate::worker::session_io::TerminalSnapshotPayloadMode::PrefixedGzip => {
+                prepare_snapshot_payload(&snapshot)
+                    .map(|prepared| prepared.payload)
+                    .unwrap_or_default()
+            }
+        };
+
+        if data.is_empty() {
+            return;
+        }
+
+        match delivery
+            .worker
+            .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::Scrollback {
+                    session_uuid: self.session_uuid.clone(),
+                    rows: delivery.rows,
+                    cols: delivery.cols,
+                    kitty_enabled: delivery.kitty_enabled,
+                    data,
+                },
+            )) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.report_initial_snapshot_backpressure(&delivery);
+                return;
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                if let Ok(mut subscriptions) = self.terminal_subscriptions.lock() {
+                    subscriptions.remove(&delivery.subscription_key);
+                }
+                return;
+            }
+        }
+
+        if delivery.confirm_subscription {
+            let _ =
+                delivery
+                    .worker
+                    .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                        crate::worker::client::ClientControlFrame::BoundaryJson(
+                            serde_json::json!({
+                                "type": "subscribed",
+                                "subscriptionId": delivery.subscription_id.clone(),
+                            }),
+                        ),
+                    ));
+        }
+
+        let _ = delivery
+            .worker
+            .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::TerminalAttach {
+                    subscription_id: delivery.subscription_id,
+                    session_uuid: self.session_uuid.clone(),
+                    state: crate::worker::client::TerminalAttachState::Attached,
+                },
+            ));
+    }
+
+    fn report_initial_snapshot_backpressure(&self, delivery: &TerminalInitialSnapshotDelivery) {
+        let _ = self.hub_event_tx.send(HubEvent::ClientWorkerControl(
+            crate::worker::hub_control::HubControlMessage::Backpressure(
+                crate::worker::hub_control::WorkerBackpressure {
+                    source: "worker.session_io.initial_snapshot_delivery",
+                    capacity: crate::worker::client::CLIENT_WORKER_QUEUE.capacity,
+                    session_uuid: Some(self.session_uuid.clone()),
+                    client_id: Some(delivery.worker.client_id.clone()),
+                },
+            ),
+        ));
+    }
+
     fn flush_if_ready(&mut self) {
         if self.coalescer.should_flush_output() || self.coalescer.metadata_age_expired() {
             self.flush_pending();
@@ -487,18 +710,126 @@ impl SessionIoRuntime {
     }
 
     fn flush_output(&mut self) {
-        self.coalescer
-            .flush_output(&self.session_uuid, &self.event_tx, &self.hub_event_tx);
+        if let Some(output) = self.coalescer.take_output() {
+            self.deliver_terminal_output(&output);
+            let _ = self.event_tx.send(PtyEvent::output(output));
+        }
     }
 
     fn flush_pending(&mut self) {
-        self.coalescer.flush_all(
+        self.flush_output();
+        self.flush_metadata();
+    }
+
+    fn flush_metadata(&mut self) {
+        for event in self.coalescer.take_metadata(
             &self.session_uuid,
-            &self.event_tx,
-            &self.hub_event_tx,
             &self.kitty_enabled,
             &self.cursor_visible,
-        );
+        ) {
+            match &event {
+                PtyEvent::KittyChanged(enabled) => {
+                    self.deliver_terminal_control(
+                        crate::worker::client::ClientControlFrame::KittyChanged {
+                            session_uuid: self.session_uuid.clone(),
+                            enabled: *enabled,
+                        },
+                    );
+                }
+                PtyEvent::FocusReportingChanged(enabled) => {
+                    self.deliver_terminal_control(
+                        crate::worker::client::ClientControlFrame::FocusReportingChanged {
+                            session_uuid: self.session_uuid.clone(),
+                            enabled: *enabled,
+                        },
+                    );
+                }
+                _ => {}
+            }
+            let _ = self.event_tx.send(event);
+        }
+    }
+
+    fn current_terminal_subscriptions(&mut self) -> Vec<TerminalOutputSubscription> {
+        let subscriptions = self
+            .terminal_subscriptions
+            .lock()
+            .map(|subscriptions| subscriptions.clone())
+            .unwrap_or_default();
+        self.terminal_filter_buffers
+            .retain(|subscription_key, _| subscriptions.contains_key(subscription_key));
+        subscriptions.into_values().collect()
+    }
+
+    fn deliver_terminal_output(&mut self, output: &[u8]) {
+        for subscription in self.current_terminal_subscriptions() {
+            let buffer = self
+                .terminal_filter_buffers
+                .entry(subscription.subscription_key.clone())
+                .or_default();
+            let filtered = subscription
+                .filter
+                .filter_chunk(&self.session_uuid, buffer, output);
+            if filtered.is_empty() {
+                continue;
+            }
+            let data = if subscription.output_prefix.is_empty() {
+                filtered
+            } else {
+                let mut prefixed =
+                    Vec::with_capacity(subscription.output_prefix.len() + filtered.len());
+                prefixed.extend(&subscription.output_prefix);
+                prefixed.extend(filtered);
+                prefixed
+            };
+            match subscription.worker.try_send(
+                crate::worker::client::ClientWorkerMessage::TerminalBytes {
+                    session_uuid: self.session_uuid.clone(),
+                    data,
+                },
+            ) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    self.report_terminal_delivery_backpressure(&subscription);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    if let Ok(mut subscriptions) = self.terminal_subscriptions.lock() {
+                        subscriptions.remove(&subscription.subscription_key);
+                    }
+                }
+            }
+        }
+    }
+
+    fn deliver_terminal_control(&mut self, frame: crate::worker::client::ClientControlFrame) {
+        for subscription in self.current_terminal_subscriptions() {
+            match subscription.worker.try_send(
+                crate::worker::client::ClientWorkerMessage::ControlFrame(frame.clone()),
+            ) {
+                Ok(()) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    self.report_terminal_delivery_backpressure(&subscription);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    if let Ok(mut subscriptions) = self.terminal_subscriptions.lock() {
+                        subscriptions.remove(&subscription.subscription_key);
+                    }
+                }
+            }
+        }
+    }
+
+    fn report_terminal_delivery_backpressure(&self, subscription: &TerminalOutputSubscription) {
+        let _ = self.hub_event_tx.send(HubEvent::ClientWorkerControl(
+            crate::worker::hub_control::HubControlMessage::Backpressure(
+                crate::worker::hub_control::WorkerBackpressure {
+                    source: "worker.session_io.terminal_delivery",
+                    capacity: crate::worker::client::CLIENT_WORKER_QUEUE.capacity,
+                    session_uuid: Some(self.session_uuid.clone()),
+                    client_id: Some(subscription.worker.client_id.clone()),
+                },
+            ),
+        ));
     }
 }
 
@@ -583,71 +914,51 @@ impl SessionIoCoalescer {
                 .is_some_and(|started| started.elapsed() >= MAX_BATCH_AGE)
     }
 
-    fn flush_all(
-        &mut self,
-        session_uuid: &str,
-        event_tx: &broadcast::Sender<PtyEvent>,
-        hub_event_tx: &HubEventTx,
-        kitty_enabled: &AtomicBool,
-        cursor_visible: &AtomicBool,
-    ) {
-        self.flush_output(session_uuid, event_tx, hub_event_tx);
-        self.flush_metadata(session_uuid, event_tx, kitty_enabled, cursor_visible);
-    }
-
-    fn flush_output(
-        &mut self,
-        session_uuid: &str,
-        event_tx: &broadcast::Sender<PtyEvent>,
-        hub_event_tx: &HubEventTx,
-    ) {
+    fn take_output(&mut self) -> Option<Vec<u8>> {
         if self.output.is_empty() {
-            return;
+            return None;
         }
 
         let output = std::mem::take(&mut self.output);
         self.output_frames = 0;
         self.output_started_at = None;
-        let _ = event_tx.send(PtyEvent::output(output.clone()));
-        let _ = hub_event_tx.send(HubEvent::SessionIoBatch(SessionIoBatch {
-            session_uuid: session_uuid.to_string(),
-            output: Some(output),
-        }));
+        Some(output)
     }
 
-    fn flush_metadata(
+    fn take_metadata(
         &mut self,
         _session_uuid: &str,
-        event_tx: &broadcast::Sender<PtyEvent>,
         kitty_enabled: &AtomicBool,
         cursor_visible: &AtomicBool,
-    ) {
+    ) -> Vec<PtyEvent> {
+        let mut events = Vec::new();
         if let Some(mode) = self.mode.take() {
             if let Some(kitty) = mode.kitty_enabled {
                 let old = kitty_enabled.load(Ordering::Relaxed);
                 if kitty != old {
                     kitty_enabled.store(kitty, Ordering::Relaxed);
-                    let _ = event_tx.send(PtyEvent::kitty_changed(kitty));
+                    events.push(PtyEvent::kitty_changed(kitty));
                 }
             }
             if let Some(vis) = mode.cursor_visible {
                 cursor_visible.store(vis, Ordering::Relaxed);
-                let _ = event_tx.send(PtyEvent::cursor_visibility_changed(vis));
+                events.push(PtyEvent::cursor_visibility_changed(vis));
             }
             if let Some(focus) = mode.focus_reporting {
-                let _ = event_tx.send(PtyEvent::focus_reporting_changed(focus));
+                events.push(PtyEvent::focus_reporting_changed(focus));
             }
         }
 
         if let Some(title) = self.title.take() {
-            let _ = event_tx.send(PtyEvent::title_changed(title));
+            events.push(PtyEvent::title_changed(title));
         }
         if let Some(cwd) = self.cwd.take() {
-            let _ = event_tx.send(PtyEvent::cwd_changed(cwd));
+            events.push(PtyEvent::cwd_changed(cwd));
         }
         if !self.has_metadata() {
             self.metadata_started_at = None;
         }
+        events
     }
 
     fn ensure_metadata_started(&mut self) {
@@ -702,7 +1013,7 @@ mod tests {
     ) -> (
         broadcast::Receiver<PtyEvent>,
         mpsc::Receiver<Frame>,
-        tokio_mpsc::UnboundedReceiver<HubEvent>,
+        tokio_mpsc::Receiver<HubEvent>,
         Arc<AtomicBool>,
     ) {
         let (_request_tx, event_rx, response_rx, hub_rx, alive) =
@@ -716,12 +1027,12 @@ mod tests {
         tokio_mpsc::Sender<SessionIoRequest>,
         broadcast::Receiver<PtyEvent>,
         mpsc::Receiver<Frame>,
-        tokio_mpsc::UnboundedReceiver<HubEvent>,
+        tokio_mpsc::Receiver<HubEvent>,
         Arc<AtomicBool>,
     ) {
         let (event_tx, event_rx) = broadcast::channel(32);
         let (response_tx, response_rx) = mpsc::channel();
-        let (hub_tx, hub_rx) = tokio_mpsc::unbounded_channel();
+        let (hub_tx, hub_rx) = tokio_mpsc::channel(64);
         let (request_tx, request_rx) = tokio_mpsc::channel(32);
         let alive = Arc::new(AtomicBool::new(true));
         let write_stream = reader.try_clone().expect("clone request stream");
@@ -741,6 +1052,7 @@ mod tests {
             hub_event_tx: HubEventTx::from(hub_tx),
             reader_alive: Arc::clone(&alive),
             pending_snapshot_requests: Arc::new(Mutex::new(VecDeque::new())),
+            terminal_subscriptions: Arc::new(Mutex::new(HashMap::new())),
         })
         .expect("spawn worker");
 
@@ -758,24 +1070,212 @@ mod tests {
         }
     }
 
-    fn recv_hub_event(rx: &mut tokio_mpsc::UnboundedReceiver<HubEvent>) -> HubEvent {
+    fn recv_hub_event(rx: &mut tokio_mpsc::Receiver<HubEvent>) -> HubEvent {
         block_on_with_timeout(async { rx.recv().await.expect("receive hub event") })
     }
 
-    fn recv_session_io_batch(rx: &mut tokio_mpsc::UnboundedReceiver<HubEvent>) -> Vec<u8> {
-        loop {
-            match recv_hub_event(rx) {
-                HubEvent::SessionIoBatch(batch) => return batch.output.expect("output batch"),
-                other => panic!("expected session I/O batch, got {other:?}"),
-            }
-        }
-    }
-
-    fn assert_no_hub_event(rx: &mut tokio_mpsc::UnboundedReceiver<HubEvent>) {
+    fn assert_no_hub_event(rx: &mut tokio_mpsc::Receiver<HubEvent>) {
         assert!(
             rx.try_recv().is_err(),
             "unexpected extra hub event after ordered boundary"
         );
+    }
+
+    #[test]
+    fn terminal_output_is_delivered_directly_to_client_worker_subscription() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (request_tx, mut event_rx, _response_rx, mut hub_rx, _alive) =
+            spawn_test_worker_with_requests(reader);
+        let (client_tx, mut client_rx) =
+            tokio_mpsc::channel::<crate::worker::client::ClientWorkerMessage>(8);
+
+        block_on_with_timeout(async {
+            request_tx
+                .send(SessionIoRequest::SubscribeTerminal {
+                    subscription: TerminalOutputSubscription {
+                        subscription_key: "client:sess-test-io".to_string(),
+                        subscription_id: "terminal_sess-test-io".to_string(),
+                        worker: crate::worker::client::ClientWorkerHandle {
+                            client_id: crate::client::ClientId::Socket("client".to_string()),
+                            tx: client_tx,
+                        },
+                        output_prefix: Vec::new(),
+                        filter: crate::worker::session_io::TerminalOutputFilter::None,
+                    },
+                })
+                .await
+                .expect("subscribe terminal");
+        });
+        std::thread::sleep(Duration::from_millis(10));
+
+        writer
+            .write_all(&encode_frame(FRAME_PTY_OUTPUT, b"direct-output"))
+            .expect("write output frame");
+
+        assert_eq!(recv_output(&mut event_rx), b"direct-output");
+        let message = block_on_with_timeout(async {
+            client_rx
+                .recv()
+                .await
+                .expect("client worker terminal bytes")
+        });
+        match message {
+            crate::worker::client::ClientWorkerMessage::TerminalBytes { session_uuid, data } => {
+                assert_eq!(session_uuid, "sess-test-io");
+                assert_eq!(data, b"direct-output");
+            }
+            other => panic!("expected TerminalBytes, got {other:?}"),
+        }
+        assert_no_hub_event(&mut hub_rx);
+    }
+
+    #[test]
+    fn initial_snapshot_is_delivered_directly_to_client_worker() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (request_tx, _event_rx, _response_rx, mut hub_rx, _alive) =
+            spawn_test_worker_with_requests(reader);
+        let (client_tx, mut client_rx) =
+            tokio_mpsc::channel::<crate::worker::client::ClientWorkerMessage>(8);
+        let worker = crate::worker::client::ClientWorkerHandle {
+            client_id: crate::client::ClientId::Socket("client".to_string()),
+            tx: client_tx,
+        };
+
+        block_on_with_timeout(async {
+            request_tx
+                .send(SessionIoRequest::GetInitialSnapshot {
+                    delivery: crate::worker::session_io::TerminalInitialSnapshotDelivery {
+                        request_id: "initial-direct".to_string(),
+                        subscription_key: "client:sess-test-io".to_string(),
+                        session_uuid: "sess-test-io".to_string(),
+                        subscription_id: "terminal_sess-test-io".to_string(),
+                        worker,
+                        rows: 24,
+                        cols: 80,
+                        kitty_enabled: false,
+                        payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
+                        confirm_subscription: false,
+                    },
+                })
+                .await
+                .expect("request initial snapshot");
+        });
+        std::thread::sleep(Duration::from_millis(10));
+
+        writer
+            .write_all(&encode_frame(FRAME_SNAPSHOT, b"initial-direct-snapshot"))
+            .expect("write snapshot frame");
+
+        let message = block_on_with_timeout(async {
+            client_rx
+                .recv()
+                .await
+                .expect("client worker initial snapshot")
+        });
+        match message {
+            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::Scrollback {
+                    session_uuid,
+                    rows,
+                    cols,
+                    kitty_enabled,
+                    data,
+                },
+            ) => {
+                assert_eq!(session_uuid, "sess-test-io");
+                assert_eq!(rows, 24);
+                assert_eq!(cols, 80);
+                assert!(!kitty_enabled);
+                assert_eq!(data, b"initial-direct-snapshot");
+            }
+            other => panic!("expected Scrollback control frame, got {other:?}"),
+        }
+        assert_no_hub_event(&mut hub_rx);
+    }
+
+    #[test]
+    fn empty_live_initial_snapshot_confirms_subscription_before_reconnecting_attach() {
+        let session_uuid = "sess-test-io".to_string();
+        let socket_path =
+            crate::session::session_socket_path(&session_uuid).expect("session socket path");
+        std::fs::write(&socket_path, b"").expect("create live session socket");
+        crate::session::write_session_pid_file(&session_uuid, std::process::id())
+            .expect("write live session pid");
+
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (request_tx, _event_rx, _response_rx, _hub_rx, _alive) =
+            spawn_test_worker_with_requests(reader);
+        let (client_tx, mut client_rx) =
+            tokio_mpsc::channel::<crate::worker::client::ClientWorkerMessage>(8);
+        let worker = crate::worker::client::ClientWorkerHandle {
+            client_id: crate::client::ClientId::Socket("client".to_string()),
+            tx: client_tx,
+        };
+
+        block_on_with_timeout(async {
+            request_tx
+                .send(SessionIoRequest::GetInitialSnapshot {
+                    delivery: crate::worker::session_io::TerminalInitialSnapshotDelivery {
+                        request_id: "initial-empty-live".to_string(),
+                        subscription_key: format!("client:{session_uuid}"),
+                        session_uuid: session_uuid.clone(),
+                        subscription_id: "terminal_empty_live".to_string(),
+                        worker,
+                        rows: 24,
+                        cols: 80,
+                        kitty_enabled: false,
+                        payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
+                        confirm_subscription: true,
+                    },
+                })
+                .await
+                .expect("request empty initial snapshot");
+        });
+        std::thread::sleep(Duration::from_millis(10));
+
+        writer
+            .write_all(&encode_frame(FRAME_SNAPSHOT, b""))
+            .expect("write empty snapshot frame");
+
+        let first = block_on_with_timeout(async {
+            client_rx.recv().await.expect("subscription confirmation")
+        });
+        match first {
+            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::BoundaryJson(value),
+            ) => {
+                assert_eq!(
+                    value.get("type").and_then(|value| value.as_str()),
+                    Some("subscribed")
+                );
+                assert_eq!(
+                    value.get("subscriptionId").and_then(|value| value.as_str()),
+                    Some("terminal_empty_live")
+                );
+            }
+            other => panic!("expected subscribed boundary, got {other:?}"),
+        }
+
+        let second =
+            block_on_with_timeout(async { client_rx.recv().await.expect("reconnecting attach") });
+        match second {
+            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::TerminalAttach { state, .. },
+            ) => {
+                assert_eq!(
+                    state,
+                    crate::worker::client::TerminalAttachState::Reconnecting
+                );
+            }
+            other => panic!("expected reconnecting terminal attach, got {other:?}"),
+        }
+
+        if let Ok(path) = crate::session::session_socket_path(&session_uuid) {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Ok(path) = crate::session::session_pid_path(&session_uuid) {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     fn wait_for_reader_stop(alive: &AtomicBool) {
@@ -792,7 +1292,7 @@ mod tests {
     #[test]
     fn coalesces_synthetic_output_burst_before_hub_delivery() {
         let (mut writer, reader) = UnixStream::pair().expect("unix pair");
-        let (mut event_rx, _response_rx, mut hub_rx, _alive) = spawn_test_worker(reader);
+        let (mut event_rx, _response_rx, _hub_rx, _alive) = spawn_test_worker(reader);
 
         let mut payload = Vec::new();
         for chunk in [b"one".as_slice(), b"two".as_slice(), b"three".as_slice()] {
@@ -802,13 +1302,12 @@ mod tests {
         writer.shutdown(Shutdown::Both).expect("shutdown writer");
 
         assert_eq!(recv_output(&mut event_rx), b"onetwothree");
-        assert_eq!(recv_session_io_batch(&mut hub_rx), b"onetwothree");
     }
 
     #[test]
     fn output_age_flushes_under_four_ms_rule_without_eof_or_size_threshold() {
         let (mut writer, reader) = UnixStream::pair().expect("unix pair");
-        let (mut event_rx, _response_rx, mut hub_rx, _alive) = spawn_test_worker(reader);
+        let (mut event_rx, _response_rx, _hub_rx, _alive) = spawn_test_worker(reader);
 
         let mut payload = Vec::new();
         for chunk in [b"age-".as_slice(), b"flush".as_slice()] {
@@ -817,13 +1316,12 @@ mod tests {
         writer.write_all(&payload).expect("write frames");
 
         assert_eq!(recv_output(&mut event_rx), b"age-flush");
-        assert_eq!(recv_session_io_batch(&mut hub_rx), b"age-flush");
     }
 
     #[test]
     fn output_thresholds_flush_without_waiting_for_eof() {
         let (mut writer, reader) = UnixStream::pair().expect("unix pair");
-        let (mut event_rx, _response_rx, mut hub_rx, _alive) = spawn_test_worker(reader);
+        let (mut event_rx, _response_rx, _hub_rx, _alive) = spawn_test_worker(reader);
 
         let mut frame_threshold_payload = Vec::new();
         for _ in 0..MAX_OUTPUT_FRAMES {
@@ -833,17 +1331,12 @@ mod tests {
             .write_all(&frame_threshold_payload)
             .expect("write frame-threshold burst");
         assert_eq!(recv_output(&mut event_rx), vec![b'f'; MAX_OUTPUT_FRAMES]);
-        assert_eq!(
-            recv_session_io_batch(&mut hub_rx),
-            vec![b'f'; MAX_OUTPUT_FRAMES]
-        );
 
         let byte_threshold_payload = vec![b'x'; MAX_OUTPUT_BYTES];
         writer
             .write_all(&encode_frame(FRAME_PTY_OUTPUT, &byte_threshold_payload))
             .expect("write byte-threshold frame");
         assert_eq!(recv_output(&mut event_rx), byte_threshold_payload);
-        assert_eq!(recv_session_io_batch(&mut hub_rx), byte_threshold_payload);
     }
 
     #[test]
@@ -970,7 +1463,7 @@ mod tests {
     #[test]
     fn noisy_log_replay_preserves_order_and_bounds_hub_batches() {
         let (mut writer, reader) = UnixStream::pair().expect("unix pair");
-        let (_event_rx, _response_rx, mut hub_rx, alive) = spawn_test_worker(reader);
+        let (mut event_rx, _response_rx, mut hub_rx, alive) = spawn_test_worker(reader);
 
         let mut payload = Vec::new();
         let mut expected = Vec::new();
@@ -990,13 +1483,14 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
 
-        let mut batches = Vec::new();
+        let mut output = Vec::new();
+        while output.len() < expected.len() {
+            output.extend_from_slice(&recv_output(&mut event_rx));
+        }
+
         let mut exits = 0;
         while let Ok(event) = hub_rx.try_recv() {
             match event {
-                HubEvent::SessionIoBatch(batch) => {
-                    batches.push(batch.output.expect("output batch"));
-                }
                 HubEvent::SessionProcessExited { exit_code, .. } => {
                     assert_eq!(exit_code, None);
                     exits += 1;
@@ -1005,13 +1499,7 @@ mod tests {
             }
         }
 
-        let replayed = batches.concat();
-        assert_eq!(replayed, expected);
-        assert!(
-            batches.len() <= 64,
-            "1001 observed-log-shaped frames should cross the hub in bounded batches, got {}",
-            batches.len()
-        );
+        assert_eq!(output, expected);
         assert_eq!(exits, 1);
     }
 
@@ -1076,14 +1564,13 @@ mod tests {
     #[test]
     fn output_flushes_before_bell_notification() {
         let (mut writer, reader) = UnixStream::pair().expect("unix pair");
-        let (mut event_rx, _response_rx, mut hub_rx, _alive) = spawn_test_worker(reader);
+        let (mut event_rx, _response_rx, _hub_rx, _alive) = spawn_test_worker(reader);
 
         let mut payload = encode_frame(FRAME_PTY_OUTPUT, b"before-bell");
         payload.extend_from_slice(&encode_frame(FRAME_BELL, b""));
         writer.write_all(&payload).expect("write frames");
 
         assert_eq!(recv_output(&mut event_rx), b"before-bell");
-        assert_eq!(recv_session_io_batch(&mut hub_rx), b"before-bell");
         match recv_pty_event(&mut event_rx) {
             PtyEvent::Notification(AgentNotification::Bell) => {}
             other => panic!("expected bell notification, got {other:?}"),
@@ -1093,7 +1580,7 @@ mod tests {
     #[test]
     fn output_flushes_before_osc_notification() {
         let (mut writer, reader) = UnixStream::pair().expect("unix pair");
-        let (mut event_rx, _response_rx, mut hub_rx, _alive) = spawn_test_worker(reader);
+        let (mut event_rx, _response_rx, _hub_rx, _alive) = spawn_test_worker(reader);
 
         let mut payload = encode_frame(FRAME_PTY_OUTPUT, b"before-notification");
         payload.extend_from_slice(
@@ -1109,7 +1596,6 @@ mod tests {
         writer.write_all(&payload).expect("write frames");
 
         assert_eq!(recv_output(&mut event_rx), b"before-notification");
-        assert_eq!(recv_session_io_batch(&mut hub_rx), b"before-notification");
         match recv_pty_event(&mut event_rx) {
             PtyEvent::Notification(AgentNotification::Osc777 { title, body }) => {
                 assert_eq!(title, "Build");
@@ -1194,7 +1680,6 @@ mod tests {
         writer.shutdown(Shutdown::Both).expect("shutdown writer");
 
         assert_eq!(recv_output(&mut event_rx), b"before-exit");
-        assert_eq!(recv_session_io_batch(&mut hub_rx), b"before-exit");
         match recv_hub_event(&mut hub_rx) {
             HubEvent::SessionProcessExited { exit_code, .. } => assert_eq!(exit_code, Some(7)),
             other => panic!("expected process exit, got {other:?}"),

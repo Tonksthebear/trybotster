@@ -202,8 +202,11 @@ Confirmation that subscription is active.
 ### entity_snapshot / entity_upsert / entity_patch / entity_remove
 
 Hub model state is sent through entity frames. Subscribing to the hub channel
-sends one `entity_snapshot` per registered entity type; subsequent changes use
-`entity_upsert`, `entity_patch`, or `entity_remove`.
+only establishes the channel and returns `subscribed`; clients then request the
+entity families they need with the `hub:entities` command. Subsequent changes
+use `entity_upsert`, `entity_patch`, or `entity_remove`. Plugin-owned history
+and surface data must be requested by the surface that needs it rather than
+sent as part of the initial connection baseline.
 
 These frames are the only durable shared state path. The browser applies them
 to frontend entity stores; the TUI applies the same envelopes to Rust entity
@@ -253,13 +256,14 @@ type. Plugins must use `id` as the entity id field, and every snapshot/upserted
 record must carry a non-empty string `id`. Built-in records may expose their
 domain id under a built-in id field, but the envelope `id` is always a string.
 
-Snapshots are authoritative reconnect baselines. On hub-channel subscribe, the
-hub sends all registered `entity_snapshot` frames before any
-`ui_tree_snapshot` frames so renderer trees can bind to already-populated
-entity stores. Snapshot frames for each type carry the current per-type
-`snapshot_seq`; upsert, patch, and remove increment that type's sequence.
-Clients drop stale deltas whose sequence is not newer than the local baseline,
-while same-sequence snapshots are accepted as resyncs.
+Snapshots are authoritative reconnect baselines. Clients request snapshots for
+the specific entity types a view needs. Browser UiTree surfaces infer needed
+types from `$bind` and `bind_list` sources in the requested presentation tree;
+other clients may use equivalent binding introspection or surface metadata.
+Snapshot frames for each type carry the current per-type `snapshot_seq`;
+upsert, patch, and remove increment that type's sequence. Clients drop stale
+deltas whose sequence is not newer than the local baseline, while same-sequence
+snapshots are accepted as resyncs.
 
 `entity_patch` performs a top-level merge only. Nested objects replace the
 previous nested value wholesale; clients do not deep-merge plugin-owned state.

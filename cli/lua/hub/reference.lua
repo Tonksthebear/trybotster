@@ -296,7 +296,6 @@ M.hooks = {
         { name = "before_client_disconnect", data = "{peer_id}",                     desc = "About to disconnect client" },
 
         -- PTY events (fired from Rust)
-        { name = "pty_output",             data = "(ctx, data) ctx={session_uuid, peer_id}", desc = "Raw PTY output bytes per chunk" },
         { name = "pty_title_changed",      data = "{session_uuid, session_name, title}",     desc = "Terminal title changed (OSC 0/2)" },
         { name = "pty_cwd_changed",        data = "{session_uuid, session_name, cwd}",       desc = "Working directory changed (OSC 7)" },
         { name = "pty_prompt",             data = "{session_uuid, session_name, mark, exit_code?, command?}", desc = "Shell prompt mark (OSC 133). mark: prompt_start|command_start|command_executed|command_finished" },
@@ -382,7 +381,7 @@ M.session_info_fields = {
     { name = "created_at",     type = "number",      desc = "Unix timestamp of creation" },
     { name = "label",          type = "string?",     desc = "User-assigned label" },
     { name = "task",           type = "string?",     desc = "Current task description" },
-    { name = "is_idle",        type = "boolean",     desc = "True if no recent PTY output" },
+    { name = "output_activity", type = '"active"|"idle"', desc = "Recent PTY output activity" },
 }
 
 -- =============================================================================

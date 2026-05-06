@@ -144,10 +144,10 @@ mod tests {
     use super::super::new_hub_event_sender;
     use super::*;
 
-    fn register_with_receiver() -> (Lua, tokio::sync::mpsc::UnboundedReceiver<HubEvent>) {
+    fn register_with_receiver() -> (Lua, tokio::sync::mpsc::Receiver<HubEvent>) {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
         *tx.lock().unwrap() = Some(sender.into());
         register(&lua, tx).expect("push primitive registers");
         (lua, receiver)

@@ -585,7 +585,7 @@ mod tests {
     fn test_delete_sends_event() {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
-        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut rx) = tokio::sync::mpsc::channel(64);
         *tx.lock().unwrap() = Some(sender.into());
         let cache = Arc::new(HandleCache::new());
         let base = PathBuf::from("/tmp/test-worktrees");
@@ -610,7 +610,7 @@ mod tests {
     fn test_multiple_delete_requests_send_events_in_order() {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
-        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut rx) = tokio::sync::mpsc::channel(64);
         *tx.lock().unwrap() = Some(sender.into());
         let cache = Arc::new(HandleCache::new());
         let base = PathBuf::from("/tmp/test-worktrees");
@@ -670,7 +670,7 @@ mod tests {
     fn test_create_async_sends_event() {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
-        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut rx) = tokio::sync::mpsc::channel(64);
         *tx.lock().unwrap() = Some(sender.into());
         let cache = Arc::new(HandleCache::new());
         let base = PathBuf::from("/tmp/test-worktrees");
@@ -724,7 +724,7 @@ mod tests {
     fn test_create_async_accepts_explicit_repo_root_and_default_label() {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
-        let (sender, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut rx) = tokio::sync::mpsc::channel(64);
         *tx.lock().unwrap() = Some(sender.into());
         let cache = Arc::new(HandleCache::new());
         let base = PathBuf::from("/tmp/test-worktrees");

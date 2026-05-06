@@ -1,7 +1,7 @@
 use super::test_support::*;
 
 #[test]
-pub(super) fn test_tui_attach_reconnecting_emits_explicit_attach_state() {
+pub(super) fn test_tui_attach_reconnecting_does_not_fake_attached_state() {
     let session_uuid = unique_session_uuid("sess-tui-reconnecting");
     register_live_session_identity(&session_uuid);
 
@@ -13,69 +13,59 @@ pub(super) fn test_tui_attach_reconnecting_emits_explicit_attach_state() {
             session_io_tx,
         ));
 
-    let req = crate::lua::primitives::CreateTuiForwarderRequest {
+    let req = crate::lua::primitives::TuiTerminalSubscriptionRequest {
         session_uuid: session_uuid.clone(),
         subscription_id: format!("tui:{session_uuid}"),
-        active_flag: Arc::new(Mutex::new(true)),
         rows: 24,
         cols: 80,
+        active_flag: Arc::new(Mutex::new(true)),
     };
-    hub.create_lua_tui_pty_forwarder(req);
+    hub.create_tui_terminal_subscription(req);
     let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
         matches!(
             request,
             crate::worker::session_io::SessionIoRequest::Resize { .. }
         )
     });
-    let request_id = match recv_session_io_request_matching(&mut session_io_rx, |request| {
-        matches!(
-            request,
-            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
-        )
-    }) {
-        crate::worker::session_io::SessionIoRequest::GetSnapshot { request_id } => request_id,
-        other => panic!("expected GetSnapshot request, got {other:?}"),
-    };
+    let delivery = recv_terminal_initial_snapshot_delivery(&mut session_io_rx);
     settle_worker_subscription();
-    hub.handle_session_io_event(crate::worker::session_io::SessionIoEvent::Snapshot {
-        request_id,
-        session_uuid: session_uuid.clone(),
-        payload: Vec::new(),
-    });
+    deliver_terminal_attach_state(
+        delivery,
+        crate::worker::client::TerminalAttachState::Reconnecting,
+    );
 
     let rt = shared_test_runtime();
     let outputs = rt.block_on(async {
         let mut outputs = Vec::new();
-        for _ in 0..2 {
-            let output = tokio::time::timeout(Duration::from_secs(2), output_rx.recv())
-                .await
-                .expect("timed out waiting for TUI output")
-                .expect("TUI output channel closed");
+        if let Some(output) = tokio::time::timeout(Duration::from_secs(2), output_rx.recv())
+            .await
+            .expect("timed out waiting for TUI output")
+        {
             outputs.push(output);
         }
         outputs
     });
 
     assert!(
-            outputs.iter().any(|output| matches!(
-                output,
-                TuiOutput::Message(json)
-                    if json.get("type").and_then(|v| v.as_str()) == Some("terminal_attach")
-                        && json.get("state").and_then(|v| v.as_str()) == Some("attached")
-                        && json.get("session_uuid").and_then(|v| v.as_str()) == Some(session_uuid.as_str())
-            )),
-            "initial attach should still emit attached state"
-        );
+        outputs.iter().any(|output| matches!(
+            output,
+            TuiOutput::Message(json)
+                if json.get("type").and_then(|v| v.as_str()) == Some("terminal_attach")
+                    && json.get("state").and_then(|v| v.as_str()) == Some("reconnecting")
+                    && json.get("session_uuid").and_then(|v| v.as_str()) == Some(session_uuid.as_str())
+        )),
+        "reconnect-pending attach should emit explicit reconnecting state"
+    );
     assert!(
-            outputs.iter().any(|output| matches!(
-                output,
-                TuiOutput::Message(json)
-                    if json.get("type").and_then(|v| v.as_str()) == Some("terminal_attach")
-                        && json.get("state").and_then(|v| v.as_str()) == Some("reconnecting")
-                        && json.get("session_uuid").and_then(|v| v.as_str()) == Some(session_uuid.as_str())
-            )),
-            "reconnect-pending attach should emit explicit reconnecting state"
-        );
+        !outputs.iter().any(|output| matches!(
+            output,
+            TuiOutput::Message(json)
+                if json.get("type").and_then(|v| v.as_str()) == Some("terminal_attach")
+                    && json.get("state").and_then(|v| v.as_str()) == Some("attached")
+                    && json.get("session_uuid").and_then(|v| v.as_str()) == Some(session_uuid.as_str())
+        )),
+        "reconnect-pending attach must not fake attached state"
+    );
     assert!(
         !outputs
             .iter()
@@ -87,7 +77,7 @@ pub(super) fn test_tui_attach_reconnecting_emits_explicit_attach_state() {
 }
 
 #[test]
-pub(super) fn test_socket_attach_reconnecting_emits_explicit_attach_state() {
+pub(super) fn test_socket_attach_reconnecting_does_not_fake_attached_state() {
     let session_uuid = unique_session_uuid("sess-socket-reconnecting");
     register_live_session_identity(&session_uuid);
 
@@ -101,59 +91,50 @@ pub(super) fn test_socket_attach_reconnecting_emits_explicit_attach_state() {
             session_io_tx,
         ));
 
-    let req = crate::lua::primitives::CreateSocketForwarderRequest {
+    let req = crate::lua::primitives::SocketTerminalSubscriptionRequest {
         client_id: client_id.to_string(),
         session_uuid: session_uuid.clone(),
         subscription_id: format!("socket:{session_uuid}"),
-        active_flag: Arc::new(Mutex::new(true)),
         rows: 24,
         cols: 80,
+        active_flag: Arc::new(Mutex::new(true)),
     };
-    hub.create_lua_socket_pty_forwarder(req);
+    hub.create_socket_terminal_subscription(req);
     let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
         matches!(
             request,
             crate::worker::session_io::SessionIoRequest::Resize { .. }
         )
     });
-    let request_id = match recv_session_io_request_matching(&mut session_io_rx, |request| {
-        matches!(
-            request,
-            crate::worker::session_io::SessionIoRequest::GetSnapshot { .. }
-        )
-    }) {
-        crate::worker::session_io::SessionIoRequest::GetSnapshot { request_id } => request_id,
-        other => panic!("expected GetSnapshot request, got {other:?}"),
-    };
+    let delivery = recv_terminal_initial_snapshot_delivery(&mut session_io_rx);
     settle_worker_subscription();
-    hub.handle_session_io_event(crate::worker::session_io::SessionIoEvent::Snapshot {
-        request_id,
-        session_uuid: session_uuid.clone(),
-        payload: Vec::new(),
-    });
+    deliver_terminal_attach_state(
+        delivery,
+        crate::worker::client::TerminalAttachState::Reconnecting,
+    );
 
-    let frames = read_test_socket_frames(&mut client_stream, 4, Duration::from_secs(5));
+    let frames = read_test_socket_frames(&mut client_stream, 1, Duration::from_secs(5));
 
     assert!(
-            frames.iter().any(|frame| matches!(
-                frame,
-                Frame::Json(value)
-                    if value.get("type").and_then(|v| v.as_str()) == Some("terminal_attach")
-                        && value.get("state").and_then(|v| v.as_str()) == Some("attached")
-                        && value.get("session_uuid").and_then(|v| v.as_str()) == Some(session_uuid.as_str())
-            )),
-            "initial socket attach should still emit attached state"
-        );
+        frames.iter().any(|frame| matches!(
+            frame,
+            Frame::Json(value)
+                if value.get("type").and_then(|v| v.as_str()) == Some("terminal_attach")
+                    && value.get("state").and_then(|v| v.as_str()) == Some("reconnecting")
+                    && value.get("session_uuid").and_then(|v| v.as_str()) == Some(session_uuid.as_str())
+        )),
+        "reconnect-pending socket attach should emit explicit reconnecting state"
+    );
     assert!(
-            frames.iter().any(|frame| matches!(
-                frame,
-                Frame::Json(value)
-                    if value.get("type").and_then(|v| v.as_str()) == Some("terminal_attach")
-                        && value.get("state").and_then(|v| v.as_str()) == Some("reconnecting")
-                        && value.get("session_uuid").and_then(|v| v.as_str()) == Some(session_uuid.as_str())
-            )),
-            "reconnect-pending socket attach should emit explicit reconnecting state"
-        );
+        !frames.iter().any(|frame| matches!(
+            frame,
+            Frame::Json(value)
+                if value.get("type").and_then(|v| v.as_str()) == Some("terminal_attach")
+                    && value.get("state").and_then(|v| v.as_str()) == Some("attached")
+                    && value.get("session_uuid").and_then(|v| v.as_str()) == Some(session_uuid.as_str())
+        )),
+        "reconnect-pending socket attach must not fake attached state"
+    );
     assert!(
         !frames
             .iter()

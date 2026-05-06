@@ -237,6 +237,8 @@ pub fn condition_matches(condition: &UiCondition, viewport: &UiViewport) -> bool
 /// - [`UiChild::Node`] passes through as-is.
 /// - [`UiConditional::When`] is kept iff the condition matches.
 /// - [`UiConditional::Hidden`] is kept iff the condition does NOT match.
+/// - [`UiChild::BindList`] is skipped here; render entry points resolve
+///   `bind_list` envelopes before typed `UiNode` rendering.
 ///
 /// Returns a fresh `Vec<UiNode>` of the survivors, ready for further
 /// adapter work.
@@ -260,6 +262,7 @@ pub fn resolve_child(child: &UiChild, viewport: &UiViewport) -> Option<UiNode> {
         UiChild::Conditional(UiConditional::Hidden { condition, node }) => {
             (!condition_matches(condition, viewport)).then(|| (**node).clone())
         }
+        UiChild::BindList(_) => None,
     }
 }
 

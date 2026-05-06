@@ -155,7 +155,7 @@ fn project_fields_includes_display_name_when_title_changes() {
 }
 
 #[test]
-fn project_fields_omits_display_name_for_isidle_change() {
+fn project_fields_omits_display_name_for_output_activity_change() {
     let (lua, _eb) = new_test_lua();
     let csp: Table = lua
         .load("return require('lib.client_session_payload')")
@@ -164,18 +164,18 @@ fn project_fields_omits_display_name_for_isidle_change() {
     let project_fields: Function = csp.get("project_fields").unwrap();
 
     let changed: Table = lua.create_table().unwrap();
-    changed.set("is_idle", false).unwrap();
+    changed.set("output_activity", "active").unwrap();
     let session_after: Table = lua.create_table().unwrap();
     session_after.set("session_uuid", "sess-a").unwrap();
     session_after.set("title", "alpha").unwrap();
-    session_after.set("is_idle", false).unwrap();
+    session_after.set("output_activity", "active").unwrap();
 
     let result: Value = project_fields.call((changed, session_after)).unwrap();
     let json: JsonValue = lua.from_value(result).unwrap();
-    assert_eq!(json["is_idle"], json!(false));
+    assert_eq!(json["output_activity"], json!("active"));
     assert!(
         json.get("display_name").is_none(),
-        "is_idle change must not re-derive display_name: {json}"
+        "output_activity change must not re-derive display_name: {json}"
     );
 }
 

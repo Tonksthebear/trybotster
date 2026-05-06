@@ -14,6 +14,13 @@ class Hub < ApplicationRecord
   scope :stale, -> { where(alive: false).or(where("last_seen_at <= ?", 2.minutes.ago)) }
   scope :with_notifications, -> { where(notifications_enabled: true) }
 
+  def self.registration_candidate_for(user, identifier:, fingerprint:)
+    hubs = user.hubs
+    return hubs.find_by(identifier: identifier) if fingerprint.blank?
+
+    hubs.where(identifier: identifier).or(hubs.where(fingerprint: fingerprint)).first
+  end
+
   after_commit :broadcast_hubs_list, if: :hub_list_commit?
   after_update_commit :broadcast_health_status, if: :health_status_changed?
   after_destroy_commit :broadcast_health_offline

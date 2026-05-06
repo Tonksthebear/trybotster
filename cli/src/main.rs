@@ -441,12 +441,8 @@ enum Commands {
         #[arg(long, short = 'y')]
         yes: bool,
     },
-    /// Attach a TUI to a running headless hub (like tmux attach)
-    Attach {
-        /// Hub identifier or name (defaults to the local device hub)
-        #[arg(long)]
-        hub: Option<String>,
-    },
+    /// Attach a TUI to the running device hub (like tmux attach)
+    Attach,
     /// Run as MCP server bridge (connects to hub, speaks MCP on stdio)
     McpServe,
     /// Get agent context values (identity, worktree metadata, plugin data).
@@ -456,6 +452,11 @@ enum Commands {
         key: Option<String>,
         /// Optional value for context helpers (e.g., `botster context file notes.md`)
         value: Option<String>,
+    },
+    /// Inspect a running hub.
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommands,
     },
     /// Run a per-session PTY process (internal — spawned by the hub)
     Session {
@@ -471,6 +472,16 @@ enum Commands {
         /// Human-readable label for process title (e.g. agent name)
         #[arg(long)]
         label: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DebugCommands {
+    /// Print memory-adjacent hub diagnostics as JSON.
+    Memory {
+        /// Hub identifier. Defaults to this device's local hub ID.
+        #[arg(long)]
+        hub: Option<String>,
     },
 }
 
@@ -557,7 +568,7 @@ impl Drop for WakePipe {
 fn set_process_title(command: &Commands) {
     // Start is handled inline in its match arm (may redirect to attach).
     let title = match command {
-        Commands::Attach { .. } => "botster attach".to_string(),
+        Commands::Attach => "botster attach".to_string(),
         Commands::McpServe => {
             // Include truncated session UUID for correlation
             let suffix = std::env::var("BOTSTER_SESSION_UUID")
@@ -656,9 +667,9 @@ fn resolve_mcp_serve_socket() -> Result<Option<String>> {
 }
 
 ///
-/// Discovers a running hub (by device-local default or explicit `--hub` arg),
-/// connects to its socket, and runs the TUI with a bridge adapter.
-fn run_attach(hub_arg: Option<String>) -> Result<()> {
+/// Discovers the running device hub, connects to its socket, and runs the TUI
+/// with a bridge adapter.
+fn run_attach() -> Result<()> {
     use botster::hub::daemon;
     use botster::socket::tui_bridge::TuiBridge;
     use std::sync::atomic::Ordering;
@@ -668,30 +679,30 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
         anyhow::bail!("Error: 'attach' requires an interactive terminal (stdin is not a TTY).");
     }
 
-    // Resolve hub_id
-    let hub_id = if let Some(ref arg) = hub_arg {
-        arg.clone()
-    } else {
-        botster::hub::local_device_hub_id()?
+    // Attach is local IPC only. Do not require device keyring access here:
+    // keychain ACL changes after rebuilding the debug binary must not prevent
+    // attaching to an already-running hub.
+    let running = daemon::discover_running_hubs();
+    let (hub_id, _) = match running.as_slice() {
+        [(hub_id, pid)] => (hub_id.clone(), *pid),
+        [] => anyhow::bail!(
+            "No running local device hub manifest found.\n\
+             Start one with: botster start --headless"
+        ),
+        hubs => {
+            eprintln!("Multiple live hub manifests found; expected one device hub.");
+            eprintln!("Conflicting hubs:");
+            for (id, pid) in hubs {
+                eprintln!("  {id} (pid={pid})");
+            }
+            anyhow::bail!("Stop the stale hub process before attaching.");
+        }
     };
 
-    let socket_path = if let Some(path) = daemon::resolve_socket_for_hub_id(&hub_id) {
-        path
+    let socket_path = if let Some(manifest) = daemon::read_manifest(&hub_id) {
+        std::path::PathBuf::from(manifest.socket_path)
     } else {
-        let running = daemon::discover_running_hubs();
-        if running.is_empty() {
-            anyhow::bail!(
-                "No running local device hub manifest found.\n\
-                 Start one with: botster start --headless"
-            );
-        } else {
-            eprintln!("No running local device hub manifest found.");
-            eprintln!("Running hubs:");
-            for (id, pid) in &running {
-                eprintln!("  {} (pid={})", &id[..id.len().min(8)], pid);
-            }
-            anyhow::bail!("Use --hub <id> to specify which hub to attach to.");
-        }
+        daemon::socket_path(&hub_id)?
     };
 
     println!("Connecting to hub {}...", &hub_id[..hub_id.len().min(8)]);
@@ -741,7 +752,7 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
 
     // Create TuiRunner with bridge channels (same as run_with_hub)
     let tui_shutdown = Arc::clone(&shutdown);
-    let mut tui_runner = tui::TuiRunner::new_with_color_cache(
+    let mut tui_runner = tui::TuiRunner::new_with_color_cache_and_session_input(
         terminal,
         channels.request_tx,
         channels.output_rx,
@@ -749,6 +760,8 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
         (inner_rows, inner_cols),
         pipe.read_fd(),
         tui_color_cache,
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        Some(channels.session_input_tx),
     );
     tui_runner.set_lua_bootstrap(tui::hot_reload::LuaBootstrap::load());
 
@@ -806,6 +819,64 @@ fn run_attach(hub_arg: Option<String>) -> Result<()> {
     // pipe fds closed automatically by WakePipe drop
 
     Ok(())
+}
+
+fn run_debug_memory(hub_id: Option<&str>) -> Result<()> {
+    use botster::socket::framing::{Frame, FrameDecoder};
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+    use std::time::Duration;
+
+    let resolved_hub_id = match hub_id {
+        Some(id) => id.to_string(),
+        None => botster::hub::local_device_hub_id()?,
+    };
+    let socket_path = botster::hub::daemon::resolve_socket_for_hub_id(&resolved_hub_id)
+        .with_context(|| {
+            format!(
+                "No live hub socket found for '{}'. Start one with: botster start --headless",
+                resolved_hub_id
+            )
+        })?;
+    let mut stream = UnixStream::connect(&socket_path)
+        .with_context(|| format!("Failed to connect to hub socket {}", socket_path.display()))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .context("failed to set socket read timeout")?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .context("failed to set socket write timeout")?;
+
+    let request_id = format!("debug-memory-{}", std::process::id());
+    let request = Frame::Json(serde_json::json!({
+        "type": "debug_memory",
+        "request_id": request_id,
+    }));
+    stream
+        .write_all(&request.encode())
+        .context("failed to send debug memory request")?;
+
+    let mut decoder = FrameDecoder::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = stream
+            .read(&mut buf)
+            .context("failed to read debug memory response")?;
+        if n == 0 {
+            anyhow::bail!("hub socket closed before debug memory response");
+        }
+        for frame in decoder.feed(&buf[..n])? {
+            let Frame::Json(value) = frame else {
+                continue;
+            };
+            if value.get("type").and_then(|v| v.as_str()) == Some("debug_memory")
+                && value.get("request_id").and_then(|v| v.as_str()) == Some(request_id.as_str())
+            {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok(());
+            }
+        }
+    }
 }
 
 /// Print local hub runtime artifact status.
@@ -1018,7 +1089,7 @@ fn main() -> Result<()> {
         let log_label = match &cli.command {
             Commands::Start { headless: true, .. } => "hub",
             Commands::Start { .. } => "tui",
-            Commands::Attach { .. } => "attach",
+            Commands::Attach => "attach",
             Commands::Session { .. } => "session",
             _ => "cli",
         };
@@ -1111,10 +1182,9 @@ fn main() -> Result<()> {
                 if let Some((hub_id, Some(socket), _)) = existing_hub.as_ref() {
                     anyhow::bail!(
                         "Hub already running on this device (hub_id={}, socket={}). \
-                         Use `botster attach --hub {}` or stop the existing hub first.",
+                         Use `botster attach` or stop the existing hub first.",
                         hub_id,
-                        socket.display(),
-                        hub_id
+                        socket.display()
                     );
                 }
                 if let Some((hub_id, None, true)) = existing_hub.as_ref() {
@@ -1133,7 +1203,7 @@ fn main() -> Result<()> {
                 if let Some((_hub_id, Some(_socket), _)) = existing_hub.as_ref() {
                     proctitle::set_title("botster attach");
                     println!("Hub already running — attaching...");
-                    run_attach(None)?;
+                    run_attach()?;
                 } else if let Some((hub_id, None, true)) = existing_hub.as_ref() {
                     let expected_socket = botster::hub::daemon::socket_path(hub_id)
                         .map(|p| p.display().to_string())
@@ -1201,8 +1271,8 @@ fn main() -> Result<()> {
         Commands::Reset { yes } => {
             commands::reset::run(yes)?;
         }
-        Commands::Attach { hub: hub_arg } => {
-            run_attach(hub_arg)?;
+        Commands::Attach => {
+            run_attach()?;
         }
         Commands::McpServe => match resolve_mcp_serve_socket()? {
             Some(socket_path) => botster::mcp_gateway::run(&socket_path)?,
@@ -1213,6 +1283,11 @@ fn main() -> Result<()> {
         Commands::Context { key, value } => {
             commands::context::run(key.as_deref(), value.as_deref())?;
         }
+        Commands::Debug { command } => match command {
+            DebugCommands::Memory { hub } => {
+                run_debug_memory(hub.as_deref())?;
+            }
+        },
         Commands::Session {
             uuid,
             socket,

@@ -1,63 +1,43 @@
 //! PTY primitives for Lua scripts.
 //!
-//! Exposes PTY terminal handling to Lua, allowing scripts to create forwarders,
-//! spawn PTY sessions, send input, resize terminals, and optionally intercept
-//! PTY output via hooks.
+//! Exposes PTY terminal handling to Lua, allowing scripts to create subscriptions,
+//! spawn PTY sessions, send input, and resize terminals.
 //!
 //! # Design Principle: "Lua controls. Rust streams."
 //!
-//! For high-frequency PTY output:
-//! - **Default (fast path)**: Rust streams directly to WebRTC, no Lua in data path
-//! - **Optional (slow path)**: If "pty_output" hooks are registered, call them
+//! For high-frequency PTY output, durable-session bytes stay on the
+//! session/client actor data plane. Lua owns control-plane decisions, not the
+//! terminal byte stream.
 //!
 //! # PTY Session Handles
 //!
 //! Runtime PTY creation uses per-session processes via
 //! `hub.spawn_session()` (see `hub.rs`). This module provides the
-//! `PtySessionHandle` userdata and PTY forwarder primitives.
+//! `PtySessionHandle` userdata and PTY subscription primitives.
 //!
-//! # PTY Forwarders
+//! # PTY Subscriptions
 //!
 //! ```lua
-//! -- Create a PTY forwarder (Rust handles the streaming)
-//! local forwarder = webrtc.create_pty_forwarder({
+//! -- Create a PTY subscription (Rust handles the streaming)
+//! local subscription = webrtc.subscribe_terminal({
 //!     peer_id = "browser-123",
 //!     session_uuid = "sess-1234567890-abcdef",
 //!     prefix = "\x01",  -- Optional: prefix for raw terminal data
 //! })
 //!
-//! -- Check forwarder status
-//! print(forwarder:id())             -- "browser-123:sess-1234567890-abcdef"
-//! print(forwarder:session_uuid())   -- "sess-1234567890-abcdef"
-//! print(forwarder:is_active())      -- true
+//! -- Check subscription status
+//! print(subscription:id())             -- "browser-123:sess-1234567890-abcdef"
+//! print(subscription:session_uuid())   -- "sess-1234567890-abcdef"
+//! print(subscription:is_active())      -- true
 //!
-//! -- Stop forwarder (forwarder is also stopped automatically on cleanup)
-//! forwarder:stop()
+//! -- Stop subscription (subscription is also stopped automatically on cleanup)
+//! subscription:stop()
 //!
 //! -- Direct PTY operations
 //! hub.write_pty(0, 0, "ls -la\n")      -- Send input to PTY
 //! hub.resize_pty(0, 0, 24, 80)         -- Resize PTY
 //! ```
 //!
-//! # Hook Integration
-//!
-//! Two hook types for PTY output:
-//!
-//! ```lua
-//! -- OBSERVER: Async, safe, cannot block or transform
-//! hooks.on("pty_output", "my_logger", function(ctx, data)
-//!     -- ctx contains: agent_index, pty_index, peer_id
-//!     -- data is the raw output bytes
-//!     log.info("Got " .. #data .. " bytes from PTY")
-//! end)
-//!
-//! -- INTERCEPTOR: Sync, blocking, can transform/drop (use sparingly!)
-//! hooks.intercept("pty_output", "my_filter", function(ctx, data)
-//!     -- Return transformed data, or nil to drop
-//!     return data:gsub("secret", "***")
-//! end, { timeout_ms = 10 })
-//! ```
-
 #[cfg(test)]
 use std::collections::HashMap;
 use std::io::Write;
@@ -521,58 +501,58 @@ impl LuaUserData for PtySessionHandle {
     }
 }
 
-/// Forwarder handle returned to Lua as userdata.
+/// Subscription handle returned to Lua as userdata.
 ///
-/// Represents an active PTY-to-WebRTC forwarder. Lua can check status
-/// and stop the forwarder. The actual streaming is handled by Rust.
+/// Represents an active PTY-to-WebRTC subscription. Lua can check status
+/// and stop the subscription. The actual streaming is handled by Rust.
 #[derive(Debug)]
-pub struct PtyForwarder {
-    /// Unique forwarder identifier: "{peer_id}:{session_uuid}".
+pub struct TerminalSubscription {
+    /// Unique subscription identifier: "{peer_id}:{session_uuid}".
     pub id: String,
     /// Browser peer that receives the PTY output.
     pub peer_id: String,
     /// Session UUID identifying the PTY.
     pub session_uuid: String,
-    /// Whether this forwarder is still active.
+    /// Whether this subscription is still active.
     /// Set to false when stop() is called or Hub cleans up.
     pub active: Arc<Mutex<bool>>,
 }
 
-impl LuaUserData for PtyForwarder {
+impl LuaUserData for TerminalSubscription {
     fn add_methods<M: LuaUserDataMethods<Self>>(methods: &mut M) {
-        // forwarder:stop() - Request forwarder shutdown
+        // subscription:stop() - Request subscription shutdown
         methods.add_method("stop", |_, this, ()| {
             let mut active = this
                 .active
                 .lock()
-                .expect("PTY forwarder active flag mutex poisoned");
+                .expect("PTY subscription active flag mutex poisoned");
             *active = false;
             Ok(())
         });
 
-        // forwarder:is_active() - Check if forwarder is still running
+        // subscription:is_active() - Check if subscription is still running
         methods.add_method("is_active", |_, this, ()| {
             let active = this
                 .active
                 .lock()
-                .expect("PTY forwarder active flag mutex poisoned");
+                .expect("PTY subscription active flag mutex poisoned");
             Ok(*active)
         });
 
-        // forwarder:id() - Get forwarder identifier
+        // subscription:id() - Get subscription identifier
         methods.add_method("id", |_, this, ()| Ok(this.id.clone()));
 
-        // forwarder:peer_id() - Get the target peer ID
+        // subscription:peer_id() - Get the target peer ID
         methods.add_method("peer_id", |_, this, ()| Ok(this.peer_id.clone()));
 
-        // forwarder:session_uuid() - Get the session UUID
+        // subscription:session_uuid() - Get the session UUID
         methods.add_method("session_uuid", |_, this, ()| Ok(this.session_uuid.clone()));
     }
 }
 
-/// Request to create a PTY forwarder (queued for Hub to process).
+/// Request to create a PTY subscription (queued for Hub to process).
 #[derive(Debug, Clone)]
-pub struct CreateForwarderRequest {
+pub struct BrowserTerminalSubscriptionRequest {
     /// Browser peer that will receive the PTY output.
     pub peer_id: String,
     /// Session UUID identifying the target PTY.
@@ -589,7 +569,7 @@ pub struct CreateForwarderRequest {
     pub rows: u16,
     /// Target terminal columns requested by the subscriber.
     pub cols: u16,
-    /// Shared active flag for the forwarder handle.
+    /// Shared active flag for the subscription handle.
     pub active_flag: Arc<Mutex<bool>>,
 }
 
@@ -608,12 +588,12 @@ pub struct RefreshSnapshotRequest {
     pub cols: u16,
 }
 
-/// Request to create a TUI PTY forwarder (queued for Hub to process).
+/// Request to create a TUI PTY subscription (queued for Hub to process).
 ///
-/// Unlike `CreateForwarderRequest`, this doesn't need a peer_id (single TUI)
+/// Unlike `BrowserTerminalSubscriptionRequest`, this doesn't need a peer_id (single TUI)
 /// and routes output through `tui_output_tx` instead of WebRTC.
 #[derive(Debug, Clone)]
-pub struct CreateTuiForwarderRequest {
+pub struct TuiTerminalSubscriptionRequest {
     /// Session UUID identifying the target PTY.
     pub session_uuid: String,
     /// Subscription ID for tracking (Lua-generated).
@@ -622,15 +602,15 @@ pub struct CreateTuiForwarderRequest {
     pub rows: u16,
     /// Target terminal columns requested by the subscriber.
     pub cols: u16,
-    /// Shared active flag for the forwarder handle.
+    /// Shared active flag for the subscription handle.
     pub active_flag: Arc<Mutex<bool>>,
 }
 
-/// Request to create a socket PTY forwarder (queued for Hub to process).
+/// Request to create a socket PTY subscription (queued for Hub to process).
 ///
 /// Streams PTY output as `Frame::PtyOutput` over a Unix domain socket connection.
 #[derive(Debug, Clone)]
-pub struct CreateSocketForwarderRequest {
+pub struct SocketTerminalSubscriptionRequest {
     /// Socket client identifier (e.g., "socket:0137b").
     pub client_id: String,
     /// Session UUID identifying the target PTY.
@@ -641,7 +621,7 @@ pub struct CreateSocketForwarderRequest {
     pub rows: u16,
     /// Target terminal columns requested by the subscriber.
     pub cols: u16,
-    /// Shared active flag for the forwarder handle.
+    /// Shared active flag for the subscription handle.
     pub active_flag: Arc<Mutex<bool>>,
 }
 
@@ -650,22 +630,22 @@ pub struct CreateSocketForwarderRequest {
 /// These are processed by Hub in its event loop after Lua callbacks return.
 #[derive(Debug)]
 pub enum PtyRequest {
-    /// Create a new PTY forwarder for streaming to WebRTC.
-    CreateForwarder(CreateForwarderRequest),
+    /// Create a new PTY subscription for streaming to WebRTC.
+    SubscribeBrowserTerminal(BrowserTerminalSubscriptionRequest),
 
     /// Replay a fresh PTY snapshot over an existing WebRTC subscription.
     RefreshSnapshot(RefreshSnapshotRequest),
 
-    /// Create a new PTY forwarder for streaming to TUI (index-based).
-    CreateTuiForwarder(CreateTuiForwarderRequest),
+    /// Create a new PTY subscription for streaming to TUI (index-based).
+    SubscribeTuiTerminal(TuiTerminalSubscriptionRequest),
 
-    /// Create a new PTY forwarder for streaming to a socket client.
-    CreateSocketForwarder(CreateSocketForwarderRequest),
+    /// Create a new PTY subscription for streaming to a socket client.
+    SubscribeSocketTerminal(SocketTerminalSubscriptionRequest),
 
-    /// Stop an existing PTY forwarder.
-    StopForwarder {
-        /// Forwarder identifier: "{peer_id}:{session_uuid}".
-        forwarder_id: String,
+    /// Stop an existing terminal subscription.
+    StopTerminalSubscription {
+        /// Subscription routing key: "{peer_id}:{session_uuid}".
+        subscription_key: String,
     },
 
     /// Write input data to a PTY.
@@ -695,12 +675,11 @@ pub enum PtyRequest {
         session_uuid: String,
         /// Session name (e.g., "cli", "server").
         session_name: String,
-        /// Whether raw PTY output should be forwarded as `PtyOutputObserved`.
+        /// Historical output-observation flag retained in the Lua request shape.
         ///
-        /// Local PTY sessions need this because the watcher is the only source
-        /// of raw output events. Session-process-backed PTYs set this false and
-        /// let the session reader emit output observations directly, avoiding a
-        /// subscribe-after-start race and duplicate probe forwarding.
+        /// PTY bytes no longer flow through the hub; output from this watcher is
+        /// ignored by hub policy and delivered only through client data-plane
+        /// subscriptions.
         observe_output: bool,
         /// Event sender to subscribe to PTY events.
         event_tx: broadcast::Sender<PtyEvent>,
@@ -711,11 +690,11 @@ pub enum PtyRequest {
 impl Clone for PtyRequest {
     fn clone(&self) -> Self {
         match self {
-            Self::CreateForwarder(req) => Self::CreateForwarder(req.clone()),
+            Self::SubscribeBrowserTerminal(req) => Self::SubscribeBrowserTerminal(req.clone()),
             Self::RefreshSnapshot(req) => Self::RefreshSnapshot(req.clone()),
-            Self::CreateTuiForwarder(req) => Self::CreateTuiForwarder(req.clone()),
-            Self::StopForwarder { forwarder_id } => Self::StopForwarder {
-                forwarder_id: forwarder_id.clone(),
+            Self::SubscribeTuiTerminal(req) => Self::SubscribeTuiTerminal(req.clone()),
+            Self::StopTerminalSubscription { subscription_key } => Self::StopTerminalSubscription {
+                subscription_key: subscription_key.clone(),
             },
             Self::WritePty { session_uuid, data } => Self::WritePty {
                 session_uuid: session_uuid.clone(),
@@ -743,7 +722,7 @@ impl Clone for PtyRequest {
                 observe_output: *observe_output,
                 event_tx: event_tx.clone(),
             },
-            Self::CreateSocketForwarder(req) => Self::CreateSocketForwarder(req.clone()),
+            Self::SubscribeSocketTerminal(req) => Self::SubscribeSocketTerminal(req.clone()),
         }
     }
 }
@@ -875,8 +854,8 @@ pub(crate) fn spawn_session_handle_from_opts(
 /// Register PTY primitives with the Lua state.
 ///
 /// Adds the following functions:
-/// - `webrtc.create_pty_forwarder(opts)` - Create a PTY-to-WebRTC forwarder
-/// - `tui.create_pty_forwarder(opts)` - Create a PTY-to-TUI forwarder
+/// - `webrtc.subscribe_terminal(opts)` - Create a PTY-to-WebRTC subscription
+/// - `tui.subscribe_terminal(opts)` - Create a PTY-to-TUI subscription
 /// - `hub.write_pty(session_uuid, data)` - Write input to PTY
 /// - `hub.resize_pty(session_uuid, rows, cols)` - Resize PTY
 ///
@@ -895,9 +874,9 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
         .get("webrtc")
         .unwrap_or_else(|_| lua.create_table().unwrap());
 
-    // webrtc.create_pty_forwarder({ peer_id, session_uuid, subscription_id, rows?, cols?, prefix? })
+    // webrtc.subscribe_terminal({ peer_id, session_uuid, subscription_id, rows?, cols?, prefix? })
     let tx = hub_event_tx.clone();
-    let create_forwarder_fn = lua
+    let subscribe_terminal_fn = lua
         .create_function(move |_lua, opts: LuaTable| {
             let peer_id: String = opts
                 .get("peer_id")
@@ -912,13 +891,13 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
             let cols: u16 = opts.get("cols").unwrap_or(80);
             let prefix: Option<LuaString> = opts.get("prefix").ok();
 
-            let forwarder_id = format!("{}:{}", peer_id, session_uuid);
+            let subscription_key = format!("{}:{}", peer_id, session_uuid);
             let active_flag = Arc::new(Mutex::new(true));
 
             // Send the request to Hub via event channel
             send_pty_event(
                 &tx,
-                PtyRequest::CreateForwarder(CreateForwarderRequest {
+                PtyRequest::SubscribeBrowserTerminal(BrowserTerminalSubscriptionRequest {
                     peer_id: peer_id.clone(),
                     session_uuid: session_uuid.clone(),
                     prefix: prefix.map(|p| p.as_bytes().to_vec()),
@@ -929,22 +908,22 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
                 }),
             );
 
-            // Return forwarder handle immediately
-            // The actual forwarder task is spawned when Hub processes the request
-            let forwarder = PtyForwarder {
-                id: forwarder_id,
+            // Return subscription handle immediately. The hub resolves it into
+            // the shared SessionIo/ClientWorker data-plane path.
+            let subscription = TerminalSubscription {
+                id: subscription_key,
                 peer_id,
                 session_uuid,
                 active: active_flag,
             };
 
-            Ok(forwarder)
+            Ok(subscription)
         })
-        .map_err(|e| anyhow!("Failed to create webrtc.create_pty_forwarder function: {e}"))?;
+        .map_err(|e| anyhow!("Failed to create webrtc.subscribe_terminal function: {e}"))?;
 
     webrtc
-        .set("create_pty_forwarder", create_forwarder_fn)
-        .map_err(|e| anyhow!("Failed to set webrtc.create_pty_forwarder: {e}"))?;
+        .set("subscribe_terminal", subscribe_terminal_fn)
+        .map_err(|e| anyhow!("Failed to set webrtc.subscribe_terminal: {e}"))?;
 
     // webrtc.request_pty_snapshot({ peer_id, session_uuid, subscription_id, rows?, cols? })
     let tx_refresh = hub_event_tx.clone();
@@ -991,12 +970,12 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
         .get("tui")
         .unwrap_or_else(|_| lua.create_table().unwrap());
 
-    // tui.create_pty_forwarder({ session_uuid, subscription_id, rows?, cols? })
+    // tui.subscribe_terminal({ session_uuid, subscription_id, rows?, cols? })
     //
-    // Like webrtc.create_pty_forwarder but routes output through TUI send queue.
+    // Like webrtc.subscribe_terminal but routes output through TUI send queue.
     // No peer_id needed — there's only one TUI client.
     let tx_tui = hub_event_tx.clone();
-    let create_tui_forwarder_fn = lua
+    let subscribe_tui_terminal_fn = lua
         .create_function(move |_lua, opts: LuaTable| {
             let session_uuid: String = opts
                 .get("session_uuid")
@@ -1007,13 +986,13 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
             let rows: u16 = opts.get("rows").unwrap_or(24);
             let cols: u16 = opts.get("cols").unwrap_or(80);
 
-            let forwarder_id = format!("tui:{}", session_uuid);
+            let subscription_key = format!("tui:{}", session_uuid);
             let active_flag = Arc::new(Mutex::new(true));
 
             // Send the request to Hub via event channel
             send_pty_event(
                 &tx_tui,
-                PtyRequest::CreateTuiForwarder(CreateTuiForwarderRequest {
+                PtyRequest::SubscribeTuiTerminal(TuiTerminalSubscriptionRequest {
                     session_uuid: session_uuid.clone(),
                     subscription_id,
                     rows,
@@ -1022,20 +1001,20 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
                 }),
             );
 
-            // Return forwarder handle immediately
-            let forwarder = PtyForwarder {
-                id: forwarder_id,
+            // Return subscription handle immediately
+            let subscription = TerminalSubscription {
+                id: subscription_key,
                 peer_id: "tui".to_string(),
                 session_uuid,
                 active: active_flag,
             };
 
-            Ok(forwarder)
+            Ok(subscription)
         })
-        .map_err(|e| anyhow!("Failed to create tui.create_pty_forwarder function: {e}"))?;
+        .map_err(|e| anyhow!("Failed to create tui.subscribe_terminal function: {e}"))?;
 
-    tui.set("create_pty_forwarder", create_tui_forwarder_fn)
-        .map_err(|e| anyhow!("Failed to set tui.create_pty_forwarder: {e}"))?;
+    tui.set("subscribe_terminal", subscribe_tui_terminal_fn)
+        .map_err(|e| anyhow!("Failed to set tui.subscribe_terminal: {e}"))?;
 
     // Ensure tui table is globally registered
     lua.globals()
@@ -1114,39 +1093,24 @@ pub(crate) fn register(lua: &Lua, hub_event_tx: HubEventSender) -> Result<()> {
     Ok(())
 }
 
-/// Context passed to PTY output hooks.
-#[derive(Debug, Clone)]
-pub struct PtyOutputContext {
-    /// Session UUID identifying the PTY producing output.
-    pub session_uuid: String,
-    /// Logical source identifier for this output stream.
-    ///
-    /// Browser delivery uses a browser identity. Session-scoped output uses a
-    /// synthetic identifier like `session:<uuid>`.
-    pub peer_id: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::new_hub_event_sender;
     use super::*;
 
     /// Create a wired-up sender with a channel for tests that need to check events.
-    fn setup_with_channel() -> (
-        HubEventSender,
-        tokio::sync::mpsc::UnboundedReceiver<HubEvent>,
-    ) {
+    fn setup_with_channel() -> (HubEventSender, tokio::sync::mpsc::Receiver<HubEvent>) {
         let tx = new_hub_event_sender();
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(64);
         *tx.lock().unwrap() = Some(sender.into());
         (tx, receiver)
     }
 
     #[test]
-    fn test_pty_forwarder_userdata() {
+    fn test_pty_subscription_userdata() {
         let lua = Lua::new();
 
-        let forwarder = PtyForwarder {
+        let subscription = TerminalSubscription {
             id: "test-peer:sess-test-uuid".to_string(),
             peer_id: "test-peer".to_string(),
             session_uuid: "sess-test-uuid".to_string(),
@@ -1154,43 +1118,46 @@ mod tests {
         };
 
         lua.globals()
-            .set("forwarder", forwarder)
-            .expect("Failed to set forwarder");
+            .set("subscription", subscription)
+            .expect("Failed to set subscription");
 
         // Test id() method
         let id: String = lua
-            .load("return forwarder:id()")
+            .load("return subscription:id()")
             .eval()
             .expect("Failed to get id");
         assert_eq!(id, "test-peer:sess-test-uuid");
 
         // Test is_active() method
         let active: bool = lua
-            .load("return forwarder:is_active()")
+            .load("return subscription:is_active()")
             .eval()
             .expect("Failed to check is_active");
         assert!(active);
 
         // Test stop() method
-        lua.load("forwarder:stop()")
+        lua.load("subscription:stop()")
             .exec()
             .expect("Failed to call stop");
         let active: bool = lua
-            .load("return forwarder:is_active()")
+            .load("return subscription:is_active()")
             .eval()
             .expect("Failed to check is_active after stop");
         assert!(!active);
 
         // Test other accessors
-        let peer_id: String = lua.load("return forwarder:peer_id()").eval().unwrap();
+        let peer_id: String = lua.load("return subscription:peer_id()").eval().unwrap();
         assert_eq!(peer_id, "test-peer");
 
-        let uuid: String = lua.load("return forwarder:session_uuid()").eval().unwrap();
+        let uuid: String = lua
+            .load("return subscription:session_uuid()")
+            .eval()
+            .unwrap();
         assert_eq!(uuid, "sess-test-uuid");
     }
 
     #[test]
-    fn test_create_pty_forwarder_sends_event() {
+    fn test_subscribe_terminal_sends_event() {
         let lua = Lua::new();
         let (tx, mut rx) = setup_with_channel();
 
@@ -1198,7 +1165,7 @@ mod tests {
 
         lua.load(
             r#"
-            forwarder = webrtc.create_pty_forwarder({
+            subscription = webrtc.subscribe_terminal({
                 peer_id = "browser-123",
                 session_uuid = "sess-fwd-test",
                 subscription_id = "sub_1_1234567890",
@@ -1206,25 +1173,25 @@ mod tests {
         "#,
         )
         .exec()
-        .expect("Should create forwarder");
+        .expect("Should create subscription");
 
         let event = rx.try_recv().expect("Should have received event");
         match event {
-            HubEvent::LuaPtyRequest(PtyRequest::CreateForwarder(req)) => {
+            HubEvent::LuaPtyRequest(PtyRequest::SubscribeBrowserTerminal(req)) => {
                 assert_eq!(req.peer_id, "browser-123");
                 assert_eq!(req.session_uuid, "sess-fwd-test");
                 assert_eq!(req.subscription_id, "sub_1_1234567890");
                 assert!(req.prefix.is_none());
             }
-            _ => panic!("Expected LuaPtyRequest CreateForwarder event"),
+            _ => panic!("Expected LuaPtyRequest SubscribeBrowserTerminal event"),
         }
 
-        let id: String = lua.load("return forwarder:id()").eval().unwrap();
+        let id: String = lua.load("return subscription:id()").eval().unwrap();
         assert_eq!(id, "browser-123:sess-fwd-test");
     }
 
     #[test]
-    fn test_create_pty_forwarder_with_prefix() {
+    fn test_subscribe_terminal_with_prefix() {
         let lua = Lua::new();
         let (tx, mut rx) = setup_with_channel();
 
@@ -1232,7 +1199,7 @@ mod tests {
 
         lua.load(
             r#"
-            webrtc.create_pty_forwarder({
+            webrtc.subscribe_terminal({
                 peer_id = "browser-456",
                 session_uuid = "sess-prefix-test",
                 subscription_id = "sub_2_9876543210",
@@ -1241,14 +1208,14 @@ mod tests {
         "#,
         )
         .exec()
-        .expect("Should create forwarder with prefix");
+        .expect("Should create subscription with prefix");
 
         match rx.try_recv().unwrap() {
-            HubEvent::LuaPtyRequest(PtyRequest::CreateForwarder(req)) => {
+            HubEvent::LuaPtyRequest(PtyRequest::SubscribeBrowserTerminal(req)) => {
                 assert_eq!(req.prefix, Some(vec![0x01]));
                 assert_eq!(req.subscription_id, "sub_2_9876543210");
             }
-            _ => panic!("Expected CreateForwarder event"),
+            _ => panic!("Expected SubscribeBrowserTerminal event"),
         }
     }
 
@@ -1308,7 +1275,7 @@ mod tests {
 
         lua.load(
             r#"
-            webrtc.create_pty_forwarder({ peer_id = "p1", session_uuid = "sess-multi", subscription_id = "sub_1" })
+            webrtc.subscribe_terminal({ peer_id = "p1", session_uuid = "sess-multi", subscription_id = "sub_1" })
             hub.write_pty("sess-multi", "test")
             hub.resize_pty("sess-multi", 24, 80)
         "#,
@@ -1322,7 +1289,7 @@ mod tests {
 
         assert!(matches!(
             e1,
-            HubEvent::LuaPtyRequest(PtyRequest::CreateForwarder(_))
+            HubEvent::LuaPtyRequest(PtyRequest::SubscribeBrowserTerminal(_))
         ));
         assert!(matches!(
             e2,
@@ -1335,7 +1302,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_forwarder_requires_peer_id() {
+    fn test_create_subscription_requires_peer_id() {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
 
@@ -1344,7 +1311,7 @@ mod tests {
         let result: mlua::Result<()> = lua
             .load(
                 r#"
-            webrtc.create_pty_forwarder({ session_uuid = "sess-x", subscription_id = "sub_1" })
+            webrtc.subscribe_terminal({ session_uuid = "sess-x", subscription_id = "sub_1" })
         "#,
             )
             .exec();
@@ -1359,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_forwarder_requires_session_uuid() {
+    fn test_create_subscription_requires_session_uuid() {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
 
@@ -1368,7 +1335,7 @@ mod tests {
         let result: mlua::Result<()> = lua
             .load(
                 r#"
-            webrtc.create_pty_forwarder({ peer_id = "test", subscription_id = "sub_1" })
+            webrtc.subscribe_terminal({ peer_id = "test", subscription_id = "sub_1" })
         "#,
             )
             .exec();
@@ -1383,7 +1350,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_forwarder_requires_subscription_id() {
+    fn test_create_subscription_requires_subscription_id() {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
 
@@ -1392,7 +1359,7 @@ mod tests {
         let result: mlua::Result<()> = lua
             .load(
                 r#"
-            webrtc.create_pty_forwarder({ peer_id = "test", session_uuid = "sess-x" })
+            webrtc.subscribe_terminal({ peer_id = "test", session_uuid = "sess-x" })
         "#,
             )
             .exec();
@@ -1407,11 +1374,11 @@ mod tests {
     }
 
     // =========================================================================
-    // TUI PTY Forwarder Tests
+    // TUI PTY Subscription Tests
     // =========================================================================
 
     #[test]
-    fn test_tui_create_pty_forwarder_exists() {
+    fn test_tui_subscribe_terminal_exists() {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
 
@@ -1424,12 +1391,12 @@ mod tests {
 
         let tui: mlua::Table = lua.globals().get("tui").expect("tui should exist");
         let _: mlua::Function = tui
-            .get("create_pty_forwarder")
-            .expect("tui.create_pty_forwarder should exist");
+            .get("subscribe_terminal")
+            .expect("tui.subscribe_terminal should exist");
     }
 
     #[test]
-    fn test_tui_create_pty_forwarder_sends_event() {
+    fn test_tui_subscribe_terminal_sends_event() {
         let lua = Lua::new();
         let (tx, mut rx) = setup_with_channel();
 
@@ -1441,37 +1408,37 @@ mod tests {
 
         lua.load(
             r#"
-            forwarder = tui.create_pty_forwarder({
+            subscription = tui.subscribe_terminal({
                 session_uuid = "sess-tui-test",
                 subscription_id = "tui_term_1",
             })
         "#,
         )
         .exec()
-        .expect("Should create TUI forwarder");
+        .expect("Should create TUI subscription");
 
         let event = rx.try_recv().expect("Should have received event");
         match event {
-            HubEvent::LuaPtyRequest(PtyRequest::CreateTuiForwarder(req)) => {
+            HubEvent::LuaPtyRequest(PtyRequest::SubscribeTuiTerminal(req)) => {
                 assert_eq!(req.session_uuid, "sess-tui-test");
                 assert_eq!(req.subscription_id, "tui_term_1");
             }
-            _ => panic!("Expected LuaPtyRequest CreateTuiForwarder event"),
+            _ => panic!("Expected LuaPtyRequest SubscribeTuiTerminal event"),
         }
 
-        // Verify forwarder handle
-        let id: String = lua.load("return forwarder:id()").eval().unwrap();
+        // Verify subscription handle
+        let id: String = lua.load("return subscription:id()").eval().unwrap();
         assert_eq!(id, "tui:sess-tui-test");
 
-        let peer: String = lua.load("return forwarder:peer_id()").eval().unwrap();
+        let peer: String = lua.load("return subscription:peer_id()").eval().unwrap();
         assert_eq!(peer, "tui");
 
-        let active: bool = lua.load("return forwarder:is_active()").eval().unwrap();
+        let active: bool = lua.load("return subscription:is_active()").eval().unwrap();
         assert!(active);
     }
 
     #[test]
-    fn test_tui_create_pty_forwarder_requires_session_uuid() {
+    fn test_tui_subscribe_terminal_requires_session_uuid() {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
 
@@ -1484,7 +1451,7 @@ mod tests {
         let result: mlua::Result<()> = lua
             .load(
                 r#"
-            tui.create_pty_forwarder({ subscription_id = "sub_1" })
+            tui.subscribe_terminal({ subscription_id = "sub_1" })
         "#,
             )
             .exec();
@@ -1499,7 +1466,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tui_forwarder_stop_sets_inactive() {
+    fn test_tui_subscription_stop_sets_inactive() {
         let lua = Lua::new();
         let tx = new_hub_event_sender();
 
@@ -1511,7 +1478,7 @@ mod tests {
 
         lua.load(
             r#"
-            fwd = tui.create_pty_forwarder({
+            fwd = tui.subscribe_terminal({
                 session_uuid = "sess-tui-stop",
                 subscription_id = "sub_tui",
             })

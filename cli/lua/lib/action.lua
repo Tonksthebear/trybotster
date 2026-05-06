@@ -31,6 +31,12 @@ local registry = state.get("ui_action_registry", {})
 
 local M = {}
 
+local function current_plugin_key()
+    local key = rawget(_G, "_loading_plugin_key") or rawget(_G, "_loading_plugin_name")
+    if type(key) == "string" and key ~= "" then return key end
+    return nil
+end
+
 --- Sentinel returned by a handler to claim ownership of an envelope and
 --- suppress the legacy-command fallback. Kept as a unique table so it
 --- cannot collide with any user-defined truthy value (e.g., a boolean
@@ -106,23 +112,35 @@ end
 -- @param action_id string Semantic Botster action id (e.g. "botster.session.select")
 -- @param name string Caller-provided tag for replace-in-place semantics
 -- @param handler function (envelope, ctx) -> action.HANDLED|any|nil
-function M.on(action_id, name, handler)
+function M.on(action_id, name, handler, opts)
     assert(type(action_id) == "string", "action_id must be a string")
     assert(type(name) == "string", "name must be a string")
     assert(type(handler) == "function", "handler must be a function")
+    opts = opts or {}
 
     local slot = registry[action_id] or {}
+    local owner_plugin = current_plugin_key()
     -- Replace existing entry with the same name so repeated calls from a
     -- hot-reloaded module don't stack handlers.
     for i, entry in ipairs(slot) do
         if entry.name == name then
-            slot[i] = { name = name, handler = handler }
+            slot[i] = {
+                name = name,
+                handler = handler,
+                owner_plugin = owner_plugin,
+                timeout_ms = opts.timeout_ms or 2000,
+            }
             registry[action_id] = slot
             log.debug(string.format("action.on: replaced handler %s for %s", name, action_id))
             return
         end
     end
-    slot[#slot + 1] = { name = name, handler = handler }
+    slot[#slot + 1] = {
+        name = name,
+        handler = handler,
+        owner_plugin = owner_plugin,
+        timeout_ms = opts.timeout_ms or 2000,
+    }
     registry[action_id] = slot
     log.debug(string.format("action.on: registered handler %s for %s", name, action_id))
 end
@@ -142,6 +160,46 @@ function M.off(action_id, name)
         end
     end
     return false
+end
+
+function M._invoke_registered(action_id, name, envelope, ctx)
+    local slot = registry[action_id]
+    if not slot then error("ui action not registered: " .. tostring(action_id)) end
+    for _, entry in ipairs(slot) do
+        if entry.name == name then
+            local result = entry.handler(envelope, ctx or {})
+            if result == M.HANDLED then
+                return { __plugin_action_status = "handled" }
+            end
+            if type(result) == "table" and result.__ui_action_result == true then
+                result.__plugin_action_status = "result"
+                return result
+            end
+            return { __plugin_action_status = "observed" }
+        end
+    end
+    error("ui action handler not registered: " .. tostring(action_id) .. ":" .. tostring(name))
+end
+
+function M.unregister_by_plugin(plugin_key)
+    if type(plugin_key) ~= "string" or plugin_key == "" then return 0 end
+    local removed = 0
+    for action_id, slot in pairs(registry) do
+        local keep = {}
+        for _, entry in ipairs(slot) do
+            if entry.owner_plugin == plugin_key then
+                removed = removed + 1
+            else
+                keep[#keep + 1] = entry
+            end
+        end
+        if #keep == 0 then
+            registry[action_id] = nil
+        elseif #keep ~= #slot then
+            registry[action_id] = keep
+        end
+    end
+    return removed
 end
 
 --- List registered action ids (for introspection and tests).
@@ -196,15 +254,36 @@ function M.dispatch(envelope, ctx)
 
     local slot = registry[envelope.id]
     if slot then
+        local supervisor = require("lib.plugin_supervisor")
         for _, entry in ipairs(slot) do
             handler_count = handler_count + 1
-            local ok, result = pcall(entry.handler, envelope, ctx)
+            local ok, result = supervisor.invoke(
+                entry.owner_plugin,
+                "ui_action:" .. envelope.id .. ":" .. entry.name,
+                entry.handler,
+                {
+                    timeout_ms = entry.timeout_ms,
+                    handler_kind = "ui_action",
+                    handler_id = envelope.id,
+                    handler_name = entry.name,
+                    payload = { envelope = envelope, ctx = ctx },
+                },
+                envelope,
+                ctx)
             if not ok then
                 log.warn(string.format(
                     "action handler %s for %s raised: %s",
                     entry.name, envelope.id, tostring(result)))
                 ok_result = false
                 error_message = tostring(result)
+            elseif type(result) == "table" and result.__plugin_action_status == "handled" then
+                handled_count = handled_count + 1
+            elseif type(result) == "table" and result.__plugin_action_status == "result" then
+                handled_count = handled_count + 1
+                if result.ok == false then ok_result = false end
+                if type(result.message) == "string" then message = result.message end
+                if type(result.error) == "string" then error_message = result.error end
+                if type(result.navigate) == "table" then navigate = result.navigate end
             elseif result == M.HANDLED then
                 handled_count = handled_count + 1
             elseif type(result) == "table" and result.__ui_action_result == true then

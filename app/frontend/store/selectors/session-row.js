@@ -22,7 +22,7 @@
  * @property {string} [branch_name]
  * @property {string} [agent_name]
  * @property {string} [session_type]       'agent' | 'accessory'
- * @property {boolean} [is_idle]
+ * @property {'active'|'idle'} [output_activity]
  * @property {boolean} [notification]
  * @property {boolean} [in_worktree]
  * @property {object} [close_actions]      { can_delete_worktree, ... }
@@ -86,9 +86,8 @@ export function titleLine(session) {
 /**
  * High-level activity bucket used to drive the dot color/visibility:
  *   - `accessory` for accessory sessions (no agent autonomy → no activity)
- *   - `idle` for agent sessions where `is_idle !== false`
- *     (default true so a brand-new session reads as idle, not active)
- *   - `active` only when `is_idle === false`
+ *   - `idle` for agent sessions without recent output
+ *   - `active` only when `output_activity === 'active'`
  *
  * @param {SessionRecord} session
  * @returns {'accessory' | 'idle' | 'active'}
@@ -96,7 +95,7 @@ export function titleLine(session) {
 export function activityState(session) {
   if (!session) return 'idle'
   if (session.session_type === 'accessory') return 'accessory'
-  return session.is_idle !== false ? 'idle' : 'active'
+  return session.output_activity === 'active' ? 'active' : 'idle'
 }
 
 /**

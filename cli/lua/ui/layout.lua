@@ -125,10 +125,10 @@ local function session_activity_icon(agent)
     return nil
   end
 
-  -- Only mark genuinely active (non-idle) agents. Idle sessions render
+  -- Only mark sessions with recent output. Idle sessions render
   -- without a glyph to keep the list visually quiet; only a working agent
   -- draws the eye. Mirrors the default web layout in cli/lua/web/layout.lua.
-  if not agent.is_idle then
+  if agent.output_activity == "active" then
     spans[#spans + 1] = { text = "✺ ", style = { fg = "green" } }
   end
 

@@ -13,10 +13,10 @@ local M = {}
 
 -- Persistent state: { [session_uuid] = { { peer_id, rows, cols, updated_at }, ... } }
 local function get_store()
-    local s = state.get("pty_clients")
+    local s = state.get("terminal_clients")
     if not s then
         s = {}
-        state.set("pty_clients", s)
+        state.set("terminal_clients", s)
     end
     return s
 end
@@ -78,7 +78,7 @@ function M.register(session_uuid, peer_id, rows, cols)
     -- Resize PTY to the new client's dimensions
     hub.resize_pty(session_uuid, rows, cols)
 
-    log.debug(string.format("pty_clients.register: %s -> %s (%dx%d, %d clients)",
+    log.debug(string.format("terminal_clients.register: %s -> %s (%dx%d, %d clients)",
         peer_id:sub(1, 8), session_uuid:sub(1, 16), cols, rows, #store[session_uuid]))
 end
 
@@ -117,7 +117,7 @@ function M.update(session_uuid, peer_id, rows, cols)
 
     hub.resize_pty(session_uuid, rows, cols)
 
-    log.debug(string.format("pty_clients.update: %s -> %s (%dx%d)",
+    log.debug(string.format("terminal_clients.update: %s -> %s (%dx%d)",
         peer_id:sub(1, 8), session_uuid:sub(1, 16), cols, rows))
 end
 
@@ -142,7 +142,7 @@ function M.unregister(session_uuid, peer_id)
     -- If no clients remain, clean up
     if #store[session_uuid] == 0 then
         store[session_uuid] = nil
-        log.debug(string.format("pty_clients.unregister: %s -> %s (no clients remain)",
+        log.debug(string.format("terminal_clients.unregister: %s -> %s (no clients remain)",
             peer_id:sub(1, 8), session_uuid:sub(1, 16)))
         return nil
     end
@@ -151,7 +151,7 @@ function M.unregister(session_uuid, peer_id)
     local best = find_most_recent(store[session_uuid])
     if best then
         hub.resize_pty(session_uuid, best.rows, best.cols)
-        log.debug(string.format("pty_clients.unregister: %s -> %s, resized to %s (%dx%d, %d remain)",
+        log.debug(string.format("terminal_clients.unregister: %s -> %s, resized to %s (%dx%d, %d remain)",
             peer_id:sub(1, 8), session_uuid:sub(1, 16),
             best.peer_id:sub(1, 8), best.cols, best.rows, #store[session_uuid]))
         return best.rows, best.cols
@@ -221,11 +221,11 @@ end
 
 -- Lifecycle hooks for hot-reload
 function M._before_reload()
-    log.info("pty_clients.lua reloading (state preserved)")
+    log.info("terminal_clients.lua reloading (state preserved)")
 end
 
 function M._after_reload()
-    log.info("pty_clients.lua reloaded")
+    log.info("terminal_clients.lua reloaded")
 end
 
 return M

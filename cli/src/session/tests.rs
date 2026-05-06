@@ -190,19 +190,6 @@ mod pty_handle_tests {
     }
 
     #[test]
-    fn session_backed_snapshot_and_subscribe() {
-        let handle = create_session_backed_pty(24, 80);
-        let (snapshot, kitty, rows, cols, _rx) = handle.snapshot_and_subscribe();
-        assert!(
-            snapshot.is_empty(),
-            "no session process means empty snapshot"
-        );
-        assert!(!kitty);
-        assert_eq!(rows, 24);
-        assert_eq!(cols, 80);
-    }
-
-    #[test]
     fn session_backed_resize_without_connection() {
         let handle = create_session_backed_pty(24, 80);
         // Resize with no session connection should not panic

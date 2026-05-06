@@ -12,6 +12,7 @@ import {
   UiTreeBody,
   createTransportDispatch,
 } from '../ui_contract'
+import { bindingEntityTypes } from '../ui_contract/binding'
 import { waitForHub } from '../lib/hub-bridge'
 import { useSurfaceReadinessStore } from '../store/surface-readiness-store'
 
@@ -83,6 +84,31 @@ function writeCachedTree(hubId, targetSurface, subpath, tree) {
   const key = treeCacheKey(hubId, targetSurface, subpath)
   if (!key || !tree) return
   treeSnapshotCache.set(key, tree)
+}
+
+function requestSurfaceSubpath(transport, targetSurface, subpath) {
+  if (!transport || !targetSurface) return
+  const normalisedSubpath =
+    typeof subpath === 'string' && subpath !== '' ? subpath : '/'
+
+  let sendPromise
+  try {
+    sendPromise = transport.sendCommand('ui_action', {
+      target_surface: targetSurface,
+      envelope: {
+        id: 'botster.surface.subpath',
+        payload: { target_surface: targetSurface, subpath: normalisedSubpath },
+      },
+    })
+  } catch (err) {
+    console.warn('[UiTree] failed to send surface.subpath', err)
+    return
+  }
+  if (sendPromise && typeof sendPromise.catch === 'function') {
+    sendPromise.catch((err) => {
+      console.warn('[UiTree] surface.subpath send rejected', err)
+    })
+  }
 }
 
 export function _resetUiTreeSnapshotCacheForTests() {
@@ -219,6 +245,7 @@ export default function UiTree({
     initialTree ?? readCachedTree(hubId, targetSurface, subpath),
   )
   const [transport, setTransport] = useState(null)
+  const requestedEntityTypesRef = useRef(new Set())
 
   // Wire protocol: collapse + nav-selection state moved into the
   // composite primitives themselves. `<SessionList>` reads collapse state
@@ -289,6 +316,10 @@ export default function UiTree({
     }
   }, [hubId])
 
+  useEffect(() => {
+    requestedEntityTypesRef.current.clear()
+  }, [hubId, transport])
+
   // Subscribe to ui_tree_snapshot frames matching this target_surface.
   //
   // Subpath filter: the hub echoes back the subpath it routed for, so a
@@ -310,6 +341,26 @@ export default function UiTree({
         return
       }
       const nextTree = message.tree ?? null
+      if (nextTree && typeof transport.requestEntitySnapshots === 'function') {
+        const neededTypes = bindingEntityTypes(nextTree)
+        const missingTypes = neededTypes.filter(
+          (entityType) => !requestedEntityTypesRef.current.has(entityType),
+        )
+        if (missingTypes.length > 0) {
+          for (const entityType of missingTypes) {
+            requestedEntityTypesRef.current.add(entityType)
+          }
+          const request = transport.requestEntitySnapshots(missingTypes)
+          if (request && typeof request.catch === 'function') {
+            request.catch((err) => {
+              for (const entityType of missingTypes) {
+                requestedEntityTypesRef.current.delete(entityType)
+              }
+              console.warn('[UiTree] failed to request bound entity snapshots', err)
+            })
+          }
+        }
+      }
       setTree(nextTree)
       writeCachedTree(hubId, targetSurface, subpath, nextTree)
       // System-test readiness: first tree for this (hub, surface) pair
@@ -329,10 +380,9 @@ export default function UiTree({
   // Whenever the (target_surface, subpath) pair changes, tell the hub so it
   // can re-render for this client.
   //
-  // We send unconditionally on every mount / change. Idempotency lives on
-  // the hub: `Client:set_surface_subpath` early-returns when the incoming
-  // subpath equals the previously-stored value, so repeating what the
-  // subscribe envelope already primed is a cheap no-op.
+  // We send unconditionally on every mount / change. This is the explicit
+  // request path for a surface tree: hub subscribe opens the channel, while
+  // UiTree asks for the one surface/subpath it is about to render.
   //
   // An earlier revision tried to skip the first send on a "cold transport"
   // under the assumption that a single UiTree instance would persist
@@ -346,35 +396,20 @@ export default function UiTree({
   // distinction entirely.
   useEffect(() => {
     if (!transport || !targetSurface) return undefined
-    const normalisedSubpath =
-      typeof subpath === 'string' && subpath !== '' ? subpath : '/'
-
-    // transport.sendCommand returns a Promise that REJECTS when the DataChannel
-    // isn't open yet (e.g. cold mount during WebRTC handshake). If we
-    // don't attach a .catch handler, the rejection surfaces as an
-    // "Uncaught Error: DataChannel closed" in the browser console —
-    // harmless for the user (the subscribe envelope already primed the
-    // hub and the hub will dedup if we resend later) but the system
-    // tests assert on an empty console.
-    let sendPromise
-    try {
-      sendPromise = transport.sendCommand('ui_action', {
-        target_surface: targetSurface,
-        envelope: {
-          id: 'botster.surface.subpath',
-          payload: { target_surface: targetSurface, subpath: normalisedSubpath },
-        },
-      })
-    } catch (err) {
-      console.warn('[UiTree] failed to send surface.subpath', err)
-      return undefined
-    }
-    if (sendPromise && typeof sendPromise.catch === 'function') {
-      sendPromise.catch((err) => {
-        console.warn('[UiTree] surface.subpath send rejected', err)
-      })
-    }
+    requestSurfaceSubpath(transport, targetSurface, subpath)
     return undefined
+  }, [transport, targetSurface, subpath])
+
+  // A reconnect keeps the same transport object, so the mount/change effect
+  // above does not rerun. Re-issue the current surface request whenever the
+  // route reports connected so the hub can rebuild the tree after a dropped
+  // DataChannel.
+  useEffect(() => {
+    if (!transport || !targetSurface) return undefined
+    if (typeof transport.onConnected !== 'function') return undefined
+    return transport.onConnected(() => {
+      requestSurfaceSubpath(transport, targetSurface, subpath)
+    })
   }, [transport, targetSurface, subpath])
 
   // -------- Interceptor registry --------

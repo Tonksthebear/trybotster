@@ -145,6 +145,44 @@ local function clear_recorded_modules(entry)
     end
 end
 
+local function cleanup_plugin_capabilities(key, entry)
+    local ok, supervisor = pcall(require, "lib.plugin_supervisor")
+    if not ok or type(supervisor) ~= "table" or type(supervisor.cleanup_plugin) ~= "function" then
+        return 0
+    end
+    return supervisor.cleanup_plugin(key, {
+        key = key,
+        name = entry and entry.name or key,
+        plugin_name = entry and entry.name or key,
+        path = entry and entry.path or nil,
+        source = entry and entry.source or nil,
+        repo_root = entry and entry.repo_root or nil,
+    })
+end
+
+local function load_plugin_worker(key, entry)
+    if rawget(_G, "_loading_plugin_worker") == true then return true end
+    local ok, supervisor = pcall(require, "lib.plugin_supervisor")
+    if not ok or type(supervisor) ~= "table" or type(supervisor.load_plugin) ~= "function" then
+        return true
+    end
+    return supervisor.load_plugin(key, {
+        key = key,
+        name = entry and entry.name or key,
+        plugin_name = entry and entry.name or key,
+        path = entry and entry.path or nil,
+        source = entry and entry.source or nil,
+        repo_root = entry and entry.repo_root or nil,
+    })
+end
+
+local function shutdown_plugin_worker(key, reason)
+    local ok, supervisor = pcall(require, "lib.plugin_supervisor")
+    if ok and type(supervisor) == "table" and type(supervisor.shutdown_plugin) == "function" then
+        supervisor.shutdown_plugin(key, reason)
+    end
+end
+
 -- ============================================================================
 -- Plugin Status, Logging, and Disabled Set (local helpers — must precede load_plugin)
 -- ============================================================================
@@ -508,8 +546,8 @@ function M.load_plugin(path, name, opts)
 
     -- Install per-plugin logger during load
     local real_log = _G.log
-    local real_hooks = _G.hooks
-    local real_hooks_module = package.loaded["hub.hooks"]
+    local real_hooks_module = package.loaded["hub.hooks"] or require("hub.hooks")
+    local real_hooks = _G.hooks or real_hooks_module
     local scoped_hooks = create_scoped_hooks(key, real_hooks)
     _G.log = create_plugin_logger(key, real_log)
     _G.hooks = scoped_hooks
@@ -549,6 +587,20 @@ function M.load_plugin(path, name, opts)
     local registry = state.get("plugin_registry", {})
     if registry[key] then
         registry[key].modules = package_loaded_added_since(loaded_before)
+    end
+    local worker_ok, worker_err = load_plugin_worker(key, registry[key] or {
+        key = key,
+        name = name,
+        path = path,
+        source = opts.source,
+        repo_root = opts.repo_root,
+    })
+    if not worker_ok then
+        cleanup_plugin_capabilities(key, registry[key])
+        local msg = string.format("load_plugin: worker error in %s: %s", path, tostring(worker_err))
+        capture_plugin_log(key, "error", msg)
+        log.error(msg)
+        return false, msg
     end
     log.info(string.format("Loaded plugin: %s from %s", key, path))
     return true
@@ -622,6 +674,8 @@ function M.reload_plugin(name)
             log.warn(string.format("_before_reload failed for plugin %s: %s", name, tostring(err)))
         end
     end
+    cleanup_plugin_capabilities(entry.key or name, entry)
+    shutdown_plugin_worker(entry.key or name, "reload")
 
     -- Batch MCP notifications: suppress mcp_tools_changed/mcp_prompts_changed during
     -- reset + re-registration, then emit exactly once per changed registry at the end.
@@ -712,6 +766,8 @@ function M.unload_plugin(name)
             log.warn(string.format("_before_unload failed for plugin %s: %s", name, tostring(err)))
         end
     end
+    cleanup_plugin_capabilities(entry.key or name, entry)
+    shutdown_plugin_worker(entry.key or name, "unload")
 
     -- Clear MCP tools/prompts registered by this plugin (source = "@" .. path).
     -- No begin_batch/end_batch needed: we only remove (never re-register), so

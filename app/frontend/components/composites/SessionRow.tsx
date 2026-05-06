@@ -34,7 +34,7 @@ type SessionRecord = {
   branch_name?: string
   agent_name?: string
   session_type?: string
-  is_idle?: boolean
+  output_activity?: 'active' | 'idle'
   notification?: boolean
 }
 

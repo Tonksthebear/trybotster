@@ -55,7 +55,7 @@ type SessionRecord = {
   owner_plugin?: string
   visibility?: string
   surface?: string
-  is_idle?: boolean
+  output_activity?: 'active' | 'idle'
   notification?: boolean
   task?: string
   target_name?: string

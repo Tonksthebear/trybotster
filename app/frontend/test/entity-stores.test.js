@@ -65,16 +65,16 @@ describe('createEntityStore', () => {
         {
           session_uuid: 'sess-a',
           title: 'alpha',
-          is_idle: true,
+          output_activity: 'idle',
           plugin_state: { example_provider: { status: 'starting', url: null } },
         },
       ],
       1
     )
 
-    s.applyPatch('sess-a', { title: 'alpha2', is_idle: false }, 2)
+    s.applyPatch('sess-a', { title: 'alpha2', output_activity: 'active' }, 2)
     expect(store.getState().byId['sess-a'].title).toBe('alpha2')
-    expect(store.getState().byId['sess-a'].is_idle).toBe(false)
+    expect(store.getState().byId['sess-a'].output_activity).toBe('active')
 
     // Nested object replaces wholesale (per §12.4).
     s.applyPatch('sess-a', { plugin_state: { example_provider: { status: 'running' } } }, 3)

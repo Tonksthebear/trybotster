@@ -64,7 +64,7 @@ BOTSTER_ENV=test ./target/debug/botster get-connection-url --hub device-14ee1782
 BOTSTER_ENV=test ./target/debug/botster start --headless --offline
 BOTSTER_ENV=test ./target/debug/botster status
 BOTSTER_ENV=test ./target/debug/botster get-connection-url --hub device-14ee1782b811190c
-BOTSTER_ENV=test ./target/debug/botster attach --hub device-14ee1782b811190c
+BOTSTER_ENV=test ./target/debug/botster attach
 ```
 
 Results:
@@ -92,7 +92,7 @@ Results:
   - Escalated smoke start succeeded and logged `Hub ready. Waiting for connections...`.
   - `botster status` reported the hub process alive and socket protocol healthy: `path_exists=true, connectable=true, protocol=true`, diagnosis `hub accepts new local IPC clients`.
   - `get-connection-url --hub device-14ee1782b811190c` returned `No connection URL found...` because offline mode does not generate a browser relay URL. Browser timing evidence comes from the headless Chrome system tests above.
-  - `attach --hub device-14ee1782b811190c` connected to the running hub and rendered the TUI frame with sessions and terminal panes. That smoke hub had no sessions, so live-session-backed TUI timing evidence comes from the focused session-backed harness above.
+  - `botster attach` connected to the running device hub and rendered the TUI frame with sessions and terminal panes. That smoke hub had no sessions, so live-session-backed TUI timing evidence comes from the focused session-backed harness above.
   - The attach process and headless hub were stopped after the smoke.
 
 ## Timing Evidence

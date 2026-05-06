@@ -78,7 +78,7 @@ fn run_process_exited_case(auto_close_literal: &str) -> (i64, i64, String) {
           upsert_connection_code = function(...) end,
           upsert_hub = function(...) end,
         }}
-        package.loaded["lib.pty_clients"] = {{
+        package.loaded["lib.terminal_clients"] = {{
           set_focused = function(...) end,
           get_focused_sessions = function(...) return {{}} end,
           is_any_focused = function(...) return false end,

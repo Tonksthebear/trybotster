@@ -104,6 +104,8 @@ pub struct PtyInputIncoming {
 pub struct FileInputIncoming {
     /// Session UUID identifying the target PTY.
     pub session_uuid: String,
+    /// Browser identity key for routing to the owning client worker.
+    pub browser_identity: String,
     /// Original filename from the browser (e.g., "screenshot.png").
     pub filename: String,
     /// Raw file bytes.
@@ -127,6 +129,8 @@ pub struct StreamIncoming {
 struct FileChunkAssembly {
     /// Session UUID identifying the target PTY.
     session_uuid: String,
+    /// Browser identity key for routing to the owning client worker.
+    browser_identity: String,
     filename: String,
     /// Accumulated file data across chunks.
     data: Vec<u8>,
@@ -2001,6 +2005,7 @@ async fn handle_dc_message(
                 if let Some(ref tx) = file_input_tx {
                     match tx.try_send(FileInputIncoming {
                         session_uuid: pty_info.session_uuid,
+                        browser_identity: browser_identity.to_string(),
                         filename,
                         data,
                     }) {
@@ -2079,6 +2084,7 @@ async fn handle_dc_message(
 
                 let mut assembly = FileChunkAssembly {
                     session_uuid,
+                    browser_identity: browser_identity.to_string(),
                     filename,
                     data: Vec::with_capacity(512 * 1024), // pre-allocate for typical file
                 };
@@ -2089,6 +2095,7 @@ async fn handle_dc_message(
                     if let Some(ref tx) = file_input_tx {
                         match tx.try_send(FileInputIncoming {
                             session_uuid: assembly.session_uuid,
+                            browser_identity: assembly.browser_identity,
                             filename: assembly.filename,
                             data: assembly.data,
                         }) {
@@ -2137,6 +2144,7 @@ async fn handle_dc_message(
                     if let Some(ref tx) = file_input_tx {
                         match tx.try_send(FileInputIncoming {
                             session_uuid: assembly.session_uuid,
+                            browser_identity: assembly.browser_identity,
                             filename: assembly.filename,
                             data: assembly.data,
                         }) {

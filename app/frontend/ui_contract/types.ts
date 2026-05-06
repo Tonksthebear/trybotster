@@ -114,8 +114,8 @@ export type UiNode = {
   slots?: Record<string, UiChild[]>
 }
 
-/** What may appear in `children` / slots: a node or a conditional wrapper. */
-export type UiChild = UiNode | UiConditional
+/** What may appear in `children` / slots. */
+export type UiChild = UiNode | UiConditional | UiBindList
 
 export type UiAction = {
   id: string

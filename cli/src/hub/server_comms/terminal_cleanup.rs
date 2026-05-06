@@ -1,28 +1,48 @@
 use super::*;
 
 impl Hub {
-    pub(super) fn stop_lua_pty_forwarder(&mut self, forwarder_id: &str) {
-        self.cleanup_pending_session_io_snapshots_for_forwarder(forwarder_id);
-        if let Some(pending) = self.pending_terminal_attaches.remove(forwarder_id) {
+    pub(super) fn stop_terminal_subscription(&mut self, subscription_key: &str) {
+        self.cleanup_pending_session_io_snapshots_for_subscription(subscription_key);
+        if let Some(pending) = self.pending_terminal_attaches.remove(subscription_key) {
             pending.request.deactivate();
         }
-        if let Some(task) = self.pty_forwarders.remove(forwarder_id) {
-            task.abort();
-            self.unregister_terminal_forwarder_peer(forwarder_id, true);
-            let session_uuid = forwarder_id
-                .rsplit_once(':')
-                .map_or(forwarder_id, |(_, session_uuid)| session_uuid)
-                .to_string();
-            if let Some((browser_identity, _)) = forwarder_id.rsplit_once(':') {
-                if let Some(worker) = self.browser_client_workers.get(browser_identity) {
-                    Self::unregister_worker_session_io_sender(worker, &session_uuid, "WebRTC");
+        let tracked = self
+            .terminal_subscription_peers
+            .get(subscription_key)
+            .cloned();
+        if tracked.is_some() || self.terminal_client_workers.contains_key(subscription_key) {
+            let session_uuid = tracked
+                .as_ref()
+                .map(|(session_uuid, _)| session_uuid.clone())
+                .unwrap_or_else(|| {
+                    subscription_key
+                        .rsplit_once(':')
+                        .map_or(subscription_key, |(_, session_uuid)| session_uuid)
+                        .to_string()
+                });
+            if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
+                let _ = session_handle.pty().enqueue_session_io_request(
+                    crate::worker::session_io::SessionIoRequest::UnsubscribeTerminal {
+                        subscription_key: subscription_key.to_string(),
+                    },
+                );
+            }
+            self.unregister_terminal_subscription_peer(subscription_key, true);
+            if let Some((browser_identity, _)) = subscription_key.rsplit_once(':') {
+                if self.browser_client_workers.contains_key(browser_identity) {
+                    if let Some(worker) = self.browser_client_workers.get(browser_identity) {
+                        Self::unregister_worker_session_io_sender(worker, &session_uuid, "WebRTC");
+                    }
                 } else {
-                    self.remove_terminal_client_worker(forwarder_id, &session_uuid, "Lua");
+                    self.remove_terminal_client_worker(subscription_key, &session_uuid, "Terminal");
                 }
             } else {
-                self.remove_terminal_client_worker(forwarder_id, &session_uuid, "Lua");
+                self.remove_terminal_client_worker(subscription_key, &session_uuid, "Terminal");
             }
-            log::debug!("[Lua] Stopped PTY forwarder {}", forwarder_id);
+            log::debug!(
+                "[Terminal] Stopped terminal subscription {}",
+                subscription_key
+            );
         }
     }
 }

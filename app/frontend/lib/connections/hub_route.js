@@ -10,6 +10,7 @@ const RECONNECT_DELAY_MS = 1000;
 const SESSION_TIMEOUT_MS = 5000;
 const PEER_PROBE_TIMEOUT_MS = 1500;
 const PEER_PROBE_COOLDOWN_MS = 1000;
+const PEER_PROBE_MISSED_PONG_LIMIT = 3;
 
 const HEALTH_STATUS_MAP = {
   offline: CliStatus.OFFLINE,
@@ -38,6 +39,7 @@ export class HubRoute {
   #peerProbePending = null;
   #peerProbeResolve = null;
   #lastPeerProbeAt = 0;
+  #missedPeerPongs = 0;
 
   constructor(key, options = {}, manager) {
     this.key = key;
@@ -186,6 +188,7 @@ export class HubRoute {
     }
 
     if (message.type === "dc_pong") {
+      this.#missedPeerPongs = 0;
       this.#resolvePeerProbe(true);
       return true;
     }
@@ -211,7 +214,7 @@ export class HubRoute {
    * command path.
    */
   async sendCommand(type, data = {}) {
-    await this.#ensureConnected();
+    await this.#ensureReadyToSend();
     if (!this.subscriptionId) return false;
 
     try {
@@ -230,7 +233,7 @@ export class HubRoute {
    * commands.
    */
   async sendTelemetry(type, data = {}) {
-    await this.#ensureConnected();
+    await this.#ensureReadyToSend();
     if (!this.subscriptionId) return false;
 
     try {
@@ -244,7 +247,7 @@ export class HubRoute {
   }
 
   async sendBinaryPty(data) {
-    await this.#ensureConnected();
+    await this.#ensureReadyToSend();
     if (!this.subscriptionId) return false;
 
     try {
@@ -262,7 +265,7 @@ export class HubRoute {
   }
 
   async sendBinaryFile(data, filename) {
-    await this.#ensureConnected();
+    await this.#ensureReadyToSend();
     if (!this.subscriptionId) return false;
 
     try {
@@ -371,6 +374,7 @@ export class HubRoute {
           }
           this.#clearReconnectTimer();
           this.#peerHealthDirty = false;
+          this.#missedPeerPongs = 0;
           if (event.mode) this.#setConnectionMode(event.mode);
           this.#ensureSubscribed().catch((error) => {
             console.error(`[${this.constructor.name}] Subscribe failed after peer connect:`, error);
@@ -534,6 +538,11 @@ export class HubRoute {
     }
   }
 
+  async #ensureReadyToSend() {
+    if (this.subscriptionId && this.isConnected()) return;
+    await this.#ensureConnected();
+  }
+
   async #probeExistingPeer() {
     const now = Date.now();
     if (this.#peerProbePending) {
@@ -549,6 +558,7 @@ export class HubRoute {
 
       const peer = await bridge.send("probePeerHealth", { hubId: this.getHubId() });
       if (!peer?.alive) {
+        this.#missedPeerPongs = PEER_PROBE_MISSED_PONG_LIMIT;
         return false;
       }
 
@@ -557,7 +567,23 @@ export class HubRoute {
       }
 
       const pong = await this.#awaitPeerPong();
-      return pong;
+      if (pong) {
+        this.#missedPeerPongs = 0;
+        return true;
+      }
+
+      this.#missedPeerPongs += 1;
+      if (this.#missedPeerPongs < PEER_PROBE_MISSED_PONG_LIMIT) {
+        console.warn(
+          `[${this.constructor.name}] Peer pong missed (${this.#missedPeerPongs}/${PEER_PROBE_MISSED_PONG_LIMIT}); keeping peer because local transport is alive`,
+        );
+        return true;
+      }
+
+      console.warn(
+        `[${this.constructor.name}] Peer pong missed ${this.#missedPeerPongs} times; rebuilding peer`,
+      );
+      return false;
     })();
 
     try {
@@ -604,6 +630,7 @@ export class HubRoute {
     this.#clearSubscription();
     this.#resolvePeerProbe(false);
     this.#peerHealthDirty = true;
+    this.#missedPeerPongs = 0;
 
     try {
       await bridge.send("disconnectPeer", { hubId: this.getHubId() });
@@ -677,6 +704,7 @@ export class HubRoute {
       params: this.channelParams(),
       subscriptionId: this.subscriptionId,
     }).then(() => {
+      this.#missedPeerPongs = 0;
       this.#setState(ConnectionState.CONNECTED);
       this.emit("connected", this);
     }).catch((error) => {

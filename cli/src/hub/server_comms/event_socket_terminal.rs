@@ -53,15 +53,6 @@ impl Hub {
                 self.remove_terminal_client_worker(&key, &session_uuid, "Socket");
             }
         }
-        self.pty_forwarders.retain(|key, task| {
-            if key.starts_with(&client_prefix) {
-                task.abort();
-                log::debug!("[Socket] Aborted PTY forwarder: {}", key);
-                false
-            } else {
-                true
-            }
-        });
         self.pending_terminal_attaches.retain(|key, intent| {
             if key.starts_with(&client_prefix) {
                 intent.request.deactivate();
@@ -82,7 +73,21 @@ impl Hub {
         msg: serde_json::Value,
     ) {
         let bytes = serde_json::to_vec(&msg).map_or(0, |v| v.len());
-        if msg.get("type").and_then(|v| v.as_str()) == Some("focus_changed") {
+        if msg.get("type").and_then(|v| v.as_str()) == Some("debug_memory") {
+            let mut data = self.debug_memory_diagnostics();
+            if let Some(request_id) = msg.get("request_id").cloned() {
+                data["request_id"] = request_id;
+            }
+            if let Some(conn) = self.socket_clients.get(&client_id) {
+                conn.send_frame(&crate::socket::framing::Frame::Json(data));
+            }
+            self.record_hot_span(
+                "socket_message.debug_memory",
+                Instant::now(),
+                bytes,
+                &client_id,
+            );
+        } else if msg.get("type").and_then(|v| v.as_str()) == Some("focus_changed") {
             let started = Instant::now();
             if let Some(session_uuid) = msg.get("session_uuid").and_then(|v| v.as_str()) {
                 let focused = msg
@@ -110,42 +115,6 @@ impl Hub {
             } else {
                 self.record_hot_span("socket_message.lua", started, bytes, &client_id);
             }
-        }
-    }
-
-    pub(super) fn handle_socket_pty_input_event(
-        &mut self,
-        client_id: String,
-        session_uuid: String,
-        data: Vec<u8>,
-    ) {
-        if data == b"\x1b[I" {
-            self.set_active_terminal_peer(&session_uuid, &client_id, true);
-            self.lua.set_pty_focused(&session_uuid, &client_id, true);
-        } else if data == b"\x1b[O" {
-            self.set_active_terminal_peer(&session_uuid, &client_id, false);
-            self.lua.set_pty_focused(&session_uuid, &client_id, false);
-        }
-        self.learn_terminal_probe_replies(&session_uuid, &client_id, &data);
-        self.lua.notify_pty_input(&session_uuid);
-
-        let forwarder_key = format!("{client_id}:{session_uuid}");
-        if let Some(worker) = self.terminal_client_workers.get(&forwarder_key) {
-            let ingress = crate::worker::transport::SocketFrameAdapter::frame_to_ingress(
-                crate::socket::framing::Frame::PtyInput {
-                    session_uuid: session_uuid.clone(),
-                    data,
-                },
-            )
-            .expect("PtyInput frame maps to worker ingress");
-            let adapter = crate::worker::transport::SocketFrameAdapter::new(client_id);
-            let message =
-                crate::worker::transport::TransportAdapter::ingress_to_client(&adapter, ingress);
-            if let Err(e) = worker.try_send(message) {
-                log::warn!("[Socket] Worker input queue rejected {forwarder_key}: {e}");
-            }
-        } else {
-            log::warn!("[Socket] No workerized terminal subscription for {forwarder_key}");
         }
     }
 
@@ -178,20 +147,20 @@ impl Hub {
         use crate::lua::PtyRequest;
 
         match request {
-            PtyRequest::CreateForwarder(req) => {
-                self.create_lua_pty_forwarder(req);
+            PtyRequest::SubscribeBrowserTerminal(req) => {
+                self.create_browser_terminal_subscription(req);
             }
             PtyRequest::RefreshSnapshot(req) => {
                 self.refresh_lua_terminal_snapshot(req);
             }
-            PtyRequest::CreateTuiForwarder(req) => {
-                self.create_lua_tui_pty_forwarder(req);
+            PtyRequest::SubscribeTuiTerminal(req) => {
+                self.create_tui_terminal_subscription(req);
             }
-            PtyRequest::CreateSocketForwarder(req) => {
-                self.create_lua_socket_pty_forwarder(req);
+            PtyRequest::SubscribeSocketTerminal(req) => {
+                self.create_socket_terminal_subscription(req);
             }
-            PtyRequest::StopForwarder { forwarder_id } => {
-                self.stop_lua_pty_forwarder(&forwarder_id);
+            PtyRequest::StopTerminalSubscription { subscription_key } => {
+                self.stop_terminal_subscription(&subscription_key);
             }
             PtyRequest::WritePty { session_uuid, data } => {
                 if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {

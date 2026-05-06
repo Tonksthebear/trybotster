@@ -16,7 +16,6 @@ use crate::hub::handle_cache::HandleCache;
 use super::primitives;
 use super::primitives::events::SharedEventCallbacks;
 use super::primitives::http::HttpAsyncRegistry;
-use super::primitives::pty::PtyOutputContext;
 use super::primitives::socket::registry_keys as socket_registry_keys;
 use super::primitives::timer::TimerRegistry;
 use super::primitives::tui::registry_keys as tui_registry_keys;
@@ -71,10 +70,6 @@ pub struct LuaRuntime {
     hub_client_pending_requests: primitives::HubClientPendingRequests,
     /// Direct frame write channels for `hub_client.request()` (bypasses event loop).
     hub_client_frame_senders: primitives::HubClientFrameSenders,
-    /// Cached compiled function for PTY output interceptor calls.
-    pty_hook_fn: Option<mlua::RegistryKey>,
-    /// Cached reusable context table for PTY output interceptor calls.
-    pty_hook_ctx: Option<mlua::RegistryKey>,
     /// Whether any agent has a pending notification to clear on PTY input.
     ///
     /// Set `true` by `notify_pty_notification` when a notification fires.
@@ -208,6 +203,9 @@ impl LuaRuntime {
         // Create hub client frame senders map for hub_client.request() direct writes
         let hub_client_frame_senders = primitives::new_hub_client_frame_senders();
 
+        // Create plugin worker registry for isolated plugin execution.
+        let plugin_worker_registry = primitives::new_plugin_worker_registry();
+
         // Register all primitives
         primitives::register_all(&lua).context("Failed to register Lua primitives")?;
 
@@ -273,6 +271,9 @@ impl LuaRuntime {
         )
         .context("Failed to register hub client primitives")?;
 
+        primitives::register_plugin_worker(&lua, plugin_worker_registry.clone())
+            .context("Failed to register plugin worker primitives")?;
+
         // Note: Hub, connection, and worktree primitives are registered later via
         // register_hub_primitives() because they need a HandleCache reference from Hub
 
@@ -299,8 +300,6 @@ impl LuaRuntime {
             hub_client_callback_registry,
             hub_client_pending_requests,
             hub_client_frame_senders,
-            pty_hook_fn: None,
-            pty_hook_ctx: None,
             pty_input_listening: false,
         })
     }
@@ -580,7 +579,7 @@ impl LuaRuntime {
     /// 1. Project root (`{repo}/.botster/lua/`) — highest priority
     /// 2. Userspace (`~/.botster/lua/`) — user overrides
     /// 3. Embedded (this searcher) — fallback/base
-    fn install_embedded_searcher(&self) -> Result<()> {
+    pub(crate) fn install_embedded_searcher(&self) -> Result<()> {
         use super::embedded;
 
         let lua = &self.lua;
@@ -717,8 +716,8 @@ impl LuaRuntime {
     /// Stop all blocking watcher tasks (user `watch.directory()` watches).
     ///
     /// Must be called before the tokio runtime drops to prevent a deadlock.
-    /// Each watcher's `spawn_blocking` forwarder blocks on `rx.recv()` — the
-    /// sender lives inside the `FileWatcher`. Aborting the forwarder and
+    /// Each watcher's `spawn_blocking` subscription blocks on `rx.recv()` — the
+    /// sender lives inside the `FileWatcher`. Aborting the subscription and
     /// dropping the watcher closes the channel, allowing the runtime's
     /// blocking pool to shut down cleanly.
     pub fn stop_all_watchers(&mut self) {
@@ -728,11 +727,12 @@ impl LuaRuntime {
             .stop_all();
     }
 
-    /// Poll user file watches via periodic drain (test-only fallback).
+    /// Poll user file watches via periodic drain.
     ///
-    /// Production uses `HubEvent::UserFileWatch` from blocking forwarder tasks.
-    #[cfg(test)]
-    pub fn poll_user_file_watches(&self) -> usize {
+    /// Hub production uses `HubEvent::UserFileWatch` from blocking subscription
+    /// tasks. Plugin worker runtimes do not own a Hub event queue, so they use
+    /// this periodic drain to keep plugin-owned watch callbacks in-worker.
+    pub(crate) fn poll_user_file_watches(&self) -> usize {
         use super::primitives::watch;
         watch::poll_user_watches(&self.lua, &self.watcher_registry)
     }
@@ -758,11 +758,12 @@ impl LuaRuntime {
         timer::poll_timers(&self.lua, &self.timer_registry)
     }
 
-    /// Poll HTTP responses via shared vec (test-only fallback).
+    /// Poll HTTP responses via shared vec.
     ///
-    /// Production uses `HubEvent::HttpResponse` from background threads.
-    #[cfg(test)]
-    pub fn poll_http_responses(&self) -> usize {
+    /// The hub uses `HubEvent::HttpResponse` from background threads. Plugin
+    /// workers do not own a hub event sender, so they pump their local async
+    /// HTTP callback queue directly from the worker loop.
+    pub(crate) fn poll_http_responses(&self) -> usize {
         use super::primitives::http;
         http::poll_http_responses(&self.lua, &self.http_registry)
     }
@@ -779,7 +780,7 @@ impl LuaRuntime {
     ///
     /// # Arguments
     ///
-    /// * `event_name` - The event name to check (e.g., "pty_output", "message_received")
+    /// * `event_name` - The event name to check (e.g., "before_client_subscribe", "message_received")
     ///
     /// # Returns
     ///
@@ -817,8 +818,8 @@ impl LuaRuntime {
     /// # Example
     ///
     /// ```ignore
-    /// if lua.has_hooks("pty_output") {
-    ///     // Hooks exist - need to involve Lua
+    /// if lua.has_hooks("before_client_subscribe") {
+    ///     // Hooks exist - need to involve Lua for this control-plane path
     /// } else {
     ///     // Fast path: no hooks, skip Lua entirely
     /// }
@@ -864,8 +865,8 @@ impl LuaRuntime {
     /// # Example
     ///
     /// ```ignore
-    /// if let Some(output) = lua.call_interceptors("pty_output", raw_output) {
-    ///     // Use transformed output
+    /// if let Some(value) = lua.call_interceptors("before_command", raw_value) {
+    ///     // Use transformed control-plane value
     /// } else {
     ///     // Interceptor returned nil, drop this output
     /// }
@@ -1352,145 +1353,6 @@ impl LuaRuntime {
     // PTY Operations
     // =========================================================================
 
-    /// Notify PTY output observers (fire-and-forget).
-    ///
-    /// Observers are called asynchronously and cannot affect data flow.
-    /// Use this for logging, metrics, side effects.
-    ///
-    /// # Arguments
-    ///
-    /// * `ctx` - Context containing session_uuid, peer_id
-    /// * `data` - Raw PTY output bytes
-    ///
-    /// # Returns
-    ///
-    /// Number of observers notified.
-    pub fn notify_pty_output_observers(&self, ctx: &PtyOutputContext, data: &[u8]) -> usize {
-        let result: mlua::Result<usize> = (|| {
-            let ctx_table = self.lua.create_table()?;
-            ctx_table.set("session_uuid", ctx.session_uuid.as_str())?;
-            ctx_table.set("peer_id", ctx.peer_id.clone())?;
-
-            let data_str = self.lua.create_string(data)?;
-
-            let hooks: mlua::Table = self.lua.globals().get("hooks")?;
-            let notify: mlua::Function = hooks.get("notify")?;
-            notify.call::<usize>(("pty_output", ctx_table, data_str))
-        })();
-
-        match result {
-            Ok(count) => count,
-            Err(e) => {
-                log::warn!("PTY output observer notification failed: {}", e);
-                0
-            }
-        }
-    }
-
-    /// Call PTY output interceptors with context and data.
-    ///
-    /// Interceptors can transform or drop data. They run synchronously
-    /// in the critical path - only use when transformation is needed.
-    ///
-    /// # Arguments
-    ///
-    /// * `ctx` - Context containing agent_index, pty_index, peer_id
-    /// * `data` - Raw PTY output bytes
-    ///
-    /// # Returns
-    ///
-    /// - `Ok(Some(data))` - Transformed data to send
-    /// - `Ok(None)` - Interceptor returned nil, drop this output
-    /// - `Err(_)` - Error (Hub should send original data)
-    ///
-    /// # Usage
-    ///
-    /// ```ignore
-    /// // Check for interceptors first (observers don't block)
-    /// let final_data = if lua.has_interceptors("pty_output") {
-    ///     match lua.call_pty_output_interceptors(&ctx, &data) {
-    ///         Ok(Some(transformed)) => transformed,
-    ///         Ok(None) => return, // drop
-    ///         Err(_) => data, // fallback
-    ///     }
-    /// } else {
-    ///     data
-    /// };
-    /// send(final_data);
-    ///
-    /// // Notify observers separately (async, never blocks)
-    /// if lua.has_observers("pty_output") {
-    ///     lua.notify_pty_output_observers(&ctx, &final_data);
-    /// }
-    /// ```
-    pub fn call_pty_output_interceptors(
-        &mut self,
-        ctx: &PtyOutputContext,
-        data: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
-        // Lazily initialize cached function and reusable context table
-        if self.pty_hook_fn.is_none() {
-            let f: mlua::Function = self
-                .lua
-                .load(
-                    r#"
-                return function(ctx, data)
-                    return hooks.call("pty_output", ctx, data)
-                end
-                "#,
-                )
-                .eval()
-                .map_err(|e| anyhow!("Failed to create PTY hook wrapper: {e}"))?;
-            let fn_key = self
-                .lua
-                .create_registry_value(f)
-                .map_err(|e| anyhow!("Failed to cache PTY hook function: {e}"))?;
-            self.pty_hook_fn = Some(fn_key);
-
-            let ctx_table = self
-                .lua
-                .create_table()
-                .map_err(|e| anyhow!("Failed to create context table: {e}"))?;
-            let ctx_key = self
-                .lua
-                .create_registry_value(ctx_table)
-                .map_err(|e| anyhow!("Failed to cache PTY context table: {e}"))?;
-            self.pty_hook_ctx = Some(ctx_key);
-        }
-
-        // Reuse cached context table — update fields in place
-        let ctx_table: mlua::Table = self
-            .lua
-            .registry_value(self.pty_hook_ctx.as_ref().unwrap())
-            .map_err(|e| anyhow!("Failed to retrieve cached PTY context table: {e}"))?;
-
-        ctx_table
-            .set("session_uuid", ctx.session_uuid.as_str())
-            .map_err(|e| anyhow!("Failed to set session_uuid: {e}"))?;
-        ctx_table
-            .set("peer_id", ctx.peer_id.clone())
-            .map_err(|e| anyhow!("Failed to set peer_id: {e}"))?;
-
-        // Convert data to Lua string (binary-safe)
-        let data_str = self
-            .lua
-            .create_string(data)
-            .map_err(|e| anyhow!("Failed to create data string: {e}"))?;
-
-        let func: mlua::Function = self
-            .lua
-            .registry_value(self.pty_hook_fn.as_ref().unwrap())
-            .map_err(|e| anyhow!("Failed to retrieve cached PTY hook function: {e}"))?;
-
-        let result: mlua::Result<Option<mlua::String>> = func.call((ctx_table, data_str));
-
-        match result {
-            Ok(Some(transformed)) => Ok(Some(transformed.as_bytes().to_vec())),
-            Ok(None) => Ok(None),
-            Err(e) => Err(anyhow!("PTY output hook error: {e}")),
-        }
-    }
-
     // =========================================================================
     // Hub State Primitives
     // =========================================================================
@@ -1549,23 +1411,24 @@ impl LuaRuntime {
         Ok(())
     }
 
-    /// Poll WebSocket events via shared vec (test-only fallback).
+    /// Poll WebSocket events via shared vec.
     ///
-    /// Production uses `HubEvent::WebSocketEvent` from background threads.
-    #[cfg(test)]
-    pub fn poll_websocket_events(&self) -> usize {
+    /// The hub uses `HubEvent::WebSocketEvent` from background threads. Plugin
+    /// workers do not own a hub event sender, so they pump their local
+    /// WebSocket callback queue directly from the worker loop.
+    pub(crate) fn poll_websocket_events(&self) -> usize {
         primitives::websocket::poll_websocket_events(&self.lua, &self.websocket_registry)
     }
 
     /// Set up a test event channel for the `HubEventSender`.
     ///
-    /// Creates an unbounded channel, fills the shared `HubEventSender` so that
+    /// Creates a bounded channel, fills the shared `HubEventSender` so that
     /// Lua closures can send events, and returns the receiver for assertions.
     #[cfg(test)]
     pub(crate) fn setup_test_event_channel(
         &self,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<crate::hub::events::HubEvent> {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    ) -> tokio::sync::mpsc::Receiver<crate::hub::events::HubEvent> {
+        let (tx, rx) = tokio::sync::mpsc::channel(64);
         *self
             .hub_event_sender
             .lock()
@@ -1728,20 +1591,12 @@ impl LuaRuntime {
     {
         let perf = lua_perf_enabled();
         let total_started = Instant::now();
-        // Collect callbacks and their functions in one lock acquisition
-        let callbacks_to_call: Vec<mlua::Function> = {
-            let callbacks = self
-                .event_callbacks
-                .lock()
-                .expect("Event callbacks mutex poisoned");
-            callbacks
-                .get_callbacks(event)
-                .iter()
-                .filter_map(|key| self.lua.registry_value::<mlua::Function>(key).ok())
-                .collect()
-        };
+        let callbacks_to_call = super::primitives::events::collect_event_callbacks(
+            &self.lua,
+            &self.event_callbacks,
+            event,
+        );
         let callbacks_collected = Instant::now();
-        // Lock released here
 
         if callbacks_to_call.is_empty() {
             return Ok(());
@@ -1753,20 +1608,12 @@ impl LuaRuntime {
         let args = args_fn(&self.lua)?;
         let args_built = Instant::now();
 
-        // Call callbacks without holding the lock
-        let mut callback_total_us = 0u128;
-        let mut callback_max_us = 0u128;
-        for callback in callbacks_to_call {
-            let callback_started = perf.then(Instant::now);
-            if let Err(e) = callback.call::<()>(args.clone()) {
-                log::error!("Event callback error for '{}': {}", event, e);
-            }
-            if let Some(started) = callback_started {
-                let elapsed = started.elapsed().as_micros();
-                callback_total_us += elapsed;
-                callback_max_us = callback_max_us.max(elapsed);
-            }
-        }
+        let callbacks_started = perf.then(Instant::now);
+        super::primitives::events::fire_collected_events(&self.lua, event, callbacks_to_call, args);
+        let callback_total_us = callbacks_started
+            .map(|started| started.elapsed().as_micros())
+            .unwrap_or(0);
+        let callback_max_us = callback_total_us;
 
         if perf {
             let done = Instant::now();
@@ -1914,7 +1761,7 @@ impl LuaRuntime {
         self.pty_input_listening = true;
     }
 
-    /// Update per-client focus state in Lua's `pty_clients` module.
+    /// Update per-client focus state in Lua's `terminal_clients` module.
     ///
     /// Called when focus-in (`\x1b[I`) or focus-out (`\x1b[O`) sequences
     /// are detected in PTY input. The `peer_id` identifies the client
@@ -2459,12 +2306,12 @@ mod tests {
     }
 
     #[test]
-    fn test_create_pty_forwarder_function_exists() {
+    fn test_subscribe_terminal_function_exists() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
         let globals = runtime.lua().globals();
         let webrtc: mlua::Table = globals.get("webrtc").expect("webrtc should exist");
-        let create_fn: mlua::Result<mlua::Function> = webrtc.get("create_pty_forwarder");
-        assert!(create_fn.is_ok(), "create_pty_forwarder should exist");
+        let create_fn: mlua::Result<mlua::Function> = webrtc.get("subscribe_terminal");
+        assert!(create_fn.is_ok(), "subscribe_terminal should exist");
     }
 
     #[test]
@@ -2534,7 +2381,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_forwarder_sends_event() {
+    fn test_create_subscription_sends_event() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
         let mut rx = runtime.setup_test_event_channel();
 
@@ -2542,7 +2389,7 @@ mod tests {
             .lua()
             .load(
                 r#"
-            forwarder = webrtc.create_pty_forwarder({
+            subscription = webrtc.subscribe_terminal({
                 peer_id = "test-browser",
                 session_uuid = "fwd-session-uuid",
                 subscription_id = "sub_1_test",
@@ -2556,24 +2403,24 @@ mod tests {
         assert!(rx.try_recv().is_err(), "No more events expected");
 
         match event {
-            HubEvent::LuaPtyRequest(PtyRequest::CreateForwarder(req)) => {
+            HubEvent::LuaPtyRequest(PtyRequest::SubscribeBrowserTerminal(req)) => {
                 assert_eq!(req.peer_id, "test-browser");
                 assert_eq!(req.session_uuid, "fwd-session-uuid");
                 assert_eq!(req.subscription_id, "sub_1_test");
             }
-            _ => panic!("Expected LuaPtyRequest CreateForwarder event"),
+            _ => panic!("Expected LuaPtyRequest SubscribeBrowserTerminal event"),
         }
     }
 
     #[test]
-    fn test_forwarder_handle_methods() {
+    fn test_subscription_handle_methods() {
         let runtime = LuaRuntime::new().expect("Should create runtime");
 
         runtime
             .lua()
             .load(
                 r#"
-            forwarder = webrtc.create_pty_forwarder({
+            subscription = webrtc.subscribe_terminal({
                 peer_id = "browser-xyz",
                 session_uuid = "handle-session-uuid",
                 subscription_id = "sub_2_test",
@@ -2583,157 +2430,28 @@ mod tests {
             .exec()
             .unwrap();
 
-        let id: String = runtime.lua().load("return forwarder:id()").eval().unwrap();
+        let id: String = runtime
+            .lua()
+            .load("return subscription:id()")
+            .eval()
+            .unwrap();
         assert_eq!(id, "browser-xyz:handle-session-uuid");
 
         let active: bool = runtime
             .lua()
-            .load("return forwarder:is_active()")
+            .load("return subscription:is_active()")
             .eval()
             .unwrap();
         assert!(active);
 
-        runtime.lua().load("forwarder:stop()").exec().unwrap();
+        runtime.lua().load("subscription:stop()").exec().unwrap();
 
         let active_after: bool = runtime
             .lua()
-            .load("return forwarder:is_active()")
+            .load("return subscription:is_active()")
             .eval()
             .unwrap();
         assert!(!active_after);
-    }
-
-    #[test]
-    fn test_call_pty_output_interceptors_passthrough() {
-        let mut runtime = LuaRuntime::new().expect("Should create runtime");
-
-        // Set up hooks that pass through unchanged
-        runtime
-            .lua()
-            .load(
-                r#"
-            hooks = {
-                call = function(event_name, ctx, data)
-                    return data
-                end
-            }
-        "#,
-            )
-            .exec()
-            .unwrap();
-
-        let ctx = PtyOutputContext {
-            session_uuid: "test-session".to_string(),
-            peer_id: "test-peer".to_string(),
-        };
-
-        let result = runtime
-            .call_pty_output_interceptors(&ctx, b"hello world")
-            .unwrap();
-        assert_eq!(result, Some(b"hello world".to_vec()));
-    }
-
-    #[test]
-    fn test_call_pty_output_interceptors_transform() {
-        let mut runtime = LuaRuntime::new().expect("Should create runtime");
-
-        // Set up hooks that transform data
-        runtime
-            .lua()
-            .load(
-                r#"
-            hooks = {
-                call = function(event_name, ctx, data)
-                    return data .. " transformed"
-                end
-            }
-        "#,
-            )
-            .exec()
-            .unwrap();
-
-        let ctx = PtyOutputContext {
-            session_uuid: "test-session".to_string(),
-            peer_id: "test-peer".to_string(),
-        };
-
-        let result = runtime
-            .call_pty_output_interceptors(&ctx, b"hello")
-            .unwrap();
-        assert_eq!(result, Some(b"hello transformed".to_vec()));
-    }
-
-    #[test]
-    fn test_call_pty_output_interceptors_drop() {
-        let mut runtime = LuaRuntime::new().expect("Should create runtime");
-
-        // Set up hooks that drop data
-        runtime
-            .lua()
-            .load(
-                r#"
-            hooks = {
-                call = function(event_name, ctx, data)
-                    return nil
-                end
-            }
-        "#,
-            )
-            .exec()
-            .unwrap();
-
-        let ctx = PtyOutputContext {
-            session_uuid: "test-session".to_string(),
-            peer_id: "test-peer".to_string(),
-        };
-
-        let result = runtime
-            .call_pty_output_interceptors(&ctx, b"hello")
-            .unwrap();
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn test_call_pty_output_interceptors_receives_context() {
-        let mut runtime = LuaRuntime::new().expect("Should create runtime");
-
-        // Set up hooks that use context
-        runtime
-            .lua()
-            .load(
-                r#"
-            received_ctx = nil
-            hooks = {
-                call = function(event_name, ctx, data)
-                    received_ctx = ctx
-                    return data
-                end
-            }
-        "#,
-            )
-            .exec()
-            .unwrap();
-
-        let ctx = PtyOutputContext {
-            session_uuid: "sess-abc-123".to_string(),
-            peer_id: "context-test-peer".to_string(),
-        };
-
-        runtime.call_pty_output_interceptors(&ctx, b"test").unwrap();
-
-        let session_uuid: String = runtime
-            .lua()
-            .load("return received_ctx.session_uuid")
-            .eval()
-            .unwrap();
-        let peer_id: String = runtime
-            .lua()
-            .load("return received_ctx.peer_id")
-            .eval()
-            .unwrap();
-
-        assert_eq!(session_uuid, "sess-abc-123");
-        assert_eq!(peer_id, "context-test-peer");
     }
 
     // =========================================================================
@@ -3604,8 +3322,7 @@ mod tests {
         }
     }
 
-    // Legacy recovery tests removed after the session-process migration.
-    // Session recovery is now handled via `recover_session_processes()` in hub/mod.rs.
+    // Session recovery is handled via `recover_session_processes()` in hub/mod.rs.
 
     // =========================================================================
     // PTY Input Notification Gating Tests

@@ -17,7 +17,7 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use super::framing::{Frame, FrameDecoder};
-use crate::client::{TuiOutput, TuiRequest};
+use crate::client::{TuiOutput, TuiRequest, TuiSessionInput};
 
 /// How many times attach-mode retries reconnecting after hub restart.
 const RECONNECT_RETRIES: u32 = 10;
@@ -28,6 +28,18 @@ const RECONNECT_RETRY_MS: u64 = 1_000;
 const SOCKET_PROTOCOL_VERSION: u32 = 2;
 /// Oldest socket protocol version still accepted by this bridge.
 const SOCKET_PROTOCOL_MIN_SUPPORTED: u32 = 1;
+/// Hub subscription id used by attach-mode TUI.
+const TUI_HUB_SUBSCRIPTION_ID: &str = "tui_hub";
+/// Core entity snapshots needed to render attach-mode TUI shell state.
+const TUI_CORE_ENTITY_TYPES: &[&str] = &[
+    "hub",
+    "connection_code",
+    "session",
+    "session_action",
+    "workspace",
+    "spawn_target",
+    "worktree",
+];
 
 /// Why a bridge session ended.
 enum SessionExit {
@@ -42,6 +54,8 @@ pub struct TuiBridge {
     output_tx: mpsc::UnboundedSender<TuiOutput>,
     /// Receiver for TuiRequest from TuiRunner (TUI → bridge direction).
     request_rx: mpsc::UnboundedReceiver<TuiRequest>,
+    /// Receiver for terminal input from TuiRunner (TUI → bridge direction).
+    session_input_rx: mpsc::UnboundedReceiver<TuiSessionInput>,
     /// Read half of the Unix socket.
     socket_reader: tokio::net::unix::OwnedReadHalf,
     /// Write half of the Unix socket.
@@ -59,6 +73,8 @@ pub struct TuiBridge {
 pub struct BridgeChannels {
     /// Sender for TuiRunner → bridge (TuiRequest).
     pub request_tx: mpsc::UnboundedSender<TuiRequest>,
+    /// Sender for TuiRunner → bridge terminal input.
+    pub session_input_tx: mpsc::UnboundedSender<TuiSessionInput>,
     /// Receiver for bridge → TuiRunner (TuiOutput).
     pub output_rx: mpsc::UnboundedReceiver<TuiOutput>,
 }
@@ -85,10 +101,12 @@ impl TuiBridge {
         let (reader, writer) = stream.into_split();
         let (output_tx, output_rx) = mpsc::unbounded_channel::<TuiOutput>();
         let (request_tx, request_rx) = mpsc::unbounded_channel::<TuiRequest>();
+        let (session_input_tx, session_input_rx) = mpsc::unbounded_channel::<TuiSessionInput>();
 
         let bridge = Self {
             output_tx,
             request_rx,
+            session_input_rx,
             socket_reader: reader,
             socket_writer: writer,
             wake_write_fd,
@@ -98,6 +116,7 @@ impl TuiBridge {
 
         let channels = BridgeChannels {
             request_tx,
+            session_input_tx,
             output_rx,
         };
 
@@ -168,10 +187,16 @@ impl TuiBridge {
         let subscribe = Frame::Json(serde_json::json!({
             "type": "subscribe",
             "channel": "hub",
-            "subscriptionId": "tui_hub"
+            "subscriptionId": TUI_HUB_SUBSCRIPTION_ID
         }));
         if let Err(e) = self.socket_writer.write_all(&subscribe.encode()).await {
             log::error!("[TuiBridge] Failed to send subscribe: {e}");
+            return SessionExit::HubDisconnected;
+        }
+
+        let entities = tui_core_entities_frame();
+        if let Err(e) = self.socket_writer.write_all(&entities.encode()).await {
+            log::error!("[TuiBridge] Failed to request core entity snapshots: {e}");
             return SessionExit::HubDisconnected;
         }
 
@@ -197,6 +222,19 @@ impl TuiBridge {
                     let encoded = tui_request_to_frame(&request).encode();
                     if let Err(e) = self.socket_writer.write_all(&encoded).await {
                         log::error!("[TuiBridge] Socket write error: {e}");
+                        return SessionExit::HubDisconnected;
+                    }
+                }
+                input = self.session_input_rx.recv() => {
+                    let Some(input) = input else {
+                        return SessionExit::Shutdown;
+                    };
+                    let frame = Frame::PtyInput {
+                        session_uuid: input.session_uuid,
+                        data: input.data,
+                    };
+                    if let Err(e) = self.socket_writer.write_all(&frame.encode()).await {
+                        log::error!("[TuiBridge] Socket session input write error: {e}");
                         return SessionExit::HubDisconnected;
                     }
                 }
@@ -285,6 +323,13 @@ impl TuiBridge {
                 | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
             }
         }
+        loop {
+            match self.session_input_rx.try_recv() {
+                Ok(_) => dropped += 1,
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
         dropped
     }
 }
@@ -358,10 +403,6 @@ fn frame_to_tui_output(frame: Frame) -> Option<TuiOutput> {
 fn tui_request_to_frame(request: &TuiRequest) -> Frame {
     match request {
         TuiRequest::LuaMessage(json) => Frame::Json(json.clone()),
-        TuiRequest::PtyInput { session_uuid, data } => Frame::PtyInput {
-            session_uuid: session_uuid.clone(),
-            data: data.clone(),
-        },
         TuiRequest::FocusChanged {
             session_uuid,
             focused,
@@ -373,9 +414,36 @@ fn tui_request_to_frame(request: &TuiRequest) -> Frame {
     }
 }
 
+fn tui_core_entities_frame() -> Frame {
+    Frame::Json(serde_json::json!({
+        "subscriptionId": TUI_HUB_SUBSCRIPTION_ID,
+        "data": {
+            "type": "hub:entities",
+            "entity_types": TUI_CORE_ENTITY_TYPES,
+        },
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn is_tui_core_entities_frame(frame: &Frame) -> bool {
+        let Frame::Json(value) = frame else {
+            return false;
+        };
+        value.pointer("/data/type").and_then(|v| v.as_str()) == Some("hub:entities")
+            && value.get("subscriptionId").and_then(|v| v.as_str()) == Some(TUI_HUB_SUBSCRIPTION_ID)
+            && value
+                .pointer("/data/entity_types")
+                .and_then(|v| v.as_array())
+                .map(|types| {
+                    TUI_CORE_ENTITY_TYPES
+                        .iter()
+                        .all(|needle| types.iter().any(|actual| actual.as_str() == Some(*needle)))
+                })
+                .unwrap_or(false)
+    }
 
     /// Helper: create a connected TuiBridge over a Unix socket pair.
     async fn setup_bridge(
@@ -454,7 +522,8 @@ mod tests {
             .send(TuiRequest::LuaMessage(serde_json::json!({"type": "ping"})))
             .unwrap();
 
-        // Read all frames — bridge sends auto-subscribe first, then our test message
+        // Read all frames — bridge sends auto-subscribe + core entity pull first,
+        // then our test message.
         let mut decoder = FrameDecoder::new();
         let mut all_frames = Vec::new();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -479,6 +548,10 @@ mod tests {
         assert!(
             has_subscribe,
             "Expected auto-subscribe frame, got: {all_frames:?}"
+        );
+        assert!(
+            all_frames.iter().any(is_tui_core_entities_frame),
+            "Expected TUI core entities request frame, got: {all_frames:?}"
         );
 
         // Verify our test message arrived
@@ -526,8 +599,8 @@ mod tests {
             setup_bridge(&tmp, "pty_in.sock").await;
 
         channels
-            .request_tx
-            .send(TuiRequest::PtyInput {
+            .session_input_tx
+            .send(TuiSessionInput {
                 session_uuid: "test-session".to_string(),
                 data: b"hello".to_vec(),
             })
@@ -782,14 +855,15 @@ mod tests {
         );
         let handle = tokio::spawn(bridge.run());
 
-        // Initial connection sends hello + hub subscribe.
+        // Initial connection sends hello + hub subscribe + core entity pull.
         let mut decoder_a = FrameDecoder::new();
         let mut buf = [0u8; 4096];
         let mut frames = Vec::new();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !frames.iter().any(
+        while !(frames.iter().any(
             |f| matches!(f, Frame::Json(v) if v["type"] == "subscribe" && v["channel"] == "hub"),
-        ) {
+        ) && frames.iter().any(is_tui_core_entities_frame))
+        {
             let n = tokio::time::timeout_at(deadline, server_read_a.read(&mut buf))
                 .await
                 .expect("timed out waiting for initial subscribe")
@@ -810,6 +884,10 @@ mod tests {
                 |f| matches!(f, Frame::Json(v) if v["type"] == "subscribe" && v["channel"] == "hub")
             ),
             "expected initial hub subscribe frame, got: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(is_tui_core_entities_frame),
+            "expected initial TUI core entities request frame, got: {frames:?}"
         );
 
         // Force disconnect and queue a stale request while socket is down.
@@ -848,13 +926,14 @@ mod tests {
             other => panic!("expected bridge_reconnected message, got: {other:?}"),
         }
 
-        // New socket session should begin with fresh hello + hub subscribe.
+        // New socket session should begin with fresh hello + hub subscribe + core entity pull.
         let mut decoder_b = FrameDecoder::new();
         let mut frames = Vec::new();
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !frames.iter().any(
+        while !(frames.iter().any(
             |f| matches!(f, Frame::Json(v) if v["type"] == "subscribe" && v["channel"] == "hub"),
-        ) {
+        ) && frames.iter().any(is_tui_core_entities_frame))
+        {
             let n = tokio::time::timeout_at(deadline, server_read_b.read(&mut buf))
                 .await
                 .expect("timed out waiting for reconnect subscribe")
@@ -875,6 +954,10 @@ mod tests {
                 |f| matches!(f, Frame::Json(v) if v["type"] == "subscribe" && v["channel"] == "hub")
             ),
             "expected reconnect hub subscribe frame, got: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(is_tui_core_entities_frame),
+            "expected reconnect TUI core entities request frame, got: {frames:?}"
         );
         assert!(
             !frames

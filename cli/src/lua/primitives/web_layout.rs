@@ -40,8 +40,7 @@ use std::sync::Mutex;
 
 use anyhow::{anyhow, Result};
 use mlua::{Function, Lua, LuaSerdeExt, Table, Value};
-
-use crate::ui_contract::node::UiNode;
+use serde_json::Value as JsonValue;
 
 /// The env var that toggles dev-mode config directories (`.botster-dev/` vs
 /// `.botster/`). Matches the convention used elsewhere in the CLI.
@@ -199,12 +198,39 @@ fn render_surface(lua: &Lua, surface_name: &str, state: Value) -> Result<String>
         },
     };
 
-    let node: UiNode = lua
+    let node: JsonValue = lua
         .from_value(returned)
-        .map_err(|e| anyhow!("surface `{surface_name}` did not return a UiNode: {e}"))?;
+        .map_err(|e| anyhow!("surface `{surface_name}` did not return JSON: {e}"))?;
+    validate_uinode_json(surface_name, &node)?;
 
     serde_json::to_string(&node)
-        .map_err(|e| anyhow!("failed to serialise UiNode for `{surface_name}`: {e}"))
+        .map_err(|e| anyhow!("failed to serialise UiNode JSON for `{surface_name}`: {e}"))
+}
+
+fn validate_uinode_json(surface_name: &str, node: &JsonValue) -> Result<()> {
+    let object = node.as_object().ok_or_else(|| {
+        anyhow!(
+            "surface `{surface_name}` did not return a UiNode: expected object, got {}",
+            json_value_type(node)
+        )
+    })?;
+    match object.get("type").and_then(JsonValue::as_str) {
+        Some(node_type) if !node_type.is_empty() => Ok(()),
+        _ => Err(anyhow!(
+            "surface `{surface_name}` did not return a UiNode: missing string `type`"
+        )),
+    }
+}
+
+fn json_value_type(value: &JsonValue) -> &'static str {
+    match value {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "boolean",
+        JsonValue::Number(_) => "number",
+        JsonValue::String(_) => "string",
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
+    }
 }
 
 /// Look up `surface_name` in the resolved layout table and call it with the
@@ -609,6 +635,7 @@ fn error_fallback_json(surface_name: &str, error_msg: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui_contract::node::UiNode;
 
     #[test]
     fn error_fallback_is_valid_uinode_json() {
