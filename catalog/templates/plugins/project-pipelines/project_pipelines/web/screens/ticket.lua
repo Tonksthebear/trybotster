@@ -518,6 +518,42 @@ local function merge_controls(ticket, ctx, overview)
     return children
 end
 
+local function merge_result_rows(_ticket, _ctx, overview)
+    local run = overview and overview.latest_run
+    local artifact = run and repo.latest_merge_pr_artifact(run.id) or nil
+    if not artifact then
+        return {}
+    end
+    local payload = util.decode(artifact.payload, {})
+    local pr_url = artifact.uri or payload.pr_url
+    local merge_commit = payload.merge_commit
+    local summary = artifact.summary or payload.merge_summary or "Merge confirmed."
+    local children = {
+        view.panel{
+            ui.stack{ direction = "vertical", gap = "2", children = {
+                view.row{
+                    view.badge("✓", "success"),
+                    ui.text{ text = "Merge recorded", size = "sm", weight = "semibold" },
+                },
+                ui.text{ text = summary, size = "sm", tone = "muted" },
+            } },
+        },
+    }
+    if pr_url and pr_url ~= "" then
+        table.insert(children, ui.button{
+            id = "ticket-" .. tostring(run.ticket_id) .. "-merge-pr",
+            label = "Open PR",
+            icon = "external-link",
+            variant = "solid",
+            tone = "accent",
+            action = ui.action("botster.url.open", { url = pr_url }),
+        })
+    elseif merge_commit and merge_commit ~= "" then
+        table.insert(children, ui.text{ text = "Merge commit: " .. tostring(merge_commit), size = "xs", tone = "muted" })
+    end
+    return children
+end
+
 local function run_rows(ticket_id, ctx, overview)
     local children = {}
     for _, run in ipairs(overview and overview.runs or repo.ticket_runs(ticket_id)) do
@@ -588,6 +624,10 @@ function M.render(view_state, ctx)
         view.section("Questions", question_rows(ticket, ctx, overview)),
         view.section("Dependencies", dependency_rows(ticket, ctx, overview)),
     }
+    local merge_result_children = merge_result_rows(ticket, ctx, overview)
+    if #merge_result_children > 0 then
+        table.insert(children, view.section("Merge Result", merge_result_children))
+    end
     local merge_children = merge_controls(ticket, ctx, overview)
     if #merge_children > 0 then
         table.insert(children, view.section("Merge", merge_children))

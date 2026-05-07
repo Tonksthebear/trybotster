@@ -15,7 +15,7 @@ local function project_options(selected_project_id)
     local options = {
         { value = "", label = "No project" },
     }
-    for _, project in ipairs(repo.list_projects()) do
+    for _, project in ipairs(repo.open_projects()) do
         table.insert(options, { value = project.id, label = project.name })
     end
     return options
@@ -167,12 +167,12 @@ end
 
 function M.project(_view_state, ctx)
     local recent = {}
-    for _, project in ipairs(repo.list_projects()) do
+    for _, project in ipairs(repo.open_projects()) do
         table.insert(recent, view.panel{
             ui.stack{ direction = "vertical", gap = "2", children = {
                 view.metadata{
+                    view.status_mark(project.status),
                     ui.text{ text = project.name, size = "sm", weight = "semibold" },
-                    view.badge(project.status),
                 },
                 ui.text{ text = project.description or "", size = "xs", tone = "muted" },
                 ui.button{

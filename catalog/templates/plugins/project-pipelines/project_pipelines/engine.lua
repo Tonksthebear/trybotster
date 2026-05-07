@@ -50,6 +50,33 @@ local function ticket_workspace_name(ticket, fallback)
     return "Pipeline - " .. title
 end
 
+local function infer_base_from_dependencies(ticket_id)
+    for _, dependency in ipairs(repo.closed_ticket_dependencies(ticket_id)) do
+        local dependency_ticket = repo.get_ticket(dependency.depends_on_ticket_id)
+        local dependency_run = repo.latest_ticket_run(dependency.depends_on_ticket_id)
+        local pr_artifact = dependency_run and repo.latest_merge_pr_artifact(dependency_run.id) or nil
+        if dependency_ticket and dependency_run and pr_artifact then
+            return {
+                base_ticket_id = dependency_ticket.id,
+                base_run_id = dependency_run.id,
+                base_ref = ticket_branch_for(dependency_ticket, dependency_run.id),
+                base_target_path = dependency_run.base_target_path,
+            }
+        end
+    end
+    return {}
+end
+
+local function run_base_attrs(params, ticket_id)
+    local inferred = infer_base_from_dependencies(ticket_id)
+    return {
+        base_ticket_id = params.base_ticket_id or inferred.base_ticket_id,
+        base_run_id = params.base_run_id or params.parent_run_id or inferred.base_run_id,
+        base_ref = params.base_ref or inferred.base_ref,
+        base_target_path = params.base_target_path or inferred.base_target_path,
+    }
+end
+
 local M = {}
 
 function M.register_entities()
@@ -293,6 +320,8 @@ local function spawn_step_agent(run, step)
             request_id = request_id,
             agent_name = step.agent_name,
             issue_or_branch = agent_branch_for(ticket, run, step),
+            base_ref = run.base_ref,
+            base_target_path = run.base_target_path,
             target_id = run.target_id,
             target_path = run.target_path,
             workspace_id = run.workspace_id,
@@ -307,6 +336,10 @@ local function spawn_step_agent(run, step)
                 run_id = run.id,
                 step_id = step.id,
                 pipeline_id = run.pipeline_id,
+                base_ticket_id = run.base_ticket_id,
+                base_run_id = run.base_run_id,
+                base_ref = run.base_ref,
+                base_target_path = run.base_target_path,
                 role = step.id,
             },
         }
@@ -382,6 +415,8 @@ function M.ask_agent(params, context)
             request_id = request_id,
             agent_name = params.agent_name or "claude",
             issue_or_branch = ticket_branch_for(resolved.ticket, question.id),
+            base_ref = resolved.run and resolved.run.base_ref or nil,
+            base_target_path = resolved.run and resolved.run.base_target_path or nil,
             target_id = resolved.ticket.target_id,
             target_path = resolved.ticket.target_path,
             workspace_id = resolved.run and resolved.run.workspace_id or params.workspace_id,
@@ -394,6 +429,8 @@ function M.ask_agent(params, context)
                 surface = SURFACE,
                 ticket_id = resolved.ticket.id,
                 run_id = resolved.run and resolved.run.id or nil,
+                base_ref = resolved.run and resolved.run.base_ref or nil,
+                base_target_path = resolved.run and resolved.run.base_target_path or nil,
                 question_id = question.id,
                 role = "question_advisor",
             },
@@ -503,6 +540,9 @@ function M.request_merge(params, context)
         merge_policy == "pr"
             and "This pipeline requires a PR. Create or update the PR only through the Botster MCP PR tools. Do not merge directly. Do not use gh, hub, direct GitHub API calls, browser automation, or manual web UI actions for PR creation or PR updates."
             or "This pipeline requires a direct merge to main. If the acceptance check passes, merge according to the repo's direct-merge convention and do not open a PR.",
+        merge_policy == "pr" and not util.is_blank(run.base_ref)
+            and ("This is stacked pipeline work. Open or update the PR against base_ref `" .. tostring(run.base_ref) .. "`, not main.")
+            or "",
         merge_policy == "pr"
             and "If the Botster MCP PR tools are unavailable, ask a human question and wait instead of creating the PR another way."
             or "If direct merge is blocked by conflicts or repo state, add a blocker artifact or ask a human question and wait.",
@@ -518,6 +558,8 @@ function M.request_merge(params, context)
             request_id = request_id,
             agent_name = params.agent_name or "codex",
             issue_or_branch = ticket_branch_for(ticket, run.id),
+            base_ref = run.base_ref,
+            base_target_path = run.base_target_path,
             target_id = run.target_id or ticket.target_id,
             target_path = run.target_path or ticket.target_path,
             workspace_id = run.workspace_id or params.workspace_id,
@@ -530,6 +572,10 @@ function M.request_merge(params, context)
                 surface = SURFACE,
                 ticket_id = ticket.id,
                 run_id = run.id,
+                base_ticket_id = run.base_ticket_id,
+                base_run_id = run.base_run_id,
+                base_ref = run.base_ref,
+                base_target_path = run.base_target_path,
                 role = "merge",
             },
         }
@@ -546,6 +592,9 @@ function M.request_merge(params, context)
             status = created and created.status or "queued",
             strategy = params.strategy or "agent",
             merge_policy = merge_policy,
+            base_ref = run.base_ref,
+            base_ticket_id = run.base_ticket_id,
+            base_run_id = run.base_run_id,
         },
     })
     refresh_surfaces(context)
@@ -746,6 +795,7 @@ function M.start_run(params)
         error("pipeline has no steps: " .. tostring(pipeline_id))
     end
 
+    local base_attrs = run_base_attrs(params, params.ticket_id)
     local run = repo.create_run{
         ticket_id = params.ticket_id,
         pipeline_id = pipeline_id,
@@ -754,6 +804,10 @@ function M.start_run(params)
         target_path = params.target_path or ticket.target_path,
         workspace_id = params.workspace_id,
         workspace_name = params.workspace_name or ticket_workspace_name(ticket, params.ticket_id),
+        base_ticket_id = base_attrs.base_ticket_id,
+        base_run_id = base_attrs.base_run_id,
+        base_ref = base_attrs.base_ref,
+        base_target_path = base_attrs.base_target_path,
     }
     local first_step = repo.next_step(run)
     local activation = M.activate_step(run, first_step)
@@ -813,6 +867,84 @@ function M.request_step_advance(params, context)
     local updated = repo.get_run(run.id)
     local activation = M.activate_step(updated, next_step)
     return { ok = true, completed_step = step, next_step = next_step, activation = activation, run = repo.get_run(run.id) }
+end
+
+function M.retry_step_agent(params, context)
+    params = params or {}
+    local run_id = params.run_id
+    if util.is_blank(run_id) and context and context.session_uuid then
+        local assignment = repo.find_active_assignment(context.session_uuid)
+        run_id = assignment and assignment.run_id or nil
+    end
+    util.assert_present(run_id, "run_id")
+
+    local run = repo.get_run(run_id)
+    if not run then
+        error("run not found: " .. tostring(run_id))
+    end
+    if util.is_blank(run.current_step_id) then
+        error("run has no current step")
+    end
+    local step = repo.get_step(run.current_step_id)
+    if not step then
+        error("current step not found: " .. tostring(run.current_step_id))
+    end
+    if step.kind ~= "agent" then
+        error("current step is not an agent step: " .. tostring(step.kind))
+    end
+
+    local run_step_id = params.run_step_id or run.current_run_step_id
+    local visit = nil
+    if not util.is_blank(run_step_id) then
+        visit = repo.get_run_step_visit(run_step_id)
+        if not visit then
+            error("run_step_id not found: " .. tostring(run_step_id))
+        end
+        if visit.run_id ~= run.id then
+            error("run_step_id does not belong to run: " .. tostring(run_step_id))
+        end
+        if visit.step_id ~= step.id then
+            error("run_step_id does not match current step: " .. tostring(run_step_id))
+        end
+    end
+    if not visit then
+        visit = repo.get_run_step(run.id, step.id)
+    end
+    if not visit then
+        error("no run step visit found for current step")
+    end
+
+    repo.update_run(run.id, { status = "active", current_step_id = step.id, current_run_step_id = visit.id })
+    repo.update_run_step_visit(visit.id, {
+        status = "active",
+        agent_session_uuid = "",
+        started_at = util.now(),
+    })
+    repo.append_event("step.agent_retry_requested", {
+        run_id = run.id,
+        ticket_id = run.ticket_id,
+        payload = {
+            step_id = step.id,
+            run_step_id = visit.id,
+            requested_by_session_uuid = context and context.session_uuid or params.requested_by_session_uuid,
+            reason = params.reason,
+        },
+    })
+
+    local created, err = spawn_step_agent(repo.get_run(run.id), step)
+    if err then
+        repo.update_run(run.id, { status = "blocked" })
+        repo.update_run_step_visit(visit.id, { status = "blocked" })
+        repo.append_event("step.spawn_failed", {
+            run_id = run.id,
+            ticket_id = run.ticket_id,
+            payload = { step_id = step.id, run_step_id = visit.id, retry = true, error = err },
+        })
+        return { ok = false, status = "blocked", run = repo.get_run(run.id), step = step, run_step = repo.get_run_step_visit(visit.id), error = err }
+    end
+
+    refresh_surfaces(context)
+    return { ok = true, status = "active", run = repo.get_run(run.id), step = step, run_step = repo.get_run_step_visit(visit.id), agent = created }
 end
 
 function M.handle_command_gate_completed(data)

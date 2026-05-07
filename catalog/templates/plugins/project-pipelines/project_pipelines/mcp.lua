@@ -530,6 +530,10 @@ function M.register()
                 target_path = { type = "string" },
                 workspace_id = { type = "string" },
                 workspace_name = { type = "string" },
+                base_ticket_id = { type = "string" },
+                base_run_id = { type = "string" },
+                base_ref = { type = "string" },
+                base_target_path = { type = "string" },
             },
             required = { "ticket_id" },
         },
@@ -731,6 +735,20 @@ function M.register()
         return sync_ok(engine.request_step_advance(params, context))
     end)
 
+    tool("project_pipelines_retry_step_agent", {
+        description = "Retry the current blocked agent step after agent spawn or lifecycle failure. Clears stale session linkage on the current run step visit and requeues the pipeline-owned agent spawn. If run_id is omitted, the caller's active pipeline assignment is used.",
+        input_schema = {
+            type = "object",
+            properties = {
+                run_id = { type = "string" },
+                run_step_id = { type = "string" },
+                reason = { type = "string" },
+            },
+        },
+    }, function(params, context)
+        return sync_ok(engine.retry_step_agent(params, context))
+    end)
+
     tool("project_pipelines_submit_review", {
         description = "Submit a structured review for a pipeline step, including findings that become visible to every agent in the run context.",
         input_schema = {
@@ -797,6 +815,10 @@ function M.register()
                 target_path = { type = "string" },
                 workspace_id = { type = "string" },
                 workspace_name = { type = "string" },
+                base_ticket_id = { type = "string" },
+                base_run_id = { type = "string" },
+                base_ref = { type = "string" },
+                base_target_path = { type = "string" },
             },
             required = { "parent_run_id", "title" },
         },
@@ -818,6 +840,10 @@ function M.register()
         params.target_path = target_path
         params.workspace_id = params.workspace_id or parent.workspace_id
         params.workspace_name = params.workspace_name or parent.workspace_name
+        params.base_ticket_id = params.base_ticket_id or parent.base_ticket_id
+        params.base_run_id = params.base_run_id or parent.base_run_id or parent.id
+        params.base_ref = params.base_ref or parent.base_ref
+        params.base_target_path = params.base_target_path or parent.base_target_path
         local started = engine.start_run(params)
         repo.append_event("run.child_created", {
             run_id = parent.id,

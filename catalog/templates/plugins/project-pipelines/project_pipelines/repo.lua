@@ -539,6 +539,15 @@ function M.blocking_ticket_dependencies(ticket_id)
                   ORDER BY td.created_at ASC]], ticket_id)
 end
 
+function M.closed_ticket_dependencies(ticket_id)
+    return rows([[SELECT td.*, t.title AS depends_on_title, t.status AS depends_on_status
+                  FROM ticket_dependencies td
+                  LEFT JOIN tickets t ON t.id = td.depends_on_ticket_id
+                  WHERE td.ticket_id = ?
+                    AND COALESCE(t.status, 'open') = 'closed'
+                  ORDER BY td.created_at ASC]], ticket_id)
+end
+
 function M.update_ticket(ticket_id, attrs)
     local ticket = M.get_ticket(ticket_id)
     if not ticket then
@@ -588,6 +597,12 @@ end
 
 function M.list_projects()
     return rows("SELECT * FROM projects ORDER BY updated_at DESC, created_at DESC")
+end
+
+function M.open_projects()
+    return rows([[SELECT * FROM projects
+                  WHERE COALESCE(status, 'open') != 'closed'
+                  ORDER BY updated_at DESC, created_at DESC]])
 end
 
 function M.get_project(project_id)
@@ -1021,6 +1036,10 @@ function M.create_run(attrs)
         target_path = attrs.target_path,
         workspace_id = attrs.workspace_id,
         workspace_name = attrs.workspace_name,
+        base_ticket_id = attrs.base_ticket_id,
+        base_run_id = attrs.base_run_id,
+        base_ref = attrs.base_ref,
+        base_target_path = attrs.base_target_path,
         created_at = now,
         updated_at = now,
     }
@@ -1058,6 +1077,21 @@ end
 
 function M.latest_ticket_run(ticket_id)
     return first("SELECT * FROM runs WHERE ticket_id = ? ORDER BY created_at DESC LIMIT 1", ticket_id)
+end
+
+function M.latest_merge_pr_artifact(run_id)
+    if util.is_blank(run_id) then
+        return nil
+    end
+    for _, artifact in ipairs(rows([[SELECT * FROM artifacts
+                                     WHERE run_id = ? AND kind = 'merge'
+                                     ORDER BY created_at DESC, id DESC]], run_id)) do
+        local payload = util.decode(artifact.payload, {})
+        if not util.is_blank(artifact.uri) or not util.is_blank(payload.pr_url) then
+            return artifact
+        end
+    end
+    return nil
 end
 
 function M.run_steps(run_id)
