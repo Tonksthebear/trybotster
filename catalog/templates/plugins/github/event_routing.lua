@@ -8,7 +8,7 @@
 local M = {}
 
 local Agent = require("lib.agent")
-local InternalClient = require("lib.internal_client")
+local Hub = require("lib.hub")
 local state = require("hub.state")
 local routing_state = state.get("github.event_routing", {})
 
@@ -49,11 +49,13 @@ local function format_notification(payload)
 end
 
 local function notify_agent(agent, payload)
-    if agent.session then
-        agent.session:send_message(format_notification(payload))
+    local ok, err = pcall(function()
+        Hub.get():send_message(agent.session_uuid, format_notification(payload))
+    end)
+    if ok then
         log.info(string.format("GitHub: notified existing agent %s", agent.session_uuid))
     else
-        log.warn(string.format("GitHub: cannot notify agent %s (no session)", agent.session_uuid))
+        log.warn(string.format("GitHub: cannot notify agent %s: %s", agent.session_uuid, tostring(err)))
     end
 end
 
@@ -66,11 +68,7 @@ local function handle_message(default_repo, message, channel_id)
             local ws_name = github_workspace_name(event_repo, payload.issue_number)
             local matches = Agent.find_by_workspace(ws_name)
             for _, agent in ipairs(matches) do
-                InternalClient.dispatch("github", {
-                    type = "delete_agent",
-                    agent_id = agent.session_uuid,
-                    delete_worktree = false,
-                })
+                Hub.get():delete_agent(agent.session_uuid, false)
             end
         end
     else
@@ -80,8 +78,7 @@ local function handle_message(default_repo, message, channel_id)
         else
             local issue_num = payload.issue_number
             local ws_name = github_workspace_name(event_repo, issue_num)
-            InternalClient.dispatch("github", {
-                type = "create_agent",
+            Hub.get():create_agent({
                 issue_or_branch = issue_num and tostring(issue_num),
                 prompt = payload.prompt or payload.context or payload.comment_body,
                 repo = event_repo,

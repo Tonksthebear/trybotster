@@ -33,7 +33,6 @@ local state = require("hub.state")
 local hooks = require("hub.hooks")
 local Agent = require("lib.agent")
 local Hub = require("lib.hub")
-local InternalClient = require("lib.internal_client")
 
 local self_id = hub.hub_id()
 
@@ -545,13 +544,7 @@ hooks.on("hub_rpc_request", "orchestrator_rpc", function(client_id, message)
             if type(command) ~= "table" then
                 error("hub_command requires command table")
             end
-            local result = InternalClient.dispatch("hub_rpc", command)
-            for _, frame in ipairs(result.frames or {}) do
-                if frame.type == "command_response" and frame.request_id == command.request_id then
-                    return frame
-                end
-            end
-            return { ok = true, request_id = command.request_id }
+            return local_hub:command(command)
         end)
     elseif message.type == "get_pty_snapshot" then
         respond(function()

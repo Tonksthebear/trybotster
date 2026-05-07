@@ -23,7 +23,8 @@ fn lua_src_dir() -> PathBuf {
 
 fn plugin_path() -> PathBuf {
     repo_dir()
-        .join(".botster")
+        .join("catalog")
+        .join("templates")
         .join("plugins")
         .join("cloudflare-hosted-preview")
         .join("init.lua")
@@ -41,7 +42,7 @@ fn new_lua() -> Lua {
 }
 
 #[test]
-fn cloudflare_plugin_registers_and_runs_generic_session_action() {
+fn catalog_plugin_cloudflare_registers_and_runs_generic_session_action() {
     let lua = new_lua();
     let plugin_source = std::fs::read_to_string(plugin_path()).expect("read plugin");
 
@@ -97,20 +98,18 @@ fn cloudflare_plugin_registers_and_runs_generic_session_action() {
                 }
               end,
             }
-            package.loaded["lib.accessory"] = {
-              new = function(opts)
-                local connector = {
-                  session_uuid = "conn-1",
-                  status = "running",
-                  metadata = opts.metadata,
-                  session_opts = opts.session,
-                  get_meta = function(self, key) return self.metadata[key] end,
-                  set_meta = function(self, key, value) self.metadata[key] = value end,
-                  close = function(self) self.status = "closed" end,
+            package.loaded["lib.hub"] = {
+              get = function()
+                return {
+                  create_accessory = function(_, opts)
+                    _G.created_connector_request = opts
+                    return {
+                      ok = true,
+                      status = "queued",
+                      request_id = opts.request_id,
+                    }
+                  end,
                 }
-                sessions[connector.session_uuid] = connector
-                _G.created_connector = connector
-                return connector
               end,
             }
 
@@ -188,7 +187,7 @@ fn cloudflare_plugin_registers_and_runs_generic_session_action() {
                 assert(prepare_request.config_path:match("botster%-cloudflared%-quick%.yml$"))
                 assert(prepare_request.config_contents == "{}\n")
                 assert(prepare_request.context.parent_session_uuid == "parent-1")
-                assert(created_connector == nil)
+                assert(created_connector_request == nil)
 
                 event_handlers.plugin_command_prepared({
                   request_id = "stale-request",
@@ -196,7 +195,7 @@ fn cloudflare_plugin_registers_and_runs_generic_session_action() {
                   config_path = "/tmp/botster-cloudflared-quick.yml",
                   context = { parent_session_uuid = "parent-1", port = 4567 },
                 })
-                assert(created_connector == nil)
+                assert(created_connector_request == nil)
 
                 event_handlers.plugin_command_prepared({
                   request_id = preview.prepare_request_id,
@@ -204,13 +203,32 @@ fn cloudflare_plugin_registers_and_runs_generic_session_action() {
                   config_path = "/tmp/botster-cloudflared-quick.yml",
                   context = { parent_session_uuid = "parent-1", port = 4567 },
                 })
-                assert(created_connector.session_opts.command == "/usr/local/bin/cloudflared")
-                assert(created_connector.session_opts.args[5] == "http://127.0.0.1:4567")
-                assert(created_connector.metadata.system_kind == "cloudflare_hosted_preview_connector")
-                assert(created_connector.metadata.owner_plugin == "cloudflare-hosted-preview")
+                assert(created_connector_request.session.command == "/usr/local/bin/cloudflared")
+                assert(created_connector_request.session.args[5] == "http://127.0.0.1:4567")
+                assert(created_connector_request.metadata.system_kind == "cloudflare_hosted_preview_connector")
+                assert(created_connector_request.metadata.owner_plugin == "cloudflare-hosted-preview")
                 preview = test_sessions["parent-1"].plugin_state.cloudflare_hosted_preview
                 assert(preview.status == "starting")
                 assert(preview.provider == "cloudflare")
+                assert(preview.prepare_request_id ~= false)
+
+                local connector = {
+                  session_uuid = "conn-1",
+                  status = "running",
+                  metadata = created_connector_request.metadata,
+                  session_opts = created_connector_request.session,
+                  get_meta = function(self, key) return self.metadata[key] end,
+                  set_meta = function(self, key, value) self.metadata[key] = value end,
+                  close = function(self) self.status = "closed" end,
+                }
+                test_sessions[connector.session_uuid] = connector
+                _G.created_connector = connector
+                hook_handlers["agent_created:cloudflare-hosted-preview.connector_created"]({
+                  session_uuid = connector.session_uuid,
+                  metadata = connector.metadata,
+                })
+                preview = test_sessions["parent-1"].plugin_state.cloudflare_hosted_preview
+                assert(preview.connector_session_uuid == "conn-1")
                 assert(preview.prepare_request_id == false)
 
                 hook_handlers["pty_output:cloudflare-hosted-preview.cloudflared_output"](

@@ -16,16 +16,16 @@ local notifications = require("notifications")
 local event_routing = require("event_routing")
 
 local repo = hub.detect_repo()
-if not repo then
-    log.info("GitHub plugin: disabled (no repo detected)")
-    return {}
-end
 
 mcp_proxy.start()
 notifications.register()
-event_routing.start(repo)
 
-log.info(string.format("GitHub plugin loaded for %s", repo))
+if repo then
+    event_routing.start(repo)
+    log.info(string.format("GitHub plugin loaded for %s", repo))
+else
+    log.info("GitHub plugin loaded without repo event routing")
+end
 
 return {
     _before_reload = function()

@@ -26,7 +26,7 @@ fn create_lua_vm() -> Lua {
 }
 
 #[test]
-fn repository_catalog_includes_cloudflare_hosted_preview_template() {
+fn catalog_plugin_repository_includes_cloudflare_hosted_preview_template() {
     let lua = create_lua_vm();
     let catalog_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
