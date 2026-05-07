@@ -106,6 +106,34 @@ local function dispatch_local_command_response(command)
     return response or { ok = true }
 end
 
+local function dispatch_local_command_async(command)
+    command.request_id = command.request_id or generate_msg_id()
+    local request_id = command.request_id
+    local metadata = command.metadata or {}
+
+    local function run_command()
+        local ok, err = pcall(dispatch_local_command_response, command)
+        if not ok then
+            log.warn(string.format("Hub async command failed: %s request_id=%s error=%s",
+                tostring(command.type), tostring(request_id), tostring(err)))
+        end
+    end
+
+    if type(timer) == "table" and type(timer.after) == "function" then
+        timer.after(0, run_command)
+    else
+        log.warn(string.format("Hub async command not dispatched because timer.after is unavailable: %s request_id=%s",
+            tostring(command.type), tostring(request_id)))
+    end
+
+    return {
+        ok = true,
+        status = "queued",
+        request_id = request_id,
+        assignment_id = command.assignment_id or metadata.assignment_id,
+    }
+end
+
 local function reconnectable_error(err)
     err = tostring(err)
     return err:find("not found or closed", 1, true)
@@ -150,6 +178,22 @@ local function dispatch_remote_command_response(self, command, timeout_ms)
     local response = result.result or {}
     if response.ok == false then
         error(response.error or "command failed")
+    end
+    return response
+end
+
+local function dispatch_remote_command_async(self, command, timeout_ms)
+    command.request_id = command.request_id or generate_msg_id()
+    local result = remote_request(self, {
+        type = "hub_command_async",
+        command = command,
+    }, timeout_ms or 10000)
+    if result.error then
+        error(result.error)
+    end
+    local response = result.result or {}
+    if response.ok == false then
+        error(response.error or "command queue failed")
     end
     return response
 end
@@ -208,6 +252,11 @@ function Hub._handle_worker_parent_request(payload)
 
     if kind == "hub_command" then
         local response = dispatch_local_command_response(payload.command or {})
+        return { result = response }
+    end
+
+    if kind == "hub_command_async" then
+        local response = dispatch_local_command_async(payload.command or {})
         return { result = response }
     end
 
@@ -636,7 +685,9 @@ end
 --   assignment_id = "...", metadata = { owner_plugin = "...", ... },
 -- })
 -- Backward-compatible positional arguments are still accepted.
--- Local: dispatches through internal client command ingress. Remote: uses hub_client.request().
+-- Local: dispatches through internal client command ingress. Remote hubs use
+-- hub_client.request(). Plugin workers calling their parent hub enqueue the
+-- request and must correlate completion through request_id lifecycle events.
 -- @return table Result payload
 function Hub:create_agent(issue_or_branch, prompt, agent_name, workspace_id, workspace_name, target)
     local opts = normalize_create_agent_opts(issue_or_branch, prompt, agent_name, workspace_id, workspace_name, target)
@@ -669,6 +720,10 @@ function Hub:create_agent(issue_or_branch, prompt, agent_name, workspace_id, wor
             assignment_id = response.assignment_id or command.metadata.assignment_id,
             message = "Agent creation initiated (worktree may be creating async)",
         }
+    end
+
+    if self._is_worker_parent then
+        return dispatch_remote_command_async(self, command, 10000)
     end
 
     return dispatch_remote_command_response(self, command, 60000)

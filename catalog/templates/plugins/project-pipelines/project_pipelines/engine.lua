@@ -316,28 +316,21 @@ local function spawn_step_agent(run, step)
         return nil, tostring(created)
     end
 
-    local session_uuid = created and (created.session_uuid or created.uuid or created.id) or nil
-    if not session_uuid and type(created) == "table" and created.session then
-        session_uuid = created.session.session_uuid or created.session.uuid or created.session.id
-    end
-    if session_uuid then
-        if current_visit then
-            repo.update_run_step_visit(current_visit.id, { agent_session_uuid = session_uuid })
-        else
-            repo.update_run_step(run.id, step.id, { agent_session_uuid = session_uuid })
-        end
-    end
-    repo.append_event("step.agent_spawned", {
+    repo.append_event("step.agent_requested", {
         run_id = run.id,
         ticket_id = run.ticket_id,
         payload = {
             step_id = step.id,
             agent_name = step.agent_name,
-            session_uuid = session_uuid,
             request_id = request_id,
+            status = created and created.status or "queued",
         },
     })
-    return created, nil
+    return {
+        ok = true,
+        request_id = request_id,
+        status = created and created.status or "queued",
+    }, nil
 end
 
 function M.ask_human(params, context)
@@ -411,14 +404,14 @@ function M.ask_agent(params, context)
         error(tostring(created))
     end
 
-    local session_uuid = created and (created.session_uuid or created.uuid or created.id) or nil
-    if session_uuid then
-        question = repo.update_question(question.id, { advisor_session_uuid = session_uuid })
-    end
     repo.append_event("question.agent_requested", {
         run_id = resolved.run and resolved.run.id or nil,
         ticket_id = resolved.ticket.id,
-        payload = { question_id = question.id, request_id = request_id, session_uuid = session_uuid },
+        payload = {
+            question_id = question.id,
+            request_id = request_id,
+            status = created and created.status or "queued",
+        },
     })
     refresh_surfaces()
     return question
@@ -545,11 +538,15 @@ function M.request_merge(params, context)
         error(tostring(created))
     end
 
-    local session_uuid = created and (created.session_uuid or created.uuid or created.id) or nil
     repo.append_event("ticket.merge_requested", {
         run_id = run.id,
         ticket_id = ticket.id,
-        payload = { request_id = request_id, session_uuid = session_uuid, strategy = params.strategy or "agent", merge_policy = merge_policy },
+        payload = {
+            request_id = request_id,
+            status = created and created.status or "queued",
+            strategy = params.strategy or "agent",
+            merge_policy = merge_policy,
+        },
     })
     refresh_surfaces(context)
     return { ticket = ticket, run = run, merge_policy = merge_policy, agent = created, request_id = request_id }

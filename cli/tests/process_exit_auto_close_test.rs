@@ -51,6 +51,8 @@ fn run_process_exited_case(auto_close_literal: &str) -> (i64, i64, String) {
 
         timer = {{
           after_idle = function(_key, _delay, fn) fn() end,
+          every = function(_delay, _fn) return "timer:output_activity" end,
+          cancel = function(_id) end,
         }}
 
         events = {{
@@ -112,6 +114,7 @@ fn run_process_exited_case(auto_close_literal: &str) -> (i64, i64, String) {
             if uuid == "sess-accessory" then return session end
             return nil
           end,
+          list = function() return {{}} end,
           is_system_session = function(...) return false end,
         }}
 
