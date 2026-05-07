@@ -140,22 +140,19 @@ local function notified_agent_rows(ctx)
     return children
 end
 
-local function run_row(run)
-    local ticket = repo.get_ticket(run.ticket_id)
-    local pipeline = repo.get_pipeline(run.pipeline_id)
-    local current_step = run.current_step_id and repo.get_step(run.current_step_id) or nil
+local function run_template()
     return ui.list_item{
-        id = "pipelines-home-run-" .. run.id,
-        action = ui.action("botster.nav.open", { path = "/pipelines/runs/" .. run.id }),
+        id = ui.bind("@/id"),
+        action = ui.action("botster.nav.open", { path = ui.bind("@/path") }),
         title = {
-            ui.text{ text = ticket and ticket.title or run.ticket_id, size = "sm", weight = "semibold" },
+            ui.text{ text = ui.bind("@/ticket_title"), size = "sm", weight = "semibold" },
         },
         subtitle = {
-            ui.text{ text = pipeline and pipeline.name or run.pipeline_id, size = "xs", tone = "muted" },
+            ui.text{ text = ui.bind("@/pipeline_name"), size = "xs", tone = "muted" },
         },
         end_ = {
-            view.badge(run.status),
-            ui.text{ text = current_step and current_step.name or "No current step", size = "xs", tone = "muted" },
+            ui.badge{ text = ui.bind("@/status"), tone = ui.bind("@/status_tone") },
+            ui.text{ text = ui.bind("@/current_step_name"), size = "xs", tone = "muted" },
         },
     }
 end
@@ -172,15 +169,7 @@ local function list_or_empty(items, renderer, empty)
 end
 
 function M.render(_view_state, ctx)
-    local active_runs = {}
-    for _, run in ipairs(repo.list_runs(12)) do
-        if run.status == "active" or run.status == "blocked" then
-            active_runs[#active_runs + 1] = run
-        end
-    end
-    active_runs = limit(active_runs, 6)
     local notified_agents = notified_agent_rows(ctx)
-    local open_questions = repo.has_open_questions()
 
     return ui.stack{ direction = "vertical", gap = "4", children = {
         view.page_header{
@@ -212,7 +201,7 @@ function M.render(_view_state, ctx)
                 },
             },
         },
-        view.panel{ view.section("Open Questions", open_questions and {
+        view.panel{ view.section("Open Questions", {
             ui.list{ children = {
                 ui.bind_list{
                     source = "/project-pipelines.question",
@@ -220,14 +209,24 @@ function M.render(_view_state, ctx)
                     item_template = question_template(),
                 },
             } },
-        } or {
-            view.empty("No open questions", "Questions that block work will appear here.", "question-mark-circle"),
         }) },
         view.panel{ view.section("Agents Needing Attention", #notified_agents > 0 and { ui.list{ children = notified_agents } } or {
             view.empty("No agent notifications", "Agents that need attention will appear here.", "bell"),
         }) },
-        view.panel{ view.section("Open Runs", list_or_empty(active_runs, run_row,
-            view.empty("No active runs", "Open a project or ticket to start a pipeline.", "play"))) },
+        view.panel{ view.section("Open Runs", {
+            ui.list{ children = {
+                ui.bind_list{
+                    source = "/project-pipelines.run",
+                    where = { status = "active" },
+                    item_template = run_template(),
+                },
+                ui.bind_list{
+                    source = "/project-pipelines.run",
+                    where = { status = "blocked" },
+                    item_template = run_template(),
+                },
+            } },
+        }) },
         view.panel{ view.section("Projects", {
             ui.list{ children = {
                 ui.bind_list{

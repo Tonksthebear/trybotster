@@ -216,41 +216,16 @@ local function active_session_button(run, ctx, overview)
 end
 
 local function current_state_panel(ticket, ctx, overview)
-    local run = overview and overview.latest_run or repo.latest_ticket_run(ticket.id)
-    if not run then
-        return view.panel{
-            ui.stack{ direction = "vertical", gap = "2", children = {
-                view.row{
-                    view.badge("ready", "muted"),
-                    ui.text{ text = "Ready for pipeline", size = "md", weight = "semibold" },
-                },
-                ui.text{ text = "No run has started for this ticket.", size = "sm", tone = "muted" },
-            } },
-        }
-    end
-
-    local pipeline = overview and overview.pipelines_by_id and overview.pipelines_by_id[run.pipeline_id] or repo.get_pipeline(run.pipeline_id)
-    local step = run.current_step_id and overview and overview.steps_by_id and overview.steps_by_id[run.current_step_id] or nil
-    if not step and run.current_step_id then
-        step = repo.get_step(run.current_step_id)
-    end
-    local status_label = run.status == "blocked" and "blocked" or (run.status == "done" and "complete" or "in progress")
-    local tone = run.status == "blocked" and "danger" or (run.status == "done" and "success" or "accent")
-    local children = {
+    local ticket_path = "/project-pipelines.ticket/" .. ticket.id
+    return view.panel{
+        ui.stack{ direction = "vertical", gap = "2", children = {
         view.row{
-            view.badge(status_label, tone),
-            ui.text{ text = step and step.name or (pipeline and pipeline.name or "Pipeline"), size = "md", weight = "semibold" },
+            view.badge(ui.bind(ticket_path .. "/latest_run_badge"), ui.bind(ticket_path .. "/latest_run_tone")),
+            ui.text{ text = ui.bind(ticket_path .. "/active_work_label"), size = "md", weight = "semibold" },
         },
-        ui.text{ text = pipeline and pipeline.name or run.pipeline_id, size = "sm", tone = "muted" },
+        ui.text{ text = ui.bind(ticket_path .. "/active_work_detail"), size = "sm", tone = "muted" },
+        } },
     }
-    if step and step.prompt and step.prompt ~= "" then
-        table.insert(children, ui.text{ text = step.prompt, size = "xs", tone = "muted" })
-    end
-    local terminal = active_session_button(run, ctx, overview)
-    if terminal then
-        table.insert(children, terminal)
-    end
-    return view.panel{ ui.stack{ direction = "vertical", gap = "2", children = children } }
 end
 
 local function handoff_rows(run, ctx, overview)
@@ -370,54 +345,46 @@ local function handoff_rows(run, ctx, overview)
     return children
 end
 
-local function question_rows(ticket, ctx, overview)
-    local questions = overview and overview.open_questions or repo.ticket_questions(ticket.id, "open")
-    local children = {}
-    for _, question in ipairs(questions) do
-        local header = {
-            view.badge(question.kind == "agent" and "agent question" or "human question", question.blocking == 1 and "danger" or "accent"),
-        }
-        if question.blocking == 1 then
-            table.insert(header, view.badge("blocking", "danger"))
-        end
-        table.insert(children, view.panel{
+local function question_rows(ticket, _ctx, _overview)
+    return {
+        ui.bind_list{
+            source = "/project-pipelines.question",
+            where = { ticket_id = ticket.id, status = "open" },
+            item_template = view.panel{
             ui.stack{ direction = "vertical", gap = "2", children = {
-                view.row(header),
-                ui.text{ text = question.question, size = "sm", weight = "semibold" },
+                view.row{
+                    view.badge(ui.bind("@/kind_label"), "accent"),
+                    ui.badge(ui.bind("@/blocking_label"), ui.bind("@/blocking_tone")),
+                },
+                ui.text{ text = ui.bind("@/question"), size = "sm", weight = "semibold" },
                 ui.textarea{
-                    id = "question-answer-" .. question.id,
                     label = "Answer",
                     placeholder = "Answer this question",
-                    on_change = view.field_action("project_pipelines.update_question_answer", { question_id = question.id }),
+                    on_change = view.field_action("project_pipelines.update_question_answer", { question_id = ui.bind("@/id") }),
                 },
                 view.row{
                     ui.button{
-                        id = "question-" .. question.id .. "-answer",
                         label = "Answer",
                         icon = "check",
                         variant = "solid",
                         tone = "accent",
-                        action = ui.action("project_pipelines.answer_question", { question_id = question.id }),
+                        action = ui.action("project_pipelines.answer_question", { question_id = ui.bind("@/id") }),
                     },
                     ui.button{
-                        id = "question-" .. question.id .. "-dismiss",
                         label = "Dismiss",
                         icon = "x-mark",
                         variant = "ghost",
                         action = ui.action("project_pipelines.answer_question", {
-                            question_id = question.id,
+                            question_id = ui.bind("@/id"),
                             answer = "Dismissed by human.",
                             status = "dismissed",
                         }),
                     },
                 },
             } },
-        })
-    end
-    if #children == 0 then
-        table.insert(children, ui.text{ text = "No open questions.", size = "sm", tone = "muted" })
-    end
-    return children
+            },
+        },
+    }
 end
 
 local function dependency_rows(ticket, ctx, overview)
@@ -582,17 +549,12 @@ function M.render(view_state, ctx)
     local overview = repo.ticket_detail_overview(ticket.id)
     local latest_run = overview.latest_run
     local open_run = latest_run and (latest_run.status == "active" or latest_run.status == "blocked") and latest_run or nil
+    local ticket_path = "/project-pipelines.ticket/" .. ticket.id
 
     local meta = {
-        view.badge(view.target_label(ticket.target_id, ticket.target_path), "accent"),
+        view.badge(ui.bind(ticket_path .. "/target_label"), "accent"),
+        view.badge(ui.bind(ticket_path .. "/latest_run_badge"), ui.bind(ticket_path .. "/latest_run_tone")),
     }
-    if ticket.status == "closed" then
-        table.insert(meta, view.badge("closed", "muted"))
-    elseif open_run then
-        table.insert(meta, view.badge(open_run.status == "blocked" and "blocked" or "in progress", open_run.status == "blocked" and "danger" or "accent"))
-    else
-        table.insert(meta, view.badge("ready", "muted"))
-    end
     local notification = view.notification_badge(view.notification_count_for_uuids(overview.session_uuids))
     if notification then
         table.insert(meta, notification)
@@ -613,12 +575,12 @@ function M.render(view_state, ctx)
 
     local children = {
         view.page_header{
-            title = ticket.title,
+            title = ui.bind(ticket_path .. "/title"),
             back_id = "ticket-" .. ticket.id .. "-back",
             back_path = ctx.path("/"),
             meta = meta,
             actions = header_actions,
-            description = ticket.description or "",
+            description = ui.bind(ticket_path .. "/description"),
         },
         current_state_panel(ticket, ctx, overview),
         view.section("Questions", question_rows(ticket, ctx, overview)),

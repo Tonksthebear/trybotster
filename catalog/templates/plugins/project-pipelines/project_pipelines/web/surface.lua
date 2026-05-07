@@ -53,13 +53,51 @@ end
 
 local function sidebar_project(project)
     return ui.list_item{
-        id = "pipelines-sidebar-project-" .. project.id,
-        action = ui.action("botster.nav.open", { path = "/pipelines/projects/" .. project.id }),
+        id = project and ("pipelines-sidebar-project-" .. project.id) or ui.bind("@/id"),
+        action = ui.action("botster.nav.open", { path = project and ("/pipelines/projects/" .. project.id) or ui.bind("@/path") }),
         start = {
-            view.status_mark(project.status),
+            project and view.status_mark(project.status) or ui.status_dot{ state = ui.bind("@/status_state"), label = ui.bind("@/status_label") },
         },
         title = {
-            ui.text{ text = project.name, size = "sm", weight = "semibold" },
+            ui.text{ text = project and project.name or ui.bind("@/name"), size = "sm", weight = "semibold" },
+        },
+    }
+end
+
+local function sidebar_question_template()
+    return ui.list_item{
+        id = ui.bind("@/id"),
+        action = ui.action("botster.nav.open", { path = ui.bind("@/path") }),
+        start = {
+            ui.status_dot{ state = "danger", label = "?" },
+        },
+        title = {
+            ui.text{ text = ui.bind("@/ticket_title"), size = "sm", weight = "semibold" },
+        },
+        subtitle = {
+            ui.text{ text = ui.bind("@/question"), size = "xs", tone = "muted" },
+        },
+        end_ = {
+            ui.badge{ text = ui.bind("@/blocking_label"), tone = ui.bind("@/blocking_tone") },
+        },
+    }
+end
+
+local function sidebar_ticket_template()
+    return ui.list_item{
+        id = ui.bind("@/id"),
+        action = ui.action("botster.nav.open", { path = ui.bind("@/path") }),
+        start = {
+            ui.status_dot{ state = ui.bind("@/status_state"), label = ui.bind("@/status_label") },
+        },
+        title = {
+            ui.text{ text = ui.bind("@/title"), size = "sm", weight = "semibold" },
+        },
+        subtitle = {
+            ui.text{ text = ui.bind("@/tail_label"), size = "xs", tone = "muted" },
+        },
+        end_ = {
+            ui.badge{ text = ui.bind("@/latest_run_badge"), tone = ui.bind("@/latest_run_tone") },
         },
     }
 end
@@ -93,45 +131,24 @@ local function render_sidebar()
             path = "/pipelines/pipelines",
         },
     }
-    local projects = repo.open_projects()
-    if #projects > 0 then
-        table.insert(children, ui.text{ text = "Projects", size = "xs", weight = "semibold", tone = "muted" })
-        for _, project in ipairs(projects) do
-            table.insert(children, sidebar_project(project))
-        end
-    end
-    local questions = repo.open_questions_with_tickets()
-    if #questions > 0 then
-        table.insert(children, ui.text{ text = "Questions", size = "xs", weight = "semibold", tone = "muted" })
-        for _, question in ipairs(questions) do
-            table.insert(children, sidebar_button{
-                id = "pipelines-sidebar-question-" .. question.id,
-                label = question.ticket_title or question.ticket_id,
-                icon = question.kind == "agent" and "user-circle" or "question-mark-circle",
-                path = "/pipelines/tickets/" .. question.ticket_id,
-                badge = view.badge(question.blocking == 1 and "blocking" or "open", question.blocking == 1 and "danger" or "accent"),
-            })
-        end
-    end
+    table.insert(children, ui.text{ text = "Projects", size = "xs", weight = "semibold", tone = "muted" })
+    table.insert(children, ui.bind_list{
+        source = "/project-pipelines.project",
+        where = { status = "open" },
+        item_template = sidebar_project(),
+    })
+    table.insert(children, ui.text{ text = "Questions", size = "xs", weight = "semibold", tone = "muted" })
+    table.insert(children, ui.bind_list{
+        source = "/project-pipelines.question",
+        where = { status = "open" },
+        item_template = sidebar_question_template(),
+    })
     table.insert(children, ui.text{ text = "Tickets", size = "xs", weight = "semibold", tone = "muted" })
-    local standalone_tickets = repo.standalone_tickets()
-    local ticket_ids = {}
-    for _, ticket in ipairs(standalone_tickets) do
-        table.insert(ticket_ids, ticket.id)
-    end
-    local notification_counts = view.ticket_notification_counts(repo, ticket_ids)
-    for _, ticket in ipairs(standalone_tickets) do
-        local notifications = notification_counts[ticket.id] or 0
-        if view.ticket_should_show(ticket, repo, notification_counts) then
-        table.insert(children, sidebar_button{
-            id = "pipelines-sidebar-ticket-" .. ticket.id,
-            label = ticket.title,
-            icon = notifications > 0 and "exclamation-circle" or "ticket",
-            path = "/pipelines/tickets/" .. ticket.id,
-            badge = view.notification_badge(notifications),
-        })
-        end
-    end
+    table.insert(children, ui.bind_list{
+        source = "/project-pipelines.ticket",
+        where = { status = "open", standalone = true },
+        item_template = sidebar_ticket_template(),
+    })
 
     return ui.stack{ direction = "vertical", gap = "3", children = children }
 end
