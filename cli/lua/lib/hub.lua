@@ -15,6 +15,7 @@
 local state = require("hub.state")
 local Agent = require("lib.agent")
 local InternalClient = require("lib.internal_client")
+local OrchestrationQueue = require("lib.hub_orchestration_queue")
 
 local Hub = state.class("Hub")
 
@@ -106,32 +107,9 @@ local function dispatch_local_command_response(command)
     return response or { ok = true }
 end
 
-local function dispatch_local_command_async(command)
+local function dispatch_local_orchestration(command)
     command.request_id = command.request_id or generate_msg_id()
-    local request_id = command.request_id
-    local metadata = command.metadata or {}
-
-    local function run_command()
-        local ok, err = pcall(dispatch_local_command_response, command)
-        if not ok then
-            log.warn(string.format("Hub async command failed: %s request_id=%s error=%s",
-                tostring(command.type), tostring(request_id), tostring(err)))
-        end
-    end
-
-    if type(timer) == "table" and type(timer.after) == "function" then
-        timer.after(0, run_command)
-    else
-        log.warn(string.format("Hub async command not dispatched because timer.after is unavailable: %s request_id=%s",
-            tostring(command.type), tostring(request_id)))
-    end
-
-    return {
-        ok = true,
-        status = "queued",
-        request_id = request_id,
-        assignment_id = command.assignment_id or metadata.assignment_id,
-    }
+    return OrchestrationQueue.enqueue(command, dispatch_local_command_response)
 end
 
 local function reconnectable_error(err)
@@ -166,8 +144,25 @@ local function remote_request(self, payload, timeout_ms)
     return hub_client.request(self._conn_id, payload, timeout_ms or 10000)
 end
 
+local function dispatch_remote_orchestration(self, command, timeout_ms)
+    command.request_id = command.request_id or generate_msg_id()
+    local result = remote_request(self, OrchestrationQueue.parent_request(command), timeout_ms or 10000)
+    if result.error then
+        error(result.error)
+    end
+    local response = result.result or {}
+    if response.ok == false then
+        error(response.error or "command queue failed")
+    end
+    return response
+end
+
 local function dispatch_remote_command_response(self, command, timeout_ms)
     command.request_id = command.request_id or generate_msg_id()
+    if self._is_worker_parent and OrchestrationQueue.is_queued_command(command) then
+        return dispatch_remote_orchestration(self, command, timeout_ms or 10000)
+    end
+
     local result = remote_request(self, {
         type = "hub_command",
         command = command,
@@ -178,22 +173,6 @@ local function dispatch_remote_command_response(self, command, timeout_ms)
     local response = result.result or {}
     if response.ok == false then
         error(response.error or "command failed")
-    end
-    return response
-end
-
-local function dispatch_remote_command_async(self, command, timeout_ms)
-    command.request_id = command.request_id or generate_msg_id()
-    local result = remote_request(self, {
-        type = "hub_command_async",
-        command = command,
-    }, timeout_ms or 10000)
-    if result.error then
-        error(result.error)
-    end
-    local response = result.result or {}
-    if response.ok == false then
-        error(response.error or "command queue failed")
     end
     return response
 end
@@ -255,8 +234,12 @@ function Hub._handle_worker_parent_request(payload)
         return { result = response }
     end
 
-    if kind == "hub_command_async" then
-        local response = dispatch_local_command_async(payload.command or {})
+    if kind == "hub_orchestration" then
+        local command = payload.command or {}
+        if not OrchestrationQueue.is_queued_command(command) then
+            return { error = string.format("unsupported hub orchestration command: %s", tostring(command.type)) }
+        end
+        local response = dispatch_local_orchestration(command)
         return { result = response }
     end
 
@@ -686,8 +669,9 @@ end
 -- })
 -- Backward-compatible positional arguments are still accepted.
 -- Local: dispatches through internal client command ingress. Remote hubs use
--- hub_client.request(). Plugin workers calling their parent hub enqueue the
--- request and must correlate completion through request_id lifecycle events.
+-- hub_client.request(). Plugin workers calling their parent hub enqueue
+-- orchestration commands and must correlate completion through request_id
+-- lifecycle events.
 -- @return table Result payload
 function Hub:create_agent(issue_or_branch, prompt, agent_name, workspace_id, workspace_name, target)
     local opts = normalize_create_agent_opts(issue_or_branch, prompt, agent_name, workspace_id, workspace_name, target)
@@ -720,10 +704,6 @@ function Hub:create_agent(issue_or_branch, prompt, agent_name, workspace_id, wor
             assignment_id = response.assignment_id or command.metadata.assignment_id,
             message = "Agent creation initiated (worktree may be creating async)",
         }
-    end
-
-    if self._is_worker_parent then
-        return dispatch_remote_command_async(self, command, 10000)
     end
 
     return dispatch_remote_command_response(self, command, 60000)
