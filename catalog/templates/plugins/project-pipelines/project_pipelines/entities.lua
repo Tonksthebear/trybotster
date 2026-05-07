@@ -222,6 +222,9 @@ local function ticket_entity(ticket)
     local current_step = latest and latest.current_step_id and repo and repo.get_step(latest.current_step_id) or nil
     local notifications = view and repo and view.ticket_notification_count(ticket.id, repo) or 0
     entity.target_label = target_label(view, ticket.target_id, ticket.target_path)
+    entity.status_tone = view and view.status_tone(ticket.status) or "muted"
+    entity.status_label = view and view.status_label(ticket.status) or tostring(ticket.status or "")
+    entity.status_state = view and view.status_state(ticket.status) or "neutral"
     entity.standalone = ticket.project_id == nil or ticket.project_id == ""
     entity.run_count = #runs
     entity.run_count_label = string.format("%d run%s", #runs, #runs == 1 and "" or "s")
@@ -242,6 +245,8 @@ local function project_entity(project)
     local entity = copy(project)
     local view = with_view()
     entity.status_tone = view and view.status_tone(project.status) or "muted"
+    entity.status_label = view and view.status_label(project.status) or tostring(project.status or "")
+    entity.status_state = view and view.status_state(project.status) or "neutral"
     entity.path = "/pipelines/projects/" .. project.id
     return entity
 end

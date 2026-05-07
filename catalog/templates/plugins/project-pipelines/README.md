@@ -274,6 +274,15 @@ scaffold-only or a human waiver is recorded.
 
 Tickets can optionally depend on other tickets. A ticket with open dependencies cannot start a pipeline run until each dependency ticket is closed. Project tickets remain visible from the project page; the sidebar ticket list shows standalone tickets only, plus notification badges when their associated sessions need attention.
 
+Stacked pipeline work is modeled explicitly on runs. `base_ref` records the
+branch, commit, or PR head that the run should start from; `base_ticket_id` and
+`base_run_id` keep the semantic link to upstream pipeline work; and
+`base_target_path` can point at an existing source worktree when the base ref is
+only available there. When a closed dependency has PR merge metadata, new runs
+infer `base_ref` from that dependency's pipeline branch so follow-on work stacks
+on the dependency branch instead of silently assuming main. Merge agents for PR
+pipelines must open stacked PRs against `base_ref`.
+
 ## Persistence And Evolution
 
 State lives in the plugin database at the Botster device data root under `plugin-data/project-pipelines/db.sqlite`. The schema is additive-friendly, but non-additive changes need an explicit `version` bump and migration function in `project_pipelines_db.lua`.

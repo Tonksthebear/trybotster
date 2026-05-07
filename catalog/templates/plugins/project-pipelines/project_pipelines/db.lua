@@ -6,7 +6,7 @@
 -- @version 1.0.0
 
 local db = plugin.db{
-    version = 5,
+    version = 6,
     models = {
         tickets = {
             id = { "text", required = true, primary = true },
@@ -87,6 +87,10 @@ local db = plugin.db{
             target_path = { "text" },
             workspace_id = { "text" },
             workspace_name = { "text" },
+            base_ticket_id = { "text" },
+            base_run_id = { "text" },
+            base_ref = { "text" },
+            base_target_path = { "text" },
             created_at = { "integer", required = true },
             updated_at = { "integer", required = true },
         },
@@ -189,6 +193,8 @@ local indexes = {
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_project_targets_project ON project_targets(project_id, target_id)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_gates_step ON pipeline_gates(step_id)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_runs_ticket ON runs(ticket_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_project_pipelines_runs_base_ticket ON runs(base_ticket_id, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_project_pipelines_runs_base_run ON runs(base_run_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_run_steps_run ON run_steps(run_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_run_steps_run_sequence ON run_steps(run_id, sequence)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_run_steps_session ON run_steps(agent_session_uuid, status)",

@@ -42,14 +42,6 @@ local function time_label(value)
     return os.date("%Y-%m-%d %H:%M", timestamp)
 end
 
-local function latest_run_badge(ticket, latest_run_by_ticket)
-    local run = latest_run_by_ticket and latest_run_by_ticket[ticket.id] or repo.latest_ticket_run(ticket.id)
-    if run then
-        return view.badge(run.status, view.status_tone(run.status))
-    end
-    return view.badge("not started", "muted")
-end
-
 local function ticket_status_badge(ticket, open_run_by_ticket)
     if ticket.status == "closed" then
         return view.badge("closed", "success")
@@ -137,7 +129,6 @@ local function dependency_tree_nodes(project_id, ctx, overview)
                     view.badge("stage " .. tostring(level + 1), "muted"),
                     ui.text{ text = title, size = "sm", weight = "semibold" },
                     ticket_status_badge(ticket, overview and overview.open_run_by_ticket),
-                    latest_run_badge(ticket, overview and overview.latest_run_by_ticket),
                 },
                 ui.text{ text = details, size = "xs", tone = "muted" },
                 ui.button{
@@ -164,8 +155,8 @@ local function timeline_nodes(project_id, ctx)
             item_template = view.panel{
             ui.stack{ direction = "vertical", gap = "2", children = {
                 view.row{
+                    ui.status_dot{ state = ui.bind("@/status_state"), label = ui.bind("@/status_label") },
                     ui.text{ text = ui.bind("@/title"), size = "sm", weight = "semibold" },
-                    view.badge(ui.bind("@/status")),
                     view.badge(ui.bind("@/latest_run_badge"), ui.bind("@/latest_run_tone")),
                 },
                 ui.text{ text = ui.bind("@/description"), size = "xs", tone = "muted" },
@@ -236,7 +227,7 @@ function M.render(view_state, ctx)
             title = project.name,
             back_id = "project-" .. project.id .. "-back",
             back_path = ctx.path("/"),
-            meta = { view.badge(project.status) },
+            meta = { view.status_mark(project.status) },
             actions = {
                 ui.button{
                     id = "project-" .. project.id .. "-new-ticket",

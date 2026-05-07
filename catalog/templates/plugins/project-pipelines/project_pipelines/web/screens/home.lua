@@ -31,8 +31,11 @@ local function project_template()
         subtitle = {
             ui.text{ text = ui.bind("@/description"), size = "xs", tone = "muted" },
         },
+        start = {
+            ui.status_dot{ state = ui.bind("@/status_state"), label = ui.bind("@/status_label") },
+        },
         end_ = {
-            ui.badge{ text = ui.bind("@/status"), tone = ui.bind("@/status_tone") },
+            ui.badge{ text = ui.bind("@/status_label"), tone = ui.bind("@/status_tone") },
         },
     }
 end
@@ -227,7 +230,11 @@ function M.render(_view_state, ctx)
             view.empty("No active runs", "Open a project or ticket to start a pipeline.", "play"))) },
         view.panel{ view.section("Projects", {
             ui.list{ children = {
-                ui.bind_list{ source = "/project-pipelines.project", item_template = project_template() },
+                ui.bind_list{
+                    source = "/project-pipelines.project",
+                    where = { status = "open" },
+                    item_template = project_template(),
+                },
             } },
         }) },
         view.panel{ view.section("Standalone Tickets", {

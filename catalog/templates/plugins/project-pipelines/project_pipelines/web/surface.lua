@@ -51,6 +51,19 @@ local function sidebar_button(attrs)
     return view.metadata(row)
 end
 
+local function sidebar_project(project)
+    return ui.list_item{
+        id = "pipelines-sidebar-project-" .. project.id,
+        action = ui.action("botster.nav.open", { path = "/pipelines/projects/" .. project.id }),
+        start = {
+            view.status_mark(project.status),
+        },
+        title = {
+            ui.text{ text = project.name, size = "sm", weight = "semibold" },
+        },
+    }
+end
+
 local function render_sidebar()
     local children = {
         sidebar_button{
@@ -80,17 +93,11 @@ local function render_sidebar()
             path = "/pipelines/pipelines",
         },
     }
-    local projects = repo.list_projects()
+    local projects = repo.open_projects()
     if #projects > 0 then
         table.insert(children, ui.text{ text = "Projects", size = "xs", weight = "semibold", tone = "muted" })
         for _, project in ipairs(projects) do
-            table.insert(children, sidebar_button{
-                id = "pipelines-sidebar-project-" .. project.id,
-                label = project.name,
-                icon = "folder",
-                path = "/pipelines/projects/" .. project.id,
-                badge = view.badge(project.status),
-            })
+            table.insert(children, sidebar_project(project))
         end
     end
     local questions = repo.open_questions_with_tickets()

@@ -21,6 +21,12 @@ local session_info_cache = {
 }
 
 function M.status_tone(status)
+    if status == "open" then
+        return "accent"
+    end
+    if status == "closed" then
+        return "success"
+    end
     if status == "done" or status == "approved" or status == "passed" or status == "resolved" then
         return "success"
     end
@@ -33,8 +39,38 @@ function M.status_tone(status)
     return "muted"
 end
 
+function M.status_label(status)
+    if type(status) == "table" then
+        return status
+    end
+    if status == "open" then
+        return "+"
+    end
+    if status == "closed" then
+        return "✓"
+    end
+    return tostring(status or "")
+end
+
+function M.status_state(status)
+    if status == "open" or status == "active" then
+        return "active"
+    end
+    if status == "closed" or status == "done" or status == "approved" or status == "passed" or status == "resolved" then
+        return "success"
+    end
+    if status == "blocked" or status == "failed" or status == "blocker" or status == "high" then
+        return "danger"
+    end
+    return "neutral"
+end
+
 function M.badge(label, tone)
-    return ui.badge{ text = tostring(label or ""), tone = tone or M.status_tone(label) }
+    return ui.badge{ text = M.status_label(label), tone = tone or M.status_tone(label) }
+end
+
+function M.status_mark(status)
+    return ui.status_dot{ state = M.status_state(status), label = M.status_label(status) }
 end
 
 function M.panel(children)
