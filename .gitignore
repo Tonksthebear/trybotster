@@ -58,6 +58,7 @@ mise.toml
 
 # Agent worktree context (written at runtime, never committed)
 .botster/context.json
+.botster/pastes/
 
 # Rust build artifacts (all projects)
 **/target/
