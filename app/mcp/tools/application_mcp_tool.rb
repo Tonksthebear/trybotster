@@ -3,6 +3,8 @@
 class ApplicationMCPTool < ActionMCP::Tool
   abstract!
 
+  validate :default_repo_from_botster_context
+
   # Extract idempotency key from request metadata.
   # MCP callers can send this via _meta.idempotencyKey in the request.
   def idempotency_key_from_request
@@ -103,6 +105,13 @@ class ApplicationMCPTool < ActionMCP::Tool
     hash_value(meta, "botster") if meta.is_a?(Hash)
   end
 
+  def botster_agent_repo
+    botster = botster_agent_metadata
+    return nil unless botster.is_a?(Hash)
+
+    hash_value(botster, "repo").presence
+  end
+
   # Helper to get user attribution string
   def user_attribution
     current_user&.email || current_user&.username || "MCP User"
@@ -116,6 +125,14 @@ class ApplicationMCPTool < ActionMCP::Tool
   end
 
   private
+
+  def default_repo_from_botster_context
+    return unless self.class._schema_properties.key?("repo")
+    return unless respond_to?(:repo) && respond_to?(:repo=)
+    return if repo.present?
+
+    self.repo = botster_agent_repo
+  end
 
   def hash_value(hash, key)
     return nil unless hash.is_a?(Hash)

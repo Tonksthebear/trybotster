@@ -4,7 +4,7 @@ class GithubGetPullRequestTool < ApplicationMCPTool
   tool_name "github_get_pull_request"
   description "Get detailed information about a specific GitHub pull request, including diff and merge status. Requires repository in 'owner/repo' format and PR number."
 
-  property :repo, type: "string", description: "Repository in 'owner/repo' format (e.g., 'octocat/Hello-World')", required: true
+  property :repo, type: "string", description: "Repository in 'owner/repo' format. Defaults to the calling Botster session repo when available.", required: false
   property :pr_number, type: "integer", description: "Pull request number", required: true
 
   validates :repo, format: { with: /\A[\w\-\.]+\/[\w\-\.]+\z/, message: "must be in 'owner/repo' format" }

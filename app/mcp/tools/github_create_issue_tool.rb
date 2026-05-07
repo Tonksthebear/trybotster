@@ -4,7 +4,7 @@ class GithubCreateIssueTool < ApplicationMCPTool
   tool_name "github_create_issue"
   description "Create a new issue in a GitHub repository. Requires the repository in 'owner/repo' format, a title, and optional body text."
 
-  property :repo, type: "string", description: "Repository in 'owner/repo' format (e.g., 'octocat/Hello-World')", required: true
+  property :repo, type: "string", description: "Repository in 'owner/repo' format. Defaults to the calling Botster session repo when available.", required: false
   property :title, type: "string", description: "Issue title", required: true
   property :body, type: "string", description: "Issue description/body (optional)", required: false
   property :labels, type: "string", description: "Comma-separated list of labels (optional)", required: false

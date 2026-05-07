@@ -59,4 +59,45 @@ class ApplicationMCPToolTest < ActiveSupport::TestCase
 
     assert_equal "Botster MCP session", tool.botster_session_attribution
   end
+
+  test "defaults repo property from Botster agent metadata" do
+    tool = GithubListIssuesTool.new
+    tool.define_singleton_method(:execution_context) do
+      {
+        request: {
+          params: {
+            _meta: {
+              "botster" => {
+                "repo" => "owner/repo",
+                "session_uuid" => "sess-1234567890abcdef"
+              }
+            }
+          }
+        }
+      }
+    end
+
+    assert_predicate tool, :valid?
+    assert_equal "owner/repo", tool.repo
+  end
+
+  test "keeps explicit repo over Botster agent metadata" do
+    tool = GithubListIssuesTool.new(repo: "explicit/repo")
+    tool.define_singleton_method(:execution_context) do
+      {
+        request: {
+          params: {
+            _meta: {
+              "botster" => {
+                "repo" => "owner/repo"
+              }
+            }
+          }
+        }
+      }
+    end
+
+    assert_predicate tool, :valid?
+    assert_equal "explicit/repo", tool.repo
+  end
 end

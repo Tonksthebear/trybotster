@@ -21,7 +21,7 @@ class GithubCreatePullRequestReviewTool < ApplicationMCPTool
     `comments` (no body), or both together.
   DESC
 
-  property :repo, type: "string", description: "Repository in 'owner/repo' format (e.g., 'octocat/Hello-World')", required: true
+  property :repo, type: "string", description: "Repository in 'owner/repo' format. Defaults to the calling Botster session repo when available.", required: false
   property :pr_number, type: "integer", description: "Pull request number", required: true
   property :event, type: "string", description: "Review verdict: 'APPROVE', 'REQUEST_CHANGES', or 'COMMENT'. Use COMMENT when you are the PR author — GitHub prevents authors from approving or requesting changes on their own PRs.", required: true
   property :body, type: "string", description: "Top-level review summary (required for REQUEST_CHANGES, recommended for all events). Supports markdown.", required: false
