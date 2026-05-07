@@ -639,7 +639,7 @@ fn hub_get_defaults_to_parent_hub_inside_plugin_worker() {
               metadata = {{ owner_plugin = "knowledge-inbox-pipeline" }},
             }})
 
-            assert(seen.command.type == "hub_command_async")
+            assert(seen.command.type == "hub_orchestration")
             assert(seen.command.command.type == "create_agent")
             assert(seen.command.command.metadata.owner_plugin == "knowledge-inbox-pipeline")
             assert(seen.command.command.target_id == "target-1")
@@ -655,7 +655,7 @@ fn hub_get_defaults_to_parent_hub_inside_plugin_worker() {
 }
 
 #[test]
-fn worker_parent_async_hub_command_returns_before_dispatch() {
+fn worker_parent_orchestration_returns_before_dispatch() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
 
@@ -704,8 +704,12 @@ fn worker_parent_async_hub_command_returns_before_dispatch() {
             }}
 
             local Hub = require("lib.hub")
+            local OrchestrationQueue = require("lib.hub_orchestration_queue")
+            assert(OrchestrationQueue.is_queued_command({{ type = "create_agent" }}))
+            assert(not OrchestrationQueue.is_queued_command({{ type = "list_agents" }}))
+
             local response = Hub._handle_worker_parent_request({{
-              type = "hub_command_async",
+              type = "hub_orchestration",
               command = {{
                 type = "create_agent",
                 request_id = "req-async",
@@ -720,12 +724,18 @@ fn worker_parent_async_hub_command_returns_before_dispatch() {
             assert(type(scheduled) == "function")
             scheduled()
             assert(dispatched == 1)
+
+            local rejected = Hub._handle_worker_parent_request({{
+              type = "hub_orchestration",
+              command = {{ type = "list_agents", request_id = "req-read" }},
+            }})
+            assert(rejected.error:match("unsupported hub orchestration command"))
             return "ok"
             "#,
             dir = dir.display()
         ))
         .eval()
-        .expect("async worker parent command should be queued before dispatch");
+        .expect("worker parent orchestration command should be queued before dispatch");
 
     assert_eq!(result, "ok");
 }
