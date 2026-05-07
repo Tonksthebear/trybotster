@@ -25,7 +25,7 @@ fn create_lua_vm() -> Lua {
 }
 
 #[test]
-fn github_template_catalog_entry_is_a_multi_file_plugin() {
+fn catalog_plugin_github_template_catalog_entry_is_a_multi_file_plugin() {
     let catalog_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -64,7 +64,111 @@ fn github_template_catalog_entry_is_a_multi_file_plugin() {
 }
 
 #[test]
-fn project_pipelines_template_catalog_entry_is_a_multi_file_plugin() {
+fn catalog_plugin_github_template_starts_mcp_without_repo_detection() {
+    let plugin_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates/plugins/github");
+    let init_path = plugin_root.join("init.lua");
+
+    let lua = create_lua_vm();
+    let result_lua: Value = lua
+        .load(format!(
+            r#"
+            _G.__github_test = {{ mcp_started = false, notifications_registered = false, routed_repo = nil }}
+            package.preload["mcp_proxy"] = function()
+              return {{
+                start = function() _G.__github_test.mcp_started = true end,
+                stop = function() end,
+              }}
+            end
+            package.preload["notifications"] = function()
+              return {{
+                register = function() _G.__github_test.notifications_registered = true end,
+              }}
+            end
+            package.preload["event_routing"] = function()
+              return {{
+                start = function(repo) _G.__github_test.routed_repo = repo end,
+                stop = function() end,
+              }}
+            end
+            hub = {{ detect_repo = function() return nil end }}
+            log = {{ info = function(_) end }}
+
+            local chunk = assert(loadfile({init_path}))
+            local plugin = chunk()
+            return {{
+              mcp_started = _G.__github_test.mcp_started,
+              notifications_registered = _G.__github_test.notifications_registered,
+              routed_repo_missing = _G.__github_test.routed_repo == nil,
+              has_reload_hook = type(plugin._before_reload) == "function",
+            }}
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval()
+        .expect("GitHub plugin should load without detected repo");
+    let result: JsonValue = lua
+        .from_value(result_lua)
+        .expect("GitHub plugin result should convert to JSON");
+
+    assert_eq!(
+        result,
+        json!({
+            "mcp_started": true,
+            "notifications_registered": true,
+            "routed_repo_missing": true,
+            "has_reload_hook": true,
+        })
+    );
+}
+
+#[test]
+fn catalog_plugin_github_template_starts_event_routing_when_repo_is_detected() {
+    let plugin_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates/plugins/github");
+    let init_path = plugin_root.join("init.lua");
+
+    let lua = create_lua_vm();
+    let routed_repo: Option<String> = lua
+        .load(format!(
+            r#"
+            _G.__github_test = {{ routed_repo = nil }}
+            package.preload["mcp_proxy"] = function()
+              return {{
+                start = function() end,
+                stop = function() end,
+              }}
+            end
+            package.preload["notifications"] = function()
+              return {{ register = function() end }}
+            end
+            package.preload["event_routing"] = function()
+              return {{
+                start = function(repo) _G.__github_test.routed_repo = repo end,
+                stop = function() end,
+              }}
+            end
+            hub = {{ detect_repo = function() return "owner/repo" end }}
+            log = {{ info = function(_) end }}
+
+            local chunk = assert(loadfile({init_path}))
+            chunk()
+            return _G.__github_test.routed_repo
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval()
+        .expect("GitHub plugin should route events for detected repo");
+
+    assert_eq!(routed_repo.as_deref(), Some("owner/repo"));
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_template_catalog_entry_is_a_multi_file_plugin() {
     let catalog_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -116,7 +220,7 @@ fn project_pipelines_template_catalog_entry_is_a_multi_file_plugin() {
 }
 
 #[test]
-fn project_pipelines_dynamic_state_uses_plugin_entities_not_forced_tree_refreshes() {
+fn catalog_plugin_project_pipelines_dynamic_state_uses_plugin_entities_not_forced_tree_refreshes() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -158,7 +262,7 @@ fn project_pipelines_dynamic_state_uses_plugin_entities_not_forced_tree_refreshe
 }
 
 #[test]
-fn project_pipelines_automates_merge_from_pipeline_policy() {
+fn catalog_plugin_project_pipelines_automates_merge_from_pipeline_policy() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -230,7 +334,7 @@ fn project_pipelines_automates_merge_from_pipeline_policy() {
 }
 
 #[test]
-fn project_pipelines_detail_bind_lists_use_entity_store_paths() {
+fn catalog_plugin_project_pipelines_detail_bind_lists_use_entity_store_paths() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -276,7 +380,7 @@ fn project_pipelines_detail_bind_lists_use_entity_store_paths() {
 }
 
 #[test]
-fn project_pipelines_entity_publish_snapshots_and_deltas_use_plugin_entity_frames() {
+fn catalog_plugin_project_pipelines_entity_publish_snapshots_and_deltas_use_plugin_entity_frames() {
     let plugin_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -473,7 +577,7 @@ fn project_pipelines_entity_publish_snapshots_and_deltas_use_plugin_entity_frame
 }
 
 #[test]
-fn github_event_routing_template_uses_internal_client_ingress() {
+fn catalog_plugin_github_event_routing_template_uses_hub_api_ingress() {
     let template = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -483,12 +587,16 @@ fn github_event_routing_template_uses_internal_client_ingress() {
     .expect("read github event routing template");
 
     assert!(
-        template.contains(r#"require("lib.internal_client")"#),
-        "GitHub template should route application commands through client.lua ingress"
+        template.contains(r#"require("lib.hub")"#),
+        "GitHub template should route application commands through the standard hub API"
     );
     assert!(
-        template.contains("InternalClient.dispatch"),
-        "GitHub template should dispatch canonical commands through internal client"
+        template.contains("Hub.get():create_agent") && template.contains("Hub.get():delete_agent"),
+        "GitHub template should dispatch canonical commands through Hub.get()"
+    );
+    assert!(
+        !template.contains("InternalClient.dispatch"),
+        "GitHub template should not bypass the worker-parent hub boundary"
     );
     assert!(
         !template.contains(r#"events.emit("command_message""#),
@@ -497,7 +605,7 @@ fn github_event_routing_template_uses_internal_client_ingress() {
 }
 
 #[test]
-fn github_event_routing_template_notifies_matching_agent_before_create() {
+fn catalog_plugin_github_event_routing_template_notifies_matching_agent_before_create() {
     let template_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -510,7 +618,8 @@ fn github_event_routing_template_notifies_matching_agent_before_create() {
         .load(format!(
             r#"
             local notifications = {{}}
-            local dispatches = 0
+            local creates = 0
+            local deletes = 0
             local acked = false
             local callback = nil
 
@@ -520,24 +629,30 @@ fn github_event_routing_template_notifies_matching_agent_before_create() {
                   return {{
                     {{
                       session_uuid = "sess-existing",
-                      session = {{
-                        send_message = function(_, text)
-                          notifications[#notifications + 1] = text
-                        end,
-                      }},
                     }},
                   }}
                 end
                 return {{}}
               end,
             }}
-            package.loaded["lib.internal_client"] = {{
-              dispatch = function()
-                dispatches = dispatches + 1
-              end,
-            }}
             package.loaded["hub.state"] = {{
               get = function() return {{}} end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  send_message = function(_, session_uuid, text)
+                    assert(session_uuid == "sess-existing")
+                    notifications[#notifications + 1] = text
+                  end,
+                  create_agent = function()
+                    creates = creates + 1
+                  end,
+                  delete_agent = function()
+                    deletes = deletes + 1
+                  end,
+                }}
+              end,
             }}
             action_cable = {{
               connect = function() return "conn-1" end,
@@ -564,7 +679,8 @@ fn github_event_routing_template_notifies_matching_agent_before_create() {
 
             assert(#notifications == 1)
             assert(notifications[1]:match("Please inspect this"))
-            assert(dispatches == 0)
+            assert(creates == 0)
+            assert(deletes == 0)
             assert(acked == true)
             return "ok"
             "#

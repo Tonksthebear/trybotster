@@ -1,3 +1,10 @@
+-- @template Cloudflare Hosted Preview
+-- @description Expose port-forwarded sessions with Cloudflare quick tunnels
+-- @category plugins
+-- @dest plugins/cloudflare-hosted-preview/init.lua
+-- @scope device
+-- @version 1.0.0
+
 -- Cloudflare hosted-preview session action.
 --
 -- The Cloudflare quick-tunnel lifecycle is plugin-owned: this module registers
@@ -5,7 +12,7 @@
 -- cloudflared output, probes URL readiness, and mirrors action state onto the
 -- parent session.
 
-local Accessory = require("lib.accessory")
+local Hub = require("lib.hub")
 local Session = require("lib.session")
 local SessionActions = require("lib.session_actions")
 local TargetContext = require("lib.target_context")
@@ -176,6 +183,7 @@ end
 local function start_connector(parent, prepared)
     local command = prepared and prepared.command or nil
     local quick_config_path = prepared and prepared.config_path or nil
+    local request_id = prepared and prepared.request_id or nil
     if type(command) ~= "string" or command == "" then
         local error_message = "Cloudflare hosted preview returned no connector command"
         update_parent_preview(parent, {
@@ -207,6 +215,7 @@ local function start_connector(parent, prepared)
     end
 
     local metadata = TargetContext.with_metadata({
+        request_id = request_id,
         workspace = parent._workspace_name,
         workspace_id = parent._workspace_id,
         system_session = true,
@@ -217,29 +226,29 @@ local function start_connector(parent, prepared)
         target_forward_port = session_port(parent),
     }, TargetContext.from_session(parent))
 
-    local ok, connector = pcall(Accessory.new, {
-        repo = parent.repo,
-        branch_name = parent.branch_name,
-        worktree_path = parent.worktree_path,
-        session = {
-            name = "cloudflare-preview",
-            command = command,
-            args = connector_spec(parent, command, quick_config_path).args,
-            notifications = false,
-            forward_port = false,
-        },
-        metadata = metadata,
-        target_id = parent.target_id,
-        target_path = parent.target_path,
-        target_repo = parent.target_repo,
-        workspace = parent._workspace_name,
-        workspace_id = parent._workspace_id,
-        dims = { rows = 24, cols = 80 },
-        agent_name = parent.agent_name,
-    })
+    local ok, result = pcall(function()
+        return Hub.get():create_accessory({
+            request_id = request_id,
+            repo = parent.repo,
+            target_id = parent.target_id,
+            target_path = parent.target_path,
+            target_repo = parent.target_repo,
+            workspace_id = parent._workspace_id,
+            workspace_name = parent._workspace_name,
+            agent_name = parent.agent_name,
+            metadata = metadata,
+            session = {
+                name = "cloudflare-preview",
+                command = command,
+                args = connector_spec(parent, command, quick_config_path).args,
+                notifications = false,
+                forward_port = false,
+            },
+        })
+    end)
 
     if not ok then
-        local error_message = tostring(connector)
+        local error_message = tostring(result)
         update_parent_preview(parent, {
             status = "error",
             error = error_message,
@@ -251,16 +260,19 @@ local function start_connector(parent, prepared)
         return nil, error_message
     end
 
-    connector_output_buffers[connector.session_uuid] = ""
+    local session_uuid = result and result.session_uuid or nil
+    if session_uuid then
+        connector_output_buffers[session_uuid] = ""
+    end
     update_parent_preview(parent, {
         status = "starting",
         error = nil,
         install_url = nil,
         url = nil,
-        connector_session_uuid = connector.session_uuid,
-        prepare_request_id = false,
+        connector_session_uuid = session_uuid,
+        prepare_request_id = session_uuid and false or request_id,
     })
-    return connector
+    return result or true
 end
 
 function M.enable(parent)
@@ -333,7 +345,39 @@ function M.handle_plugin_command_prepared(data)
     return start_connector(parent, {
         command = data.command,
         config_path = data.config_path,
+        request_id = request_id,
     }) ~= nil
+end
+
+function M.handle_agent_created(info)
+    local metadata = info and info.metadata or {}
+    if metadata.owner_plugin ~= PLUGIN_NAME
+        or metadata.system_kind ~= CONNECTOR_SYSTEM_KIND
+        or type(metadata.request_id) ~= "string" then
+        return false
+    end
+
+    local parent = metadata.target_session_uuid and Session.get(metadata.target_session_uuid) or nil
+    local session_uuid = info.session_uuid or info.id
+    if not parent or not session_uuid then
+        return false
+    end
+
+    local hosted = preview_state_for(parent)
+    if hosted.prepare_request_id ~= metadata.request_id then
+        return false
+    end
+
+    connector_output_buffers[session_uuid] = ""
+    update_parent_preview(parent, {
+        status = "starting",
+        error = nil,
+        install_url = nil,
+        url = nil,
+        connector_session_uuid = session_uuid,
+        prepare_request_id = false,
+    })
+    return true
 end
 
 function M.handle_output(ctx, data)
@@ -607,6 +651,10 @@ hooks.on("before_agent_close", PLUGIN_NAME .. ".close_connector", function(sessi
     M.handle_session_closing(session)
 end)
 
+hooks.on("agent_created", PLUGIN_NAME .. ".connector_created", function(info)
+    M.handle_agent_created(info)
+end)
+
 event_subs[#event_subs + 1] = events.on("url_probe_ready", function(data)
     M.handle_url_ready(data)
 end)
@@ -623,6 +671,9 @@ M.reconcile()
 
 function M._before_reload()
     SessionActions.unregister(ACTION_ID)
+    hooks.off("pty_output", PLUGIN_NAME .. ".cloudflared_output")
+    hooks.off("before_agent_close", PLUGIN_NAME .. ".close_connector")
+    hooks.off("agent_created", PLUGIN_NAME .. ".connector_created")
     for _, sub in ipairs(event_subs) do
         events.off(sub)
     end
