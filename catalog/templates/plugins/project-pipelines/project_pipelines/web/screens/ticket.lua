@@ -354,7 +354,7 @@ local function question_rows(ticket, _ctx, _overview)
             ui.stack{ direction = "vertical", gap = "2", children = {
                 view.row{
                     view.badge(ui.bind("@/kind_label"), "accent"),
-                    ui.badge(ui.bind("@/blocking_label"), ui.bind("@/blocking_tone")),
+                    view.badge(ui.bind("@/blocking_label"), ui.bind("@/blocking_tone")),
                 },
                 ui.text{ text = ui.bind("@/question"), size = "sm", weight = "semibold" },
                 ui.textarea{
