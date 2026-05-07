@@ -37,6 +37,15 @@ local function current_plugin_key()
     return nil
 end
 
+local function worker_ctx(ctx)
+    ctx = ctx or {}
+    return {
+        sub_id = ctx.sub_id,
+        target_surface = ctx.target_surface,
+        action_request_id = ctx.action_request_id,
+    }
+end
+
 --- Sentinel returned by a handler to claim ownership of an envelope and
 --- suppress the legacy-command fallback. Kept as a unique table so it
 --- cannot collide with any user-defined truthy value (e.g., a boolean
@@ -266,7 +275,7 @@ function M.dispatch(envelope, ctx)
                     handler_kind = "ui_action",
                     handler_id = envelope.id,
                     handler_name = entry.name,
-                    payload = { envelope = envelope, ctx = ctx },
+                    payload = { envelope = envelope, ctx = worker_ctx(ctx) },
                 },
                 envelope,
                 ctx)

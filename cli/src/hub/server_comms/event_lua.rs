@@ -441,6 +441,7 @@ impl Hub {
                 label,
                 branch,
                 repo_root,
+                base_ref,
                 metadata,
                 prompt,
                 agent_name,
@@ -457,6 +458,7 @@ impl Hub {
                 let branch_clone = branch.clone();
                 let label_clone = label.clone();
                 let repo_root_clone = repo_root.clone();
+                let base_ref_clone = base_ref.clone();
 
                 self.tokio_runtime.spawn(async move {
                     let result = tokio::task::spawn_blocking(move || {
@@ -473,7 +475,11 @@ impl Hub {
                             {
                                 Ok(path)
                             } else {
-                                manager.create_worktree_for_repo_root(repo_path, &branch_clone)
+                                manager.create_worktree_for_repo_root_from_ref(
+                                    repo_path,
+                                    &branch_clone,
+                                    base_ref_clone.as_deref(),
+                                )
                             }
                         } else {
                             manager.create_worktree_with_branch(&branch_clone)
@@ -492,6 +498,7 @@ impl Hub {
                             label: label_clone,
                             branch,
                             repo_root,
+                            base_ref,
                             result: outcome,
                             metadata,
                             prompt,

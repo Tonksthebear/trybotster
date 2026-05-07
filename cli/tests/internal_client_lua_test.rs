@@ -639,7 +639,7 @@ fn hub_get_defaults_to_parent_hub_inside_plugin_worker() {
               metadata = {{ owner_plugin = "knowledge-inbox-pipeline" }},
             }})
 
-            assert(seen.command.type == "hub_orchestration")
+            assert(seen.command.type == "hub_command")
             assert(seen.command.command.type == "create_agent")
             assert(seen.command.command.metadata.owner_plugin == "knowledge-inbox-pipeline")
             assert(seen.command.command.target_id == "target-1")
@@ -650,6 +650,78 @@ fn hub_get_defaults_to_parent_hub_inside_plugin_worker() {
         ))
         .eval()
         .expect("plugin worker Hub.get should proxy to parent hub");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn worker_boundary_hub_mutations_proxy_to_parent_command_queue() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let dir = lua_src_dir();
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{dir}/?.lua;{dir}/?/init.lua;" .. package.path
+
+            _plugin_worker_parent_hub_id = "hub-parent"
+            hub = {{ hub_id = function() return "plugin-worker:workflow" end }}
+            events = {{ emit = function() end }}
+
+            local seen = {{}}
+            plugin_worker_parent_hub = {{
+              request = function(command)
+                assert(command.type == "hub_command")
+                seen[#seen + 1] = command.command
+                return {{ result = {{ ok = true, status = "queued", request_id = command.command.request_id }} }}
+              end,
+            }}
+
+            package.loaded["hub.state"] = {{
+              class = function(_)
+                local cls = {{}}
+                cls.__index = cls
+                return cls
+              end,
+              get = function(_, default) return default end,
+            }}
+            package.loaded["lib.agent"] = {{
+              list = function() error("worker Hub.get() must not use local Agent") end,
+              get = function() error("worker Hub.get() must not use local Agent") end,
+              all_info = function() return {{}} end,
+            }}
+            package.loaded["lib.internal_client"] = {{
+              dispatch = function() error("worker Hub.get() must not dispatch locally") end,
+            }}
+
+            local Hub = require("lib.hub")
+            local h = Hub.get()
+            h:update_session("sess-1", {{ label = "Updated" }})
+            h:move_agent_workspace("sess-1", "workspace-2")
+            h:rename_workspace("workspace-2", "Workspace 2")
+            h:entity_upsert("workflow.item", {{ id = "item-1" }}, {{ owner_plugin = "workflow" }})
+            h:delete_agent("sess-1", false)
+
+            assert(#seen == 5)
+            assert(seen[1].type == "update_session")
+            assert(seen[1].agent_id == "sess-1")
+            assert(seen[2].type == "move_agent_workspace")
+            assert(seen[2].agent_id == "sess-1")
+            assert(seen[2].workspace_id == "workspace-2")
+            assert(seen[3].type == "rename_workspace")
+            assert(seen[3].workspace_id == "workspace-2")
+            assert(seen[4].type == "plugin_entity_publish")
+            assert(seen[4].op == "upsert")
+            assert(seen[4].owner_plugin == "workflow")
+            assert(seen[5].type == "delete_agent")
+            assert(seen[5].agent_id == "sess-1")
+            return "ok"
+            "#,
+            dir = dir.display()
+        ))
+        .eval()
+        .expect("plugin worker hub mutation calls should proxy through orchestration queue");
 
     assert_eq!(result, "ok");
 }
@@ -677,6 +749,24 @@ fn worker_parent_orchestration_returns_before_dispatch() {
               end,
             }}
 
+            local expected = {{
+              create_agent = "req-async",
+              delete_agent = "req-delete",
+              update_session = "req-update",
+              move_agent_workspace = "req-move",
+              rename_workspace = "req-rename",
+              plugin_entity_publish = "req-entity",
+              create_accessory = "req-hub-command",
+            }}
+            local expected_order = {{
+              "create_agent",
+              "delete_agent",
+              "update_session",
+              "move_agent_workspace",
+              "rename_workspace",
+              "plugin_entity_publish",
+              "create_accessory",
+            }}
             local dispatched = 0
             package.loaded["hub.state"] = {{
               class = function(_)
@@ -693,23 +783,38 @@ fn worker_parent_orchestration_returns_before_dispatch() {
             package.loaded["lib.internal_client"] = {{
               dispatch = function(_, command)
                 dispatched = dispatched + 1
-                assert(command.type == "create_agent")
-                assert(command.request_id == "req-async")
+                local expected_type = expected_order[dispatched]
+                assert(command.type == expected_type, "expected " .. tostring(expected_type) .. ", got " .. tostring(command.type))
+                assert(command.request_id == expected[expected_type])
                 return {{
                   frames = {{
-                    {{ type = "command_response", request_id = "req-async", ok = true, status = "pending" }},
+                    {{ type = "command_response", request_id = command.request_id, ok = true, status = "pending" }},
                   }},
                 }}
               end,
             }}
 
+            local commands = require("lib.commands")
+            commands.register("create_agent", function() end)
+            commands.register("delete_agent", function() end)
+            commands.register("update_session", function() end)
+            commands.register("move_agent_workspace", function() end)
+            commands.register("rename_workspace", function() end)
+            commands.register("plugin_entity_publish", function() end)
+            commands.register("create_accessory", function() end)
+
             local Hub = require("lib.hub")
-            local OrchestrationQueue = require("lib.hub_orchestration_queue")
-            assert(OrchestrationQueue.is_queued_command({{ type = "create_agent" }}))
-            assert(not OrchestrationQueue.is_queued_command({{ type = "list_agents" }}))
+            local WorkerParentCommandQueue = require("lib.worker_parent_command_queue")
+            assert(WorkerParentCommandQueue.is_queued_command({{ type = "create_agent" }}))
+            assert(WorkerParentCommandQueue.is_queued_command({{ type = "delete_agent" }}))
+            assert(WorkerParentCommandQueue.is_queued_command({{ type = "update_session" }}))
+            assert(WorkerParentCommandQueue.is_queued_command({{ type = "move_agent_workspace" }}))
+            assert(WorkerParentCommandQueue.is_queued_command({{ type = "rename_workspace" }}))
+            assert(WorkerParentCommandQueue.is_queued_command({{ type = "plugin_entity_publish" }}))
+            assert(not WorkerParentCommandQueue.is_queued_command({{ type = "not_registered" }}))
 
             local response = Hub._handle_worker_parent_request({{
-              type = "hub_orchestration",
+              type = "hub_command",
               command = {{
                 type = "create_agent",
                 request_id = "req-async",
@@ -724,12 +829,111 @@ fn worker_parent_orchestration_returns_before_dispatch() {
             assert(type(scheduled) == "function")
             scheduled()
             assert(dispatched == 1)
+            scheduled = nil
+
+            local delete_response = Hub._handle_worker_parent_request({{
+              type = "hub_command",
+              command = {{
+                type = "delete_agent",
+                request_id = "req-delete",
+                session_uuid = "sess-delete",
+              }},
+            }})
+
+            assert(dispatched == 1)
+            assert(delete_response.result.status == "queued")
+            assert(delete_response.result.request_id == "req-delete")
+            assert(type(scheduled) == "function")
+            scheduled()
+            assert(dispatched == 2)
+
+            local update_response = Hub._handle_worker_parent_request({{
+              type = "hub_command",
+              command = {{
+                type = "update_session",
+                request_id = "req-update",
+                session_uuid = "sess-update",
+                label = "updated",
+              }},
+            }})
+            assert(dispatched == 2)
+            assert(update_response.result.status == "queued")
+            scheduled()
+            assert(dispatched == 3)
+            scheduled = nil
+
+            local move_response = Hub._handle_worker_parent_request({{
+              type = "hub_command",
+              command = {{
+                type = "move_agent_workspace",
+                request_id = "req-move",
+                session_uuid = "sess-move",
+                workspace_id = "workspace-1",
+              }},
+            }})
+            assert(dispatched == 3)
+            assert(move_response.result.status == "queued")
+            scheduled()
+            assert(dispatched == 4)
+            scheduled = nil
+
+            local rename_response = Hub._handle_worker_parent_request({{
+              type = "hub_command",
+              command = {{
+                type = "rename_workspace",
+                request_id = "req-rename",
+                workspace_id = "workspace-1",
+                new_name = "Workspace 1",
+              }},
+            }})
+            assert(dispatched == 4)
+            assert(rename_response.result.status == "queued")
+            scheduled()
+            assert(dispatched == 5)
+            scheduled = nil
+
+            local entity_response = Hub._handle_worker_parent_request({{
+              type = "hub_command",
+              command = {{
+                type = "plugin_entity_publish",
+                request_id = "req-entity",
+                op = "upsert",
+                entity_type = "project-pipelines.ticket",
+                entity = {{ id = "ticket-1" }},
+                owner_plugin = "project-pipelines",
+              }},
+            }})
+            assert(dispatched == 5)
+            assert(entity_response.result.status == "queued")
+            scheduled()
+            assert(dispatched == 6)
+            scheduled = nil
+
+            local hub_command_response = Hub._handle_worker_parent_request({{
+              type = "hub_command",
+              command = {{
+                type = "create_accessory",
+                request_id = "req-hub-command",
+                accessory_name = "server",
+              }},
+            }})
+            assert(dispatched == 6)
+            assert(hub_command_response.result.status == "queued")
+            scheduled()
+            assert(dispatched == 7)
+            scheduled = nil
 
             local rejected = Hub._handle_worker_parent_request({{
-              type = "hub_orchestration",
-              command = {{ type = "list_agents", request_id = "req-read" }},
+              type = "hub_command",
+              command = {{ type = "not_registered", request_id = "req-read" }},
             }})
-            assert(rejected.error:match("unsupported hub orchestration command"))
+            assert(rejected.error:match("unsupported worker parent hub command"))
+
+            local stale_direct_create = Hub._handle_worker_parent_request({{
+              type = "create_agent",
+              request_id = "req-stale-direct",
+            }})
+            assert(stale_direct_create.error:match("unsupported worker parent hub request"))
             return "ok"
             "#,
             dir = dir.display()

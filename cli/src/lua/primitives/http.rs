@@ -155,6 +155,15 @@ impl HttpAsyncEntries {
         self.hub_event_tx = Some(tx);
     }
 
+    /// Route completed responses through the registry-local fallback queue.
+    ///
+    /// Plugin worker runtimes cannot receive `HubEvent::HttpResponse` on the
+    /// parent hub event loop because their Lua callbacks live in the worker VM.
+    /// They poll this local queue from the worker thread instead.
+    pub(crate) fn use_local_polling(&mut self) {
+        self.hub_event_tx = None;
+    }
+
     /// Emit a completed response through the event channel or shared vec.
     ///
     /// If `hub_event_tx` is set (production), sends via the channel for

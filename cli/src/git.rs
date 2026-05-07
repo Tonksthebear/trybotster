@@ -165,6 +165,17 @@ impl WorktreeManager {
         repo_path: &Path,
         branch_name: &str,
     ) -> Result<PathBuf> {
+        self.create_worktree_for_repo_root_from_ref(repo_path, branch_name, None)
+    }
+
+    /// Creates a worktree for an explicit repository root, optionally branching
+    /// from a specific starting ref.
+    pub fn create_worktree_for_repo_root_from_ref(
+        &self,
+        repo_path: &Path,
+        branch_name: &str,
+        base_ref: Option<&str>,
+    ) -> Result<PathBuf> {
         let repo_name = repo_name_for_root(repo_path)?;
         let repo_safe = repo_name.replace('/', "-");
         let sanitized_branch = branch_name.replace('/', "-");
@@ -183,6 +194,19 @@ impl WorktreeManager {
                     "add",
                     worktree_path.to_str().expect("path is valid UTF-8"),
                     branch_name,
+                ])
+                .current_dir(repo_path)
+                .output()?
+        } else if let Some(base_ref) = base_ref.filter(|value| !value.trim().is_empty()) {
+            log::info!("Creating new branch: {} from {}", branch_name, base_ref);
+            std::process::Command::new("git")
+                .args([
+                    "worktree",
+                    "add",
+                    "-b",
+                    branch_name,
+                    worktree_path.to_str().expect("path is valid UTF-8"),
+                    base_ref,
                 ])
                 .current_dir(repo_path)
                 .output()?

@@ -730,6 +730,15 @@ impl LuaRuntime {
             .stop_all();
     }
 
+    /// Stop all isolated plugin workers owned by this runtime.
+    ///
+    /// Plugin workers can own file watches whose forwarding tasks run on the
+    /// parent Tokio runtime. They must be asked to exit before that runtime is
+    /// dropped, otherwise runtime shutdown waits on their blocking watch tasks.
+    pub fn shutdown_plugin_workers(&mut self, reason: &str) {
+        self.plugin_worker_registry.shutdown_all(reason);
+    }
+
     /// Poll user file watches via periodic drain.
     ///
     /// Hub production uses `HubEvent::UserFileWatch` from blocking subscription
@@ -1480,6 +1489,24 @@ impl LuaRuntime {
             .set_hub_event_tx(tx, tokio_handle);
     }
 
+    /// Keep async callback delivery local to this runtime.
+    ///
+    /// Plugin workers share the parent's HubEvent sender for primitives that
+    /// need hub-owned scheduling, but HTTP/WebSocket callbacks are registry
+    /// keys in the worker Lua VM. Sending their completions to the parent hub
+    /// event loop makes the parent runtime log "unknown request_id" and drops
+    /// the callback.
+    pub(crate) fn use_local_async_callback_polling(&mut self) {
+        self.http_registry
+            .lock()
+            .expect("HttpAsyncEntries mutex poisoned")
+            .use_local_polling();
+        self.websocket_registry
+            .lock()
+            .expect("WebSocketRegistry mutex poisoned")
+            .use_local_polling();
+    }
+
     /// Fire the Lua callback for a single completed HTTP response.
     ///
     /// Called from `handle_hub_event()` for `HubEvent::HttpResponse` events.
@@ -1895,6 +1922,13 @@ impl LuaRuntime {
         }
 
         Ok(())
+    }
+}
+
+impl Drop for LuaRuntime {
+    fn drop(&mut self) {
+        self.shutdown_plugin_workers("runtime_drop");
+        self.stop_all_watchers();
     }
 }
 
