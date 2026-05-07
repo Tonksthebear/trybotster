@@ -179,3 +179,159 @@ fn mcp_mutators_return_without_bulk_snapshot_publish() {
 
     assert_eq!(result, "ok");
 }
+
+#[test]
+fn start_run_queues_agent_and_links_later_by_request_id() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local create_agent_calls = 0
+            local events = {{}}
+            local run = nil
+            local visit = nil
+
+            local ticket = {{
+              id = "ticket-1",
+              title = "Async spawn",
+              target_id = "target-1",
+              target_path = "/repo",
+            }}
+            local pipeline = {{ id = "pipe-1", name = "Default" }}
+            local step = {{
+              id = "step-1",
+              kind = "agent",
+              name = "Implement",
+              agent_name = "codex",
+              prompt = "Do the work",
+            }}
+
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+
+            package.loaded["project_pipelines.repo"] = {{
+              prune_legacy_seed_data = function() end,
+              get_ticket = function(id)
+                assert(id == "ticket-1")
+                return ticket
+              end,
+              open_ticket_run = function() return nil end,
+              blocking_ticket_dependencies = function() return {{}} end,
+              get_pipeline = function(id)
+                assert(id == "pipe-1")
+                return pipeline
+              end,
+              pipeline_steps = function(id)
+                assert(id == "pipe-1")
+                return {{ step }}
+              end,
+              create_run = function(attrs)
+                run = {{
+                  id = "run-1",
+                  ticket_id = attrs.ticket_id,
+                  pipeline_id = attrs.pipeline_id,
+                  target_id = attrs.target_id,
+                  target_path = attrs.target_path,
+                  workspace_id = attrs.workspace_id,
+                  workspace_name = attrs.workspace_name,
+                  status = "queued",
+                }}
+                return run
+              end,
+              next_step = function(seen_run)
+                assert(seen_run.id == "run-1")
+                return step
+              end,
+              create_run_step_visit = function(run_id, step_id, attrs)
+                assert(run_id == "run-1")
+                assert(step_id == "step-1")
+                visit = {{
+                  id = "visit-1",
+                  run_id = run_id,
+                  step_id = step_id,
+                  status = attrs.status,
+                  sequence = 1,
+                }}
+                return visit
+              end,
+              update_run = function(run_id, attrs)
+                assert(run_id == "run-1")
+                for key, value in pairs(attrs or {{}}) do
+                  run[key] = value
+                end
+                return run
+              end,
+              get_run = function(run_id)
+                assert(run_id == "run-1")
+                return run
+              end,
+              get_run_step_visit = function(visit_id)
+                assert(visit_id == "visit-1")
+                return visit
+              end,
+              latest_step_session = function() return nil end,
+              append_event = function(kind, event)
+                events[#events + 1] = {{ kind = kind, event = event }}
+              end,
+              update_run_step = function(_run_id, _step_id, attrs)
+                assert(attrs.agent_session_uuid == nil, "start_run must not link a session synchronously")
+              end,
+              update_run_step_visit = function(_visit_id, attrs)
+                assert(attrs.agent_session_uuid == nil, "start_run must not link a session synchronously")
+              end,
+            }}
+
+            package.loaded["lib.agent"] = {{
+              get = function() return nil end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  create_agent = function(_, opts)
+                    create_agent_calls = create_agent_calls + 1
+                    assert(opts.request_id == "project-pipelines:run-1:step-1:agent")
+                    assert(opts.metadata.owner_plugin == "project-pipelines")
+                    assert(opts.metadata.run_id == "run-1")
+                    assert(opts.metadata.step_id == "step-1")
+                    return {{ ok = true, status = "queued", request_id = opts.request_id }}
+                  end,
+                }}
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            local result = engine.start_run({{ ticket_id = "ticket-1", pipeline_id = "pipe-1" }})
+
+            assert(create_agent_calls == 1)
+            assert(result.activation.ok == true)
+            assert(result.activation.agent.status == "queued")
+            assert(result.activation.agent.request_id == "project-pipelines:run-1:step-1:agent")
+
+            local requested = nil
+            for _, entry in ipairs(events) do
+              assert(entry.kind ~= "step.agent_spawned")
+              if entry.kind == "step.agent_requested" then
+                requested = entry.event
+              end
+            end
+            assert(requested ~= nil)
+            assert(requested.payload.request_id == "project-pipelines:run-1:step-1:agent")
+            assert(requested.payload.status == "queued")
+            assert(requested.payload.session_uuid == nil)
+            assert(visit ~= nil and visit.agent_session_uuid == nil)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("project pipelines start_run should queue agent creation");
+
+    assert_eq!(result, "ok");
+}

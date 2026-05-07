@@ -115,7 +115,7 @@ fn workspace_accessories_inherit_agent_resolved_default_workspace() {
             handlers.handle_create_agent(
               "feature-accessory",
               nil,
-              nil,
+              "{worktree_path}",
               nil,
               "codex",
               {{ workspace_config = {{ accessories = {{ "rails-server" }} }} }},

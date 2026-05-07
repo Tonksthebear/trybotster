@@ -189,7 +189,7 @@ mcp.tool("list_spawn_targets", {
 end)
 
 mcp.tool("create_agent", {
-    description = "Create a new agent on a hub. For the local hub, omit hub_id or pass the local hub's ID. For remote hubs, pass their hub_id (from list_hubs). Returns the created agent's info. Use list_spawn_targets to get valid target_id values.",
+    description = "Queue a new agent on a hub. For the local hub, omit hub_id or pass the local hub's ID. For remote hubs, pass their hub_id (from list_hubs). Returns a request_id immediately; use lifecycle/session listing to observe the created agent. Use list_spawn_targets to get valid target_id values.",
     input_schema = {
         type = "object",
         properties = {
@@ -227,7 +227,7 @@ mcp.tool("create_agent", {
             },
             label = {
                 type = "string",
-                description = "Human-readable label for the agent (e.g. 'rust-plugins-field'). Set on the session after creation.",
+                description = "Human-readable label for the agent (e.g. 'rust-plugins-field'). Stored on the creation request and applied when the session is created.",
             },
         },
         required = { "issue_or_branch" },
@@ -267,14 +267,20 @@ mcp.tool("create_agent", {
 
     return Hub.call_safely(params.hub_id, function()
         local h = Hub.get(params.hub_id)
-        local result = h:create_agent(
-            params.issue_or_branch,
-            params.prompt,
-            params.agent_name,
-            params.workspace_id,
-            params.workspace_name,
-            target
-        )
+        local result = h:create_agent({
+            issue_or_branch = params.issue_or_branch,
+            prompt = params.prompt,
+            agent_name = params.agent_name,
+            workspace_id = params.workspace_id,
+            workspace_name = params.workspace_name,
+            target_id = target and target.target_id or params.target_id,
+            target_path = target and target.target_path or params.target_path,
+            target_repo = target and target.target_repo or params.target_repo,
+            label = params.label,
+            metadata = {
+                label = params.label,
+            },
+        })
 
         -- Set label on the newly created session if provided
         if params.label and result and result.id then

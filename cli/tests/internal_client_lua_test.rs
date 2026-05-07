@@ -608,7 +608,7 @@ fn hub_get_defaults_to_parent_hub_inside_plugin_worker() {
             plugin_worker_parent_hub = {{
               request = function(command)
                 seen.command = command
-                return {{ result = {{ ok = true, status = "pending", request_id = command.command.request_id }} }}
+                return {{ result = {{ ok = true, status = "queued", request_id = command.command.request_id }} }}
               end,
             }}
 
@@ -639,17 +639,93 @@ fn hub_get_defaults_to_parent_hub_inside_plugin_worker() {
               metadata = {{ owner_plugin = "knowledge-inbox-pipeline" }},
             }})
 
-            assert(seen.command.type == "hub_command")
+            assert(seen.command.type == "hub_command_async")
             assert(seen.command.command.type == "create_agent")
             assert(seen.command.command.metadata.owner_plugin == "knowledge-inbox-pipeline")
             assert(seen.command.command.target_id == "target-1")
-            assert(result.status == "pending")
+            assert(result.status == "queued")
             return "ok"
             "#,
             dir = dir.display()
         ))
         .eval()
         .expect("plugin worker Hub.get should proxy to parent hub");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn worker_parent_async_hub_command_returns_before_dispatch() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let dir = lua_src_dir();
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{dir}/?.lua;{dir}/?/init.lua;" .. package.path
+
+            hub = {{ hub_id = function() return "hub-parent" end }}
+            events = {{ emit = function() end }}
+
+            local scheduled = nil
+            timer = {{
+              after = function(delay, callback)
+                assert(delay == 0)
+                scheduled = callback
+                return "timer-1"
+              end,
+            }}
+
+            local dispatched = 0
+            package.loaded["hub.state"] = {{
+              class = function(_)
+                local cls = {{}}
+                cls.__index = cls
+                return cls
+              end,
+              get = function(_, default) return default end,
+            }}
+            package.loaded["lib.agent"] = {{
+              list = function() return {{}} end,
+              all_info = function() return {{}} end,
+            }}
+            package.loaded["lib.internal_client"] = {{
+              dispatch = function(_, command)
+                dispatched = dispatched + 1
+                assert(command.type == "create_agent")
+                assert(command.request_id == "req-async")
+                return {{
+                  frames = {{
+                    {{ type = "command_response", request_id = "req-async", ok = true, status = "pending" }},
+                  }},
+                }}
+              end,
+            }}
+
+            local Hub = require("lib.hub")
+            local response = Hub._handle_worker_parent_request({{
+              type = "hub_command_async",
+              command = {{
+                type = "create_agent",
+                request_id = "req-async",
+                metadata = {{ assignment_id = "assign-async" }},
+              }},
+            }})
+
+            assert(dispatched == 0)
+            assert(response.result.status == "queued")
+            assert(response.result.request_id == "req-async")
+            assert(response.result.assignment_id == "assign-async")
+            assert(type(scheduled) == "function")
+            scheduled()
+            assert(dispatched == 1)
+            return "ok"
+            "#,
+            dir = dir.display()
+        ))
+        .eval()
+        .expect("async worker parent command should be queued before dispatch");
 
     assert_eq!(result, "ok");
 }
