@@ -833,7 +833,7 @@ fn test_build_workspace_groups_uses_name() {
     let lua = create_lua_vm(dir.path());
     load_workspace_store(&lua);
 
-    let (has_name, has_metadata): (bool, bool) = lua
+    let (has_name, has_metadata, has_workspace_id, is_active): (bool, bool, bool, bool) = lua
         .load(format!(
             r#"
             local dd = "{dd}"
@@ -855,7 +855,9 @@ fn test_build_workspace_groups_uses_name() {
             local groups = ws.build_workspace_groups(dd, agents)
             local g = groups[1]
             return g.name == "owner/repo#42",
-                   g.metadata ~= nil and g.metadata.repo == "owner/repo"
+                   g.metadata ~= nil and g.metadata.repo == "owner/repo",
+                   g.workspace_id == ws_id,
+                   g.status == "active"
             "#,
             dd = dir.path().to_str().unwrap()
         ))
@@ -864,6 +866,14 @@ fn test_build_workspace_groups_uses_name() {
 
     assert!(has_name, "Workspace group should include name");
     assert!(has_metadata, "Workspace group should include metadata");
+    assert!(
+        has_workspace_id,
+        "Workspace group should include wire workspace_id"
+    );
+    assert!(
+        is_active,
+        "Workspace group with live agents should be active"
+    );
 }
 
 #[test]

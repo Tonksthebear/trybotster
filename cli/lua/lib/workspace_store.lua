@@ -676,19 +676,14 @@ function M.build_workspace_groups(data_dir, agents)
                     display_name = agent.workspace_name or agent.branch_name or "General"
                 end
 
-                -- Read-only status derivation for payloads: avoid write-on-read churn.
-                local status = M.compute_workspace_status(data_dir, workspace_id)
-                if status then
-                    manifest.status = status
-                end
-
                 by_id[workspace_id] = {
                     id = workspace_id,
+                    workspace_id = workspace_id,
                     name = display_name,
                     target_id = manifest.target_id,
                     target_path = manifest.target_path,
                     target_repo = manifest.target_repo,
-                    status = manifest.status,
+                    status = "active",
                     created_at = manifest.created_at,
                     updated_at = manifest.updated_at,
                     metadata = manifest.metadata or {},
@@ -785,11 +780,21 @@ end
 --   workspace_id, session_uuid, manifest (decoded table), data_dir
 --
 -- @param data_dir string
+-- @param wanted_by_uuid table|nil Optional set of session UUIDs to return.
 -- @return array
-function M.scan_recoverable_sessions(data_dir)
+function M.scan_recoverable_sessions(data_dir, wanted_by_uuid)
     local results = {}
     local ws_dir = M.workspaces_dir(data_dir)
     if not fs.exists(ws_dir) then return results end
+
+    local wanted = type(wanted_by_uuid) == "table" and wanted_by_uuid or nil
+    local remaining = 0
+    if wanted then
+        for _, enabled in pairs(wanted) do
+            if enabled then remaining = remaining + 1 end
+        end
+        if remaining == 0 then return results end
+    end
 
     local ws_entries, ws_err = fs.list_dir(ws_dir)
     if not ws_entries then
@@ -812,6 +817,9 @@ function M.scan_recoverable_sessions(data_dir)
         end
 
         for _, session_uuid in ipairs(sess_entries) do
+            if wanted and not wanted[session_uuid] then
+                goto continue_session
+            end
             local manifest = M.read_session(data_dir, workspace_id, session_uuid)
             if manifest and manifest.status ~= "closed" then
                 results[#results + 1] = {
@@ -820,7 +828,15 @@ function M.scan_recoverable_sessions(data_dir)
                     manifest = manifest,
                     data_dir = data_dir,
                 }
+                if wanted then
+                    wanted[session_uuid] = nil
+                    remaining = remaining - 1
+                    if remaining <= 0 then
+                        return results
+                    end
+                end
             end
+            ::continue_session::
         end
 
         ::continue_workspace::

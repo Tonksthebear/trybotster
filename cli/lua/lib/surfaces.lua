@@ -73,6 +73,17 @@ local M = {}
 local registry = state.get("surfaces.registry", { by_name = {}, seq = 0 })
 if registry.by_name == nil then registry.by_name = {} end
 if registry.seq == nil then registry.seq = 0 end
+local PERF = os.getenv("BOTSTER_LUA_PERF") == "1"
+
+local function elapsed_ms(started)
+    return math.floor(((os.clock() - started) * 1000) + 0.5)
+end
+
+local function log_perf(message)
+    if PERF and log and log.info then
+        log.info("[PERF][surface_worker] " .. message)
+    end
+end
 
 local function current_plugin_key()
     local key = rawget(_G, "_loading_plugin_key") or rawget(_G, "_loading_plugin_name")
@@ -741,6 +752,7 @@ function M.render_node(name, render_state)
     local entry = M.get(name)
     if not entry then return nil end
     if entry.owner_plugin and not running_in_plugin_worker(entry.owner_plugin) then
+        local started = PERF and os.clock() or nil
         local ok, result = require("lib.plugin_supervisor").invoke(
             entry.owner_plugin,
             "surface_route:" .. tostring(name),
@@ -752,6 +764,14 @@ function M.render_node(name, render_state)
                 payload = { render_state = render_state or {} },
             },
             render_state)
+        if started then
+            log_perf(string.format(
+                "surface=%s owner=%s ok=%s elapsed_ms=%d",
+                tostring(name),
+                tostring(entry.owner_plugin),
+                tostring(ok),
+                elapsed_ms(started)))
+        end
         if not ok then error(result) end
         return result
     end

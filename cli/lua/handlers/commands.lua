@@ -464,14 +464,18 @@ commands.register("update_session", function(client, sub_id, command)
         return
     end
 
-    -- Only allow updating label and task (not arbitrary fields)
+    -- Only allow explicit session presentation/ownership fields.
     local fields = {}
     if command.label ~= nil then fields.label = command.label end
     if command.task ~= nil then fields.task = command.task end
+    if command.metadata ~= nil then fields.metadata = command.metadata end
+    if command.owner_plugin ~= nil then fields.owner_plugin = command.owner_plugin end
+    if command.visibility ~= nil then fields.visibility = command.visibility end
+    if command.surface ~= nil then fields.surface = command.surface end
 
     if not next(fields) then
         log.warn("update_session missing updatable fields")
-        send_command_response(client, sub_id, command, { ok = false, error = "label or task is required" })
+        send_command_response(client, sub_id, command, { ok = false, error = "updatable field is required" })
         return
     end
 
@@ -572,6 +576,36 @@ commands.register("hub:entities", function(client, sub_id, command)
         types = entity_types,
     })
 end, { description = "Send requested entity snapshots on demand" })
+
+commands.register("plugin_entity_publish", function(client, sub_id, command)
+    local op = command.op
+    local entity_type = command.entity_type
+    local owner_plugin = command.owner_plugin
+    local EB = require("lib.entity_broadcast")
+    local ok, result = pcall(function()
+        EB.assert_plugin_publish_owner(entity_type, owner_plugin, "plugin_entity_publish")
+        if op == "snapshot" then
+            EB.snapshot(entity_type, command.items or {})
+            return { entity_type = entity_type, count = type(command.items) == "table" and #command.items or 0 }
+        elseif op == "upsert" then
+            EB.upsert(entity_type, command.entity)
+            return { entity_type = entity_type, id = command.entity and command.entity.id or nil }
+        elseif op == "patch" then
+            EB.patch(entity_type, command.id, command.fields)
+            return { entity_type = entity_type, id = command.id }
+        elseif op == "remove" then
+            EB.remove(entity_type, command.id)
+            return { entity_type = entity_type, id = command.id }
+        end
+        error("unknown plugin entity publish op: " .. tostring(op))
+    end)
+    if not ok then
+        send_command_response(client, sub_id, command, { ok = false, error = tostring(result) })
+        return
+    end
+    result.ok = true
+    send_command_response(client, sub_id, command, result)
+end, { description = "Publish plugin-owned entities through hub command ingress" })
 
 -- Phase 2b: structured browser → hub action envelopes. Wraps the Phase-1
 -- command channel with semantic action ids so plugin-registered handlers

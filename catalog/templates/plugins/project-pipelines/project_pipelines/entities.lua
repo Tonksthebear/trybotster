@@ -195,6 +195,7 @@ local function ticket_entities(tickets)
         local current_step = latest and latest.current_step_id and steps_by_id[latest.current_step_id] or nil
         local notifications = notification_counts[ticket.id] or 0
         entity.target_label = target_label(view, ticket.target_id, ticket.target_path)
+        entity.standalone = ticket.project_id == nil or ticket.project_id == ""
         entity.run_count = #runs
         entity.run_count_label = string.format("%d run%s", #runs, #runs == 1 and "" or "s")
         entity.latest_run_id = latest and latest.id or nil
@@ -221,6 +222,7 @@ local function ticket_entity(ticket)
     local current_step = latest and latest.current_step_id and repo and repo.get_step(latest.current_step_id) or nil
     local notifications = view and repo and view.ticket_notification_count(ticket.id, repo) or 0
     entity.target_label = target_label(view, ticket.target_id, ticket.target_path)
+    entity.standalone = ticket.project_id == nil or ticket.project_id == ""
     entity.run_count = #runs
     entity.run_count_label = string.format("%d run%s", #runs, #runs == 1 and "" or "s")
     entity.latest_run_id = latest and latest.id or nil
@@ -354,6 +356,17 @@ local function gate_result_entity(result)
     return entity
 end
 
+local function question_entity(question)
+    local entity = copy(question)
+    local ticket = rows("SELECT id, title FROM tickets WHERE id = ? LIMIT 1", question.ticket_id)[1]
+    entity.ticket_title = ticket and ticket.title or question.ticket_id
+    entity.path = "/pipelines/tickets/" .. tostring(question.ticket_id or "")
+    entity.kind_label = question.kind == "agent" and "agent" or "human"
+    entity.blocking_label = question.blocking == 1 and "blocking" or "open"
+    entity.blocking_tone = question.blocking == 1 and "danger" or "accent"
+    return entity
+end
+
 local function artifact_entity(artifact)
     local entity = copy(artifact)
     entity.payload = decode(artifact.payload, {})
@@ -457,8 +470,14 @@ local ENTITY = {
         one = artifact_entity,
     },
     [M.types.question] = {
-        all = function() return rows("SELECT * FROM questions ORDER BY updated_at DESC, created_at DESC, id DESC") end,
-        one = copy,
+        all = function()
+            local out = {}
+            for _, question in ipairs(rows("SELECT * FROM questions ORDER BY updated_at DESC, created_at DESC, id DESC")) do
+                out[#out + 1] = question_entity(question)
+            end
+            return out
+        end,
+        one = question_entity,
     },
     [M.types.event] = {
         all = function()

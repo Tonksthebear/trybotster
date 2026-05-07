@@ -150,3 +150,121 @@ fn process_exited_accepts_string_true_for_auto_close_metadata() {
     assert_eq!(update_count, 0);
     assert_eq!(status, "");
 }
+
+#[test]
+fn pty_title_changed_patches_clients_without_waiting_for_manifest_debounce() {
+    let lua = new_lua();
+    let script = r#"
+        local hook_callbacks = {}
+
+        log = {
+          debug = function(...) end,
+          info = function(...) end,
+          warn = function(...) end,
+          error = function(...) end,
+        }
+
+        hooks = {
+          on = function(name, id, fn) hook_callbacks[name] = fn end,
+          off = function(...) end,
+          notify = function(...) end,
+        }
+
+        local timer_calls = { after_idle = 0 }
+        timer = {
+          after_idle = function(_key, _delay, _fn)
+            timer_calls.after_idle = timer_calls.after_idle + 1
+          end,
+          every = function(_delay, _fn)
+            return "timer:output_activity"
+          end,
+          cancel = function(_id) end,
+        }
+
+        events = {
+          on = function(name, _fn) return name .. ":sub" end,
+          off = function(_id) end,
+        }
+
+        package.loaded["hub.state"] = {
+          get = function(_key, default) return default end,
+        }
+
+        local session = {
+          session_uuid = "sess-title",
+          title = nil,
+          sync_count = 0,
+          _sync_session_manifest = function(self)
+            self.sync_count = self.sync_count + 1
+          end,
+        }
+
+        package.loaded["lib.agent"] = {
+          get = function(uuid)
+            if uuid == "sess-title" then return session end
+            return nil
+          end,
+          list = function() return {} end,
+        }
+        package.loaded["lib.session"] = {
+          get = function(uuid)
+            if uuid == "sess-title" then return session end
+            return nil
+          end,
+          list = function() return {} end,
+          is_system_session = function(...) return false end,
+        }
+
+        local patches = {}
+        package.loaded["lib.entity_model"] = {
+          publish_session = function(...) end,
+          remove_session = function(...) end,
+          patch_session = function(target_session, fields)
+            patches[#patches + 1] = require("lib.client_session_payload").project_fields(fields, target_session)
+          end,
+          upsert_session_workspace = function(...) end,
+          upsert_workspace = function(...) end,
+          patch_workspace = function(...) end,
+          upsert_connection_code = function(...) end,
+          upsert_hub = function(...) end,
+        }
+        package.loaded["lib.session_actions"] = {
+          publish_for_session = function(...) end,
+        }
+        package.loaded["lib.terminal_clients"] = {
+          set_focused = function(...) end,
+          get_focused_sessions = function(...) return {} end,
+          is_any_focused = function(...) return false end,
+        }
+        package.loaded["lib.entity_broadcast"] = {
+          set_broadcaster = function(...) end,
+        }
+        package.loaded["lib.surfaces"] = {
+          build_route_registry_payload = function()
+            return { type = "ui_route_registry", routes = {} }
+          end,
+          path = function(...) return nil end,
+        }
+
+        require("handlers.connections")
+        hook_callbacks.pty_title_changed({ session_uuid = "sess-title", title = "⠋ Working" })
+
+        return session.title, #patches, patches[1].title, patches[1].display_name, session.sync_count, timer_calls.after_idle
+        "#;
+
+    let (title, patch_count, patch_title, patch_display_name, sync_count, timer_count): (
+        String,
+        i64,
+        String,
+        String,
+        i64,
+        i64,
+    ) = lua.load(script).eval().expect("run pty title patch case");
+
+    assert_eq!(title, "⠋ Working");
+    assert_eq!(patch_count, 1);
+    assert_eq!(patch_title, "⠋ Working");
+    assert_eq!(patch_display_name, "⠋ Working");
+    assert_eq!(sync_count, 0);
+    assert_eq!(timer_count, 1);
+}

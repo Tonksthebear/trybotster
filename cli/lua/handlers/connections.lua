@@ -406,14 +406,28 @@ local function queue_osc_session_update(session_uuid, fields)
     end
 
     local changed = false
+    local changed_fields = {}
     for k, v in pairs(fields) do
         if agent[k] ~= v then
             agent[k] = v
             pending[k] = v
+            changed_fields[k] = v
             changed = true
         end
     end
     if not changed then return end
+
+    -- OSC title/cwd changes are live UI facts. Patch connected clients now;
+    -- debounce only the durable manifest write below. Using after_idle for
+    -- the wire patch made continuously changing titles look frozen because
+    -- the timer never fired until the terminal went quiet.
+    hooks.notify("session_updated", {
+        session_uuid = session_uuid,
+        source = "osc_live",
+        fields = changed_fields,
+    })
+    EntityModel.patch_session(agent, changed_fields)
+    require("lib.session_actions").publish_for_session(agent)
 
     timer.after_idle("session_osc_update:" .. session_uuid, OSC_SESSION_UPDATE_DEBOUNCE_SECS, function()
         local current = pending_osc_session_updates[session_uuid]
@@ -423,11 +437,6 @@ local function queue_osc_session_update(session_uuid, fields)
         if not s or type(current) ~= "table" or next(current) == nil then return end
 
         s:_sync_session_manifest()
-        hooks.notify("session_updated", {
-            session_uuid = session_uuid,
-            source = "osc_debounced",
-            fields = current,
-        })
     end)
 end
 
@@ -568,6 +577,23 @@ _event_subs[#_event_subs + 1] = events.on("process_exited", function(data)
         else
             session:update({ status = "exited" })
         end
+    end
+end)
+
+_event_subs[#_event_subs + 1] = events.on("session_reconnected", function(data)
+    local session_uuid = data and data.session_uuid
+    local session = (session_uuid and Session.get(session_uuid))
+    if not session then return end
+
+    local fields = {}
+    if type(data.title) == "string" and data.title ~= "" then
+        fields.title = data.title
+    end
+    if type(data.cwd) == "string" and data.cwd ~= "" then
+        fields.cwd = data.cwd
+    end
+    if next(fields) then
+        queue_osc_session_update(session_uuid, fields)
     end
 end)
 

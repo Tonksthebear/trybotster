@@ -91,6 +91,7 @@ function M.load_plugin(plugin_key, metadata)
         source = metadata.source,
         repo_root = metadata.repo_root,
         lua_base_path = rawget(_G, "_lua_base_path"),
+        parent_hub_id = hub and hub.hub_id and hub.hub_id() or nil,
     })
     if not ok then
         return false, tostring(err)

@@ -107,6 +107,8 @@ mod protocol_tests {
             rows: 24,
             cols: 80,
             last_output_at: 1234567890,
+            title: Some("working".to_string()),
+            cwd: Some("/tmp/project".to_string()),
             mode_flags: ModeFlags {
                 kitty_enabled: true,
                 cursor_visible: false,
@@ -124,6 +126,8 @@ mod protocol_tests {
         assert_eq!(decoded.rows, 24);
         assert_eq!(decoded.cols, 80);
         assert_eq!(decoded.last_output_at, 1234567890);
+        assert_eq!(decoded.title.as_deref(), Some("working"));
+        assert_eq!(decoded.cwd.as_deref(), Some("/tmp/project"));
         assert!(decoded.mode_flags.kitty_enabled);
         assert!(!decoded.mode_flags.cursor_visible);
         assert!(decoded.mode_flags.bracketed_paste);

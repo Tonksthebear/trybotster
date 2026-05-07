@@ -42,6 +42,18 @@ local state = require("hub.state")
 
 local M = {}
 
+local PERF = os.getenv("BOTSTER_LUA_PERF") == "1"
+
+local function elapsed_ms(started)
+    return math.floor(((os.clock() - started) * 1000) + 0.5)
+end
+
+local function log_perf(message)
+    if PERF and log and log.info then
+        log.info("[PERF][entity_snapshot] " .. message)
+    end
+end
+
 local BUILTIN_ENTITY_TYPES = {
     session = true,
     session_action = true,
@@ -541,8 +553,10 @@ end
 function M.send_snapshots_to(client, sub_id, opts)
     assert(client and type(client.send) == "function",
         "entity_broadcast.send_snapshots_to: client must support :send(msg)")
+    local batch_started = PERF and os.clock() or nil
     local sent = 0
     for _, entity_type in ipairs(registered_type_names(opts)) do
+        local started = PERF and os.clock() or nil
         local entry = registry[entity_type]
         local items = snapshot_items(entry, entity_type)
         local frame = {
@@ -555,6 +569,15 @@ function M.send_snapshots_to(client, sub_id, opts)
         if sub_id ~= nil then frame.subscriptionId = sub_id end
         client:send(frame)
         sent = sent + 1
+        if started then
+            log_perf(string.format(
+                "type=%s items=%d seq=%s sub=%s elapsed_ms=%d",
+                tostring(entity_type),
+                #items,
+                tostring(frame.snapshot_seq),
+                tostring(sub_id or "nil"),
+                elapsed_ms(started)))
+        end
         log.info(string.format(
             "entity_broadcast.snapshot: type=%s items=%d seq=%s sub=%s",
             tostring(entity_type),
@@ -566,6 +589,13 @@ function M.send_snapshots_to(client, sub_id, opts)
         "entity_broadcast.snapshot: sent %d type snapshot(s) to sub=%s",
         sent,
         tostring(sub_id or "nil")))
+    if batch_started then
+        log_perf(string.format(
+            "sent=%d sub=%s elapsed_ms=%d",
+            sent,
+            tostring(sub_id or "nil"),
+            elapsed_ms(batch_started)))
+    end
 end
 
 -- -------------------------------------------------------------------------

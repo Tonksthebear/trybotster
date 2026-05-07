@@ -16,6 +16,13 @@ fn lua_src_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua")
 }
 
+fn project_root_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("cli has repo parent")
+        .to_path_buf()
+}
+
 fn new_lua() -> Lua {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
@@ -33,6 +40,99 @@ fn new_lua() -> Lua {
     .expect("configure lua");
 
     lua
+}
+
+#[test]
+fn project_pipelines_home_render_uses_bounded_notified_session_lookup() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local calls = {{
+              agent_list = 0,
+              ticket_session_links_for_uuids = 0,
+              ticket_session_uuids_by_ticket = 0,
+              list_tickets = 0,
+            }}
+
+            ui = {{
+              bind = function(path) return {{ bind = path }} end,
+              action = function(name, payload) return {{ name = name, payload = payload }} end,
+              list_item = function(props) return {{ type = "list_item", props = props }} end,
+              text = function(props) return {{ type = "text", props = props }} end,
+              badge = function(props) return {{ type = "badge", props = props }} end,
+              button = function(props) return {{ type = "button", props = props }} end,
+              list = function(props) return {{ type = "list", props = props }} end,
+              bind_list = function(props) return {{ type = "bind_list", props = props }} end,
+              stack = function(props) return {{ type = "stack", props = props }} end,
+            }}
+
+            package.loaded["project_pipelines.web.ui"] = {{
+              page_header = function(props) return {{ type = "page_header", props = props }} end,
+              panel = function(child) return {{ type = "panel", child = child }} end,
+              section = function(title, children) return {{ type = "section", title = title, children = children }} end,
+              empty = function(title) return {{ type = "empty", title = title }} end,
+              badge = function(text, tone) return {{ type = "badge", text = text, tone = tone }} end,
+            }}
+
+            package.loaded["project_pipelines.repo"] = {{
+              list_runs = function()
+                return {{
+                  {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipe-1", current_step_id = "step-1", status = "active" }},
+                }}
+              end,
+              get_ticket = function(id) return {{ id = id, title = "Ticket " .. id }} end,
+              get_pipeline = function(id) return {{ id = id, name = "Pipeline " .. id }} end,
+              get_step = function(id) return {{ id = id, name = "Step " .. id }} end,
+              has_open_questions = function() return false end,
+              ticket_session_links_for_uuids = function(uuids)
+                calls.ticket_session_links_for_uuids = calls.ticket_session_links_for_uuids + 1
+                assert(#uuids == 1)
+                assert(uuids[1] == "sess-notified")
+                return {{
+                  ["sess-notified"] = {{ {{ id = "ticket-1", title = "Important ticket" }} }},
+                }}
+              end,
+              ticket_session_uuids_by_ticket = function()
+                calls.ticket_session_uuids_by_ticket = calls.ticket_session_uuids_by_ticket + 1
+                error("home render must not scan every ticket/session link")
+              end,
+              list_tickets = function()
+                calls.list_tickets = calls.list_tickets + 1
+                error("home render must not list every ticket for notification rows")
+              end,
+            }}
+
+            package.loaded["lib.agent"] = {{
+              list = function()
+                calls.agent_list = calls.agent_list + 1
+                return {{
+                  {{ info = function() return {{ session_uuid = "sess-notified", notification = true, label = "Needs attention" }} end }},
+                  {{ info = function() return {{ session_uuid = "sess-quiet", notification = false, label = "Quiet" }} end }},
+                }}
+              end,
+            }}
+
+            local home = require("project_pipelines.web.screens.home")
+            home.render({{}}, {{ path = function(path) return "/pipelines" .. path end }})
+
+            assert(calls.agent_list == 1)
+            assert(calls.ticket_session_links_for_uuids == 1)
+            assert(calls.ticket_session_uuids_by_ticket == 0)
+            assert(calls.list_tickets == 0)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("project pipelines home render should use bounded session lookup");
+
+    assert_eq!(result, "ok");
 }
 
 #[test]
@@ -536,8 +636,9 @@ fn hub_list_owned_sessions_remote_returns_sessions_array() {
               connect = function(_) return "conn-remote" end,
               request = function(conn_id, command)
                 assert(conn_id == "conn-remote")
-                assert(command.type == "list_owned_sessions")
-                assert(command.owner_plugin == "workflow")
+                assert(command.type == "hub_command")
+                assert(command.command.type == "list_owned_sessions")
+                assert(command.command.owner_plugin == "workflow")
                 return {{
                   result = {{
                     ok = true,
@@ -584,6 +685,189 @@ fn hub_list_owned_sessions_remote_returns_sessions_array() {
         ))
         .eval()
         .expect("remote list_owned_sessions should return sessions array");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn hub_get_defaults_to_parent_hub_inside_plugin_worker() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let dir = lua_src_dir();
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{dir}/?.lua;{dir}/?/init.lua;" .. package.path
+
+            _plugin_worker_parent_hub_id = "hub-parent"
+            hub = {{ hub_id = function() return "plugin-worker:vault" end }}
+            events = {{ emit = function() end }}
+
+            local seen = {{}}
+            plugin_worker_parent_hub = {{
+              request = function(command)
+                seen.command = command
+                return {{ result = {{ ok = true, status = "pending", request_id = command.command.request_id }} }}
+              end,
+            }}
+
+            package.loaded["hub.state"] = {{
+              class = function(_)
+                local cls = {{}}
+                cls.__index = cls
+                return cls
+              end,
+              get = function(_, default) return default end,
+            }}
+            package.loaded["lib.agent"] = {{
+              list = function() error("worker Hub.get() must not use local Agent") end,
+              all_info = function() return {{}} end,
+            }}
+            package.loaded["lib.internal_client"] = {{
+              dispatch = function() error("worker Hub.get() must not dispatch locally") end,
+            }}
+
+            local Hub = require("lib.hub")
+            local result = Hub.get():create_agent({{
+              issue_or_branch = "main",
+              prompt = "process inbox",
+              agent_name = "codex",
+              target_id = "target-1",
+              target_path = "/repo",
+              target_repo = "repo",
+              metadata = {{ owner_plugin = "knowledge-inbox-pipeline" }},
+            }})
+
+            assert(seen.command.type == "hub_command")
+            assert(seen.command.command.type == "create_agent")
+            assert(seen.command.command.metadata.owner_plugin == "knowledge-inbox-pipeline")
+            assert(seen.command.command.target_id == "target-1")
+            assert(result.status == "pending")
+            return "ok"
+            "#,
+            dir = dir.display()
+        ))
+        .eval()
+        .expect("plugin worker Hub.get should proxy to parent hub");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn agent_session_lookups_proxy_to_parent_hub_inside_plugin_worker() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let dir = lua_src_dir();
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{dir}/?.lua;{dir}/?/init.lua;" .. package.path
+
+            _plugin_worker_parent_hub_id = "hub-parent"
+            hub = {{ hub_id = function() return "plugin-worker:vault" end }}
+            events = {{ emit = function() end }}
+            local request_count = 0
+            plugin_worker_parent_hub = {{
+              request = function(command)
+                request_count = request_count + 1
+                if command.type == "get_agent_list" then
+                  return {{
+                    result = {{
+                      {{
+                        id = "sess-worker",
+                        session_uuid = "sess-worker",
+                        session_type = "agent",
+                        label = "Knowledge Worker",
+                        workspace_name = "Vault",
+                        target_path = "/Users/jasonconigliari/knowledge",
+                        metadata = {{ owner_plugin = "knowledge-inbox-pipeline" }},
+                        status = "running",
+                      }},
+                    }},
+                  }}
+                end
+                error("unexpected command " .. tostring(command.type))
+              end,
+            }}
+            package.loaded["hub.state"] = {{
+              class = function(name)
+                local cls = {{}}
+                cls.__index = cls
+                return cls
+              end,
+              get = function(_, default) return default end,
+            }}
+
+            local Agent = require("lib.agent")
+            local Session = require("lib.session")
+            local list = Agent.list()
+            local found = Agent.get("sess-worker")
+            local by_meta = Session.find_by_meta("owner_plugin", "knowledge-inbox-pipeline")
+
+            assert(#list == 1)
+            assert(found and found:info().session_uuid == "sess-worker")
+            assert(#by_meta == 1)
+            assert(request_count == 1, "expected cached parent list lookup, got " .. tostring(request_count))
+            return "ok"
+            "#,
+            dir = dir.display()
+        ))
+        .eval()
+        .expect("worker Agent/Session lookups should proxy to parent hub");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn hub_proxy_uses_parent_bridge_inside_plugin_worker() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let dir = lua_src_dir();
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{dir}/?.lua;{dir}/?/init.lua;" .. package.path
+
+            _plugin_worker_parent_hub_id = "hub-parent"
+            hub = {{ hub_id = function() return "plugin-worker:vault" end }}
+            events = {{ emit = function() end }}
+
+            local request_count = 0
+            plugin_worker_parent_hub = {{
+              request = function(command)
+                request_count = request_count + 1
+                assert(command.type == "get_agent_list")
+                return {{ result = {{ {{ session_uuid = "sess-parent-bridge" }} }} }}
+              end,
+            }}
+            package.loaded["hub.state"] = {{
+              class = function(_)
+                local cls = {{}}
+                cls.__index = cls
+                return cls
+              end,
+              get = function(_, default) return default end,
+            }}
+            package.loaded["lib.agent"] = {{
+              all_info = function() return {{}} end,
+            }}
+            package.loaded["lib.internal_client"] = {{
+              dispatch = function() error("worker Hub.get() must not dispatch locally") end,
+            }}
+
+            local Hub = require("lib.hub")
+            local sessions = Hub.get():list_agents()
+            assert(request_count == 1)
+            assert(sessions[1].session_uuid == "sess-parent-bridge")
+            return "ok"
+            "#,
+            dir = dir.display()
+        ))
+        .eval()
+        .expect("worker Hub proxy should use parent bridge");
 
     assert_eq!(result, "ok");
 }

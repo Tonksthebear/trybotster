@@ -23,6 +23,8 @@ local remote_hubs = state.get("hub_remote_registry", {})
 
 -- Local hub ID (cached on first access)
 local self_id = hub.hub_id()
+local worker_parent_hub_id = rawget(_G, "_plugin_worker_parent_hub_id")
+local in_plugin_worker = type(worker_parent_hub_id) == "string" and worker_parent_hub_id ~= ""
 
 -- =============================================================================
 -- Envelope Helpers
@@ -104,6 +106,54 @@ local function dispatch_local_command_response(command)
     return response or { ok = true }
 end
 
+local function reconnectable_error(err)
+    err = tostring(err)
+    return err:find("not found or closed", 1, true)
+        or err:find("connection", 1, true)
+        or err:find("closed", 1, true)
+        or err:find("broken pipe", 1, true)
+end
+
+local function remote_request(self, payload, timeout_ms)
+    if in_plugin_worker and self._is_worker_parent then
+        local bridge = rawget(_G, "plugin_worker_parent_hub")
+        if not bridge or type(bridge.request) ~= "function" then
+            error("plugin worker parent hub bridge is unavailable")
+        end
+        return bridge.request(payload, timeout_ms or 10000)
+    end
+
+    local ok, result = pcall(hub_client.request, self._conn_id, payload, timeout_ms or 10000)
+    if ok then
+        return result
+    end
+
+    if not reconnectable_error(result) then
+        error(result)
+    end
+
+    Hub.unregister(self.id)
+    local fresh = Hub.get(self.id)
+    self._conn_id = fresh._conn_id
+    return hub_client.request(self._conn_id, payload, timeout_ms or 10000)
+end
+
+local function dispatch_remote_command_response(self, command, timeout_ms)
+    command.request_id = command.request_id or generate_msg_id()
+    local result = remote_request(self, {
+        type = "hub_command",
+        command = command,
+    }, timeout_ms or 10000)
+    if result.error then
+        error(result.error)
+    end
+    local response = result.result or {}
+    if response.ok == false then
+        error(response.error or "command failed")
+    end
+    return response
+end
+
 local function loading_plugin_name()
     local display_name = rawget(_G, "_loading_plugin_display_name")
     if type(display_name) == "string" and display_name ~= "" then return display_name end
@@ -144,7 +194,61 @@ local function new_hub(hub_id, is_local, conn_id)
         id = hub_id,
         _is_local = is_local,
         _conn_id = conn_id,
+        _is_worker_parent = in_plugin_worker and hub_id == worker_parent_hub_id,
     }, Hub)
+end
+
+function Hub._handle_worker_parent_request(payload)
+    if type(payload) ~= "table" then
+        return { error = "worker parent hub request payload must be a table" }
+    end
+
+    local kind = payload.type
+    local local_hub = new_hub(self_id, true, nil)
+
+    if kind == "hub_command" then
+        local response = dispatch_local_command_response(payload.command or {})
+        return { result = response }
+    end
+
+    if kind == "get_agent_list" then
+        return { result = Agent.all_info() }
+    end
+
+    if kind == "list_workspaces" then
+        return { result = local_hub:list_workspaces() }
+    end
+
+    if kind == "get_pty_snapshot" then
+        return { result = local_hub:get_pty_snapshot(payload.agent_id, payload.session) }
+    end
+
+    if kind == "send_message" then
+        return { result = local_hub:send_message(payload.agent_id, payload.text, payload.session) }
+    end
+
+    if kind == "post_message" then
+        return {
+            result = local_hub:post(payload.agent_id, {
+                type = payload.msg_type,
+                payload = payload.payload,
+                reply_to = payload.reply_to,
+                expires_in = payload.expires_in,
+                session = payload.session,
+                from_agent_id = payload.from_agent_id,
+            }),
+        }
+    end
+
+    if kind == "receive_messages" then
+        return { result = local_hub:receive_messages(payload.agent_id) }
+    end
+
+    if kind == "create_agent" then
+        return { result = local_hub:create_agent(payload) }
+    end
+
+    return { error = string.format("unsupported worker parent hub request: %s", tostring(kind)) }
 end
 
 -- =============================================================================
@@ -195,6 +299,10 @@ end
 -- @param hub_id string|nil Hub identifier (nil = local)
 -- @return Hub instance
 function Hub.get(hub_id)
+    if in_plugin_worker and (not hub_id or hub_id == self_id) then
+        return new_hub(worker_parent_hub_id, false, nil)
+    end
+
     -- nil or self -> local
     if not hub_id or hub_id == self_id then
         return new_hub(self_id, true, nil)
@@ -225,6 +333,9 @@ end
 -- @param hub_id string|nil Hub identifier
 -- @return boolean
 function Hub.is_local(hub_id)
+    if in_plugin_worker and (not hub_id or hub_id == self_id) then
+        return false
+    end
     return not hub_id or hub_id == self_id
 end
 
@@ -277,7 +388,7 @@ function Hub:get_pty_snapshot(agent_id, session)
     end
 
     -- Remote: blocking request via hub_client.request()
-    local result = hub_client.request(self._conn_id, {
+    local result = remote_request(self, {
         type = "get_pty_snapshot",
         agent_id = agent_id,
         session = session,
@@ -310,7 +421,7 @@ function Hub:send_message(agent_id, text, session)
         return "Message sent"
     end
 
-    local result = hub_client.request(self._conn_id, {
+    local result = remote_request(self, {
         type = "send_message",
         agent_id = agent_id,
         session = session,
@@ -403,7 +514,7 @@ function Hub:post(agent_id, opts)
     end
 
     -- Remote hub: RPC to target hub which handles inbox write and doorbell
-    local result = hub_client.request(self._conn_id, {
+    local result = remote_request(self, {
         type          = "post_message",
         agent_id      = agent_id,
         msg_type      = msg_type,
@@ -438,7 +549,7 @@ function Hub:receive_messages(agent_id)
         return messages
     end
 
-    local result = hub_client.request(self._conn_id, {
+    local result = remote_request(self, {
         type = "receive_messages",
         agent_id = agent_id,
     }, 10000)
@@ -560,13 +671,7 @@ function Hub:create_agent(issue_or_branch, prompt, agent_name, workspace_id, wor
         }
     end
 
-    local result = hub_client.request(self._conn_id, command, 60000)
-
-    if result.error then
-        error(string.format("Hub:create_agent remote error: %s", result.error))
-    end
-
-    return result.result
+    return dispatch_remote_command_response(self, command, 60000)
 end
 
 --- List sessions owned by a plugin.
@@ -589,20 +694,30 @@ function Hub:list_owned_sessions(owner_plugin)
         return owned
     end
 
-    local result = hub_client.request(self._conn_id, {
+    local response = dispatch_remote_command_response(self, {
         type = "list_owned_sessions",
         owner_plugin = owner_plugin,
     }, 10000)
+    return response.sessions or response
+end
+
+--- List sessions visible on this hub.
+-- Local: returns hub Agent state. Remote: requests the parent/remote hub list.
+-- @return array Session info tables
+function Hub:list_agents()
+    if self._is_local then
+        return Agent.all_info()
+    end
+
+    local result = remote_request(self, {
+        type = "get_agent_list",
+    }, 10000)
 
     if result.error then
-        error(string.format("Hub:list_owned_sessions remote error: %s", result.error))
+        error(string.format("Hub:list_agents remote error: %s", result.error))
     end
 
-    local response = result.result or {}
-    if response.sessions then
-        return response.sessions
-    end
-    return response
+    return result.result or {}
 end
 
 --- Publish an authoritative plugin entity snapshot.
@@ -615,6 +730,17 @@ end
 -- @param opts table|nil { owner_plugin = string }
 -- @return table { entity_type, count }
 function Hub:entity_snapshot(entity_type, items, opts)
+    opts = opts or {}
+    if not self._is_local then
+        return dispatch_remote_command_response(self, {
+            type = "plugin_entity_publish",
+            op = "snapshot",
+            entity_type = entity_type,
+            items = items,
+            owner_plugin = opts.owner_plugin or owner_plugin_from_opts(opts),
+        }, 10000)
+    end
+
     local eb = ensure_local_entity_publish_api(self, "entity_snapshot")
     assert_plugin_publish(eb, entity_type, opts, "entity_snapshot")
     eb.snapshot(entity_type, items)
@@ -627,6 +753,17 @@ end
 -- @param opts table|nil { owner_plugin = string }
 -- @return table { entity_type, id }
 function Hub:entity_upsert(entity_type, entity, opts)
+    opts = opts or {}
+    if not self._is_local then
+        return dispatch_remote_command_response(self, {
+            type = "plugin_entity_publish",
+            op = "upsert",
+            entity_type = entity_type,
+            entity = entity,
+            owner_plugin = opts.owner_plugin or owner_plugin_from_opts(opts),
+        }, 10000)
+    end
+
     local eb = ensure_local_entity_publish_api(self, "entity_upsert")
     local entry = assert_plugin_publish(eb, entity_type, opts, "entity_upsert")
     local id = entity and (entity[entry.id_field] or entity.id) or nil
@@ -644,6 +781,18 @@ end
 -- @param opts table|nil { owner_plugin = string }
 -- @return table { entity_type, id }
 function Hub:entity_patch(entity_type, id, fields, opts)
+    opts = opts or {}
+    if not self._is_local then
+        return dispatch_remote_command_response(self, {
+            type = "plugin_entity_publish",
+            op = "patch",
+            entity_type = entity_type,
+            id = id,
+            fields = fields,
+            owner_plugin = opts.owner_plugin or owner_plugin_from_opts(opts),
+        }, 10000)
+    end
+
     local eb = ensure_local_entity_publish_api(self, "entity_patch")
     assert_plugin_publish(eb, entity_type, opts, "entity_patch")
     if type(id) ~= "string" or id == "" then
@@ -662,6 +811,17 @@ end
 -- @param opts table|nil { owner_plugin = string }
 -- @return table { entity_type, id }
 function Hub:entity_remove(entity_type, id, opts)
+    opts = opts or {}
+    if not self._is_local then
+        return dispatch_remote_command_response(self, {
+            type = "plugin_entity_publish",
+            op = "remove",
+            entity_type = entity_type,
+            id = id,
+            owner_plugin = opts.owner_plugin or owner_plugin_from_opts(opts),
+        }, 10000)
+    end
+
     local eb = ensure_local_entity_publish_api(self, "entity_remove")
     assert_plugin_publish(eb, entity_type, opts, "entity_remove")
     if type(id) ~= "string" or id == "" then
@@ -682,48 +842,17 @@ function Hub:list_workspaces()
         end
 
         local ws = require("lib.workspace_store")
-        local workspaces = ws.list_workspaces(data_dir)
-        local counts_by_id = {}
-
-        for _, session in ipairs(Agent.all_info()) do
-            local ws_id = session.workspace_id
-            if ws_id then
-                if not counts_by_id[ws_id] then
-                    counts_by_id[ws_id] = {
-                        agents = {},
-                        session_counts = { agent = 0, accessory = 0, other = 0 },
-                    }
-                end
-                local rec = counts_by_id[ws_id]
-                rec.agents[#rec.agents + 1] = session.id
-                if session.session_type == "agent" then
-                    rec.session_counts.agent = rec.session_counts.agent + 1
-                elseif session.session_type == "accessory" then
-                    rec.session_counts.accessory = rec.session_counts.accessory + 1
-                else
-                    rec.session_counts.other = rec.session_counts.other + 1
-                end
-            end
-        end
-
-        local result = {}
-        for _, workspace in ipairs(workspaces) do
-            local counts = counts_by_id[workspace.id]
-            workspace.agents = counts and counts.agents or {}
-            workspace.session_counts = counts and counts.session_counts or {
-                agent = 0,
-                accessory = 0,
-                other = 0,
-            }
-            -- Only return workspaces with running sessions
-            if counts then
-                table.insert(result, workspace)
-            end
-        end
-
-        return result
+        return ws.build_workspace_groups(data_dir, Agent.all_info())
     end
-    error("Hub:list_workspaces is local-only; remote clients receive workspace entities")
+    local result = remote_request(self, {
+        type = "list_workspaces",
+    }, 10000)
+
+    if result.error then
+        error(string.format("Hub:list_workspaces remote error: %s", result.error))
+    end
+
+    return result.result
 end
 
 --- Rename a workspace on this hub.
@@ -743,17 +872,15 @@ function Hub:rename_workspace(workspace_id, new_name)
         }
     end
 
-    local result = hub_client.request(self._conn_id, {
+    local response = dispatch_remote_command_response(self, {
         type = "rename_workspace",
         workspace_id = workspace_id,
         new_name = new_name,
     }, 10000)
-
-    if result.error then
-        error(string.format("Hub:rename_workspace remote error: %s", result.error))
-    end
-
-    return result.result
+    return {
+        workspace_id = response.workspace_id or workspace_id,
+        name = response.name or new_name,
+    }
 end
 
 --- Move a live session to another workspace.
@@ -784,18 +911,12 @@ function Hub:move_agent_workspace(agent_id, workspace_id, workspace_name)
         }
     end
 
-    local result = hub_client.request(self._conn_id, {
+    return dispatch_remote_command_response(self, {
         type = "move_agent_workspace",
         agent_id = agent_id,
         workspace_id = workspace_id,
         workspace_name = workspace_name,
     }, 10000)
-
-    if result.error then
-        error(string.format("Hub:move_agent_workspace remote error: %s", result.error))
-    end
-
-    return result.result
 end
 
 --- Update a session's label or task on this hub.
@@ -811,6 +932,10 @@ function Hub:update_session(agent_id, fields)
             session_uuid = agent_id,
             label = fields.label,
             task = fields.task,
+            metadata = fields.metadata,
+            owner_plugin = fields.owner_plugin,
+            visibility = fields.visibility,
+            surface = fields.surface,
         })
         local session = Agent.get(response.session_uuid or agent_id)
         if not session then
@@ -819,18 +944,16 @@ function Hub:update_session(agent_id, fields)
         return session_payload(session)
     end
 
-    local result = hub_client.request(self._conn_id, {
+    return dispatch_remote_command_response(self, {
         type = "update_session",
         agent_id = agent_id,
         label = fields.label,
         task = fields.task,
+        metadata = fields.metadata,
+        owner_plugin = fields.owner_plugin,
+        visibility = fields.visibility,
+        surface = fields.surface,
     }, 10000)
-
-    if result.error then
-        error(string.format("Hub:update_session remote error: %s", result.error))
-    end
-
-    return result.result
 end
 
 --- Delete an agent on this hub.
@@ -865,26 +988,20 @@ function Hub:delete_agent(agent_id, delete_worktree)
         return "Delete requested: " .. resolved_id
     end
 
-    local result = hub_client.request(self._conn_id, {
+    return dispatch_remote_command_response(self, {
         type = "delete_agent",
         agent_id = agent_id,
         delete_worktree = delete_worktree or false,
     }, 30000)
-
-    if result.error then
-        error(string.format("Hub:delete_agent remote error: %s", result.error))
-    end
-
-    return result.result
 end
 
 --- List sessions on the local hub.
 -- @return array of agent info tables
 function Hub:agent_list()
-    if self._is_local then
-        return require("lib.client_session_payload").build_many(Agent.all_info())
+    if not self._is_local then
+        return self:list_agents()
     end
-    error("Hub:agent_list is local-only; remote clients receive session entities")
+    return require("lib.client_session_payload").build_many(Agent.all_info())
 end
 
 -- =============================================================================

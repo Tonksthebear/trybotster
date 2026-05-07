@@ -9,6 +9,17 @@ local repo = require("project_pipelines.repo")
 local view = require("project_pipelines.web.ui")
 
 local M = {}
+local PERF = os.getenv("BOTSTER_LUA_PERF") == "1"
+
+local function elapsed_ms(started)
+    return math.floor(((os.clock() - started) * 1000) + 0.5)
+end
+
+local function log_perf(message)
+    if PERF and log and log.info then
+        log.info("[PERF][project_pipelines.project] " .. message)
+    end
+end
 
 local function sorted_project_tickets(project_id)
     local tickets = repo.project_tickets(project_id)
@@ -175,14 +186,52 @@ local function timeline_nodes(project_id, ctx)
 end
 
 function M.render(view_state, ctx)
+    local render_started = PERF and os.clock() or nil
     local params = view_state and view_state.params or {}
+    local started = PERF and os.clock() or nil
     local project = repo.get_project(params.project_id)
+    if started then
+        log_perf(string.format(
+            "phase=get_project project_id=%s elapsed_ms=%d",
+            tostring(params.project_id),
+            elapsed_ms(started)))
+    end
     if not project then
         return view.panel{ ui.text{ text = "Project not found", tone = "danger" } }
     end
+    started = PERF and os.clock() or nil
     local overview = repo.project_dependency_overview(project.id)
+    if started then
+        log_perf(string.format(
+            "phase=dependency_overview project_id=%s tickets=%d elapsed_ms=%d",
+            tostring(project.id),
+            #(overview and overview.tickets or {}),
+            elapsed_ms(started)))
+    end
 
-    return ui.stack{ direction = "vertical", gap = "4", children = {
+    started = PERF and os.clock() or nil
+    local target_nodes = project_target_nodes(project.id)
+    if started then
+        log_perf(string.format(
+            "phase=project_targets project_id=%s nodes=%d elapsed_ms=%d",
+            tostring(project.id),
+            #target_nodes,
+            elapsed_ms(started)))
+    end
+
+    started = PERF and os.clock() or nil
+    local dependency_nodes = dependency_tree_nodes(project.id, ctx, overview)
+    if started then
+        log_perf(string.format(
+            "phase=dependency_tree project_id=%s nodes=%d elapsed_ms=%d",
+            tostring(project.id),
+            #dependency_nodes,
+            elapsed_ms(started)))
+    end
+
+    local timeline = timeline_nodes(project.id, ctx)
+
+    local node = ui.stack{ direction = "vertical", gap = "4", children = {
         view.page_header{
             title = project.name,
             back_id = "project-" .. project.id .. "-back",
@@ -200,10 +249,17 @@ function M.render(view_state, ctx)
             },
             description = project.description or "",
         },
-        view.section("Project Targets", project_target_nodes(project.id)),
-        view.section("Dependency Tree", dependency_tree_nodes(project.id, ctx, overview)),
-        view.section("Chronological Timeline", timeline_nodes(project.id, ctx)),
+        view.section("Project Targets", target_nodes),
+        view.section("Dependency Tree", dependency_nodes),
+        view.section("Chronological Timeline", timeline),
     } }
+    if render_started then
+        log_perf(string.format(
+            "phase=render_total project_id=%s elapsed_ms=%d",
+            tostring(project.id),
+            elapsed_ms(render_started)))
+    end
+    return node
 end
 
 return M

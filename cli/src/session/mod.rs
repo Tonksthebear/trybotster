@@ -334,6 +334,8 @@ fn run_session(
             rows: 24,
             cols: 80,
             last_output_at: 0,
+            title: None,
+            cwd: None,
             mode_flags: ModeFlags::default(),
         },
     )
@@ -661,6 +663,8 @@ fn run_session(
                                 rows,
                                 cols,
                                 last_output_at: last_output_at.load(Ordering::Relaxed),
+                                title: parser_title(&parser),
+                                cwd: parser_cwd(&parser),
                                 mode_flags: parser_mode_flags(&parser),
                             },
                         );
@@ -907,6 +911,29 @@ fn parser_mode_flags(parser: &Arc<Mutex<TerminalParser>>) -> ModeFlags {
             application_cursor: p.application_cursor(),
         })
         .unwrap_or_default()
+}
+
+fn parser_title(parser: &Arc<Mutex<TerminalParser>>) -> Option<String> {
+    parser
+        .lock()
+        .ok()
+        .map(|p| p.terminal().title())
+        .filter(|title| !title.is_empty())
+}
+
+fn parser_cwd(parser: &Arc<Mutex<TerminalParser>>) -> Option<String> {
+    parser
+        .lock()
+        .ok()
+        .map(|p| {
+            let raw = p.terminal().pwd();
+            if let Some(rest) = raw.strip_prefix("file://") {
+                rest.find('/').map(|i| rest[i..].to_string()).unwrap_or(raw)
+            } else {
+                raw
+            }
+        })
+        .filter(|cwd| !cwd.is_empty())
 }
 
 // ─── Reader loop ─────────────────────────────────────────────────────────────

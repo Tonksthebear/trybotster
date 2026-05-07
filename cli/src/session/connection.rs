@@ -103,6 +103,8 @@ impl SessionConnection {
                 rows: 24,
                 cols: 80,
                 last_output_at: 0,
+                title: None,
+                cwd: None,
                 mode_flags: ModeFlags::default(),
             },
         }
@@ -309,10 +311,10 @@ impl SessionConnection {
     }
 
     /// Connect to a session process and seed reconnect state from handshake metadata.
-    pub fn connect_and_seed(socket_path: &Path) -> Result<(Self, Option<ModeFlags>)> {
+    pub fn connect_and_seed(socket_path: &Path) -> Result<(Self, SessionMetadata)> {
         let conn = Self::connect(socket_path)?;
-        let mode_flags = Some(conn.metadata.mode_flags.clone());
-        Ok((conn, mode_flags))
+        let metadata = conn.metadata.clone();
+        Ok((conn, metadata))
     }
 
     /// Send a ping and wait for pong.
