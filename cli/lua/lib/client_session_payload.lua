@@ -64,17 +64,17 @@ local DERIVATION_INPUTS = {
 
 local function display_name_for(session)
     if type(session) ~= "table" then return nil end
-    -- Mirrors the web/TUI displayName selector logic: label > display_name >
-    -- title > session_uuid. Hub-side computation matters because patches go
-    -- straight to the client store without re-running selectors.
-    if type(session.label) == "string" and session.label ~= "" then
-        return session.label
-    end
-    if type(session.display_name) == "string" and session.display_name ~= "" then
-        return session.display_name
-    end
+    -- Mirrors Session:info(): display_name is derived from live terminal title,
+    -- then configured agent name, then branch. Label stays a separate client
+    -- field; clients may choose to prefer it when rendering the primary name.
     if type(session.title) == "string" and session.title ~= "" then
         return session.title
+    end
+    if type(session.agent_name) == "string" and session.agent_name ~= "" then
+        return session.agent_name
+    end
+    if type(session.branch_name) == "string" and session.branch_name ~= "" then
+        return session.branch_name
     end
     return session.session_uuid
 end

@@ -118,6 +118,21 @@ describe('<UiTree>', () => {
     expect(await screen.findByText('hello world')).toBeInTheDocument()
   })
 
+  it('renders a single child object without crashing', async () => {
+    render(<UiTree hubId="hub-1" targetSurface="workspace_panel" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'workspace_panel',
+        tree: {
+          type: 'panel',
+          children: { type: 'text', props: { text: 'single child' } },
+        },
+      })
+    })
+    expect(await screen.findByText('single child')).toBeInTheDocument()
+  })
+
   it('requests entity snapshots named by surface bindings', async () => {
     const boundTree = {
       type: 'list',
@@ -584,6 +599,49 @@ describe('<UiTree> subpath wire protocol (Phase 4b)', () => {
     await act(async () => {
       await new Promise((r) => setTimeout(r, 120))
     })
+    const subpathCalls = fakeTransport.sendCommand.mock.calls.filter(
+      ([, body]) => body?.envelope?.id === 'botster.surface.subpath',
+    )
+    expect(subpathCalls).toHaveLength(1)
+    expect(subpathCalls[0][1]).toEqual({
+      target_surface: 'kanban',
+      envelope: {
+        id: 'botster.surface.subpath',
+        payload: { target_surface: 'kanban', subpath: '/board/42' },
+      },
+    })
+  })
+
+  it('does not duplicate surface.subpath when connected listener registration is immediate-safe', async () => {
+    const connectedSpy = vi.fn((callback) => {
+      callback(fakeTransport)
+      return () => {}
+    })
+    fakeTransport.onConnected = connectedSpy
+
+    render(<UiTree hubId="hub-1" targetSurface="kanban" subpath="/" />)
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 120))
+    })
+
+    const subpathCalls = fakeTransport.sendCommand.mock.calls.filter(
+      ([, body]) => body?.envelope?.id === 'botster.surface.subpath',
+    )
+    expect(subpathCalls).toHaveLength(1)
+    expect(connectedSpy).not.toHaveBeenCalled()
+  })
+
+  it('resends surface.subpath on a future connected event', async () => {
+    render(<UiTree hubId="hub-1" targetSurface="kanban" subpath="/board/42" />)
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 120))
+    })
+    fakeTransport.sendCommand.mockClear()
+
+    await act(async () => {
+      fakeTransport.emit('connected', fakeTransport)
+    })
+
     const subpathCalls = fakeTransport.sendCommand.mock.calls.filter(
       ([, body]) => body?.envelope?.id === 'botster.surface.subpath',
     )

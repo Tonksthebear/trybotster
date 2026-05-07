@@ -40,7 +40,7 @@ impl Hub {
                 generation
             );
             match crate::session::connection::SessionConnection::connect_and_seed(&socket_path) {
-                Ok((conn, mode_flags)) => {
+                Ok((conn, metadata)) => {
                     log::info!(
                         "[Session] Reconnect handshake succeeded for '{}'",
                         &session_uuid[..session_uuid.len().min(16)]
@@ -49,7 +49,7 @@ impl Hub {
                         session_uuid,
                         generation,
                         conn,
-                        mode_flags,
+                        metadata,
                     });
                 }
                 Err(e) => {

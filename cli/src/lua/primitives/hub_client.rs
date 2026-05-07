@@ -445,11 +445,20 @@ pub(crate) fn register(
                     Frame::Json(data_json).encode()
                 };
                 let sent = {
-                    let senders = frames.lock().expect("HubClientFrameSenders mutex poisoned");
-                    if let Some(tx) = senders.get(&connection_id) {
-                        tx.send(frame_bytes).is_ok()
-                    } else {
-                        false
+                    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+                    loop {
+                        let maybe_tx = {
+                            let senders =
+                                frames.lock().expect("HubClientFrameSenders mutex poisoned");
+                            senders.get(&connection_id).cloned()
+                        };
+                        if let Some(tx) = maybe_tx {
+                            break tx.send(frame_bytes.clone()).is_ok();
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            break false;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
                     }
                 };
                 if !sent {

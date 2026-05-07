@@ -61,7 +61,7 @@ impl Hub {
         session_uuid: String,
         generation: u64,
         mut conn: crate::session::connection::SessionConnection,
-        mode_flags: Option<crate::session::protocol::ModeFlags>,
+        metadata: crate::session::protocol::SessionMetadata,
     ) {
         let valid = self
             .pending_reconnects
@@ -122,12 +122,14 @@ impl Hub {
             }
         }
 
-        if let Some(flags) = mode_flags {
-            pty.kitty_enabled_arc()
-                .store(flags.kitty_enabled, std::sync::atomic::Ordering::Relaxed);
-            pty.cursor_visible_arc()
-                .store(flags.cursor_visible, std::sync::atomic::Ordering::Relaxed);
-        }
+        pty.kitty_enabled_arc().store(
+            metadata.mode_flags.kitty_enabled,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        pty.cursor_visible_arc().store(
+            metadata.mode_flags.cursor_visible,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
         self.pending_reconnects.remove(&session_uuid);
         self.hub_event_metrics.record_counter("reconnect.ready", 1);
@@ -137,7 +139,11 @@ impl Hub {
             &session_uuid[..session_uuid.len().min(16)]
         );
 
-        let data = serde_json::json!({ "session_uuid": session_uuid });
+        let data = serde_json::json!({
+            "session_uuid": session_uuid,
+            "title": metadata.title,
+            "cwd": metadata.cwd,
+        });
         if let Err(e) = self.lua.fire_json_event("session_reconnected", &data) {
             log::error!("[Session] Failed to fire session_reconnected: {e}");
         }

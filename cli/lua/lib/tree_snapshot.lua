@@ -14,6 +14,18 @@ local state = require("hub.state")
 
 local M = {}
 
+local PERF = os.getenv("BOTSTER_LUA_PERF") == "1"
+
+local function elapsed_ms(started)
+    return math.floor(((os.clock() - started) * 1000) + 0.5)
+end
+
+local function log_perf(message)
+    if PERF and log and log.info then
+        log.info("[PERF][ui_tree_snapshot] " .. message)
+    end
+end
+
 -- (surface_name, subpath) -> version. Single global table; reload-safe via
 -- hub.state.
 local versions = state.get("tree_snapshot.versions", {})
@@ -59,6 +71,16 @@ local function fnv1a64_hex(s)
     return string.format("%08x%08x", hi, lo)
 end
 
+local function tree_version_hash(s)
+    if type(web_layout) == "table" and type(web_layout.version_hash) == "function" then
+        local ok, hash = pcall(web_layout.version_hash, s or "")
+        if ok and type(hash) == "string" and hash ~= "" then
+            return hash
+        end
+    end
+    return fnv1a64_hex(s)
+end
+
 -- -------------------------------------------------------------------------
 -- Frame construction
 -- -------------------------------------------------------------------------
@@ -68,16 +90,30 @@ local function bucket_key(surface_name, subpath)
 end
 
 local function render_one(surface_name, surface_state)
+    local started = PERF and os.clock() or nil
     local ok, result_json = pcall(function()
         return web_layout.render(surface_name, surface_state)
     end)
     if not ok then
+        if started then
+            log_perf(string.format(
+                "surface=%s phase=render failed elapsed_ms=%d",
+                tostring(surface_name),
+                elapsed_ms(started)))
+        end
         log.warn(string.format(
             "tree_snapshot: web_layout.render failed for %s: %s",
             surface_name, tostring(result_json)))
         return nil
     end
     if type(result_json) ~= "string" then
+        if started then
+            log_perf(string.format(
+                "surface=%s phase=render invalid_type=%s elapsed_ms=%d",
+                tostring(surface_name),
+                type(result_json),
+                elapsed_ms(started)))
+        end
         log.warn(string.format(
             "tree_snapshot: render returned %s for %s",
             type(result_json), surface_name))
@@ -86,6 +122,13 @@ local function render_one(surface_name, surface_state)
 
     local tree, decode_err = json.decode(result_json)
     if type(tree) ~= "table" then
+        if started then
+            log_perf(string.format(
+                "surface=%s phase=decode failed bytes=%d elapsed_ms=%d",
+                tostring(surface_name),
+                #result_json,
+                elapsed_ms(started)))
+        end
         log.warn(string.format(
             "tree_snapshot: tree decode failed for %s: %s",
             surface_name, tostring(decode_err)))
@@ -93,9 +136,9 @@ local function render_one(surface_name, surface_state)
     end
 
     local subpath = (type(surface_state) == "table") and surface_state.path or nil
-    local tree_version = fnv1a64_hex(result_json)
+    local tree_version = tree_version_hash(result_json)
 
-    return {
+    local frame = {
         v = 2,
         type = "ui_tree_snapshot",
         target_surface = surface_name,
@@ -104,6 +147,15 @@ local function render_one(surface_name, surface_state)
         hub_id = (type(surface_state) == "table") and surface_state.hub_id or nil,
         subpath = subpath,
     }
+    if started then
+        log_perf(string.format(
+            "surface=%s subpath=%s phase=render bytes=%d elapsed_ms=%d",
+            tostring(surface_name),
+            tostring(subpath or "/"),
+            #result_json,
+            elapsed_ms(started)))
+    end
+    return frame
 end
 
 local function resolve_subpath(client, surface_name)
@@ -170,12 +222,21 @@ function M.build_frames(opts)
                 -- a minimal hub-id-only base.
                 local surface_state
                 if entry.input_builder then
+                    local input_started = PERF and os.clock() or nil
                     local ok, built = pcall(
                         entry.input_builder,
                         opts.client,
                         opts.subscription_key,
                         route_ctx
                     )
+                    if input_started then
+                        log_perf(string.format(
+                            "surface=%s subpath=%s phase=input_builder ok=%s elapsed_ms=%d",
+                            tostring(surface_name),
+                            tostring(subpath or "/"),
+                            tostring(ok),
+                            elapsed_ms(input_started)))
+                    end
                     if ok then
                         surface_state = built
                     else
@@ -275,6 +336,7 @@ function M._reset_for_tests()
 end
 
 M._fnv1a64_hex = fnv1a64_hex
+M._tree_version_hash = tree_version_hash
 M._bucket_key = bucket_key
 
 return M

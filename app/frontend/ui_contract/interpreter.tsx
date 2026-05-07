@@ -18,6 +18,15 @@ import { isBindList, isConditional } from './types'
 import { matchesCondition, useViewport } from './viewport'
 import { resolveBindings, useBindingInvalidation } from './binding'
 
+function childArray(value: UiChild[] | UiChild | null | undefined): UiChild[] {
+  if (value == null) return []
+  if (Array.isArray(value)) return value
+  if (typeof console !== 'undefined') {
+    console.warn('[ui_contract] expected children to be an array; rendering single child')
+  }
+  return [value]
+}
+
 function renderChild(
   child: UiChild,
   ctx: RenderContext,
@@ -58,14 +67,14 @@ function renderInternal(
     return null
   }
 
-  const children: ReactNode[] = (node.children ?? []).map((child, idx) =>
+  const children: ReactNode[] = childArray(node.children).map((child, idx) =>
     renderChild(child, ctx, idx),
   )
 
   const slots: Record<string, ReactNode[]> = {}
   if (node.slots) {
     for (const [slotName, slotChildren] of Object.entries(node.slots)) {
-      slots[slotName] = slotChildren.map((child, idx) =>
+      slots[slotName] = childArray(slotChildren).map((child, idx) =>
         renderChild(child, ctx, `${slotName}-${idx}`),
       )
     }

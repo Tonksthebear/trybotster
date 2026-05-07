@@ -338,7 +338,7 @@ M.events = {
     { name = "shutdown",               data = "nil",                           desc = "Hub shutting down" },
     { name = "process_exited",         data = "{session_uuid, session_name, exit_code}", desc = "PTY process exited" },
     { name = "session_process_exited", data = "{session_uuid, exit_code}",     desc = "Session process exited (distinct from PTY)" },
-    { name = "session_reconnected",    data = "{session_uuid}",               desc = "Hub reconnected to session after reader death" },
+    { name = "session_reconnected",    data = "{session_uuid, title?, cwd?}", desc = "Hub reconnected to session after reader death" },
     { name = "connection_code_ready",  data = "{url, qr_ascii}",              desc = "Pairing QR code generated" },
     { name = "connection_code_error",  data = "error string",                  desc = "Pairing code generation failed" },
     { name = "hub_recovery_state",     data = "{state, server_hub_id?, error?}", desc = "Hub recovery lifecycle (recovering/ready/error)" },

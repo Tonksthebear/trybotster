@@ -440,6 +440,73 @@ fn hub_visible_plugin_surfaces_survive_plugin_worker_bootstrap() {
 }
 
 #[test]
+fn plugin_worker_can_query_parent_hub_during_bootstrap() {
+    // SAFETY: This integration filter runs this test in isolation and the
+    // worker VM must resolve the repository Lua modules instead of user config.
+    unsafe {
+        std::env::set_var(
+            "BOTSTER_LUA_PATH",
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua"),
+        )
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let plugin_dir = tmp.path().join("worker-parent-query-plugin");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    let init_path = plugin_dir.join("init.lua");
+    fs::write(
+        &init_path,
+        r#"
+        local Hub = require("lib.hub")
+        local sessions = Hub.get():list_agents()
+        if #sessions ~= 1 then
+            error("expected one parent session, got " .. tostring(#sessions))
+        end
+        if sessions[1].session_uuid ~= "sess-parent" then
+            error("unexpected parent session: " .. tostring(sessions[1].session_uuid))
+        end
+        return {}
+        "#,
+    )
+    .unwrap();
+
+    let runtime = LuaRuntime::new().unwrap();
+    runtime
+        .lua()
+        .load(format!(
+            r#"
+            _G.hub = {{
+                hub_id = function() return "hub-parent" end,
+                server_id = function() return "hub-parent" end,
+                detect_repo = function() return "botster/test" end,
+            }}
+            package.loaded["lib.agent"] = {{
+                list = function() return {{}} end,
+                get = function() return nil end,
+                all_info = function()
+                    return {{
+                        {{
+                            session_uuid = "sess-parent",
+                            label = "Parent Session",
+                            metadata = {{}},
+                            status = "running",
+                        }},
+                    }}
+                end,
+            }}
+
+            local loader = require("hub.loader")
+            local ok, err = loader.load_plugin({init_path}, "worker-parent-query-plugin", {{ source = "device" }})
+            assert(ok, tostring(err))
+            return true
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval::<bool>()
+        .unwrap();
+}
+
+#[test]
 fn plugin_owned_asset_message_runs_in_plugin_worker_vm() {
     // SAFETY: This integration filter runs this test in isolation and the
     // worker VM must resolve the repository Lua modules instead of user config.

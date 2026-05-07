@@ -383,14 +383,9 @@ impl Hub {
                 session_uuid,
                 generation,
                 conn,
-                mode_flags,
+                metadata,
             } => {
-                self.handle_session_reconnect_ready_event(
-                    session_uuid,
-                    generation,
-                    conn,
-                    mode_flags,
-                );
+                self.handle_session_reconnect_ready_event(session_uuid, generation, conn, metadata);
             }
 
             HubEvent::SessionUnregistered { session_uuid } => {

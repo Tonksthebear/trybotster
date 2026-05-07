@@ -14,6 +14,39 @@ local M = {}
 
 -- Command registry: cmd_type -> { handler, description }
 local registry = {}
+local PERF = os.getenv("BOTSTER_LUA_PERF") == "1"
+
+local function elapsed_ms(started)
+    return math.floor(((os.clock() - started) * 1000) + 0.5)
+end
+
+local function describe_command(cmd_type, command)
+    if type(command) ~= "table" then
+        return ""
+    end
+    if cmd_type == "ui_action" then
+        local envelope = command.envelope or {}
+        local payload = envelope.payload or {}
+        return string.format(
+            " action=%s target_surface=%s subpath=%s",
+            tostring(envelope.id or command.id or ""),
+            tostring(command.target_surface or payload.target_surface or payload.surface or ""),
+            tostring(payload.subpath or payload.path or ""))
+    end
+    if cmd_type == "hub:entities" then
+        local types = command.entity_types or command.types
+        if type(types) == "table" then
+            return " entity_types=" .. table.concat(types, ",")
+        end
+    end
+    return ""
+end
+
+local function log_perf(message)
+    if PERF and log and log.info then
+        log.info("[PERF][command] " .. message)
+    end
+end
 
 local function current_plugin_key()
     local key = rawget(_G, "_loading_plugin_key") or rawget(_G, "_loading_plugin_name")
@@ -89,6 +122,7 @@ end
 function M.dispatch(client, sub_id, command)
     local hooks = require("hub.hooks")
     local cmd_type = command.type or command.command
+    local started = PERF and os.clock() or nil
 
     -- Interceptor: plugins can transform or block commands (return nil)
     local result = hooks.call("before_command", {
@@ -104,6 +138,13 @@ function M.dispatch(client, sub_id, command)
     -- Allow interceptors to replace the command
     command = result.command or command
     cmd_type = command.type or command.command
+    if started then
+        log_perf(string.format(
+            "type=%s sub=%s phase=start%s",
+            tostring(cmd_type),
+            tostring(sub_id or "nil"),
+            describe_command(cmd_type, command)))
+    end
 
     local entry = registry[cmd_type]
     if entry then
@@ -129,6 +170,15 @@ function M.dispatch(client, sub_id, command)
             log.error(string.format("Command '%s' error: %s", cmd_type, tostring(err)))
             send_failure_response(client, sub_id, command, err)
         end
+        if started then
+            log_perf(string.format(
+                "type=%s sub=%s phase=finish ok=%s elapsed_ms=%d%s",
+                tostring(cmd_type),
+                tostring(sub_id or "nil"),
+                tostring(ok),
+                elapsed_ms(started),
+                describe_command(cmd_type, command)))
+        end
         hooks.notify("after_hub_command", {
             command = cmd_type,
             client = client,
@@ -139,6 +189,13 @@ function M.dispatch(client, sub_id, command)
         return ok, err
     else
         log.debug(string.format("Unknown hub command: %s", tostring(cmd_type)))
+        if started then
+            log_perf(string.format(
+                "type=%s sub=%s phase=unknown elapsed_ms=%d",
+                tostring(cmd_type),
+                tostring(sub_id or "nil"),
+                elapsed_ms(started)))
+        end
         return false, "unknown command: " .. tostring(cmd_type)
     end
 end

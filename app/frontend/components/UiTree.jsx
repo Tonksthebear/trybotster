@@ -401,13 +401,15 @@ export default function UiTree({
   }, [transport, targetSurface, subpath])
 
   // A reconnect keeps the same transport object, so the mount/change effect
-  // above does not rerun. Re-issue the current surface request whenever the
-  // route reports connected so the hub can rebuild the tree after a dropped
-  // DataChannel.
+  // above does not rerun. Re-issue the current surface request on future
+  // connected events so the hub can rebuild the tree after a dropped
+  // DataChannel. Use the raw event subscription instead of `onConnected()`
+  // because that helper fires immediately when already connected; the mount
+  // effect above already sent the initial request.
   useEffect(() => {
     if (!transport || !targetSurface) return undefined
-    if (typeof transport.onConnected !== 'function') return undefined
-    return transport.onConnected(() => {
+    if (typeof transport.on !== 'function') return undefined
+    return transport.on('connected', () => {
       requestSurfaceSubpath(transport, targetSurface, subpath)
     })
   }, [transport, targetSurface, subpath])

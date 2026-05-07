@@ -33,6 +33,7 @@ local state = require("hub.state")
 local hooks = require("hub.hooks")
 local Agent = require("lib.agent")
 local Hub = require("lib.hub")
+local InternalClient = require("lib.internal_client")
 
 local self_id = hub.hub_id()
 
@@ -516,6 +517,7 @@ hooks.on("hub_rpc_request", "orchestrator_rpc", function(client_id, message)
     -- Resolve agent_label to session_uuid for incoming RPCs.
     local function resolve_rpc_session_uuid(msg)
         if msg.session_uuid then return msg.session_uuid end
+        if msg.agent_id then return msg.agent_id end
         if not msg.agent_label then return nil end
         for _, agent in ipairs(Agent.list()) do
             if agent.label == msg.agent_label then
@@ -527,7 +529,23 @@ hooks.on("hub_rpc_request", "orchestrator_rpc", function(client_id, message)
 
     if message.type == "send_message" then
         respond(function()
-            return local_hub:send_message(message.session_uuid, message.text, message.session)
+            local session_uuid = resolve_rpc_session_uuid(message)
+            if not session_uuid then error("No agent specified") end
+            return local_hub:send_message(session_uuid, message.text, message.session)
+        end)
+    elseif message.type == "hub_command" then
+        respond(function()
+            local command = message.command
+            if type(command) ~= "table" then
+                error("hub_command requires command table")
+            end
+            local result = InternalClient.dispatch("hub_rpc", command)
+            for _, frame in ipairs(result.frames or {}) do
+                if frame.type == "command_response" and frame.request_id == command.request_id then
+                    return frame
+                end
+            end
+            return { ok = true, request_id = command.request_id }
         end)
     elseif message.type == "get_pty_snapshot" then
         respond(function()
@@ -545,14 +563,24 @@ hooks.on("hub_rpc_request", "orchestrator_rpc", function(client_id, message)
                     target_repo = message.target_repo,
                 }
             end
-            return local_hub:create_agent(
-                message.issue_or_branch,
-                message.prompt,
-                message.agent_name,
-                message.workspace_id,
-                message.workspace_name,
-                target
-            )
+            return local_hub:create_agent({
+                issue_or_branch = message.issue_or_branch or message.branch,
+                branch = message.branch,
+                label = message.label,
+                prompt = message.prompt,
+                from_worktree = message.from_worktree,
+                agent_name = message.agent_name,
+                workspace_id = message.workspace_id,
+                workspace_name = message.workspace_name,
+                workspace_template = message.workspace_template,
+                invocation_url = message.invocation_url,
+                target_id = target and target.target_id or message.target_id,
+                target_path = target and target.target_path or message.target_path,
+                target_repo = target and target.target_repo or message.target_repo,
+                repo = message.repo,
+                metadata = message.metadata,
+                request_id = message.request_id,
+            })
         end)
     elseif message.type == "list_workspaces" then
         respond(function()
@@ -589,7 +617,9 @@ hooks.on("hub_rpc_request", "orchestrator_rpc", function(client_id, message)
         end)
     elseif message.type == "post_message" then
         respond(function()
-            return local_hub:post(message.session_uuid, {
+            local session_uuid = resolve_rpc_session_uuid(message)
+            if not session_uuid then error("No agent specified") end
+            return local_hub:post(session_uuid, {
                 type          = message.msg_type,
                 payload       = message.payload,
                 reply_to      = message.reply_to,
@@ -600,7 +630,9 @@ hooks.on("hub_rpc_request", "orchestrator_rpc", function(client_id, message)
         end)
     elseif message.type == "receive_messages" then
         respond(function()
-            return local_hub:receive_messages(message.session_uuid)
+            local session_uuid = resolve_rpc_session_uuid(message)
+            if not session_uuid then error("No agent specified") end
+            return local_hub:receive_messages(session_uuid)
         end)
     elseif message.type == "get_agent_list" then
         respond(function()

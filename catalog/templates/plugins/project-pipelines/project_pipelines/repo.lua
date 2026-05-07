@@ -9,6 +9,25 @@ local db = require("project_pipelines.db")
 local util = require("project_pipelines.util")
 
 local M = {}
+local PERF = os.getenv("BOTSTER_LUA_PERF") == "1"
+
+local function elapsed_ms(started)
+    return math.floor(((os.clock() - started) * 1000) + 0.5)
+end
+
+local function sql_label(sql)
+    local label = tostring(sql or ""):gsub("%s+", " "):gsub("^%s+", ""):gsub("%s+$", "")
+    if #label > 120 then
+        label = label:sub(1, 117) .. "..."
+    end
+    return label
+end
+
+local function log_perf(message)
+    if PERF and log and log.info then
+        log.info("[PERF][project_pipelines.repo] " .. message)
+    end
+end
 
 local PIPELINE_UPDATE_FIELDS = {
     name = true,
@@ -54,12 +73,23 @@ local PROJECT_UPDATE_FIELDS = {
 local function rows(sql, ...)
     local params = { ... }
     local result
+    local started = PERF and os.clock() or nil
     if #params == 0 then
         result = db:eval(sql)
     elseif #params == 1 then
         result = db:eval(sql, params[1])
     else
         result = db:eval(sql, params)
+    end
+    if started then
+        local count = type(result) == "table" and #result or 0
+        local elapsed = elapsed_ms(started)
+        log_perf(string.format(
+            "rows=%d params=%d elapsed_ms=%d sql=%s",
+            count,
+            #params,
+            elapsed,
+            sql_label(sql)))
     end
     if type(result) == "table" then
         return result
@@ -1116,6 +1146,66 @@ function M.ticket_session_uuids_by_ticket(ticket_ids)
     end
 
     return by_ticket, all_uuids
+end
+
+function M.ticket_session_links_for_uuids(session_uuids)
+    if type(session_uuids) ~= "table" or #session_uuids == 0 then
+        return {}
+    end
+
+    local wanted = {}
+    for _, uuid in ipairs(session_uuids) do
+        if not util.is_blank(uuid) then
+            wanted[uuid] = true
+        end
+    end
+
+    local uuid_filter, params = id_filter("rs.agent_session_uuid", session_uuids)
+    local links = {}
+    local seen = {}
+
+    local function add(uuid, ticket)
+        if util.is_blank(uuid) or not ticket or util.is_blank(ticket.id) then
+            return
+        end
+        seen[uuid] = seen[uuid] or {}
+        if seen[uuid][ticket.id] then
+            return
+        end
+        seen[uuid][ticket.id] = true
+        links[uuid] = links[uuid] or {}
+        table.insert(links[uuid], ticket)
+    end
+
+    for _, row in ipairs(rows([[SELECT rs.agent_session_uuid, t.*
+                                FROM run_steps rs
+                                JOIN runs r ON r.id = rs.run_id
+                                JOIN tickets t ON t.id = r.ticket_id
+                                WHERE rs.agent_session_uuid IS NOT NULL
+                                  AND rs.agent_session_uuid != '']] .. uuid_filter .. [[
+                                ORDER BY t.updated_at DESC, t.created_at DESC]], params)) do
+        local uuid = row.agent_session_uuid
+        row.agent_session_uuid = nil
+        add(uuid, row)
+    end
+
+    for _, event in ipairs(rows([[SELECT e.ticket_id, e.payload, t.*
+                                  FROM events e
+                                  JOIN tickets t ON t.id = e.ticket_id
+                                  WHERE e.ticket_id IS NOT NULL
+                                    AND e.kind IN ('ticket.merge_requested',
+                                                   'ticket.merge_agent_linked',
+                                                   'question.agent_linked')
+                                  ORDER BY t.updated_at DESC, t.created_at DESC]])) do
+        local payload = util.decode(event.payload, {})
+        local uuid = payload.session_uuid
+        if wanted[uuid] then
+            event.payload = nil
+            add(uuid, event)
+        end
+    end
+
+    return links
 end
 
 function M.ticket_detail_overview(ticket_id)

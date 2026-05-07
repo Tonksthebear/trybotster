@@ -28,6 +28,51 @@ local Session = state.class("Session")
 -- Session registry keyed by session_uuid (persistent across reloads)
 local sessions = state.get("agent_registry", {})
 
+local function plugin_worker_hub_proxy_enabled()
+    local parent_hub_id = rawget(_G, "_plugin_worker_parent_hub_id")
+    return type(parent_hub_id) == "string" and parent_hub_id ~= ""
+end
+
+local proxy_cache = {
+    loaded_at = 0,
+    by_key = {},
+}
+
+local function proxy_session_info(info)
+    if type(info) ~= "table" then return info end
+    if info.__botster_session_proxy then return info end
+    info.__botster_session_proxy = true
+    info.info = function(self) return self end
+    info.update = function(self, fields)
+        return require("lib.hub").get():update_session(self.session_uuid or self.id, fields or {})
+    end
+    info.close = function(self, delete_worktree)
+        return require("lib.hub").get():delete_agent(self.session_uuid or self.id, delete_worktree or false)
+    end
+    return info
+end
+
+local function proxy_session_list(opts)
+    opts = opts or {}
+    local key = opts.include_system and "include_system" or "default"
+    local now = os.clock()
+    local cached = proxy_cache.by_key[key]
+    if cached and (now - cached.loaded_at) <= 1 then
+        return cached.list
+    end
+
+    local list = require("lib.hub").get():list_agents(opts)
+    local out = {}
+    for _, info in ipairs(list or {}) do
+        out[#out + 1] = proxy_session_info(info)
+    end
+    proxy_cache.by_key[key] = {
+        loaded_at = now,
+        list = out,
+    }
+    return out
+end
+
 -- Reserve forwarded ports from a high, non-common range and probe localhost
 -- availability before assigning them to accessories.
 local FORWARD_PORT_MIN = 46000
@@ -1180,6 +1225,14 @@ end
 -- @param session_uuid string Session UUID
 -- @return Session subclass instance or nil
 function Session.get(session_uuid)
+    if plugin_worker_hub_proxy_enabled() then
+        for _, sess in ipairs(proxy_session_list()) do
+            if sess.session_uuid == session_uuid or sess.id == session_uuid then
+                return sess
+            end
+        end
+        return nil
+    end
     return sessions[session_uuid]
 end
 
@@ -1187,6 +1240,9 @@ end
 --- List all sessions in creation order.
 -- @return array of Session subclass instances
 function Session.list()
+    if plugin_worker_hub_proxy_enabled() then
+        return proxy_session_list()
+    end
     local result = {}
     for _, sess in pairs(sessions) do
         table.insert(result, sess)
@@ -1203,6 +1259,15 @@ end
 -- @param value any Value to match
 -- @return array of Session subclass instances
 function Session.find_by_meta(key, value)
+    if plugin_worker_hub_proxy_enabled() then
+        local result = {}
+        for _, sess in ipairs(proxy_session_list()) do
+            if sess.metadata and sess.metadata[key] == value then
+                result[#result + 1] = sess
+            end
+        end
+        return result
+    end
     local result = {}
     for _, sess in ipairs(Session.list()) do
         if sess.metadata and sess.metadata[key] == value then
@@ -1217,6 +1282,15 @@ end
 -- @param target table|nil Optional target context to scope the lookup
 -- @return array of Session subclass instances
 function Session.find_by_workspace(name, target)
+    if plugin_worker_hub_proxy_enabled() then
+        local result = {}
+        for _, sess in ipairs(proxy_session_list()) do
+            if sess.workspace_name == name and (not target or TargetContext.matches(sess, target)) then
+                result[#result + 1] = sess
+            end
+        end
+        return result
+    end
     local result = {}
     for _, sess in ipairs(Session.list()) do
         if sess._workspace_name == name and (not target or TargetContext.matches(sess, target)) then
@@ -1230,6 +1304,9 @@ end
 --- Count active sessions.
 -- @return number
 function Session.count()
+    if plugin_worker_hub_proxy_enabled() then
+        return #proxy_session_list()
+    end
     local count = 0
     for _ in pairs(sessions) do
         count = count + 1
@@ -1252,6 +1329,9 @@ end
 -- @param opts table|nil { include_system = boolean }
 -- @return array of info tables sorted by creation time
 function Session.all_info(opts)
+    if plugin_worker_hub_proxy_enabled() then
+        return proxy_session_list(opts)
+    end
     local result = {}
     for _, entry in pairs(sessions) do
         if (opts and opts.include_system) or not Session.is_system_session(entry) then

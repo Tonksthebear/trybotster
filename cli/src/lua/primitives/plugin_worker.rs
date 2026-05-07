@@ -8,25 +8,37 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use mlua::{Lua, LuaSerdeExt, Table, Value};
 
+use crate::hub::events::HubEventTx;
 use crate::lua::primitives::json::json_to_lua;
 use crate::lua::LuaRuntime;
 use crate::worker::plugin::PLUGIN_WORKER_QUEUE;
 
 const LOAD_TIMEOUT: Duration = Duration::from_secs(5);
 
+fn lua_perf_enabled() -> bool {
+    std::env::var("BOTSTER_LUA_PERF")
+        .map(|value| {
+            let value = value.to_ascii_lowercase();
+            value == "1" || value == "true" || value == "yes" || value == "on"
+        })
+        .unwrap_or(false)
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct PluginWorkerRegistry {
     workers: Arc<Mutex<HashMap<String, PluginWorkerHandle>>>,
+    hub_event_channel: Arc<Mutex<Option<(HubEventTx, tokio::runtime::Handle)>>>,
 }
 
 #[derive(Clone)]
 struct PluginWorkerHandle {
     tx: mpsc::SyncSender<PluginWorkerRequest>,
+    parent_rx: Arc<Mutex<mpsc::Receiver<WorkerParentRequest>>>,
 }
 
 enum PluginWorkerRequest {
@@ -43,6 +55,13 @@ enum PluginWorkerRequest {
     },
 }
 
+enum WorkerParentRequest {
+    HubRequest {
+        payload: serde_json::Value,
+        response: mpsc::Sender<Result<serde_json::Value, String>>,
+    },
+}
+
 #[derive(Debug, Clone)]
 struct WorkerSpec {
     plugin_key: String,
@@ -51,6 +70,7 @@ struct WorkerSpec {
     source: Option<String>,
     repo_root: Option<PathBuf>,
     lua_base_path: Option<PathBuf>,
+    parent_hub_id: Option<String>,
 }
 
 #[must_use]
@@ -61,10 +81,10 @@ pub(crate) fn new_plugin_worker_registry() -> PluginWorkerRegistry {
 pub(crate) fn register(lua: &Lua, registry: PluginWorkerRegistry) -> Result<()> {
     let load_registry = registry.clone();
     let load_fn = lua
-        .create_function(move |_, spec: Table| {
+        .create_function(move |lua, spec: Table| {
             let worker_spec = table_to_spec(spec)?;
             load_registry
-                .load(worker_spec)
+                .load(lua, worker_spec)
                 .map_err(mlua::Error::external)?;
             Ok(true)
         })
@@ -89,7 +109,7 @@ pub(crate) fn register(lua: &Lua, registry: PluginWorkerRegistry) -> Result<()> 
                     mlua::Error::external(format!("plugin worker payload conversion failed: {e}"))
                 })?;
                 let result = invoke_registry
-                    .invoke(&plugin_key, kind, id, name, payload_json, timeout_ms)
+                    .invoke_with_lua(lua, &plugin_key, kind, id, name, payload_json, timeout_ms)
                     .map_err(mlua::Error::external)?;
                 json_to_lua(lua, &result)
             },
@@ -122,6 +142,7 @@ fn table_to_spec(table: Table) -> mlua::Result<WorkerSpec> {
     let source: Option<String> = table.get("source").ok();
     let repo_root: Option<String> = table.get("repo_root").ok();
     let lua_base_path: Option<String> = table.get("lua_base_path").ok();
+    let parent_hub_id: Option<String> = table.get("parent_hub_id").ok();
     Ok(WorkerSpec {
         plugin_key,
         display_name,
@@ -129,27 +150,48 @@ fn table_to_spec(table: Table) -> mlua::Result<WorkerSpec> {
         source,
         repo_root: repo_root.map(PathBuf::from),
         lua_base_path: lua_base_path.map(PathBuf::from),
+        parent_hub_id,
     })
 }
 
 impl PluginWorkerRegistry {
-    fn load(&self, spec: WorkerSpec) -> Result<()> {
+    pub(crate) fn set_hub_event_tx(&self, tx: HubEventTx, tokio_handle: tokio::runtime::Handle) {
+        *self
+            .hub_event_channel
+            .lock()
+            .expect("PluginWorkerRegistry hub_event_channel mutex poisoned") =
+            Some((tx, tokio_handle));
+    }
+
+    fn load(&self, lua: &Lua, spec: WorkerSpec) -> Result<()> {
         self.shutdown(&spec.plugin_key, "replace");
 
         let (tx, rx) = mpsc::sync_channel(PLUGIN_WORKER_QUEUE.capacity);
+        let (parent_tx, parent_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let plugin_key = spec.plugin_key.clone();
+        let hub_event_channel = self
+            .hub_event_channel
+            .lock()
+            .expect("PluginWorkerRegistry hub_event_channel mutex poisoned")
+            .clone();
         thread::Builder::new()
             .name(format!("botster-plugin-{plugin_key}"))
-            .spawn(move || worker_loop(spec, rx, ready_tx))
+            .spawn(move || worker_loop(spec, rx, parent_tx, ready_tx, hub_event_channel))
             .map_err(|e| anyhow!("spawn plugin worker: {e}"))?;
 
-        match ready_rx.recv_timeout(LOAD_TIMEOUT) {
+        match wait_for_ready(lua, ready_rx, &parent_rx, LOAD_TIMEOUT) {
             Ok(Ok(())) => {
                 self.workers
                     .lock()
                     .expect("PluginWorkerRegistry mutex poisoned")
-                    .insert(plugin_key, PluginWorkerHandle { tx });
+                    .insert(
+                        plugin_key,
+                        PluginWorkerHandle {
+                            tx,
+                            parent_rx: Arc::new(Mutex::new(parent_rx)),
+                        },
+                    );
                 Ok(())
             }
             Ok(Err(err)) => Err(anyhow!(err)),
@@ -157,8 +199,9 @@ impl PluginWorkerRegistry {
         }
     }
 
-    fn invoke(
+    fn invoke_with_lua(
         &self,
+        lua: &Lua,
         plugin_key: &str,
         kind: String,
         id: String,
@@ -166,6 +209,9 @@ impl PluginWorkerRegistry {
         payload: serde_json::Value,
         timeout_ms: u64,
     ) -> Result<serde_json::Value> {
+        let perf_started = lua_perf_enabled().then(Instant::now);
+        let log_kind = kind.clone();
+        let log_id = id.clone();
         let handle = self
             .workers
             .lock()
@@ -185,11 +231,29 @@ impl PluginWorkerRegistry {
                 response: response_tx,
             })
             .map_err(|e| anyhow!("plugin worker queue rejected invoke: {e}"))?;
-        match response_rx.recv_timeout(Duration::from_millis(timeout_ms.max(1))) {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(err)) => Err(anyhow!(err)),
-            Err(_) => Err(anyhow!("plugin worker invoke timeout")),
+        let result = {
+            let parent_rx = handle
+                .parent_rx
+                .lock()
+                .expect("PluginWorkerHandle parent_rx mutex poisoned");
+            wait_for_invoke_response(
+                lua,
+                response_rx,
+                &parent_rx,
+                Duration::from_millis(timeout_ms.max(1)),
+            )
+        };
+        if let Some(started) = perf_started {
+            log::info!(
+                "[PERF][plugin_worker] plugin={} kind={} id={} phase=roundtrip ok={} elapsed_ms={}",
+                plugin_key,
+                log_kind,
+                log_id,
+                result.is_ok(),
+                started.elapsed().as_millis()
+            );
         }
+        result
     }
 
     fn shutdown(&self, plugin_key: &str, reason: &str) {
@@ -209,7 +273,9 @@ impl PluginWorkerRegistry {
 fn worker_loop(
     spec: WorkerSpec,
     rx: mpsc::Receiver<PluginWorkerRequest>,
+    parent_tx: mpsc::Sender<WorkerParentRequest>,
     ready_tx: mpsc::Sender<Result<(), String>>,
+    hub_event_channel: Option<(HubEventTx, tokio::runtime::Handle)>,
 ) {
     let mut runtime = match LuaRuntime::new() {
         Ok(runtime) => runtime,
@@ -218,6 +284,13 @@ fn worker_loop(
             return;
         }
     };
+    if let Some((tx, tokio_handle)) = hub_event_channel {
+        runtime.set_hub_event_tx(tx, tokio_handle);
+    }
+    if let Err(err) = install_parent_hub_bridge(&runtime, parent_tx) {
+        let _ = ready_tx.send(Err(format!("install parent hub bridge: {err}")));
+        return;
+    }
     if let Some(lua_base_path) = &spec.lua_base_path {
         runtime.set_base_path(lua_base_path.clone());
         if let Err(err) = runtime.update_package_path(lua_base_path) {
@@ -263,8 +336,19 @@ fn worker_loop(
                 timeout_ms,
                 response,
             } => {
+                let perf_started = lua_perf_enabled().then(Instant::now);
                 let result =
                     invoke_in_worker(&runtime, &kind, &id, name.as_deref(), payload, timeout_ms);
+                if let Some(started) = perf_started {
+                    log::info!(
+                        "[PERF][plugin_worker] plugin={} kind={} id={} phase=execute ok={} elapsed_ms={}",
+                        spec.plugin_key,
+                        kind,
+                        id,
+                        result.is_ok(),
+                        started.elapsed().as_millis()
+                    );
+                }
                 let _ = response.send(result);
             }
             PluginWorkerRequest::Shutdown { reason } => {
@@ -279,6 +363,136 @@ fn worker_loop(
     }
 }
 
+fn install_parent_hub_bridge(
+    runtime: &LuaRuntime,
+    parent_tx: mpsc::Sender<WorkerParentRequest>,
+) -> Result<()> {
+    let lua = runtime.lua();
+    let bridge = lua
+        .create_table()
+        .map_err(|e| anyhow!("create plugin_worker_parent_hub table: {e}"))?;
+    let request_tx = parent_tx.clone();
+    let request_fn = lua
+        .create_function(move |lua, (payload, timeout_ms): (Value, Option<u64>)| {
+            let payload_json: serde_json::Value = lua.from_value(payload).map_err(|e| {
+                mlua::Error::external(format!(
+                    "plugin_worker_parent_hub.request: failed to serialize payload: {e}"
+                ))
+            })?;
+            let (response_tx, response_rx) = mpsc::channel();
+            request_tx
+                .send(WorkerParentRequest::HubRequest {
+                    payload: payload_json,
+                    response: response_tx,
+                })
+                .map_err(|e| {
+                    mlua::Error::external(format!(
+                        "plugin_worker_parent_hub.request: parent hub unavailable: {e}"
+                    ))
+                })?;
+            let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1));
+            match response_rx.recv_timeout(timeout) {
+                Ok(Ok(response)) => json_to_lua(lua, &response),
+                Ok(Err(err)) => Err(mlua::Error::external(err)),
+                Err(mpsc::RecvTimeoutError::Timeout) => Err(mlua::Error::external(format!(
+                    "plugin_worker_parent_hub.request: timeout after {}ms",
+                    timeout.as_millis()
+                ))),
+                Err(mpsc::RecvTimeoutError::Disconnected) => Err(mlua::Error::external(
+                    "plugin_worker_parent_hub.request: response channel closed",
+                )),
+            }
+        })
+        .map_err(|e| anyhow!("create plugin_worker_parent_hub.request: {e}"))?;
+    bridge
+        .set("request", request_fn)
+        .map_err(|e| anyhow!("set plugin_worker_parent_hub.request: {e}"))?;
+    lua.globals()
+        .set("plugin_worker_parent_hub", bridge)
+        .map_err(|e| anyhow!("set plugin_worker_parent_hub global: {e}"))?;
+    Ok(())
+}
+
+fn wait_for_ready(
+    lua: &Lua,
+    ready_rx: mpsc::Receiver<Result<(), String>>,
+    parent_rx: &mpsc::Receiver<WorkerParentRequest>,
+    timeout: Duration,
+) -> Result<Result<(), String>, mpsc::RecvTimeoutError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        service_parent_requests(lua, parent_rx);
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(mpsc::RecvTimeoutError::Timeout);
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(result) => return Ok(result),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+fn wait_for_invoke_response(
+    lua: &Lua,
+    response_rx: mpsc::Receiver<Result<serde_json::Value, String>>,
+    parent_rx: &mpsc::Receiver<WorkerParentRequest>,
+    timeout: Duration,
+) -> Result<serde_json::Value> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        service_parent_requests(lua, parent_rx);
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(anyhow!("plugin worker invoke timeout"));
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        match response_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(err)) => return Err(anyhow!(err)),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!("plugin worker response channel closed"));
+            }
+        }
+    }
+}
+
+fn service_parent_requests(lua: &Lua, parent_rx: &mpsc::Receiver<WorkerParentRequest>) {
+    while let Ok(request) = parent_rx.try_recv() {
+        match request {
+            WorkerParentRequest::HubRequest { payload, response } => {
+                let _ = response.send(handle_parent_hub_request(lua, payload));
+            }
+        }
+    }
+}
+
+fn handle_parent_hub_request(
+    lua: &Lua,
+    payload: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let payload_lua = json_to_lua(lua, &payload).map_err(|e| e.to_string())?;
+    let globals = lua.globals();
+    globals
+        .set("__plugin_worker_parent_hub_payload", payload_lua)
+        .map_err(|e| e.to_string())?;
+    let result: Value = lua
+        .load(
+            r#"
+            local Hub = require("lib.hub")
+            return Hub._handle_worker_parent_request(__plugin_worker_parent_hub_payload)
+            "#,
+        )
+        .set_name("plugin_worker_parent_hub_request")
+        .eval()
+        .map_err(|e| e.to_string())?;
+    lua.from_value(result)
+        .map_err(|e| format!("plugin worker parent hub response conversion failed: {e}"))
+}
+
 fn install_worker_bootstrap(runtime: &LuaRuntime, spec: &WorkerSpec) -> Result<(), String> {
     let lua = runtime.lua();
     let globals = lua.globals();
@@ -288,6 +502,11 @@ fn install_worker_bootstrap(runtime: &LuaRuntime, spec: &WorkerSpec) -> Result<(
     globals
         .set("_plugin_worker_key", spec.plugin_key.clone())
         .map_err(|e| e.to_string())?;
+    if let Some(parent_hub_id) = &spec.parent_hub_id {
+        globals
+            .set("_plugin_worker_parent_hub_id", parent_hub_id.clone())
+            .map_err(|e| e.to_string())?;
+    }
     if let Some(repo_root) = &spec.repo_root {
         globals
             .set(
@@ -649,4 +868,68 @@ fn invoke_in_worker(
 
     lua.from_value(result)
         .map_err(|e| format!("plugin worker result conversion failed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    #![expect(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::missing_docs_in_private_items,
+        reason = "test-code brevity"
+    )]
+
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+
+    #[test]
+    fn load_wait_services_worker_parent_hub_requests() {
+        let lua = Lua::new();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let lib_dir = temp.path().join("lib");
+        fs::create_dir_all(&lib_dir).expect("create lib dir");
+        fs::write(
+            lib_dir.join("hub.lua"),
+            r#"
+            return {
+              _handle_worker_parent_request = function(payload)
+                return { result = { ok = true, echoed_type = payload.type } }
+              end,
+            }
+            "#,
+        )
+        .expect("write fake hub.lua");
+        lua.load(format!(
+            r#"
+            package.path = "{dir}/?.lua;{dir}/?/init.lua;" .. package.path
+            "#,
+            dir = temp.path().display()
+        ))
+        .exec()
+        .expect("configure package path");
+
+        let (parent_tx, parent_rx) = mpsc::channel();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (response_tx, response_rx) = mpsc::channel();
+            parent_tx
+                .send(WorkerParentRequest::HubRequest {
+                    payload: json!({ "type": "get_agent_list" }),
+                    response: response_tx,
+                })
+                .expect("send parent request");
+            let response = response_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("parent response")
+                .expect("parent response ok");
+            assert_eq!(response["result"]["echoed_type"], "get_agent_list");
+            ready_tx.send(Ok(())).expect("send ready");
+        });
+
+        let result = wait_for_ready(&lua, ready_rx, &parent_rx, Duration::from_secs(1))
+            .expect("wait should not time out")
+            .expect("worker should report ready");
+        assert_eq!(result, ());
+    }
 }

@@ -122,6 +122,12 @@ pub struct SessionMetadata {
     pub cols: u16,
     /// Unix timestamp of last PTY output.
     pub last_output_at: u64,
+    /// Current terminal title from OSC 0/2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Current terminal working directory from OSC 7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
     /// Terminal mode flags at handshake time.
     ///
     /// Reconnect handshakes carry this so the hub can seed state without
@@ -584,6 +590,8 @@ mod tests {
             rows: 24,
             cols: 80,
             last_output_at: 0,
+            title: Some("Build".to_string()),
+            cwd: Some("/work/repo".to_string()),
             mode_flags: ModeFlags {
                 kitty_enabled: true,
                 cursor_visible: false,
@@ -638,6 +646,8 @@ mod tests {
         assert_eq!(decoded.pid, 42);
         assert_eq!(decoded.rows, 24);
         assert_eq!(decoded.cols, 80);
+        assert_eq!(decoded.title.as_deref(), Some("Build"));
+        assert_eq!(decoded.cwd.as_deref(), Some("/work/repo"));
         assert!(decoded.mode_flags.kitty_enabled);
         assert!(!decoded.mode_flags.cursor_visible);
         assert!(decoded.mode_flags.bracketed_paste);

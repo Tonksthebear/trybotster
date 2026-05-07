@@ -66,8 +66,8 @@ const LAYOUT_WEB_FILE: &str = "layout_web.lua";
 /// for web; Phase 2b or later may let the TUI consume the same file.
 const LAYOUT_SHARED_FILE: &str = "layout.lua";
 
-/// Install `web_layout` as a global Lua table with two methods: `render` and
-/// `reload`.
+/// Install `web_layout` as a global Lua table with methods for rendering and
+/// layout cache management.
 ///
 /// ```lua
 /// local json = web_layout.render("workspace_surface", {
@@ -111,6 +111,14 @@ pub fn register(lua: &Lua) -> Result<()> {
         .set("render", render_fn)
         .map_err(|e| anyhow!("Failed to set web_layout.render: {e}"))?;
 
+    let version_hash_fn = lua
+        .create_function(|_, input: String| Ok(fnv1a64_hex(input.as_bytes())))
+        .map_err(|e| anyhow!("Failed to create web_layout.version_hash: {e}"))?;
+
+    table
+        .set("version_hash", version_hash_fn)
+        .map_err(|e| anyhow!("Failed to set web_layout.version_hash: {e}"))?;
+
     // `web_layout.reload()` — explicit invalidation of all caches. Matches
     // the `reload_plugin` pattern: callers explicitly opt in so editor fs
     // chatter doesn't trigger spurious reloads mid-edit. The hub does not
@@ -132,6 +140,18 @@ pub fn register(lua: &Lua) -> Result<()> {
 
     log::debug!("Registered web_layout primitive");
     Ok(())
+}
+
+fn fnv1a64_hex(bytes: &[u8]) -> String {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x00000100000001b3;
+
+    let mut hash = FNV_OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
 }
 
 /// Invalidate every layer of caching so the next `render()` re-reads the

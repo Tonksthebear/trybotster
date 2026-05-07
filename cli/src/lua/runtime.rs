@@ -70,6 +70,8 @@ pub struct LuaRuntime {
     hub_client_pending_requests: primitives::HubClientPendingRequests,
     /// Direct frame write channels for `hub_client.request()` (bypasses event loop).
     hub_client_frame_senders: primitives::HubClientFrameSenders,
+    /// Registry of isolated plugin workers.
+    plugin_worker_registry: primitives::PluginWorkerRegistry,
     /// Whether any agent has a pending notification to clear on PTY input.
     ///
     /// Set `true` by `notify_pty_notification` when a notification fires.
@@ -300,6 +302,7 @@ impl LuaRuntime {
             hub_client_callback_registry,
             hub_client_pending_requests,
             hub_client_frame_senders,
+            plugin_worker_registry,
             pty_input_listening: false,
         })
     }
@@ -1473,6 +1476,8 @@ impl LuaRuntime {
             .lock()
             .expect("WatcherEntries mutex poisoned")
             .set_hub_event_tx(tx.clone(), tokio_handle.clone());
+        self.plugin_worker_registry
+            .set_hub_event_tx(tx, tokio_handle);
     }
 
     /// Fire the Lua callback for a single completed HTTP response.

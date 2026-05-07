@@ -357,8 +357,8 @@ pub(crate) enum HubEvent {
         generation: u64,
         /// Fresh connection (reader not yet installed).
         conn: crate::session::connection::SessionConnection,
-        /// Mode flags fetched during reconnect handshake.
-        mode_flags: Option<crate::session::protocol::ModeFlags>,
+        /// Metadata fetched during reconnect handshake.
+        metadata: crate::session::protocol::SessionMetadata,
     },
 
     /// A session was removed from `HandleCache` by `hub.unregister_session()`.
@@ -506,12 +506,7 @@ impl HubEvent {
                 event,
                 ..
             } => match event {
-                crate::agent::pty::PtyEvent::TitleChanged(_) => {
-                    Some(HubEventCoalescingKey::PtyOsc {
-                        session_uuid: session_uuid.clone(),
-                        kind: "title",
-                    })
-                }
+                crate::agent::pty::PtyEvent::TitleChanged(_) => None,
                 crate::agent::pty::PtyEvent::CwdChanged(_) => Some(HubEventCoalescingKey::PtyOsc {
                     session_uuid: session_uuid.clone(),
                     kind: "cwd",
@@ -1175,6 +1170,47 @@ mod tests {
         ));
         assert!(bulk_rx.try_recv().is_err());
         assert!(priority_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn sender_does_not_coalesce_title_updates() {
+        let (bulk_tx, mut bulk_rx) = mpsc::channel(8);
+        let (priority_tx, mut priority_rx) = mpsc::channel(8);
+        let metrics = Arc::new(HubEventMetrics::default());
+        let sender = HubEventTx::new_with_priority(bulk_tx, priority_tx, Arc::clone(&metrics));
+
+        sender
+            .send(HubEvent::PtyOscEvent {
+                session_uuid: "sess-1".to_string(),
+                session_name: "agent".to_string(),
+                event: crate::agent::pty::PtyEvent::title_changed("step-1"),
+            })
+            .expect("send first title");
+        sender
+            .send(HubEvent::PtyOscEvent {
+                session_uuid: "sess-1".to_string(),
+                session_name: "agent".to_string(),
+                event: crate::agent::pty::PtyEvent::title_changed("step-2"),
+            })
+            .expect("send second title");
+
+        assert!(matches!(
+            bulk_rx.try_recv(),
+            Ok(HubEvent::PtyOscEvent {
+                event: crate::agent::pty::PtyEvent::TitleChanged(title),
+                ..
+            }) if title == "step-1"
+        ));
+        assert!(matches!(
+            bulk_rx.try_recv(),
+            Ok(HubEvent::PtyOscEvent {
+                event: crate::agent::pty::PtyEvent::TitleChanged(title),
+                ..
+            }) if title == "step-2"
+        ));
+        assert!(bulk_rx.try_recv().is_err());
+        assert!(priority_rx.try_recv().is_err());
+        assert_eq!(metrics.snapshot().counters.get("hub_event.coalesced"), None);
     }
 
     #[test]
