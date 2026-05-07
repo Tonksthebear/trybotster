@@ -4,7 +4,7 @@ class GithubCommentIssueTool < ApplicationMCPTool
   tool_name "github_comment_issue"
   description "Add a comment to a GitHub issue or pull request. Requires the repository in 'owner/repo' format, issue number, and comment body."
 
-  property :repo, type: "string", description: "Repository in 'owner/repo' format (e.g., 'octocat/Hello-World')", required: true
+  property :repo, type: "string", description: "Repository in 'owner/repo' format. Defaults to the calling Botster session repo when available.", required: false
   property :issue_number, type: "integer", description: "Issue or PR number", required: true
   property :body, type: "string", description: "Comment text", required: true
 

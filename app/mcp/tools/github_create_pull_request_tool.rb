@@ -4,7 +4,7 @@ class GithubCreatePullRequestTool < ApplicationMCPTool
   tool_name "github_create_pull_request"
   description "Create a new pull request in a GitHub repository. Requires repository in 'owner/repo' format, title, head branch (source), and base branch (target, usually 'main')."
 
-  property :repo, type: "string", description: "Repository in 'owner/repo' format (e.g., 'octocat/Hello-World')", required: true
+  property :repo, type: "string", description: "Repository in 'owner/repo' format. Defaults to the calling Botster session repo when available.", required: false
   property :title, type: "string", description: "Pull request title", required: true
   property :body, type: "string", description: "Pull request description/body (optional)", required: false
   property :head, type: "string", description: "The name of the branch where your changes are (e.g., 'feature-branch')", required: true
