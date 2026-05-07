@@ -268,6 +268,21 @@ impl PluginWorkerRegistry {
             });
         }
     }
+
+    pub(crate) fn shutdown_all(&self, reason: &str) {
+        let handles: Vec<_> = self
+            .workers
+            .lock()
+            .expect("PluginWorkerRegistry mutex poisoned")
+            .drain()
+            .collect();
+        for (plugin_key, handle) in handles {
+            let _ = handle.tx.try_send(PluginWorkerRequest::Shutdown {
+                reason: reason.to_string(),
+            });
+            log::debug!("plugin worker {plugin_key} shutdown requested: {reason}");
+        }
+    }
 }
 
 fn worker_loop(
@@ -286,6 +301,7 @@ fn worker_loop(
     };
     if let Some((tx, tokio_handle)) = hub_event_channel {
         runtime.set_hub_event_tx(tx, tokio_handle);
+        runtime.use_local_async_callback_polling();
     }
     if let Err(err) = install_parent_hub_bridge(&runtime, parent_tx) {
         let _ = ready_tx.send(Err(format!("install parent hub bridge: {err}")));

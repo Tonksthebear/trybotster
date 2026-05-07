@@ -348,7 +348,7 @@ end
 -- @param target table           Explicit target context
 -- @return Accessory|nil
 -- @return string|nil
-spawn_accessory = function(branch_name, wt_path, accessory_name, agent_name, metadata, pre_resolved, target)
+spawn_accessory = function(branch_name, wt_path, accessory_name, agent_name, metadata, pre_resolved, target, explicit_session_config)
     local resolved_target, target_err = resolve_target(target, metadata)
     if not resolved_target then
         return nil, tostring(target_err)
@@ -372,7 +372,10 @@ spawn_accessory = function(branch_name, wt_path, accessory_name, agent_name, met
         end
     end
 
-    local session_config = pick_accessory_config(resolved, accessory_name)
+    local session_config = explicit_session_config
+    if type(session_config) ~= "table" then
+        session_config = pick_accessory_config(resolved, accessory_name)
+    end
     if not session_config then
         -- Fall back to a raw shell with the given name
         session_config = { name = accessory_name, command = "bash" }
@@ -438,7 +441,7 @@ end
 -- @param target table|nil            Explicit target context
 -- @return Agent|nil
 -- @return string|nil
-local function handle_create_agent(issue_or_branch, prompt, from_worktree, client, agent_name, metadata, target)
+local function handle_create_agent(issue_or_branch, prompt, from_worktree, client, agent_name, metadata, target, base_ref, base_target_path)
     local early_id = issue_or_branch or "main"
 
     -- Interceptor: plugins can transform params or block creation
@@ -446,6 +449,8 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         issue_or_branch = issue_or_branch,
         prompt = prompt,
         from_worktree = from_worktree,
+        base_ref = base_ref,
+        base_target_path = base_target_path,
         agent_name = agent_name,
         metadata = metadata,
         target = target,
@@ -462,6 +467,8 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
     issue_or_branch = params.issue_or_branch
     prompt = params.prompt
     from_worktree = params.from_worktree
+    base_ref = params.base_ref
+    base_target_path = params.base_target_path
     agent_name = params.agent_name
     metadata = params.metadata
     target = params.target
@@ -519,6 +526,9 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
 
     local target_inspection = inspect_target(resolved_target)
     local worktree_root = (target_inspection and target_inspection.repo_root) or resolved_target.target_path
+    if base_target_path and base_target_path ~= "" then
+        worktree_root = base_target_path
+    end
 
     -- Non-git mode
     if not (target_inspection and target_inspection.is_git_repo) then
@@ -567,6 +577,7 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
         local create_args = {
             label = branch_name,
             branch = branch_name,
+            base_ref = base_ref,
             prompt = prompt,
             metadata = async_metadata,
             agent_name = agent_name,
@@ -574,7 +585,9 @@ local function handle_create_agent(issue_or_branch, prompt, from_worktree, clien
             client_cols = 80,
         }
 
-        if not target_uses_current_runtime(resolved_target) then
+        if base_target_path and base_target_path ~= "" then
+            create_args.repo_root = base_target_path
+        elseif not target_uses_current_runtime(resolved_target) then
             create_args.repo_root = worktree_root
         end
 
@@ -598,9 +611,9 @@ end
 -- @param target table|nil              Explicit target context
 -- @return Accessory|nil
 -- @return string|nil
-local function handle_create_accessory(workspace_id, workspace_name, accessory_name, agent_name, metadata, target)
-    if not accessory_name then
-        return nil, "accessory_name is required for accessories"
+local function handle_create_accessory(workspace_id, workspace_name, accessory_name, agent_name, metadata, target, explicit_session_config)
+    if not accessory_name and type(explicit_session_config) ~= "table" then
+        return nil, "accessory_name or session config is required for accessories"
     end
 
     local resolved_target, target_err = resolve_target(target, metadata)
@@ -645,7 +658,7 @@ local function handle_create_accessory(workspace_id, workspace_name, accessory_n
     metadata.workspace_id = workspace_id
 
     return spawn_accessory(
-        branch_name, wt_path, accessory_name, agent_name, metadata, nil, resolved_target
+        branch_name, wt_path, accessory_name, agent_name, metadata, nil, resolved_target, explicit_session_config
     )
 end
 

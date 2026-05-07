@@ -63,6 +63,63 @@ fn plugin_owned_ui_action_runs_in_plugin_worker_vm() {
 }
 
 #[test]
+fn plugin_owned_ui_action_receives_serializable_context_only() {
+    // SAFETY: This integration filter runs this test in isolation and the
+    // worker VM must resolve the repository Lua modules instead of user config.
+    unsafe {
+        std::env::set_var(
+            "BOTSTER_LUA_PATH",
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua"),
+        )
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let plugin_dir = tmp.path().join("worker-action-context-plugin");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    let init_path = plugin_dir.join("init.lua");
+    fs::write(
+        &init_path,
+        r#"
+        local action = require("lib.action")
+
+        action.on("demo.worker.context", "main", function(_envelope, ctx)
+            return action.result{
+                message = tostring(ctx.sub_id) .. ":" .. tostring(ctx.target_surface)
+                    .. ":" .. tostring(ctx.client == nil),
+            }
+        end, { timeout_ms = 2000 })
+
+        return {}
+        "#,
+    )
+    .unwrap();
+
+    let runtime = LuaRuntime::new().unwrap();
+    runtime
+        .lua()
+        .load(format!(
+            r#"
+            local loader = require("hub.loader")
+            local ok, err = loader.load_plugin({init_path}, "worker-action-context-plugin", {{ source = "device" }})
+            assert(ok, tostring(err))
+
+            local result = require("lib.action").dispatch({{ id = "demo.worker.context" }}, {{
+                sub_id = "hub-sub",
+                target_surface = "pipelines",
+                client = {{ send = function() end }},
+            }})
+            assert(result.handled == true)
+            assert(result.ok == true, result.error)
+            assert(result.message == "hub-sub:pipelines:true", result.message)
+            return true
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval::<bool>()
+        .unwrap();
+}
+
+#[test]
 fn plugin_owned_session_action_runs_in_plugin_worker_vm() {
     // SAFETY: This integration filter runs this test in isolation and the
     // worker VM must resolve the repository Lua modules instead of user config.

@@ -155,6 +155,15 @@ impl WebSocketRegistryInner {
         self.hub_event_tx = Some(tx);
     }
 
+    /// Route WebSocket events through the registry-local fallback queue.
+    ///
+    /// Plugin worker runtimes own their Lua callback registry, so events
+    /// produced by worker-created sockets must be pumped by the worker loop
+    /// rather than delivered to the parent hub Lua runtime.
+    pub(crate) fn use_local_polling(&mut self) {
+        self.hub_event_tx = None;
+    }
+
     /// Emit a WebSocket event through the event channel or shared vec.
     ///
     /// If `hub_event_tx` is set (production), sends via the channel for

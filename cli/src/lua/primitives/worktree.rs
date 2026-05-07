@@ -72,6 +72,8 @@ pub enum WorktreeRequest {
         /// Optional explicit repository root. When absent, the current runtime
         /// repository is used.
         repo_root: Option<String>,
+        /// Optional starting ref for new branch creation.
+        base_ref: Option<String>,
         /// Opaque plugin metadata (carried through for Lua agent spawning).
         metadata: serde_json::Value,
         /// Task prompt for the agent.
@@ -104,6 +106,8 @@ pub struct WorktreeCreateResult {
     pub branch: String,
     /// Explicit repository root used for creation, if any.
     pub repo_root: Option<String>,
+    /// Optional starting ref used for branch creation.
+    pub base_ref: Option<String>,
     /// `Ok(path)` on success, `Err(message)` on failure.
     pub result: Result<std::path::PathBuf, String>,
     /// Opaque plugin metadata (carried forward from request).
@@ -256,7 +260,7 @@ pub(crate) fn register(
     // threadpool. Returns immediately. Hub fires `worktree_created` or
     // `worktree_create_failed` Lua events on completion.
     //
-    // params is a table with: label, branch, repo_root, metadata, prompt,
+    // params is a table with: label, branch, repo_root, base_ref, metadata, prompt,
     // agent_name, client_rows, client_cols
     let tx = hub_event_tx.clone();
     let create_async_fn = lua
@@ -269,6 +273,7 @@ pub(crate) fn register(
                 .unwrap_or(None)
                 .unwrap_or_else(|| branch.clone());
             let repo_root: Option<String> = params.get("repo_root").unwrap_or(None);
+            let base_ref: Option<String> = params.get("base_ref").unwrap_or(None);
             let prompt: String = params
                 .get::<Option<String>>("prompt")
                 .unwrap_or(None)
@@ -287,6 +292,7 @@ pub(crate) fn register(
                     label,
                     branch,
                     repo_root,
+                    base_ref,
                     metadata: metadata_json,
                     prompt,
                     agent_name,
@@ -697,6 +703,7 @@ mod tests {
                 label,
                 branch,
                 repo_root,
+                base_ref,
                 metadata,
                 prompt,
                 agent_name,
@@ -706,6 +713,7 @@ mod tests {
                 assert_eq!(label, "test-repo-42");
                 assert_eq!(branch, "feature-branch");
                 assert_eq!(repo_root, None);
+                assert_eq!(base_ref, None);
                 assert_eq!(metadata["issue_number"], 42);
                 assert_eq!(
                     metadata["invocation_url"],

@@ -429,10 +429,11 @@ impl HubSocketProbe {
 /// This proves more than filesystem existence or connectability: the peer must
 /// decode a `hello` frame and return `hello_ack`.
 fn probe_hub_socket(path: &Path) -> HubSocketProbe {
-    let mut stream = match std::os::unix::net::UnixStream::connect(path) {
-        Ok(stream) => stream,
-        Err(e) => return HubSocketProbe::not_connected(format!("connect failed: {e}")),
-    };
+    let mut stream =
+        match crate::socket::unix::connect_with_timeout(path, Duration::from_millis(500)) {
+            Ok(stream) => stream,
+            Err(e) => return HubSocketProbe::not_connected(format!("connect failed: {e}")),
+        };
 
     let timeout = Duration::from_millis(500);
     let _ = stream.set_read_timeout(Some(timeout));
@@ -613,7 +614,9 @@ pub fn cleanup_stale_files(hub_id: &str) {
     let socket_is_live = socket_path(hub_id)
         .ok()
         .filter(|path| path.exists())
-        .is_some_and(|path| std::os::unix::net::UnixStream::connect(&path).is_ok());
+        .is_some_and(|path| {
+            crate::socket::unix::connect_with_timeout(&path, Duration::from_millis(250)).is_ok()
+        });
 
     if let Ok(path) = pid_file_path(hub_id) {
         if path.exists() {
@@ -734,12 +737,22 @@ pub fn cleanup_orphaned_sockets() {
         // Safety check: if the path is still serving a live listener, do not
         // unlink it. This protects hubs running under a different
         // BOTSTER_CONFIG_DIR from cross-deletion.
-        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
-            log::debug!(
-                "Preserving live socket owned outside current config dir: {}",
-                path.display()
-            );
-            continue;
+        match crate::socket::unix::connect_with_timeout(&path, Duration::from_millis(250)) {
+            Ok(_) => {
+                log::debug!(
+                    "Preserving live socket owned outside current config dir: {}",
+                    path.display()
+                );
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                log::warn!(
+                    "Preserving possibly live socket after timed-out probe: {}",
+                    path.display()
+                );
+                continue;
+            }
+            Err(_) => {}
         }
 
         // No live process — remove the orphaned socket

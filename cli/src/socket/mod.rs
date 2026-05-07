@@ -29,3 +29,4 @@ pub mod client_conn;
 pub mod framing;
 pub mod server;
 pub mod tui_bridge;
+pub(crate) mod unix;

@@ -55,10 +55,19 @@ impl SocketServer {
         // start and let the caller handle singleton semantics. Only unlink
         // when connect fails (stale filesystem entry).
         if socket_path.exists() {
-            match std::os::unix::net::UnixStream::connect(&socket_path) {
+            match crate::socket::unix::connect_with_timeout(
+                &socket_path,
+                std::time::Duration::from_millis(250),
+            ) {
                 Ok(_) => {
                     anyhow::bail!(
                         "Socket already in use by a live hub: {}",
+                        socket_path.display()
+                    );
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                    anyhow::bail!(
+                        "Socket probe timed out; refusing to unlink possibly live hub socket: {}",
                         socket_path.display()
                     );
                 }

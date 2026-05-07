@@ -214,6 +214,8 @@ commands.register("create_agent", function(client, sub_id, command)
     local issue_or_branch = command.issue_or_branch or command.branch
     local prompt = command.prompt
     local from_worktree = command.from_worktree
+    local base_ref = command.base_ref
+    local base_target_path = command.base_target_path
     local agent_name = command.agent_name
     local workspace_id = command.workspace_id
     local workspace_name = command.workspace_name
@@ -243,6 +245,12 @@ commands.register("create_agent", function(client, sub_id, command)
     if command.invocation_url and not metadata.invocation_url then
         metadata.invocation_url = command.invocation_url
     end
+    if base_ref and metadata.base_ref == nil then
+        metadata.base_ref = base_ref
+    end
+    if base_target_path and metadata.base_target_path == nil then
+        metadata.base_target_path = base_target_path
+    end
 
     -- Optional workspace template for auto-spawning accessory bundles.
     local workspace_config_name = command.workspace_template
@@ -263,7 +271,8 @@ commands.register("create_agent", function(client, sub_id, command)
     end
 
     local agent, err = require("handlers.agents").handle_create_agent(
-        issue_or_branch, prompt, from_worktree, client, agent_name, metadata, target
+        issue_or_branch, prompt, from_worktree, client, agent_name, metadata, target,
+        base_ref, base_target_path
     )
     if err then
         send_command_response(client, sub_id, command, { ok = false, error = err })
@@ -291,6 +300,7 @@ end, { description = "Create a new agent (with optional worktree, agent name, an
 
 commands.register("create_accessory", function(client, sub_id, command)
     local accessory_name = command.accessory_name
+    local session_config = command.session
     local workspace_id = command.workspace_id
     local workspace_name = command.workspace_name
     local agent_name = command.agent_name
@@ -303,14 +313,14 @@ commands.register("create_accessory", function(client, sub_id, command)
     end
     local metadata = TargetContext.with_metadata(command.metadata, target)
 
-    if not accessory_name then
-        log.warn("create_accessory missing accessory_name")
-        send_command_response(client, sub_id, command, { ok = false, error = "accessory_name is required" })
+    if not accessory_name and type(session_config) ~= "table" then
+        log.warn("create_accessory missing accessory_name or session config")
+        send_command_response(client, sub_id, command, { ok = false, error = "accessory_name or session config is required" })
         return
     end
 
     local accessory, err = require("handlers.agents").handle_create_accessory(
-        workspace_id, workspace_name, accessory_name, agent_name, metadata, target
+        workspace_id, workspace_name, accessory_name, agent_name, metadata, target, session_config
     )
     if err then
         send_command_response(client, sub_id, command, { ok = false, error = err })

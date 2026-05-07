@@ -1066,6 +1066,10 @@ impl Hub {
             log::warn!("Lua shutdown event error: {}", e);
         }
 
+        // Stop isolated plugin workers before the Tokio runtime is dropped.
+        // Worker-owned watches use the parent runtime's blocking pool.
+        self.lua.shutdown_plugin_workers("hub_shutdown");
+
         // Stop all file watcher forwarder tasks (Lua hot-reload + user watches).
         // These are spawn_blocking tasks that block on rx.recv() — the senders
         // live inside FileWatcher (owned by LuaRuntime). If we don't stop them
@@ -1188,6 +1192,7 @@ impl Drop for Hub {
         for key in keys {
             self.cleanup_paste_files(&key);
         }
+        self.lua.shutdown_plugin_workers("hub_drop");
         self.lua.stop_all_watchers();
     }
 }

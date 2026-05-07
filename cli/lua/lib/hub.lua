@@ -15,7 +15,7 @@
 local state = require("hub.state")
 local Agent = require("lib.agent")
 local InternalClient = require("lib.internal_client")
-local OrchestrationQueue = require("lib.hub_orchestration_queue")
+local WorkerParentCommandQueue = require("lib.worker_parent_command_queue")
 
 local Hub = state.class("Hub")
 
@@ -109,7 +109,7 @@ end
 
 local function dispatch_local_orchestration(command)
     command.request_id = command.request_id or generate_msg_id()
-    return OrchestrationQueue.enqueue(command, dispatch_local_command_response)
+    return WorkerParentCommandQueue.enqueue(command, dispatch_local_command_response)
 end
 
 local function reconnectable_error(err)
@@ -144,25 +144,8 @@ local function remote_request(self, payload, timeout_ms)
     return hub_client.request(self._conn_id, payload, timeout_ms or 10000)
 end
 
-local function dispatch_remote_orchestration(self, command, timeout_ms)
-    command.request_id = command.request_id or generate_msg_id()
-    local result = remote_request(self, OrchestrationQueue.parent_request(command), timeout_ms or 10000)
-    if result.error then
-        error(result.error)
-    end
-    local response = result.result or {}
-    if response.ok == false then
-        error(response.error or "command queue failed")
-    end
-    return response
-end
-
 local function dispatch_remote_command_response(self, command, timeout_ms)
     command.request_id = command.request_id or generate_msg_id()
-    if self._is_worker_parent and OrchestrationQueue.is_queued_command(command) then
-        return dispatch_remote_orchestration(self, command, timeout_ms or 10000)
-    end
-
     local result = remote_request(self, {
         type = "hub_command",
         command = command,
@@ -230,17 +213,11 @@ function Hub._handle_worker_parent_request(payload)
     local local_hub = new_hub(self_id, true, nil)
 
     if kind == "hub_command" then
-        local response = dispatch_local_command_response(payload.command or {})
-        return { result = response }
-    end
-
-    if kind == "hub_orchestration" then
-        local command = payload.command or {}
-        if not OrchestrationQueue.is_queued_command(command) then
-            return { error = string.format("unsupported hub orchestration command: %s", tostring(command.type)) }
+        if WorkerParentCommandQueue.is_queued_command(payload.command or {}) then
+            local response = dispatch_local_orchestration(payload.command or {})
+            return { result = response }
         end
-        local response = dispatch_local_orchestration(command)
-        return { result = response }
+        return { error = string.format("unsupported worker parent hub command: %s", tostring((payload.command or {}).type)) }
     end
 
     if kind == "get_agent_list" then
@@ -249,6 +226,10 @@ function Hub._handle_worker_parent_request(payload)
 
     if kind == "list_workspaces" then
         return { result = local_hub:list_workspaces() }
+    end
+
+    if kind == "list_owned_sessions" then
+        return { result = local_hub:list_owned_sessions(payload.owner_plugin) }
     end
 
     if kind == "get_pty_snapshot" then
@@ -274,10 +255,6 @@ function Hub._handle_worker_parent_request(payload)
 
     if kind == "receive_messages" then
         return { result = local_hub:receive_messages(payload.agent_id) }
-    end
-
-    if kind == "create_agent" then
-        return { result = local_hub:create_agent(payload) }
     end
 
     return { error = string.format("unsupported worker parent hub request: %s", tostring(kind)) }
@@ -647,6 +624,8 @@ local function create_agent_command(opts)
         label = opts.label,
         prompt = opts.prompt,
         from_worktree = opts.from_worktree,
+        base_ref = opts.base_ref,
+        base_target_path = opts.base_target_path,
         agent_name = opts.agent_name,
         workspace_id = opts.workspace_id,
         workspace_name = opts.workspace_name,
@@ -709,6 +688,68 @@ function Hub:create_agent(issue_or_branch, prompt, agent_name, workspace_id, wor
     return dispatch_remote_command_response(self, command, 60000)
 end
 
+--- Create an accessory session on this hub.
+-- Accepts a table with either `accessory_name` for configured accessories or
+-- `session = { name, command, args? }` for plugin-owned explicit accessories.
+-- Plugin workers calling their parent hub receive a queued acknowledgement and
+-- must correlate completion through lifecycle events.
+function Hub:create_accessory(opts)
+    opts = copy_table(opts or {})
+    opts.metadata = copy_table(opts.metadata)
+    local request_id = opts.request_id or (opts.metadata and opts.metadata.request_id) or generate_msg_id()
+    if opts.metadata.request_id == nil then
+        opts.metadata.request_id = request_id
+    end
+
+    local command = {
+        type = "create_accessory",
+        request_id = request_id,
+        accessory_name = opts.accessory_name,
+        session = opts.session,
+        agent_name = opts.agent_name,
+        workspace_id = opts.workspace_id,
+        workspace_name = opts.workspace_name,
+        target_id = opts.target_id,
+        target_path = opts.target_path,
+        target_repo = opts.target_repo,
+        repo = opts.repo,
+        metadata = opts.metadata,
+    }
+
+    if self._is_local then
+        local response = dispatch_local_command_response(command)
+        if response.session_uuid then
+            local created = Agent.get(response.session_uuid)
+            if created then
+                local payload = session_payload(created)
+                payload.request_id = response.request_id or command.request_id
+                return payload
+            end
+        end
+        return {
+            status = response.status or "pending",
+            request_id = response.request_id or command.request_id,
+            session_uuid = response.session_uuid,
+            id = response.id or response.session_uuid,
+        }
+    end
+
+    return dispatch_remote_command_response(self, command, 30000)
+end
+
+--- Dispatch a hub command envelope through the standard hub boundary.
+-- This is the escape hatch for generic command relays. Plugin workers still
+-- cross the parent boundary and receive queued acknowledgements.
+function Hub:command(command, timeout_ms)
+    if type(command) ~= "table" then
+        error("Hub:command requires command table")
+    end
+    if self._is_local then
+        return dispatch_local_command_response(command)
+    end
+    return dispatch_remote_command_response(self, command, timeout_ms or 10000)
+end
+
 --- List sessions owned by a plugin.
 -- @param owner_plugin string Plugin key
 -- @return array of { session_uuid, label, metadata, status }
@@ -727,6 +768,17 @@ function Hub:list_owned_sessions(owner_plugin)
             end
         end
         return owned
+    end
+
+    if self._is_worker_parent then
+        local result = remote_request(self, {
+            type = "list_owned_sessions",
+            owner_plugin = owner_plugin,
+        }, 10000)
+        if result.error then
+            error(string.format("Hub:list_owned_sessions remote error: %s", result.error))
+        end
+        return result.result or {}
     end
 
     local response = dispatch_remote_command_response(self, {
