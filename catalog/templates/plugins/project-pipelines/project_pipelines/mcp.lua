@@ -60,7 +60,6 @@ local function ok(value)
 end
 
 local function sync_ok(value)
-    pcall(engine.publish_entity_snapshots)
     return ok(value)
 end
 

@@ -111,3 +111,71 @@ fn home_render_uses_bounded_notified_session_lookup() {
 
     assert_eq!(result, "ok");
 }
+
+#[test]
+fn mcp_mutators_return_without_bulk_snapshot_publish() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local handlers = {{}}
+            local publish_snapshots = 0
+
+            mcp = {{
+              tool = function(name, _spec, handler)
+                handlers[name] = handler
+              end,
+              prompt = function(_name, _spec, _handler) end,
+            }}
+
+            package.loaded["project_pipelines.repo"] = setmetatable({{
+              prune_legacy_seed_data = function() end,
+              update_ticket = function(ticket_id, fields)
+                assert(ticket_id == "ticket-1")
+                assert(fields.title == "Updated")
+                return {{ id = ticket_id, title = fields.title }}
+              end,
+            }}, {{
+              __index = function()
+                return function() return {{}} end
+              end,
+            }})
+
+            package.loaded["project_pipelines.engine"] = setmetatable({{
+              publish_entity_snapshots = function()
+                publish_snapshots = publish_snapshots + 1
+                error("MCP mutators must not publish full entity snapshots synchronously")
+              end,
+            }}, {{
+              __index = function()
+                return function() return {{}} end
+              end,
+            }})
+
+            package.loaded["lib.config_resolver"] = {{
+              list_agents = function() return {{}} end,
+            }}
+
+            require("project_pipelines.mcp").register()
+
+            local result = handlers.project_pipelines_update_ticket({{
+              ticket_id = "ticket-1",
+              title = "Updated",
+            }}, {{}})
+            assert(result.ok == true)
+            assert(result.result.id == "ticket-1")
+            assert(publish_snapshots == 0)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("project pipelines MCP mutators should not publish bulk snapshots synchronously");
+
+    assert_eq!(result, "ok");
+}
