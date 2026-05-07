@@ -166,12 +166,25 @@ local function publish_entity(entity_key, row)
     end
 end
 
+local function publish_entity_snapshot(entity_key)
+    local ok, entities = pcall(require, "project_pipelines.entities")
+    if ok and entities and entities.types and entities.types[entity_key] and type(entities.snapshot) == "function" then
+        pcall(entities.snapshot, entities.types[entity_key])
+    end
+end
+
 local function remove_entity(entity_key, id)
     local ok, entities = pcall(require, "project_pipelines.entities")
     if ok and entities and entities.types and entities.types[entity_key] and type(entities.remove) == "function" then
         pcall(entities.remove, entities.types[entity_key], id)
     end
 end
+
+local TICKET_DERIVED_EVENT_KINDS = {
+    ["ticket.merge_requested"] = true,
+    ["ticket.merge_agent_linked"] = true,
+    ["question.agent_linked"] = true,
+}
 
 local function filter_update(attrs, allowed)
     local set = {}
@@ -325,6 +338,9 @@ function M.append_event(kind, attrs)
     }
     db.events:insert(event)
     publish_entity("event", event)
+    if TICKET_DERIVED_EVENT_KINDS[event.kind] and not util.is_blank(event.ticket_id) then
+        publish_entity("ticket", M.get_ticket(event.ticket_id))
+    end
     return event
 end
 
@@ -467,6 +483,7 @@ function M.create_ticket(attrs)
     }
     db.tickets:insert(ticket)
     publish_entity("ticket", ticket)
+    publish_entity_snapshot("ticket")
     M.append_event("ticket.created", { ticket_id = ticket.id, payload = ticket })
     return ticket
 end
@@ -500,6 +517,7 @@ function M.add_ticket_dependency(ticket_id, depends_on_ticket_id)
     }
     db.ticket_dependencies:insert(dependency)
     publish_entity("ticket_dependency", dependency)
+    publish_entity_snapshot("ticket")
     M.append_event("ticket.dependency_added", {
         ticket_id = ticket_id,
         payload = { dependency_id = dependency.id, depends_on_ticket_id = depends_on_ticket_id },
@@ -515,6 +533,7 @@ function M.remove_ticket_dependency(dependency_id)
     end
     db:eval("DELETE FROM ticket_dependencies WHERE id = ?", dependency_id)
     remove_entity("ticket_dependency", dependency_id)
+    publish_entity_snapshot("ticket")
     M.append_event("ticket.dependency_removed", {
         ticket_id = dependency.ticket_id,
         payload = { dependency_id = dependency.id, depends_on_ticket_id = dependency.depends_on_ticket_id },
@@ -1045,6 +1064,7 @@ function M.create_run(attrs)
     }
     db.runs:insert(run)
     publish_entity("run", run)
+    publish_entity("ticket", M.get_ticket(run.ticket_id))
     M.append_event("run.created", { run_id = run.id, ticket_id = run.ticket_id, payload = run })
     return run
 end
@@ -1057,8 +1077,12 @@ function M.update_run(run_id, attrs)
     local set = util.copy(attrs or {})
     set.updated_at = util.now()
     db.runs:update{ where = { id = run_id }, set = set }
-    publish_entity("run", M.get_run(run_id))
-    return M.get_run(run_id)
+    local run = M.get_run(run_id)
+    publish_entity("run", run)
+    if run then
+        publish_entity("ticket", M.get_ticket(run.ticket_id))
+    end
+    return run
 end
 
 function M.list_runs(limit)
@@ -1336,8 +1360,15 @@ function M.update_run_step_visit(run_step_id, attrs)
     local set = util.copy(attrs or {})
     set.updated_at = util.now()
     db.run_steps:update{ where = { id = run_step_id }, set = set }
-    publish_entity("run_step", M.get_run_step_visit(run_step_id))
-    return M.get_run_step_visit(run_step_id)
+    local run_step = M.get_run_step_visit(run_step_id)
+    publish_entity("run_step", run_step)
+    if run_step then
+        local run = M.get_run(run_step.run_id)
+        if run then
+            publish_entity("ticket", M.get_ticket(run.ticket_id))
+        end
+    end
+    return run_step
 end
 
 function M.next_run_step_sequence(run_id)
@@ -1362,6 +1393,10 @@ function M.create_run_step_visit(run_id, step_id, attrs)
     }
     db.run_steps:insert(visit)
     publish_entity("run_step", visit)
+    local run = M.get_run(run_id)
+    if run then
+        publish_entity("ticket", M.get_ticket(run.ticket_id))
+    end
     return visit
 end
 
@@ -1584,6 +1619,9 @@ function M.add_artifact(attrs)
     }
     db.artifacts:insert(artifact)
     publish_entity("artifact", artifact)
+    if run then
+        publish_entity("ticket", M.get_ticket(run.ticket_id))
+    end
     M.append_event("artifact.added", { run_id = artifact.run_id, payload = artifact })
     return artifact
 end
@@ -1615,6 +1653,7 @@ function M.create_question(attrs)
     }
     db.questions:insert(question)
     publish_entity("question", question)
+    publish_entity("ticket", M.get_ticket(question.ticket_id))
     M.append_event("question.created", {
         run_id = question.run_id,
         ticket_id = question.ticket_id,
@@ -1645,6 +1684,7 @@ function M.update_question(question_id, attrs)
     db.questions:update{ where = { id = question_id }, set = set }
     local updated = db.questions:where{ id = question_id }
     publish_entity("question", updated)
+    publish_entity("ticket", M.get_ticket(updated.ticket_id))
     M.append_event("question.updated", {
         run_id = updated.run_id,
         ticket_id = updated.ticket_id,

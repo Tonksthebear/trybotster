@@ -1002,6 +1002,10 @@ function M.handle_agent_created(info)
     if not util.is_blank(question_id) then
         local session_uuid = info.session_uuid or info.uuid or info.id
         if not util.is_blank(session_uuid) then
+            local question = repo.get_question(question_id)
+            if question and question.advisor_session_uuid == session_uuid then
+                return
+            end
             pcall(repo.update_question, question_id, { advisor_session_uuid = session_uuid })
             repo.append_event("question.agent_linked", {
                 ticket_id = ticket_id,
@@ -1016,6 +1020,12 @@ function M.handle_agent_created(info)
     if not util.is_blank(merge_ticket_id) then
         local session_uuid = info.session_uuid or info.uuid or info.id
         if not util.is_blank(session_uuid) then
+            for _, event in ipairs(repo.ticket_events(merge_ticket_id, "ticket.merge_agent_linked", 25)) do
+                local payload = util.decode(event.payload, {})
+                if payload.session_uuid == session_uuid and payload.request_id == request_id then
+                    return
+                end
+            end
             repo.append_event("ticket.merge_agent_linked", {
                 ticket_id = merge_ticket_id,
                 payload = { session_uuid = session_uuid, request_id = request_id },
@@ -1048,6 +1058,9 @@ function M.handle_agent_created(info)
         run_step = repo.get_run_step(run_id, step_id)
     end
     if not run_step then
+        return
+    end
+    if run_step.agent_session_uuid == session_uuid then
         return
     end
 

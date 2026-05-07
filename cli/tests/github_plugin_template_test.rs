@@ -341,6 +341,12 @@ fn catalog_plugin_project_pipelines_detail_bind_lists_use_entity_store_paths() {
         .join("catalog/templates/plugins/project-pipelines/project_pipelines/web/screens");
     let project = std::fs::read_to_string(root.join("project.lua")).expect("read project screen");
     let home = std::fs::read_to_string(root.join("home.lua")).expect("read home screen");
+    let surface = std::fs::read_to_string(
+        root.parent()
+            .unwrap()
+            .join("surface.lua"),
+    )
+    .expect("read project pipelines surface");
 
     for (label, source, screen) in [
         (
@@ -376,6 +382,21 @@ fn catalog_plugin_project_pipelines_detail_bind_lists_use_entity_store_paths() {
     assert!(
         !project.contains(r#""-timeline-ticket-" .. ticket.id"#),
         "bind_list item templates must not capture repo-local ticket variables before entity bindings resolve"
+    );
+    assert!(
+        !project.contains("Chronological Timeline"),
+        "project view should show dependency-ordered tickets, not a separate chronological timeline"
+    );
+    assert!(
+        surface.contains(r#"source = "/project-pipelines.project""#)
+            && surface.contains(r#"source = "/project-pipelines.question""#)
+            && surface.contains(r#"source = "/project-pipelines.ticket""#),
+        "sidebar volatile rows should be backed by plugin entity stores"
+    );
+    assert!(
+        !surface.contains("repo.open_questions_with_tickets()")
+            && !surface.contains("repo.standalone_tickets()"),
+        "sidebar should not pre-render stale project/question/ticket snapshots from repo queries"
     );
 }
 
