@@ -182,6 +182,105 @@ fn catalog_plugin_project_pipelines_mcp_mutators_return_without_bulk_snapshot_pu
 }
 
 #[test]
+fn catalog_plugin_project_pipelines_submit_review_reminds_current_step_to_advance() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local handlers = {{}}
+            local create_review_args = nil
+            local run = {{
+              id = "run-1",
+              current_step_id = "review",
+              current_run_step_id = "visit-review",
+            }}
+
+            mcp = {{
+              tool = function(name, _spec, handler)
+                handlers[name] = handler
+              end,
+              prompt = function(_name, _spec, _handler) end,
+            }}
+
+            package.loaded["project_pipelines.repo"] = setmetatable({{
+              prune_legacy_seed_data = function() end,
+              get_run = function(run_id)
+                assert(run_id == "run-1")
+                return run
+              end,
+              create_review = function(params)
+                create_review_args = params
+                return {{
+                  id = "review-1",
+                  run_id = params.run_id,
+                  run_step_id = params.run_step_id or run.current_run_step_id,
+                  step_id = params.step_id,
+                  reviewer_session_uuid = params.reviewer_session_uuid,
+                  verdict = params.verdict,
+                  summary = params.summary or "",
+                }}
+              end,
+            }}, {{
+              __index = function()
+                return function() return {{}} end
+              end,
+            }})
+
+            package.loaded["project_pipelines.engine"] = setmetatable({{}}, {{
+              __index = function()
+                return function() return {{}} end
+              end,
+            }})
+
+            package.loaded["lib.config_resolver"] = {{
+              list_agents = function() return {{}} end,
+            }}
+
+            require("project_pipelines.mcp").register()
+
+            local result = handlers.project_pipelines_submit_review({{
+              run_id = "run-1",
+              step_id = "review",
+              verdict = "approved",
+            }}, {{ session_uuid = "sess-reviewer" }})
+
+            assert(create_review_args.reviewer_session_uuid == "sess-reviewer")
+            assert(result.ok == true)
+            assert(result.result.review.id == "review-1")
+            assert(result.result.review.run_step_id == "visit-review")
+            assert(result.result.requires_advance == true)
+            assert(result.result.next_tool == "project_pipelines_request_step_advance")
+            assert(result.result.next_tool_params.run_id == "run-1")
+            assert(result.result.next_tool_params.evidence.review_id == "review-1")
+            assert(string.find(result.result.message, "does not advance the pipeline", 1, true) ~= nil)
+
+            run.current_step_id = "implement"
+            local historical = handlers.project_pipelines_submit_review({{
+              run_id = "run-1",
+              step_id = "review",
+              verdict = "changes_required",
+            }}, {{ session_uuid = "sess-reviewer" }})
+
+            assert(historical.ok == true)
+            assert(historical.result.requires_advance == false)
+            assert(historical.result.next_tool == nil)
+            assert(historical.result.reason == "review_not_current_step")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("project pipelines submit review should return explicit advancement guidance");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_start_run_queues_agent_and_links_later_by_request_id() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
@@ -540,6 +639,136 @@ fn catalog_plugin_project_pipelines_start_run_infers_base_ref_from_closed_pr_dep
         ))
         .eval()
         .expect("project pipelines should infer stacked base refs from closed PR dependencies");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_step_advance_can_override_to_specific_step() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local run = {{
+              id = "run-verify",
+              ticket_id = "ticket-verify",
+              pipeline_id = "pipe-1",
+              target_path = "/repo",
+              current_step_id = "verify",
+              current_run_step_id = "visit-verify",
+            }}
+            local steps = {{
+              verify = {{ id = "verify", pipeline_id = "pipe-1", kind = "agent", name = "Verify", agent_name = "codex" }},
+              implement = {{ id = "implement", pipeline_id = "pipe-1", kind = "agent", name = "Implement", agent_name = "codex" }},
+            }}
+            local events = {{}}
+
+            json = {{
+              decode = function(raw)
+                if raw == "[]" then return {{}} end
+                if raw == "{{}}" then return {{}} end
+                return {{}}
+              end,
+              encode = function(_) return "{{}}" end,
+            }}
+
+            package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
+            package.loaded["project_pipelines.repo"] = {{
+              get_run = function(run_id)
+                assert(run_id == "run-verify")
+                return run
+              end,
+              get_run_step_visit = function(run_step_id)
+                return {{ id = run_step_id, run_id = run.id, step_id = run.current_step_id }}
+              end,
+              get_step = function(step_id) return steps[step_id] end,
+              step_gates = function(step_id)
+                assert(step_id == "verify")
+                return {{ {{ id = "gate-verify", kind = "attestation", prompt = "Verify it", required_fields = "[]" }} }}
+              end,
+              latest_gate_result = function()
+                return {{ id = "gate-result-1", status = "failed", summary = "verification failed", evidence = "{{}}" }}
+              end,
+              latest_review_for_run_step = function() return nil end,
+              append_event = function(kind, attrs)
+                events[#events + 1] = {{ kind = kind, attrs = attrs }}
+              end,
+              update_run_step_visit = function(run_step_id, attrs)
+                assert(run_step_id == "visit-verify" or run_step_id == "visit-implement")
+                return {{ id = run_step_id, run_id = run.id, step_id = run_step_id == "visit-verify" and "verify" or "implement", status = attrs.status }}
+              end,
+              create_run_step_visit = function(run_id, step_id, attrs)
+                assert(run_id == "run-verify")
+                assert(step_id == "implement")
+                assert(attrs.status == "active")
+                return {{ id = "visit-implement", run_id = run_id, step_id = step_id, sequence = 2, status = "active" }}
+              end,
+              update_run = function(run_id, attrs)
+                assert(run_id == "run-verify")
+                for key, value in pairs(attrs or {{}}) do run[key] = value end
+                return run
+              end,
+              get_ticket = function(ticket_id)
+                assert(ticket_id == "ticket-verify")
+                return {{ id = ticket_id, title = "Verify fallback" }}
+              end,
+              latest_step_session = function() return nil end,
+            }}
+            package.loaded["lib.agent"] = {{ get = function() return nil end }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  create_agent = function(_, opts)
+                    assert(opts.request_id == "project-pipelines:run-verify:implement:agent")
+                    assert(opts.agent_name == "codex")
+                    return {{ status = "queued", request_id = opts.request_id }}
+                  end,
+                }}
+              end,
+            }}
+
+            local blocked = require("project_pipelines.engine").request_step_advance({{
+              run_id = "run-verify",
+              next_step_id = "implement",
+              summary = "verification failed",
+            }}, {{}})
+            assert(blocked.ok == false)
+            assert(blocked.status == "blocked")
+            assert(blocked.requested_next_step.id == "implement")
+            assert(blocked.next_tool_params.override_unmet_gates == true)
+
+            local advanced = require("project_pipelines.engine").request_step_advance({{
+              run_id = "run-verify",
+              next_step_id = "implement",
+              override_unmet_gates = true,
+              override_reason = "Verification failed; send back to implementation.",
+              summary = "route back",
+            }}, {{}})
+            assert(advanced.ok == true)
+            assert(advanced.next_step.id == "implement")
+            assert(run.current_step_id == "implement")
+            assert(run.current_run_step_id == "visit-implement")
+
+            local saw_override = false
+            for _, event in ipairs(events) do
+              if event.kind == "step.advance_override" then
+                saw_override = true
+                assert(event.attrs.payload.next_step_id == "implement")
+                assert(event.attrs.payload.reason == "Verification failed; send back to implementation.")
+              end
+            end
+            assert(saw_override == true)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("project pipelines should allow explicit recovery routing to a specific step");
 
     assert_eq!(result, "ok");
 }

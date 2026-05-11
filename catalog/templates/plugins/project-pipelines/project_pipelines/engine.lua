@@ -168,6 +168,20 @@ local function has_review_kickback(run, step)
     return false
 end
 
+local function forced_next_step(run, params)
+    if util.is_blank(params.next_step_id) then
+        return nil
+    end
+    local step = repo.get_step(params.next_step_id)
+    if not step then
+        error("next_step_id not found: " .. tostring(params.next_step_id))
+    end
+    if step.pipeline_id ~= run.pipeline_id then
+        error("next_step_id must belong to the same pipeline")
+    end
+    return step
+end
+
 local function context_from_params(params, context)
     local session_uuid = context and context.session_uuid or params.session_uuid
     local run_id = params.run_id
@@ -831,17 +845,58 @@ function M.request_step_advance(params, context)
     end
     local step = repo.get_step(run.current_step_id)
     local active_visit_id = run.current_run_step_id
-    local missing = has_review_kickback(run, step) and {} or unmet_gates(run, step)
-    if #missing > 0 then
+    local next_step_override = forced_next_step(run, params)
+    local missing = unmet_gates(run, step)
+    local review_kickback = has_review_kickback(run, step)
+    local override_unmet_gates = next_step_override and params.override_unmet_gates == true
+    if #missing > 0 and not review_kickback and not override_unmet_gates then
         repo.append_event("step.advance_blocked", {
             run_id = run.id,
             ticket_id = run.ticket_id,
-            payload = { step_id = step.id, unmet_gates = missing, summary = params.summary },
+            payload = {
+                step_id = step.id,
+                unmet_gates = missing,
+                summary = params.summary,
+                requested_next_step_id = params.next_step_id,
+            },
         })
-        return { ok = false, status = "blocked", step = step, unmet_gates = missing }
+        return {
+            ok = false,
+            status = "blocked",
+            step = step,
+            unmet_gates = missing,
+            requested_next_step = next_step_override,
+            next_tool = "project_pipelines_request_step_advance",
+            next_tool_params = next_step_override and {
+                run_id = run.id,
+                next_step_id = next_step_override.id,
+                override_unmet_gates = true,
+                override_reason = "Route around blocked gates to recover pipeline state.",
+            } or nil,
+        }
+    end
+    if override_unmet_gates and util.is_blank(params.override_reason) then
+        error("override_reason is required when override_unmet_gates=true")
+    end
+    if override_unmet_gates then
+        repo.append_event("step.advance_override", {
+            run_id = run.id,
+            ticket_id = run.ticket_id,
+            payload = {
+                step_id = step.id,
+                run_step_id = active_visit_id,
+                next_step_id = next_step_override.id,
+                unmet_gates = missing,
+                reason = params.override_reason,
+                summary = params.summary,
+            },
+        })
     end
 
-    local next_step, transition_error = repo.next_step(run, step, active_visit_id)
+    local next_step, transition_error = next_step_override, nil
+    if not next_step then
+        next_step, transition_error = repo.next_step(run, step, active_visit_id)
+    end
     if transition_error then
         repo.update_run(run.id, { status = "blocked" })
         if active_visit_id then
