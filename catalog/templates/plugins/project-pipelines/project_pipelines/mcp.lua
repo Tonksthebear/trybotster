@@ -63,6 +63,36 @@ local function sync_ok(value)
     return ok(value)
 end
 
+local function review_submission_response(review)
+    local run = review and repo.get_run(review.run_id) or nil
+    local is_current = run
+        and run.current_step_id == review.step_id
+        and (review.run_step_id == nil or review.run_step_id == "" or run.current_run_step_id == review.run_step_id)
+
+    local response = {
+        review = review,
+        requires_advance = is_current and true or false,
+    }
+
+    if is_current then
+        response.message = "Review recorded. This does not advance the pipeline. If your review is complete, call project_pipelines_request_step_advance."
+        response.next_tool = "project_pipelines_request_step_advance"
+        response.next_tool_params = {
+            run_id = review.run_id,
+            summary = "Review submitted: " .. tostring(review.verdict or "review"),
+            evidence = {
+                review_id = review.id,
+                verdict = review.verdict,
+            },
+        }
+    else
+        response.message = "Review recorded. It is not for the current active run step, so no advancement reminder is required."
+        response.reason = run and "review_not_current_step" or "run_not_found"
+    end
+
+    return response
+end
+
 local function tool(name, spec, handler)
     mcp.tool(name, spec, function(params, context)
         return handler(params or {}, context or {})
@@ -722,13 +752,16 @@ function M.register()
     end)
 
     tool("project_pipelines_request_step_advance", {
-        description = "Ask the pipeline engine to move the current step forward. Returns unmet gate prompts when advancement is blocked.",
+        description = "Ask the pipeline engine to move the current step forward. Returns unmet gate prompts when advancement is blocked. Pass next_step_id to route to a specific step; if gates are unmet, override_unmet_gates=true and override_reason are required.",
         input_schema = {
             type = "object",
             properties = {
                 run_id = { type = "string" },
                 summary = { type = "string" },
                 evidence = { type = "object" },
+                next_step_id = { type = "string" },
+                override_unmet_gates = { type = "boolean" },
+                override_reason = { type = "string" },
             },
         },
     }, function(params, context)
@@ -750,7 +783,7 @@ function M.register()
     end)
 
     tool("project_pipelines_submit_review", {
-        description = "Submit a structured review for a pipeline step, including findings that become visible to every agent in the run context.",
+        description = "Submit a structured review for a pipeline step, including findings that become visible to every agent in the run context. This records the review; it does not advance the run. The response includes next-tool guidance when the current step still needs explicit advancement.",
         input_schema = {
             type = "object",
             properties = {
@@ -765,7 +798,7 @@ function M.register()
         },
     }, function(params, context)
         params.reviewer_session_uuid = context.session_uuid
-        return sync_ok(repo.create_review(params))
+        return sync_ok(review_submission_response(repo.create_review(params)))
     end)
 
     tool("project_pipelines_resolve_finding", {
