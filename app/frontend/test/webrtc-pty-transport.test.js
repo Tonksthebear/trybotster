@@ -31,6 +31,7 @@ function fakeTerminalConnection() {
     }),
     onDisconnected: vi.fn(() => vi.fn()),
     onError: vi.fn(() => vi.fn()),
+    release: vi.fn(),
   }
 }
 
@@ -124,5 +125,33 @@ describe('WebRtcPtyTransport', () => {
     expect(conn.sendResize).toHaveBeenCalledTimes(1)
     expect(conn.sendResize).toHaveBeenCalledWith(102, 32)
     vi.useRealTimers()
+  })
+
+  it('does not subscribe a stale terminal when destroyed during async connect', async () => {
+    let resolveAcquire
+    const conn = fakeTerminalConnection()
+    mocks.acquire.mockReturnValue(
+      new Promise((resolve) => {
+        resolveAcquire = resolve
+      }),
+    )
+    const transport = new WebRtcPtyTransport({
+      hubId: 'hub-1',
+      sessionUuid: 'session-1',
+    })
+
+    const connect = transport.connect({
+      rows: 24,
+      cols: 80,
+      callbacks: {},
+    })
+    transport.destroy()
+    resolveAcquire(conn)
+    await connect
+
+    expect(conn.release).toHaveBeenCalledTimes(1)
+    expect(conn.sendResize).not.toHaveBeenCalled()
+    expect(conn.requestSnapshot).not.toHaveBeenCalled()
+    expect(conn.onOutput).not.toHaveBeenCalled()
   })
 })

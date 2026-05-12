@@ -92,6 +92,7 @@ async function flushPromises() {
 
 describe("HubRoute peer health probes", () => {
   let HubRoute;
+  let TestHubRoute;
   let route;
   let manager;
 
@@ -104,7 +105,7 @@ describe("HubRoute peer health probes", () => {
     window.localStorage.clear();
 
     ({ HubRoute } = await import("../lib/connections/hub_route"));
-    class TestHubRoute extends HubRoute {
+    TestHubRoute = class TestHubRoute extends HubRoute {
       channelName() {
         return "hub";
       }
@@ -116,7 +117,7 @@ describe("HubRoute peer health probes", () => {
       channelParams() {
         return { hub_id: this.getHubId() };
       }
-    }
+    };
 
     manager = {
       hasActiveConnectionForHub: vi.fn(() => true),
@@ -171,5 +172,96 @@ describe("HubRoute peer health probes", () => {
     await emitStallAndWaitForProbe();
 
     expect(disconnectPeerCalls()).toHaveLength(0);
+  });
+
+  it("replays subscribe when an existing route sees a peer connected event", async () => {
+    mocks.bridge.sendCalls.length = 0;
+    mocks.bridge.send.mockClear();
+    mocks.bridge.onSubscriptionMessage.mockClear();
+
+    mocks.bridge.emit("connection:state", {
+      hubId: "hub-1",
+      state: "connected",
+      mode: "direct",
+    });
+    await flushPromises();
+
+    expect(
+      mocks.bridge.sendCalls.filter(([type]) => type === "subscribe"),
+    ).toContainEqual([
+      "subscribe",
+      {
+        hubId: "hub-1",
+        channel: "hub",
+        params: { hub_id: "hub-1" },
+        subscriptionId: "hub:hub-1",
+      },
+    ]);
+    expect(mocks.bridge.onSubscriptionMessage).toHaveBeenCalledWith(
+      "hub:hub-1",
+      expect.any(Function),
+    );
+    expect(route.subscriptionId).toBe("hub:hub-1");
+  });
+
+  it("does not replay subscribe for an idle route when the peer reconnects", async () => {
+    route.notifyIdle();
+    mocks.bridge.sendCalls.length = 0;
+    mocks.bridge.send.mockClear();
+
+    mocks.bridge.emit("connection:state", {
+      hubId: "hub-1",
+      state: "connected",
+      mode: "direct",
+    });
+    await flushPromises();
+
+    expect(
+      mocks.bridge.sendCalls.filter(([type]) => type === "subscribe"),
+    ).toHaveLength(0);
+    expect(route.subscriptionId).toBeNull();
+  });
+
+  it("unsubscribes if route teardown wins a pending subscribe confirmation", async () => {
+    route.destroy();
+    route = null;
+    mocks.bridge.reset();
+
+    let resolveSubscribe;
+    mocks.bridge.send.mockImplementation((type, payload) => {
+      mocks.bridge.sendCalls.push([type, payload]);
+      if (type === "connectSignaling") {
+        queueMicrotask(() => {
+          mocks.bridge.emit("health", { hubId: payload.hubId, cli: "online" });
+        });
+        return Promise.resolve({
+          state: "connected",
+          browserSocketState: "connected",
+          mode: "direct",
+        });
+      }
+      if (type === "subscribe") {
+        return new Promise((resolve) => {
+          resolveSubscribe = resolve;
+        });
+      }
+      return Promise.resolve({});
+    });
+
+    const pendingRoute = new TestHubRoute("hub-1", { hubId: "hub-1" }, manager);
+    const initialize = pendingRoute.initialize();
+    for (let i = 0; i < 10 && !resolveSubscribe; i += 1) {
+      await flushPromises();
+    }
+
+    pendingRoute.destroy();
+    resolveSubscribe({});
+    await initialize;
+    await flushPromises();
+
+    expect(
+      mocks.bridge.sendCalls.filter(([type]) => type === "unsubscribe"),
+    ).toContainEqual(["unsubscribe", { subscriptionId: "hub:hub-1" }]);
+    expect(pendingRoute.subscriptionId).toBeNull();
   });
 });
