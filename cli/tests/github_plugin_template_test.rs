@@ -341,12 +341,8 @@ fn catalog_plugin_project_pipelines_detail_bind_lists_use_entity_store_paths() {
         .join("catalog/templates/plugins/project-pipelines/project_pipelines/web/screens");
     let project = std::fs::read_to_string(root.join("project.lua")).expect("read project screen");
     let home = std::fs::read_to_string(root.join("home.lua")).expect("read home screen");
-    let surface = std::fs::read_to_string(
-        root.parent()
-            .unwrap()
-            .join("surface.lua"),
-    )
-    .expect("read project pipelines surface");
+    let surface = std::fs::read_to_string(root.parent().unwrap().join("surface.lua"))
+        .expect("read project pipelines surface");
 
     for (label, source, screen) in [
         (
@@ -500,7 +496,7 @@ fn catalog_plugin_project_pipelines_entity_publish_snapshots_and_deltas_use_plug
         .from_value(value)
         .expect("project pipelines entities result json");
 
-    assert_eq!(result["registrations"].as_array().unwrap().len(), 15);
+    assert_eq!(result["registrations"].as_array().unwrap().len(), 18);
     assert!(result["registrations"]
         .as_array()
         .unwrap()
@@ -513,8 +509,8 @@ fn catalog_plugin_project_pipelines_entity_publish_snapshots_and_deltas_use_plug
     let frames = result["frames"].as_array().unwrap();
     assert_eq!(
         frames.len(),
-        17,
-        "15 snapshots + upsert + remove; non-string id upsert should be dropped"
+        20,
+        "18 snapshots + upsert + remove; non-string id upsert should be dropped"
     );
     assert!(
         frames
@@ -529,7 +525,7 @@ fn catalog_plugin_project_pipelines_entity_publish_snapshots_and_deltas_use_plug
         .collect();
     assert_eq!(
         snapshots.len(),
-        15,
+        18,
         "publish_snapshots should publish every registered entity family"
     );
     assert!(snapshots.iter().all(|frame| {
@@ -583,18 +579,18 @@ fn catalog_plugin_project_pipelines_entity_publish_snapshots_and_deltas_use_plug
         json!("gate-1")
     );
 
-    assert_eq!(frames[15]["type"], json!("entity_upsert"));
+    assert_eq!(frames[18]["type"], json!("entity_upsert"));
     assert_eq!(
-        frames[15]["entity_type"],
+        frames[18]["entity_type"],
         json!("project-pipelines.run_step")
     );
-    assert_eq!(frames[15]["entity"]["id"], json!("run-step-1"));
-    assert_eq!(frames[16]["type"], json!("entity_remove"));
+    assert_eq!(frames[18]["entity"]["id"], json!("run-step-1"));
+    assert_eq!(frames[19]["type"], json!("entity_remove"));
     assert_eq!(
-        frames[16]["entity_type"],
+        frames[19]["entity_type"],
         json!("project-pipelines.run_step")
     );
-    assert_eq!(frames[16]["id"], json!("run-step-1"));
+    assert_eq!(frames[19]["id"], json!("run-step-1"));
 }
 
 #[test]

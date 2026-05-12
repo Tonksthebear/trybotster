@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Result};
 use mlua::{Lua, LuaSerdeExt, Table, Value};
 
-use crate::hub::events::HubEventTx;
+use crate::hub::events::{HubEvent, HubEventTx};
 use crate::lua::primitives::json::json_to_lua;
+use crate::lua::primitives::{http, websocket};
 use crate::lua::LuaRuntime;
 use crate::worker::plugin::PLUGIN_WORKER_QUEUE;
 
@@ -53,13 +54,75 @@ enum PluginWorkerRequest {
     Shutdown {
         reason: String,
     },
+    HttpResponse(http::CompletedHttpResponse),
+    WebSocketEvent(websocket::WsEvent),
+    TimerFired {
+        timer_id: String,
+    },
+    UserFileWatch {
+        watch_id: String,
+        events: Vec<crate::file_watcher::FileEvent>,
+    },
 }
 
-enum WorkerParentRequest {
+#[derive(Clone, Debug)]
+pub(crate) struct PluginWorkerEventTx {
+    tx: mpsc::SyncSender<PluginWorkerRequest>,
+}
+
+impl PluginWorkerEventTx {
+    fn new(tx: mpsc::SyncSender<PluginWorkerRequest>) -> Self {
+        Self { tx }
+    }
+
+    pub(crate) fn send_http_response(&self, response: http::CompletedHttpResponse) {
+        if let Err(err) = self
+            .tx
+            .try_send(PluginWorkerRequest::HttpResponse(response))
+        {
+            log::warn!("plugin worker queue rejected HTTP response: {err}");
+        }
+    }
+
+    pub(crate) fn send_websocket_event(&self, event: websocket::WsEvent) {
+        if let Err(err) = self.tx.try_send(PluginWorkerRequest::WebSocketEvent(event)) {
+            log::warn!("plugin worker queue rejected WebSocket event: {err}");
+        }
+    }
+
+    pub(crate) fn send_timer_fired(&self, timer_id: String) -> bool {
+        self.tx
+            .try_send(PluginWorkerRequest::TimerFired { timer_id })
+            .is_ok()
+    }
+
+    pub(crate) fn send_user_file_watch(
+        &self,
+        watch_id: String,
+        events: Vec<crate::file_watcher::FileEvent>,
+    ) -> bool {
+        self.tx
+            .try_send(PluginWorkerRequest::UserFileWatch { watch_id, events })
+            .is_ok()
+    }
+}
+
+pub(crate) enum WorkerParentRequest {
     HubRequest {
         payload: serde_json::Value,
         response: mpsc::Sender<Result<serde_json::Value, String>>,
     },
+}
+
+impl std::fmt::Debug for WorkerParentRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HubRequest { payload, .. } => f
+                .debug_struct("HubRequest")
+                .field("payload", payload)
+                .finish_non_exhaustive(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -175,9 +238,19 @@ impl PluginWorkerRegistry {
             .lock()
             .expect("PluginWorkerRegistry hub_event_channel mutex poisoned")
             .clone();
+        let worker_event_tx = PluginWorkerEventTx::new(tx.clone());
         thread::Builder::new()
             .name(format!("botster-plugin-{plugin_key}"))
-            .spawn(move || worker_loop(spec, rx, parent_tx, ready_tx, hub_event_channel))
+            .spawn(move || {
+                worker_loop(
+                    spec,
+                    rx,
+                    worker_event_tx,
+                    parent_tx,
+                    ready_tx,
+                    hub_event_channel,
+                )
+            })
             .map_err(|e| anyhow!("spawn plugin worker: {e}"))?;
 
         match wait_for_ready(lua, ready_rx, &parent_rx, LOAD_TIMEOUT) {
@@ -288,6 +361,7 @@ impl PluginWorkerRegistry {
 fn worker_loop(
     spec: WorkerSpec,
     rx: mpsc::Receiver<PluginWorkerRequest>,
+    worker_event_tx: PluginWorkerEventTx,
     parent_tx: mpsc::Sender<WorkerParentRequest>,
     ready_tx: mpsc::Sender<Result<(), String>>,
     hub_event_channel: Option<(HubEventTx, tokio::runtime::Handle)>,
@@ -299,11 +373,12 @@ fn worker_loop(
             return;
         }
     };
+    let parent_hub_event_tx = hub_event_channel.as_ref().map(|(tx, _)| tx.clone());
     if let Some((tx, tokio_handle)) = hub_event_channel {
         runtime.set_hub_event_tx(tx, tokio_handle);
-        runtime.use_local_async_callback_polling();
     }
-    if let Err(err) = install_parent_hub_bridge(&runtime, parent_tx) {
+    runtime.set_plugin_worker_event_tx(worker_event_tx);
+    if let Err(err) = install_parent_hub_bridge(&runtime, parent_tx, parent_hub_event_tx) {
         let _ = ready_tx.send(Err(format!("install parent hub bridge: {err}")));
         return;
     }
@@ -334,13 +409,9 @@ fn worker_loop(
     let _ = ready_tx.send(Ok(()));
 
     loop {
-        let _ = runtime.poll_http_responses();
-        let _ = runtime.poll_websocket_events();
-        let _ = runtime.poll_user_file_watches();
-        let request = match rx.recv_timeout(Duration::from_millis(10)) {
+        let request = match rx.recv() {
             Ok(request) => request,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(_) => break,
         };
 
         match request {
@@ -375,6 +446,18 @@ fn worker_loop(
                 );
                 break;
             }
+            PluginWorkerRequest::HttpResponse(response) => {
+                runtime.fire_http_callback(response);
+            }
+            PluginWorkerRequest::WebSocketEvent(event) => {
+                runtime.fire_websocket_event(event);
+            }
+            PluginWorkerRequest::TimerFired { timer_id } => {
+                runtime.fire_timer_callback(&timer_id);
+            }
+            PluginWorkerRequest::UserFileWatch { watch_id, events } => {
+                runtime.fire_user_file_watch(&watch_id, events);
+            }
         }
     }
 }
@@ -382,6 +465,7 @@ fn worker_loop(
 fn install_parent_hub_bridge(
     runtime: &LuaRuntime,
     parent_tx: mpsc::Sender<WorkerParentRequest>,
+    parent_hub_event_tx: Option<HubEventTx>,
 ) -> Result<()> {
     let lua = runtime.lua();
     let bridge = lua
@@ -396,16 +480,15 @@ fn install_parent_hub_bridge(
                 ))
             })?;
             let (response_tx, response_rx) = mpsc::channel();
-            request_tx
-                .send(WorkerParentRequest::HubRequest {
-                    payload: payload_json,
-                    response: response_tx,
-                })
-                .map_err(|e| {
-                    mlua::Error::external(format!(
-                        "plugin_worker_parent_hub.request: parent hub unavailable: {e}"
-                    ))
-                })?;
+            let request = WorkerParentRequest::HubRequest {
+                payload: payload_json,
+                response: response_tx,
+            };
+            request_tx.send(request).map_err(|e| {
+                mlua::Error::external(format!(
+                    "plugin_worker_parent_hub.request: parent hub unavailable: {e}"
+                ))
+            })?;
             let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1));
             match response_rx.recv_timeout(timeout) {
                 Ok(Ok(response)) => json_to_lua(lua, &response),
@@ -423,6 +506,40 @@ fn install_parent_hub_bridge(
     bridge
         .set("request", request_fn)
         .map_err(|e| anyhow!("set plugin_worker_parent_hub.request: {e}"))?;
+    let enqueue_tx = parent_tx.clone();
+    let enqueue_event_tx = parent_hub_event_tx.clone();
+    let enqueue_fn = lua
+        .create_function(move |lua, payload: Value| {
+            let payload_json: serde_json::Value = lua.from_value(payload).map_err(|e| {
+                mlua::Error::external(format!(
+                    "plugin_worker_parent_hub.enqueue: failed to serialize payload: {e}"
+                ))
+            })?;
+            let (response_tx, _response_rx) = mpsc::channel();
+            let request = WorkerParentRequest::HubRequest {
+                payload: payload_json,
+                response: response_tx,
+            };
+            if let Some(tx) = &enqueue_event_tx {
+                tx.send(HubEvent::PluginWorkerParentRequest(request))
+                    .map_err(|e| {
+                        mlua::Error::external(format!(
+                            "plugin_worker_parent_hub.enqueue: parent hub unavailable: {e}"
+                        ))
+                    })?;
+            } else {
+                enqueue_tx.send(request).map_err(|e| {
+                    mlua::Error::external(format!(
+                        "plugin_worker_parent_hub.enqueue: parent hub unavailable: {e}"
+                    ))
+                })?;
+            }
+            Ok(true)
+        })
+        .map_err(|e| anyhow!("create plugin_worker_parent_hub.enqueue: {e}"))?;
+    bridge
+        .set("enqueue", enqueue_fn)
+        .map_err(|e| anyhow!("set plugin_worker_parent_hub.enqueue: {e}"))?;
     lua.globals()
         .set("plugin_worker_parent_hub", bridge)
         .map_err(|e| anyhow!("set plugin_worker_parent_hub global: {e}"))?;
@@ -444,9 +561,17 @@ fn wait_for_ready(
         }
         let remaining = deadline.saturating_duration_since(now);
         match ready_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
-            Ok(result) => return Ok(result),
+            Ok(result) => {
+                service_parent_requests(lua, parent_rx);
+                service_parent_requests_for(lua, parent_rx, Duration::from_millis(100));
+                return Ok(result);
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(err) => return Err(err),
+            Err(err) => {
+                service_parent_requests(lua, parent_rx);
+                service_parent_requests_for(lua, parent_rx, Duration::from_millis(100));
+                return Err(err);
+            }
         }
     }
 }
@@ -466,10 +591,20 @@ fn wait_for_invoke_response(
         }
         let remaining = deadline.saturating_duration_since(now);
         match response_rx.recv_timeout(remaining.min(Duration::from_millis(10))) {
-            Ok(Ok(value)) => return Ok(value),
-            Ok(Err(err)) => return Err(anyhow!(err)),
+            Ok(Ok(value)) => {
+                service_parent_requests(lua, parent_rx);
+                service_parent_requests_for(lua, parent_rx, Duration::from_millis(100));
+                return Ok(value);
+            }
+            Ok(Err(err)) => {
+                service_parent_requests(lua, parent_rx);
+                service_parent_requests_for(lua, parent_rx, Duration::from_millis(100));
+                return Err(anyhow!(err));
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                service_parent_requests(lua, parent_rx);
+                service_parent_requests_for(lua, parent_rx, Duration::from_millis(100));
                 return Err(anyhow!("plugin worker response channel closed"));
             }
         }
@@ -478,10 +613,35 @@ fn wait_for_invoke_response(
 
 fn service_parent_requests(lua: &Lua, parent_rx: &mpsc::Receiver<WorkerParentRequest>) {
     while let Ok(request) = parent_rx.try_recv() {
-        match request {
-            WorkerParentRequest::HubRequest { payload, response } => {
-                let _ = response.send(handle_parent_hub_request(lua, payload));
-            }
+        service_parent_request(lua, request);
+    }
+}
+
+fn service_parent_requests_for(
+    lua: &Lua,
+    parent_rx: &mpsc::Receiver<WorkerParentRequest>,
+    duration: Duration,
+) {
+    let deadline = Instant::now() + duration;
+    loop {
+        service_parent_requests(lua, parent_rx);
+        let now = Instant::now();
+        if now >= deadline {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        match parent_rx.recv_timeout(remaining.min(Duration::from_millis(1))) {
+            Ok(request) => service_parent_request(lua, request),
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+pub(crate) fn service_parent_request(lua: &Lua, request: WorkerParentRequest) {
+    match request {
+        WorkerParentRequest::HubRequest { payload, response } => {
+            let _ = response.send(handle_parent_hub_request(lua, payload));
         }
     }
 }
@@ -751,6 +911,38 @@ fn invoke_in_worker(
             .set_name("plugin_worker_invoke_hook_interceptor")
             .eval()
             .map_err(|e| e.to_string())?,
+        "notification_observer" => lua
+            .load(
+                r#"
+                local notifications = require("lib.notifications")
+                local ok, result = __hook_timed_pcall(function()
+                    return notifications._invoke_observer(
+                        __handler_id,
+                        __payload.phase,
+                        __payload.intent,
+                        __payload.decision)
+                end, __handler_timeout_ms)
+                if not ok then error(result) end
+                return result
+                "#,
+            )
+            .set_name("plugin_worker_invoke_notification_observer")
+            .eval()
+            .map_err(|e| e.to_string())?,
+        "notification_claim" => lua
+            .load(
+                r#"
+                local notifications = require("lib.notifications")
+                local ok, result = __hook_timed_pcall(function()
+                    return notifications._invoke_claim(__handler_id, __payload.intent)
+                end, __handler_timeout_ms)
+                if not ok then error(result) end
+                return result
+                "#,
+            )
+            .set_name("plugin_worker_invoke_notification_claim")
+            .eval()
+            .map_err(|e| e.to_string())?,
         "surface_route" => lua
             .load(
                 r#"
@@ -782,6 +974,21 @@ fn invoke_in_worker(
                 "#,
             )
             .set_name("plugin_worker_invoke_asset_message")
+            .eval()
+            .map_err(|e| e.to_string())?,
+        "plugin_asset_read" => lua
+            .load(
+                r#"
+                local plugin_assets = require("lib.plugin_assets")
+                local ok, result, err = __hook_timed_pcall(function()
+                    return plugin_assets.read(__payload.asset_id)
+                end, __handler_timeout_ms)
+                if not ok then error(result) end
+                if not result then error(err or "Unknown plugin asset") end
+                return result
+                "#,
+            )
+            .set_name("plugin_worker_invoke_plugin_asset_read")
             .eval()
             .map_err(|e| e.to_string())?,
         "timer" => lua
@@ -947,5 +1154,116 @@ mod tests {
             .expect("wait should not time out")
             .expect("worker should report ready");
         assert_eq!(result, ());
+    }
+
+    #[test]
+    fn enqueue_parent_hub_request_uses_hub_event_channel_when_available() {
+        let runtime = LuaRuntime::new().expect("runtime");
+        runtime
+            .lua()
+            .load(
+                r#"
+                package.loaded["lib.hub"] = {
+                  _handle_worker_parent_request = function(payload)
+                    _G.parent_payload = payload
+                    return { result = { ok = true } }
+                  end,
+                }
+                "#,
+            )
+            .exec()
+            .expect("install fake parent hub");
+
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let hub_event_tx = HubEventTx::from(event_tx);
+        let (fallback_tx, fallback_rx) = mpsc::channel();
+        install_parent_hub_bridge(&runtime, fallback_tx, Some(hub_event_tx))
+            .expect("install parent hub bridge");
+
+        runtime
+            .lua()
+            .load(
+                r#"
+                assert(plugin_worker_parent_hub.enqueue({
+                  type = "hub_command",
+                  command = {
+                    type = "update_session",
+                    agent_id = "parent-session",
+                    plugin_state = {
+                      cloudflare_hosted_preview = { status = "running" },
+                    },
+                  },
+                }))
+                "#,
+            )
+            .exec()
+            .expect("enqueue parent request");
+
+        assert!(
+            fallback_rx.try_recv().is_err(),
+            "production bridge should use the hub event loop, not the fallback queue"
+        );
+        let event = event_rx.blocking_recv().expect("parent hub event");
+        match event {
+            HubEvent::PluginWorkerParentRequest(request) => {
+                service_parent_request(runtime.lua(), request);
+            }
+            other => panic!("expected plugin worker parent request, got {other:?}"),
+        }
+
+        let status: String = runtime
+            .lua()
+            .load(
+                r#"
+                return _G.parent_payload.command.plugin_state.cloudflare_hosted_preview.status
+                "#,
+            )
+            .eval()
+            .expect("parent request handled");
+        assert_eq!(status, "running");
+    }
+
+    #[test]
+    fn blocking_parent_hub_request_keeps_load_wait_fallback_when_event_channel_exists() {
+        let runtime = LuaRuntime::new().expect("runtime");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let hub_event_tx = HubEventTx::from(event_tx);
+        let (fallback_tx, fallback_rx) = mpsc::channel();
+        install_parent_hub_bridge(&runtime, fallback_tx, Some(hub_event_tx))
+            .expect("install parent hub bridge");
+
+        let responder = std::thread::spawn(move || {
+            let request = fallback_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("fallback parent request");
+            match request {
+                WorkerParentRequest::HubRequest { payload, response } => {
+                    assert_eq!(payload["type"], "get_agent_list");
+                    response
+                        .send(Ok(json!({ "result": { "ok": true } })))
+                        .expect("send fallback response");
+                }
+            }
+        });
+
+        let ok: bool = runtime
+            .lua()
+            .load(
+                r#"
+                local response = plugin_worker_parent_hub.request({
+                  type = "get_agent_list",
+                }, 1000)
+                return response.result.ok
+                "#,
+            )
+            .eval()
+            .expect("blocking request should receive fallback response");
+
+        assert!(
+            event_rx.try_recv().is_err(),
+            "blocking request must not depend on the hub event loop during worker load"
+        );
+        responder.join().expect("responder thread");
+        assert!(ok);
     }
 }

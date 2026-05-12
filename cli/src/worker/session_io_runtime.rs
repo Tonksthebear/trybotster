@@ -172,6 +172,12 @@ impl SessionIoRequestProcessor {
                 }
             }
             SessionIoRequest::Resize { rows, cols } => {
+                log::info!(
+                    "[session-io] queue resize for {} to {}x{}",
+                    self.session_uuid,
+                    cols,
+                    rows
+                );
                 match encode_json(
                     FRAME_RESIZE,
                     &serde_json::json!({ "rows": rows, "cols": cols }),
@@ -209,6 +215,15 @@ impl SessionIoRequestProcessor {
                 }
             }
             SessionIoRequest::GetInitialSnapshot { delivery } => {
+                log::info!(
+                    "[session-io] request initial snapshot for {} subscription={} key={} target={}x{} request={}",
+                    self.session_uuid,
+                    delivery.subscription_id,
+                    delivery.subscription_key,
+                    delivery.cols,
+                    delivery.rows,
+                    delivery.request_id
+                );
                 if let Ok(mut pending) = self.pending_snapshot_requests.lock() {
                     pending.push_back(PendingSnapshotRequest::Initial {
                         delivery: delivery.clone(),
@@ -233,11 +248,22 @@ impl SessionIoRequestProcessor {
                 }
             }
             SessionIoRequest::SubscribeTerminal { subscription } => {
+                log::info!(
+                    "[session-io] register terminal subscription for {} subscription={} key={}",
+                    self.session_uuid,
+                    subscription.subscription_id,
+                    subscription.subscription_key
+                );
                 if let Ok(mut subscriptions) = self.terminal_subscriptions.lock() {
                     subscriptions.insert(subscription.subscription_key.clone(), subscription);
                 }
             }
             SessionIoRequest::UnsubscribeTerminal { subscription_key } => {
+                log::info!(
+                    "[session-io] unregister terminal subscription for {} key={}",
+                    self.session_uuid,
+                    subscription_key
+                );
                 if let Ok(mut subscriptions) = self.terminal_subscriptions.lock() {
                     subscriptions.remove(&subscription_key);
                 }
@@ -584,6 +610,15 @@ impl SessionIoRuntime {
         delivery: TerminalInitialSnapshotDelivery,
         snapshot: Vec<u8>,
     ) {
+        log::info!(
+            "[session-io] deliver initial snapshot for {} subscription={} key={} target={}x{} snapshot_bytes={}",
+            self.session_uuid,
+            delivery.subscription_id,
+            delivery.subscription_key,
+            delivery.cols,
+            delivery.rows,
+            snapshot.len()
+        );
         if snapshot.is_empty() {
             if crate::session::session_process_is_live(&self.session_uuid) {
                 if delivery.confirm_subscription {

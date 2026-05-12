@@ -91,6 +91,14 @@ local _debounce_timer_resources = nil
 -- updates feeling near-instant for a single file save.
 local NOTIFY_DEBOUNCE_SECS = 0.5
 
+local function hub_is_offline()
+    local hub_table = rawget(_G, "hub")
+    if type(hub_table) ~= "table" or type(hub_table.is_offline) ~= "function" then
+        return false
+    end
+    return hub_table.is_offline() == true
+end
+
 -- Schedule (or reschedule) the mcp_tools_changed notification.
 -- Cancels any previously pending debounce timer so rapid calls coalesce.
 local function schedule_notify()
@@ -669,7 +677,7 @@ function M.proxy(url, opts)
     if type(url) ~= "string" or url == "" then
         error("mcp.proxy: url must be a non-empty string")
     end
-    if hub.is_offline() then
+    if hub_is_offline() then
         log.warn("mcp.proxy: skipped — hub is in offline mode")
         return
     end

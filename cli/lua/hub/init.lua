@@ -175,6 +175,28 @@ if EB then
                     out[#out + 1] = payload
                 end
             end
+            for _, target in ipairs(targets) do
+                local target_path = type(target) == "table" and target.path or nil
+                if type(target_path) == "string" and registry and type(registry.inspect) == "function" then
+                    local inspect_ok, inspection = pcall(registry.inspect, target_path)
+                    local target_worktrees = inspect_ok and type(inspection) == "table" and inspection.worktrees or nil
+                    if type(target_worktrees) == "table" then
+                        for _, target_worktree in ipairs(target_worktrees) do
+                            if type(target_worktree) == "table" then
+                                local path = target_worktree.worktree_path or target_worktree.path
+                                if type(path) == "string" and path ~= "" then
+                                    out[#out + 1] = {
+                                        worktree_path = path,
+                                        path = path,
+                                        branch = target_worktree.branch,
+                                        target_id = target.target_id or target.id,
+                                    }
+                                end
+                            end
+                        end
+                    end
+                end
+            end
             return out
         end,
     })

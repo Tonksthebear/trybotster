@@ -611,7 +611,7 @@ end
 -- @param target table|nil              Explicit target context
 -- @return Accessory|nil
 -- @return string|nil
-local function handle_create_accessory(workspace_id, workspace_name, accessory_name, agent_name, metadata, target, explicit_session_config)
+local function handle_create_accessory(workspace_id, workspace_name, accessory_name, agent_name, metadata, target, explicit_session_config, from_worktree, branch_name)
     if not accessory_name and type(explicit_session_config) ~= "table" then
         return nil, "accessory_name or session config is required for accessories"
     end
@@ -621,12 +621,15 @@ local function handle_create_accessory(workspace_id, workspace_name, accessory_n
         return nil, tostring(target_err)
     end
 
-    -- Find worktree from workspace or use repo root
-    local wt_path = resolved_target and resolved_target.target_path or nil
-    local branch_name = "main"
+    -- Find worktree from explicit selection, workspace, or target root.
+    local wt_path = from_worktree or (resolved_target and resolved_target.target_path or nil)
+    branch_name = branch_name or "main"
 
-    -- If workspace provided, prefer explicit ID lookup.
-    if workspace_id then
+    -- If a worktree was selected directly, keep that as the runtime cwd. Workspace
+    -- selection only groups the session metadata in that case.
+    if from_worktree then
+        -- Keep resolved target from the command.
+    elseif workspace_id then
         for _, existing in ipairs(Agent.list()) do
             if existing._workspace_id == workspace_id then
                 wt_path = existing.worktree_path
@@ -654,8 +657,12 @@ local function handle_create_accessory(workspace_id, workspace_name, accessory_n
     end
 
     metadata = TargetContext.with_metadata(metadata, resolved_target)
-    metadata.workspace = workspace_name
-    metadata.workspace_id = workspace_id
+    if workspace_name ~= nil then
+        metadata.workspace = workspace_name
+    end
+    if workspace_id ~= nil then
+        metadata.workspace_id = workspace_id
+    end
 
     return spawn_accessory(
         branch_name, wt_path, accessory_name, agent_name, metadata, nil, resolved_target, explicit_session_config

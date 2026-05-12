@@ -8,6 +8,9 @@
 local action = require("lib.action")
 local repo = require("project_pipelines.repo")
 local engine = require("project_pipelines.engine")
+local util = require("project_pipelines.util")
+local Hub = require("lib.hub")
+local Agent = require("lib.agent")
 
 local M = {}
 local drafts = {}
@@ -73,6 +76,29 @@ local function set_field_error(ctx, id, field, err)
     local status = current_feedback(ctx)
     status.field_errors = status.field_errors or {}
     status.field_errors[field_error_key(id, field)] = err and tostring(err) or nil
+end
+
+local function ticket_branch(ticket, run_id)
+    local base = ticket and ticket.id or run_id or "ticket"
+    base = tostring(base):gsub("[^%w._-]", "-")
+    base = base:gsub("%-+", "-"):gsub("^%-+", ""):gsub("%-+$", "")
+    if util.is_blank(base) then
+        base = tostring(run_id or "ticket"):gsub("[^%w._-]", "-")
+    end
+    return "project-pipelines/" .. base
+end
+
+local function live_ticket_worktree(ticket_id)
+    for _, session_uuid in ipairs(repo.ticket_session_uuids(ticket_id)) do
+        local session = Agent.get(session_uuid)
+        if session and session.info then
+            local ok, info = pcall(session.info, session)
+            if ok and info and not util.is_blank(info.worktree_path) then
+                return info.worktree_path, info.branch_name, info.workspace_id, info.workspace_name
+            end
+        end
+    end
+    return nil, nil, nil, nil
 end
 
 function M.register()
@@ -223,6 +249,119 @@ function M.register()
             message = "Pipeline started.",
             navigate = started and started.run and { label = "Open run", path = "/pipelines/runs/" .. started.run.id } or nil,
         }
+    end)
+
+    action.on("project_pipelines.update_ticket_session_draft", "project_pipelines.update_ticket_session_draft", function(envelope, ctx)
+        local payload = value_payload(envelope)
+        if payload.ticket_id and payload.field then
+            current_draft(ctx)["ticket_session_" .. payload.ticket_id .. "_" .. payload.field] = payload.value or ""
+        end
+        return action.HANDLED
+    end)
+
+    action.on("project_pipelines.spawn_ticket_session", "project_pipelines.spawn_ticket_session", function(envelope, ctx)
+        local payload = value_payload(envelope)
+        if util.is_blank(payload.ticket_id) then
+            return action.result{ ok = false, error = "ticket_id is required" }
+        end
+        local ticket = repo.get_ticket(payload.ticket_id)
+        if not ticket then
+            return action.result{ ok = false, error = "Ticket not found." }
+        end
+        if util.is_blank(ticket.target_id) then
+            return action.result{ ok = false, error = "Ticket has no spawn target." }
+        end
+
+        local draft = current_draft(ctx)
+        local prefix = "ticket_session_" .. ticket.id .. "_"
+        local session_type = draft[prefix .. "type"] or payload.session_type or "agent"
+        local latest_run = repo.latest_ticket_run(ticket.id)
+        local branch = ticket_branch(ticket, latest_run and latest_run.id or nil)
+        local from_worktree, branch_name, workspace_id, workspace_name = live_ticket_worktree(ticket.id)
+        local target_path = ticket.target_path
+        local request_id = "project-pipelines:" .. ticket.id .. ":manual:" .. tostring(os.time())
+        local result
+
+        if session_type == "accessory" then
+            local accessory_name = draft[prefix .. "accessory_name"] or payload.accessory_name or "terminal"
+            local ok, created = pcall(function()
+                return Hub.get():create_accessory{
+                    request_id = request_id,
+                    accessory_name = accessory_name,
+                    target_id = ticket.target_id,
+                    target_path = target_path,
+                    workspace_id = workspace_id,
+                    workspace_name = workspace_name or ("Pipeline - " .. ticket.title),
+                    from_worktree = from_worktree,
+                    branch = branch_name or branch,
+                    metadata = {
+                        owner_plugin = "project-pipelines",
+                        visibility = "plugin",
+                        surface = "pipelines",
+                        ticket_id = ticket.id,
+                        run_id = latest_run and latest_run.id or nil,
+                        role = "manual-accessory",
+                    },
+                }
+            end)
+            if not ok then
+                refresh(ctx)
+                return action.result{ ok = false, error = tostring(created) }
+            end
+            result = created
+            repo.append_event("ticket.manual_accessory_requested", {
+                run_id = latest_run and latest_run.id or nil,
+                ticket_id = ticket.id,
+                payload = { request_id = request_id, accessory_name = accessory_name, session_uuid = result and result.session_uuid },
+            })
+        else
+            local agent_name = draft[prefix .. "agent_name"] or payload.agent_name or "codex"
+            local prompt = draft[prefix .. "prompt"]
+            if util.is_blank(prompt) then
+                prompt = table.concat({
+                    "You are joining a Project Pipelines ticket worktree.",
+                    "Ticket: " .. ticket.title,
+                    "Call project_pipelines_get_ticket and project_pipelines_current_context if this ticket has a run.",
+                    "Stay within the ticket intent and coordinate through Project Pipelines tools.",
+                }, "\n\n")
+            end
+            local ok, created = pcall(function()
+                return Hub.get():create_agent{
+                    request_id = request_id,
+                    agent_name = agent_name,
+                    issue_or_branch = branch,
+                    from_worktree = from_worktree,
+                    target_id = ticket.target_id,
+                    target_path = target_path,
+                    workspace_id = workspace_id,
+                    workspace_name = workspace_name or ("Pipeline - " .. ticket.title),
+                    label = "Assist - " .. ticket.title,
+                    prompt = prompt,
+                    metadata = {
+                        owner_plugin = "project-pipelines",
+                        visibility = "plugin",
+                        surface = "pipelines",
+                        ticket_id = ticket.id,
+                        run_id = latest_run and latest_run.id or nil,
+                        role = "manual-agent",
+                    },
+                }
+            end)
+            if not ok then
+                refresh(ctx)
+                return action.result{ ok = false, error = tostring(created) }
+            end
+            result = created
+            repo.append_event("ticket.manual_agent_requested", {
+                run_id = latest_run and latest_run.id or nil,
+                ticket_id = ticket.id,
+                payload = { request_id = request_id, agent_name = agent_name, session_uuid = result and result.session_uuid },
+            })
+        end
+
+        draft[prefix .. "prompt"] = nil
+        refresh(ctx)
+        return action.result{ message = "Session requested." }
     end)
 
     action.on("project_pipelines.close_ticket", "project_pipelines.close_ticket", function(envelope, ctx)

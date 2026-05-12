@@ -6,7 +6,7 @@
 -- @version 1.0.0
 
 local db = plugin.db{
-    version = 6,
+    version = 8,
     models = {
         tickets = {
             id = { "text", required = true, primary = true },
@@ -172,6 +172,44 @@ local db = plugin.db{
             created_at = { "integer", required = true },
             updated_at = { "integer", required = true },
         },
+        checklists = {
+            id = { "text", required = true, primary = true },
+            scope = { "text", required = true },
+            owner_id = { "text", required = true },
+            name = { "text", required = true },
+            description = { "text" },
+            source = { "text" },
+            created_at = { "integer", required = true },
+            updated_at = { "integer", required = true },
+        },
+        checklist_items = {
+            id = { "text", required = true, primary = true },
+            checklist_id = { "text", required = true },
+            position = { "integer", required = true },
+            prompt = { "text", required = true },
+            status = { "text", required = true },
+            source_ref = { "text" },
+            evidence = { "text" },
+            created_at = { "integer", required = true },
+            updated_at = { "integer", required = true },
+            completed_at = { "integer" },
+        },
+        pr_links = {
+            id = { "text", required = true, primary = true },
+            provider = { "text", required = true },
+            repo = { "text", required = true },
+            pr_number = { "integer", required = true },
+            pr_url = { "text" },
+            ticket_id = { "text", required = true },
+            run_id = { "text" },
+            status = { "text", required = true },
+            head_branch = { "text" },
+            base_branch = { "text" },
+            merge_commit = { "text" },
+            created_at = { "integer", required = true },
+            updated_at = { "integer", required = true },
+            merged_at = { "integer" },
+        },
         events = {
             id = { "text", required = true, primary = true },
             run_id = { "text" },
@@ -210,6 +248,12 @@ local indexes = {
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_events_ticket_kind_created ON events(ticket_id, kind, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_questions_ticket_status ON questions(ticket_id, status, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_questions_run_status ON questions(run_id, status, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_project_pipelines_checklists_owner ON checklists(scope, owner_id, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_project_pipelines_checklist_items_checklist ON checklist_items(checklist_id, position)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_project_pipelines_pr_links_unique ON pr_links(provider, repo, pr_number)",
+    "CREATE INDEX IF NOT EXISTS idx_project_pipelines_pr_links_ticket ON pr_links(ticket_id, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_project_pipelines_pr_links_run ON pr_links(run_id, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_project_pipelines_pr_links_status ON pr_links(status, updated_at)",
 }
 
 for _, statement in ipairs(indexes) do

@@ -144,6 +144,17 @@ local function remote_request(self, payload, timeout_ms)
     return hub_client.request(self._conn_id, payload, timeout_ms or 10000)
 end
 
+local function remote_enqueue(self, payload)
+    if in_plugin_worker and self._is_worker_parent then
+        local bridge = rawget(_G, "plugin_worker_parent_hub")
+        if bridge and type(bridge.enqueue) == "function" then
+            return bridge.enqueue(payload)
+        end
+    end
+    remote_request(self, payload, 1)
+    return true
+end
+
 local function dispatch_remote_command_response(self, command, timeout_ms)
     command.request_id = command.request_id or generate_msg_id()
     local result = remote_request(self, {
@@ -221,7 +232,7 @@ function Hub._handle_worker_parent_request(payload)
     end
 
     if kind == "get_agent_list" then
-        return { result = Agent.all_info() }
+        return { result = Agent.all_info(payload.opts or {}) }
     end
 
     if kind == "list_workspaces" then
@@ -234,6 +245,16 @@ function Hub._handle_worker_parent_request(payload)
 
     if kind == "get_pty_snapshot" then
         return { result = local_hub:get_pty_snapshot(payload.agent_id, payload.session) }
+    end
+
+    if kind == "prepare_plugin_command" then
+        local ok, err = pcall(function()
+            return hub.prepare_plugin_command(payload.opts or {})
+        end)
+        if not ok then
+            return { error = tostring(err) }
+        end
+        return { result = { ok = true } }
     end
 
     if kind == "send_message" then
@@ -255,6 +276,16 @@ function Hub._handle_worker_parent_request(payload)
 
     if kind == "receive_messages" then
         return { result = local_hub:receive_messages(payload.agent_id) }
+    end
+
+    if kind == "register_plugin_asset" then
+        local ok, result = pcall(function()
+            return require("lib.plugin_assets")._register(payload.entry)
+        end)
+        if not ok then
+            return { error = tostring(result) }
+        end
+        return { result = { ok = true, asset_id = result.id } }
     end
 
     return { error = string.format("unsupported worker parent hub request: %s", tostring(kind)) }
@@ -709,6 +740,8 @@ function Hub:create_accessory(opts)
         agent_name = opts.agent_name,
         workspace_id = opts.workspace_id,
         workspace_name = opts.workspace_name,
+        from_worktree = opts.from_worktree,
+        branch = opts.branch,
         target_id = opts.target_id,
         target_path = opts.target_path,
         target_repo = opts.target_repo,
@@ -735,6 +768,24 @@ function Hub:create_accessory(opts)
     end
 
     return dispatch_remote_command_response(self, command, 30000)
+end
+
+--- Prepare a plugin-owned command on this hub.
+-- Completion is delivered asynchronously through `plugin_command_prepared`.
+function Hub:prepare_plugin_command(opts)
+    opts = copy_table(opts or {})
+    if self._is_local then
+        return hub.prepare_plugin_command(opts)
+    end
+
+    local result = remote_request(self, {
+        type = "prepare_plugin_command",
+        opts = opts,
+    }, 10000)
+    if result.error then
+        error(result.error)
+    end
+    return result.result or { ok = true }
 end
 
 --- Dispatch a hub command envelope through the standard hub boundary.
@@ -791,13 +842,14 @@ end
 --- List sessions visible on this hub.
 -- Local: returns hub Agent state. Remote: requests the parent/remote hub list.
 -- @return array Session info tables
-function Hub:list_agents()
+function Hub:list_agents(opts)
     if self._is_local then
-        return Agent.all_info()
+        return Agent.all_info(opts)
     end
 
     local result = remote_request(self, {
         type = "get_agent_list",
+        opts = opts or {},
     }, 10000)
 
     if result.error then
@@ -1020,6 +1072,7 @@ function Hub:update_session(agent_id, fields)
             label = fields.label,
             task = fields.task,
             metadata = fields.metadata,
+            plugin_state = fields.plugin_state,
             owner_plugin = fields.owner_plugin,
             visibility = fields.visibility,
             surface = fields.surface,
@@ -1031,16 +1084,33 @@ function Hub:update_session(agent_id, fields)
         return session_payload(session)
     end
 
-    return dispatch_remote_command_response(self, {
+    local command = {
         type = "update_session",
         agent_id = agent_id,
         label = fields.label,
         task = fields.task,
         metadata = fields.metadata,
+        plugin_state = fields.plugin_state,
         owner_plugin = fields.owner_plugin,
         visibility = fields.visibility,
         surface = fields.surface,
-    }, 10000)
+    }
+
+    if in_plugin_worker and self._is_worker_parent then
+        remote_enqueue(self, {
+            type = "hub_command",
+            command = command,
+        })
+        return {
+            ok = true,
+            status = "queued",
+            request_id = command.request_id,
+            session_uuid = agent_id,
+            id = agent_id,
+        }
+    end
+
+    return dispatch_remote_command_response(self, command, 10000)
 end
 
 --- Delete an agent on this hub.

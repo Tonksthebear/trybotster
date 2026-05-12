@@ -20,6 +20,130 @@ fn project_root_dir() -> PathBuf {
 }
 
 #[test]
+fn catalog_plugin_project_pipelines_closes_linked_ticket_on_pr_merged_event() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local closed = nil
+            local marked = nil
+
+            package.loaded["project_pipelines.repo"] = {{
+              find_pr_link = function(attrs)
+                assert(attrs.provider == "github")
+                assert(attrs.repo == "owner/repo")
+                assert(attrs.pr_number == 42)
+                return {{
+                  id = "pr-1",
+                  provider = "github",
+                  repo = "owner/repo",
+                  pr_number = 42,
+                  pr_url = "https://github.com/owner/repo/pull/42",
+                  ticket_id = "ticket-1",
+                  run_id = "run-1",
+                  status = "open",
+                }}
+              end,
+              mark_pr_link_merged = function(link_id, attrs)
+                assert(link_id == "pr-1")
+                marked = attrs
+                return {{
+                  id = "pr-1",
+                  provider = "github",
+                  repo = "owner/repo",
+                  pr_number = 42,
+                  pr_url = attrs.pr_url,
+                  ticket_id = "ticket-1",
+                  run_id = "run-1",
+                  status = "merged",
+                  merge_commit = attrs.merge_commit,
+                }}
+              end,
+              get_ticket = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{ id = "ticket-1", status = "open" }}
+              end,
+            }}
+
+            package.loaded["project_pipelines.engine"] = {{
+              close_ticket = function(ticket_id, attrs)
+                assert(ticket_id == "ticket-1")
+                assert(attrs.merge_confirmed == true)
+                assert(attrs.source_event == "pr_merged")
+                assert(attrs.pr_url == "https://github.com/owner/repo/pull/42")
+                assert(attrs.merge_commit == "abc123")
+                closed = attrs
+                return {{ id = "ticket-1", status = "closed" }}
+              end,
+            }}
+
+            local integration = require("project_pipelines.github_integration")
+            local response = integration.handle_pr_merged({{
+              provider = "github",
+              repo = "owner/repo",
+              pr_number = 42,
+              pr_url = "https://github.com/owner/repo/pull/42",
+              merge_commit = "abc123",
+            }})
+
+            assert(response.ok == true)
+            assert(marked.merge_commit == "abc123")
+            assert(closed.repo == "owner/repo")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("linked PR merge should close ticket");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_ignores_unlinked_pr_merged_event() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            package.loaded["project_pipelines.repo"] = {{
+              find_pr_link = function() return nil end,
+            }}
+
+            package.loaded["project_pipelines.engine"] = {{
+              close_ticket = function()
+                error("unlinked PR merge must not close a ticket")
+              end,
+            }}
+
+            local integration = require("project_pipelines.github_integration")
+            local response = integration.handle_pr_merged({{
+              repo = "owner/repo",
+              pr_number = 42,
+            }})
+
+            assert(response.ok == false)
+            assert(response.reason == "pr_not_linked")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("unlinked PR merge should be ignored");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_home_render_uses_bounded_notified_session_lookup() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
@@ -56,6 +180,9 @@ fn catalog_plugin_project_pipelines_home_render_uses_bounded_notified_session_lo
               section = function(title, children) return {{ type = "section", title = title, children = children }} end,
               empty = function(title) return {{ type = "empty", title = title }} end,
               badge = function(text, tone) return {{ type = "badge", text = text, tone = tone }} end,
+              row = function(children) return {{ type = "row", children = children }} end,
+              action_row = function(children) return {{ type = "action_row", children = children }} end,
+              session_info = function() return nil end,
             }}
 
             package.loaded["project_pipelines.repo"] = {{
@@ -67,6 +194,11 @@ fn catalog_plugin_project_pipelines_home_render_uses_bounded_notified_session_lo
               get_ticket = function(id) return {{ id = id, title = "Ticket " .. id }} end,
               get_pipeline = function(id) return {{ id = id, name = "Pipeline " .. id }} end,
               get_step = function(id) return {{ id = id, name = "Step " .. id }} end,
+              get_run_step_visit = function() return nil end,
+              latest_ticket_run = function() return nil end,
+              latest_merge_pr_artifact = function() return nil end,
+              ticket_events = function() return {{}} end,
+              visible_tickets = function() return {{}} end,
               has_open_questions = function() return false end,
               ticket_session_links_for_uuids = function(uuids)
                 calls.ticket_session_links_for_uuids = calls.ticket_session_links_for_uuids + 1
@@ -99,8 +231,8 @@ fn catalog_plugin_project_pipelines_home_render_uses_bounded_notified_session_lo
             local home = require("project_pipelines.web.screens.home")
             home.render({{}}, {{ path = function(path) return "/pipelines" .. path end }})
 
-            assert(calls.agent_list == 1)
-            assert(calls.ticket_session_links_for_uuids == 1)
+            assert(calls.agent_list == 0)
+            assert(calls.ticket_session_links_for_uuids == 0)
             assert(calls.ticket_session_uuids_by_ticket == 0)
             assert(calls.list_tickets == 0)
             return "ok"

@@ -128,6 +128,9 @@ pub struct SessionMetadata {
     /// Current terminal working directory from OSC 7.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Optional HTTP forwarding port assigned to the session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     /// Terminal mode flags at handshake time.
     ///
     /// Reconnect handshakes carry this so the hub can seed state without
@@ -592,6 +595,7 @@ mod tests {
             last_output_at: 0,
             title: Some("Build".to_string()),
             cwd: Some("/work/repo".to_string()),
+            port: Some(4321),
             mode_flags: ModeFlags {
                 kitty_enabled: true,
                 cursor_visible: false,
@@ -648,6 +652,7 @@ mod tests {
         assert_eq!(decoded.cols, 80);
         assert_eq!(decoded.title.as_deref(), Some("Build"));
         assert_eq!(decoded.cwd.as_deref(), Some("/work/repo"));
+        assert_eq!(decoded.port, Some(4321));
         assert!(decoded.mode_flags.kitty_enabled);
         assert!(!decoded.mode_flags.cursor_visible);
         assert!(decoded.mode_flags.bracketed_paste);

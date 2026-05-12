@@ -269,6 +269,7 @@ pub(crate) fn register(
                 let session_name: String = metadata
                     .get("session_name")
                     .unwrap_or_else(|_| session_type_str.clone());
+                let observe_output: bool = metadata.get("observe_output").unwrap_or(false);
 
                 let workspace_id: Option<String> = metadata.get("workspace_id").ok();
 
@@ -354,7 +355,7 @@ pub(crate) fn register(
                                 watcher_key,
                                 session_uuid: session_uuid.clone(),
                                 session_name,
-                                observe_output: false,
+                                observe_output,
                                 event_tx: event_tx_clone,
                             },
                         ));
@@ -648,6 +649,7 @@ pub(crate) fn register(
                 }
                 let rows: u16 = opts.get("rows").unwrap_or(24);
                 let cols: u16 = opts.get("cols").unwrap_or(80);
+                let port: Option<u16> = opts.get("port").ok();
                 let tee_path: Option<String> = opts.get("tee_path").ok();
                 let tee_cap: u64 = opts.get("tee_cap").unwrap_or(10 * 1024 * 1024);
 
@@ -769,6 +771,7 @@ pub(crate) fn register(
                     args: command_args,
                     env: env_pairs,
                     cwd: Some(worktree_path),
+                    port,
                     rows,
                     cols,
                     init_commands,
@@ -792,11 +795,12 @@ pub(crate) fn register(
                 // hub.register_session() which creates the PtyHandle and
                 // installs the reader thread.
                 use crate::lua::primitives::pty::PtySessionHandle;
-                let handle = PtySessionHandle::new_minimal(
+                let handle = PtySessionHandle::new_minimal_with_port(
                     rows,
                     cols,
                     std::sync::Arc::clone(&tx_spawn),
                     std::sync::Arc::clone(&cc_spawn),
+                    port,
                 );
 
                 // Store the session connection on the handle so register_session
@@ -839,16 +843,18 @@ pub(crate) fn register(
 
                 let rows = conn.metadata.rows;
                 let cols = conn.metadata.cols;
+                let port = conn.metadata.port;
 
                 let shared_conn: crate::session::connection::SharedSessionConnection =
                     std::sync::Arc::new(std::sync::Mutex::new(Some(conn)));
 
                 use crate::lua::primitives::pty::PtySessionHandle;
-                let handle = PtySessionHandle::new_minimal(
+                let handle = PtySessionHandle::new_minimal_with_port(
                     rows,
                     cols,
                     std::sync::Arc::clone(&tx_connect),
                     std::sync::Arc::clone(&cc_connect),
+                    port,
                 );
                 handle.set_session_connection(shared_conn);
 
@@ -1426,7 +1432,7 @@ mod tests {
         let cc = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
         register(&lua, tx.clone(), cache, hid, sid, state, cc.clone()).expect("Should register");
 
-        let handle = PtySessionHandle::new_minimal(24, 80, tx, cc);
+        let handle = PtySessionHandle::new_minimal_with_port(24, 80, tx, cc, None);
         handle.set_session_connection(Arc::new(Mutex::new(None)));
         let handle_ud = lua
             .create_userdata(handle)
@@ -1442,6 +1448,7 @@ mod tests {
                     session_type = "agent",
                     session_name = "codex",
                     label = "",
+                    observe_output = true,
                 })
                 "#,
             )
@@ -1461,7 +1468,7 @@ mod tests {
                 assert_eq!(watcher_key, "sess-1:codex");
                 assert_eq!(session_uuid, "sess-1");
                 assert_eq!(session_name, "codex");
-                assert!(!observe_output);
+                assert!(observe_output);
             }
             other => panic!("Expected SpawnNotificationWatcher, got {:?}", other),
         }

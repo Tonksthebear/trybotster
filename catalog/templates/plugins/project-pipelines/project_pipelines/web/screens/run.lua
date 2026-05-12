@@ -7,6 +7,7 @@
 
 local repo = require("project_pipelines.repo")
 local view = require("project_pipelines.web.ui")
+local util = require("project_pipelines.util")
 
 local M = {}
 
@@ -124,6 +125,7 @@ function M.render(view_state, ctx)
 
     local ticket = overview.ticket
     local pipeline = overview.pipeline
+    local project = ticket and not util.is_blank(ticket.project_id) and repo.get_project(ticket.project_id) or nil
     local step_nodes = {}
     for _, step in ipairs(overview.steps) do
         table.insert(step_nodes, render_step(step, ctx, run.ticket_id))
@@ -137,12 +139,46 @@ function M.render(view_state, ctx)
         table.insert(event_nodes, ui.text{ text = "No events yet.", size = "sm", tone = "muted" })
     end
 
+    local header_actions = {}
+    if ticket then
+        header_actions[#header_actions + 1] = ui.button{
+            id = "run-" .. run.id .. "-ticket",
+            label = "Ticket",
+            icon = "ticket",
+            variant = "ghost",
+            action = ui.action("botster.nav.open", { path = ctx.path("/tickets/" .. ticket.id) }),
+        }
+    end
+    if project then
+        header_actions[#header_actions + 1] = ui.button{
+            id = "run-" .. run.id .. "-project",
+            label = "Project",
+            icon = "folder",
+            variant = "ghost",
+            action = ui.action("botster.nav.open", { path = ctx.path("/projects/" .. project.id) }),
+        }
+    end
+    local current = run.current_run_step_id and repo.get_run_step_visit(run.current_run_step_id) or nil
+    if current and not util.is_blank(current.agent_session_uuid) and view.session_info(current.agent_session_uuid) then
+        header_actions[#header_actions + 1] = ui.button{
+            id = "run-" .. run.id .. "-current-agent",
+            label = "Current agent",
+            icon = "command-line",
+            variant = "solid",
+            tone = "accent",
+            action = ui.action("botster.nav.open", {
+                path = ctx.path("/tickets/" .. run.ticket_id .. "/sessions/" .. current.agent_session_uuid),
+            }),
+        }
+    end
+
     return ui.stack{ direction = "vertical", gap = "4", children = {
         view.page_header{
             title = ticket and ticket.title or run.id,
             back_id = "run-" .. run.id .. "-back",
             back_path = ctx.path("/"),
             meta = { view.badge(run.status) },
+            actions = header_actions,
             description = (pipeline and pipeline.name or run.pipeline_id) .. " - current step: " .. (run.current_step_id or "none"),
         },
         view.section("Steps", step_nodes),

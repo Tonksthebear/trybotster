@@ -13,6 +13,7 @@ use crate::lua::primitives::connection::ConnectionRequest;
 use crate::lua::primitives::http::CompletedHttpResponse;
 use crate::lua::primitives::hub::HubRequest;
 use crate::lua::primitives::hub_client::HubClientRequest;
+use crate::lua::primitives::plugin_worker::WorkerParentRequest;
 use crate::lua::primitives::pty::PtyRequest;
 use crate::lua::primitives::tui::TuiSendRequest;
 use crate::lua::primitives::webrtc::WebRtcSendRequest;
@@ -55,6 +56,17 @@ pub(crate) enum HubEvent {
         session_name: String,
         /// The PtyEvent variant (TitleChanged, CwdChanged, PromptMark).
         event: crate::agent::pty::PtyEvent,
+    },
+
+    /// Opt-in PTY output observer event for sessions that explicitly request
+    /// output observation. Normal terminal delivery stays on the data plane.
+    PtyOutput {
+        /// Session UUID for routing and Lua hook context.
+        session_uuid: String,
+        /// Session name (e.g., "agent", "server").
+        session_name: String,
+        /// Raw terminal bytes observed from the PTY stream.
+        data: Vec<u8>,
     },
 
     /// PTY process exited (reader thread detected EOF).
@@ -176,6 +188,9 @@ pub(crate) enum HubEvent {
 
     /// Hub operation request from a Lua callback.
     LuaHubRequest(HubRequest),
+
+    /// Parent-hub operation requested by a plugin worker callback.
+    PluginWorkerParentRequest(WorkerParentRequest),
 
     /// Connection operation request from a Lua callback.
     LuaConnectionRequest(ConnectionRequest),
@@ -413,6 +428,7 @@ impl HubEvent {
                 crate::agent::pty::PtyEvent::CursorVisibilityChanged(_) => "pty_osc_cursor",
                 _ => "pty_osc_event",
             },
+            Self::PtyOutput { .. } => "pty_output",
             Self::PtyProcessExited { .. } => "pty_process_exited",
             Self::SessionIo(_) => "session_io",
             Self::DropPendingSessionIoSnapshot { .. } => "drop_pending_session_io_snapshot",
@@ -430,6 +446,7 @@ impl HubEvent {
             Self::TuiSend(_) => "tui_send",
             Self::LuaPtyRequest(_) => "lua_pty_request",
             Self::LuaHubRequest(_) => "lua_hub_request",
+            Self::PluginWorkerParentRequest(_) => "plugin_worker_parent_request",
             Self::LuaConnectionRequest(_) => "lua_connection_request",
             Self::LuaWorktreeRequest(_) => "lua_worktree_request",
             Self::LuaActionCableRequest(_) => "lua_action_cable_request",
@@ -471,6 +488,7 @@ impl HubEvent {
                 | Self::WebRtcSend(_)
                 | Self::CleanupTick
                 | Self::DropPendingSessionIoSnapshot { .. }
+                | Self::PluginWorkerParentRequest(_)
                 | Self::SessionProcessExited { .. }
                 | Self::SessionUnregistered { .. }
                 | Self::SessionReconnectReady { .. }
@@ -580,6 +598,11 @@ impl HubEvent {
                 message,
             } => BASE + channel_id.len() + message.to_string().len(),
             Self::UserFileWatch { watch_id, events } => BASE + watch_id.len() + (events.len() * 48),
+            Self::PtyOutput {
+                session_uuid,
+                session_name,
+                data,
+            } => BASE + session_uuid.len() + session_name.len() + data.len(),
             Self::PushSubscriptionsExpired { identities } => {
                 BASE + identities
                     .iter()

@@ -11,11 +11,13 @@ import WorkspacePicker from './WorkspacePicker'
 import {
   useSpawnTargetStore,
   useSessionStore,
+  useWorktreeStore,
   useWorkspaceEntityStore,
 } from '../../store/entities'
 import {
   activeAgentWorkspaces,
   entityId,
+  normalizedWorktree,
   spawnTargetLabel,
 } from '../../lib/entity-selectors'
 
@@ -30,6 +32,20 @@ export default function NewAccessoryForm({ hubId }) {
     () => spawnTargetOrder.map((id) => spawnTargetsById[id]).filter(Boolean),
     [spawnTargetOrder, spawnTargetsById],
   )
+  const [selectedTargetId, setSelectedTargetId] = useState('')
+  const [selectedAccessory, setSelectedAccessory] = useState(null)
+  const [selectedWorktree, setSelectedWorktree] = useState(null)
+  // { id: string|null, name: string|null } | null
+  const [workspaceChoice, setWorkspaceChoice] = useState(null)
+  const [submitting, setSubmitting] = useState(false)
+  const worktreeOrder = useWorktreeStore((state) => state.order)
+  const worktreesById = useWorktreeStore((state) => state.byId)
+  const worktrees = useMemo(() => {
+    return worktreeOrder
+      .map((id) => worktreesById[id])
+      .filter((worktree) => worktree && (!selectedTargetId || worktree.target_id === selectedTargetId))
+      .map(normalizedWorktree)
+  }, [selectedTargetId, worktreeOrder, worktreesById])
   const workspaceOrder = useWorkspaceEntityStore((state) => state.order)
   const workspacesById = useWorkspaceEntityStore((state) => state.byId)
   const sessionOrder = useSessionStore((state) => state.order)
@@ -43,11 +59,6 @@ export default function NewAccessoryForm({ hubId }) {
     }),
     [workspaceOrder, workspacesById, sessionOrder, sessionsById],
   )
-  const [selectedTargetId, setSelectedTargetId] = useState('')
-  const [selectedAccessory, setSelectedAccessory] = useState(null)
-  // { id: string|null, name: string|null } | null
-  const [workspaceChoice, setWorkspaceChoice] = useState(null)
-  const [submitting, setSubmitting] = useState(false)
   const agentConfigQuery = useAgentConfigQuery(hubId, selectedTargetId, {
     enabled: open && !!selectedTargetId,
   })
@@ -110,6 +121,7 @@ export default function NewAccessoryForm({ hubId }) {
     if (!open) {
       setSelectedTargetId('')
       setSelectedAccessory(null)
+      setSelectedWorktree(null)
       setWorkspaceChoice(null)
       setSubmitting(false)
     }
@@ -118,6 +130,7 @@ export default function NewAccessoryForm({ hubId }) {
   async function applyTarget(targetId) {
     setSelectedTargetId(targetId)
     setSelectedAccessory(null)
+    setSelectedWorktree(null)
 
     const hub = await waitForHub(hubId)
     if (!hub || !targetId) return
@@ -139,7 +152,10 @@ export default function NewAccessoryForm({ hubId }) {
       selectedAccessory,
       workspaceChoice?.id || null,
       workspaceChoice?.name || null,
-      selectedTargetId
+      selectedTargetId,
+      selectedWorktree
+        ? { fromWorktree: selectedWorktree.path, branch: selectedWorktree.branch }
+        : {},
     )
 
     if (!sent) {
@@ -151,13 +167,13 @@ export default function NewAccessoryForm({ hubId }) {
   }
 
   const targetPrompt = selectedTargetId
-    ? 'Spawn target selected. Now choose an accessory configuration.'
+    ? 'Spawn target selected. Now choose main, an existing worktree, and an accessory configuration.'
     : spawnTargets.length === 0
       ? 'Add a spawn target in Device Settings before starting an accessory.'
       : 'Choose a spawn target to unlock accessory configuration.'
 
   return (
-    <Dialog open={open} onClose={close} size="md">
+    <Dialog open={open} onClose={close} size="lg">
       <DialogTitle>New Accessory</DialogTitle>
       <DialogDescription>{targetPrompt}</DialogDescription>
 
@@ -179,6 +195,67 @@ export default function NewAccessoryForm({ hubId }) {
             })}
           </Select>
         </Field>
+
+        {/* Worktree/branch options — visible when target selected */}
+        {selectedTargetId && (
+          <div className="mt-6 space-y-4" data-new-accessory-form-target="worktreeOptions">
+            <button
+              type="button"
+              onClick={() => setSelectedWorktree(null)}
+              data-selected={!selectedWorktree ? 'true' : undefined}
+              className="w-full text-left px-4 py-3 rounded-lg border border-zinc-700 bg-zinc-900 hover:bg-zinc-800 hover:border-zinc-600 transition-colors data-[selected=true]:border-indigo-500 data-[selected=true]:bg-indigo-500/10"
+            >
+              <div className="flex items-center gap-2">
+                <svg className="size-4 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+                </svg>
+                <span className="text-sm font-medium text-zinc-100">Main branch</span>
+              </div>
+              <div className="text-xs text-zinc-500 mt-1">Start the accessory in the admitted spawn target directory</div>
+            </button>
+
+            {worktrees.length > 0 && (
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">
+                    Connect to existing git worktree
+                  </p>
+                </div>
+                <div className="space-y-1">
+                  {worktrees.map((wt) => {
+                    const label = wt.issue_number ? `Issue #${wt.issue_number}` : (wt.branch || wt.path)
+                    return (
+                      <button
+                        key={wt.path}
+                        type="button"
+                        onClick={() => setSelectedWorktree(wt)}
+                        data-selected={selectedWorktree?.path === wt.path ? 'true' : undefined}
+                        className="w-full text-left px-3 py-2 rounded-lg hover:bg-zinc-700 text-zinc-300 transition-colors data-[selected=true]:bg-indigo-500/10 data-[selected=true]:text-zinc-100"
+                      >
+                        <div className="flex items-center gap-2">
+                          <svg className="size-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                          </svg>
+                          <span className="font-mono text-sm">{label}</span>
+                          {(wt.active_sessions || 0) > 0 && (
+                            <span className="rounded-full border border-zinc-600 px-2 py-0.5 text-[11px] text-zinc-300">
+                              {wt.active_sessions} active
+                            </span>
+                          )}
+                        </div>
+                        <div className="text-xs text-zinc-500 mt-1 truncate">{wt.path}</div>
+                      </button>
+                    )
+                  })}
+                </div>
+              </div>
+            )}
+
+            {worktrees.length === 0 && (
+              <div className="text-center py-4 text-zinc-500 text-sm">No existing worktrees</div>
+            )}
+          </div>
+        )}
 
         {/* Accessory list */}
         {selectedTargetId && (

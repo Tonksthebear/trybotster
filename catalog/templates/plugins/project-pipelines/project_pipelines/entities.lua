@@ -27,6 +27,9 @@ M.types = {
     finding = OWNER .. ".finding",
     artifact = OWNER .. ".artifact",
     question = OWNER .. ".question",
+    checklist = OWNER .. ".checklist",
+    checklist_item = OWNER .. ".checklist_item",
+    pr_link = OWNER .. ".pr_link",
     event = OWNER .. ".event",
 }
 
@@ -567,6 +570,12 @@ local function event_entity(event)
     return entity
 end
 
+local function checklist_item_entity(item)
+    local entity = copy(item)
+    entity.evidence = decode(item.evidence, {})
+    return entity
+end
+
 local ENTITY = {
     [M.types.ticket] = {
         all = function()
@@ -672,6 +681,28 @@ local ENTITY = {
             return out
         end,
         one = question_entity,
+    },
+    [M.types.checklist] = {
+        all = function()
+            return rows("SELECT * FROM checklists ORDER BY updated_at DESC, created_at DESC, id DESC")
+        end,
+        one = copy,
+    },
+    [M.types.checklist_item] = {
+        all = function()
+            local out = {}
+            for _, item in ipairs(rows("SELECT * FROM checklist_items ORDER BY checklist_id ASC, position ASC, created_at ASC, id ASC")) do
+                out[#out + 1] = checklist_item_entity(item)
+            end
+            return out
+        end,
+        one = checklist_item_entity,
+    },
+    [M.types.pr_link] = {
+        all = function()
+            return rows("SELECT * FROM pr_links ORDER BY updated_at DESC, created_at DESC, id DESC")
+        end,
+        one = copy,
     },
     [M.types.event] = {
         all = function()

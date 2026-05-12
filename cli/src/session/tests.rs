@@ -109,6 +109,7 @@ mod protocol_tests {
             last_output_at: 1234567890,
             title: Some("working".to_string()),
             cwd: Some("/tmp/project".to_string()),
+            port: Some(4321),
             mode_flags: ModeFlags {
                 kitty_enabled: true,
                 cursor_visible: false,
@@ -128,6 +129,7 @@ mod protocol_tests {
         assert_eq!(decoded.last_output_at, 1234567890);
         assert_eq!(decoded.title.as_deref(), Some("working"));
         assert_eq!(decoded.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(decoded.port, Some(4321));
         assert!(decoded.mode_flags.kitty_enabled);
         assert!(!decoded.mode_flags.cursor_visible);
         assert!(decoded.mode_flags.bracketed_paste);
@@ -135,6 +137,76 @@ mod protocol_tests {
         assert!(decoded.mode_flags.alt_screen);
         assert!(decoded.mode_flags.focus_reporting);
         assert!(!decoded.mode_flags.application_cursor);
+    }
+}
+
+#[cfg(test)]
+mod session_frame_tests {
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use crate::session::protocol::{encode_json, FRAME_RESIZE};
+    use crate::session::{handle_hub_frame, PtyWriteCommand};
+    use crate::terminal::TerminalParser;
+
+    #[test]
+    fn resize_frame_updates_parser_before_writer_thread_runs() {
+        let parser = Arc::new(Mutex::new(TerminalParser::new(24, 80, 100)));
+        let resize_pending = AtomicBool::new(false);
+        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(8);
+        let (mut stream, mut peer) = UnixStream::pair().expect("socket pair");
+        let tee = Arc::new(Mutex::new(None));
+        let frame = encode_json(
+            FRAME_RESIZE,
+            &serde_json::json!({
+                "rows": 37,
+                "cols": 132,
+            }),
+        )
+        .expect("resize frame");
+
+        let decoded = {
+            let mut decoder = crate::session::protocol::FrameDecoder::new();
+            decoder
+                .feed(&frame)
+                .into_iter()
+                .next()
+                .expect("decoded frame")
+        };
+
+        handle_hub_frame(
+            &decoded,
+            &writer_tx,
+            &parser,
+            &resize_pending,
+            &tee,
+            &mut stream,
+            &AtomicBool::new(false),
+        );
+
+        {
+            let guard = parser.lock().expect("parser lock");
+            assert_eq!(guard.terminal().rows(), 37);
+            assert_eq!(guard.terminal().cols(), 132);
+        }
+        assert!(matches!(
+            writer_rx.try_recv(),
+            Ok(PtyWriteCommand::Resize {
+                rows: 37,
+                cols: 132
+            })
+        ));
+
+        peer.set_read_timeout(Some(Duration::from_millis(10)))
+            .expect("timeout");
+        let mut buf = [0u8; 1];
+        assert!(
+            peer.read(&mut buf).is_err(),
+            "resize should not write a reply"
+        );
     }
 }
 

@@ -205,6 +205,9 @@ pub struct SpawnConfig {
     pub env: Vec<(String, String)>,
     /// Working directory for the spawned process.
     pub cwd: Option<String>,
+    /// Optional HTTP forwarding port assigned to this session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
     /// Initial PTY row count.
     pub rows: u16,
     /// Initial PTY column count.
@@ -336,6 +339,7 @@ fn run_session(
             last_output_at: 0,
             title: None,
             cwd: None,
+            port: None,
             mode_flags: ModeFlags::default(),
         },
     )
@@ -352,6 +356,7 @@ fn run_session(
         .context("set config read timeout")?;
     let mut decoder = FrameDecoder::new();
     let config = read_spawn_config(&mut stream, &mut decoder)?;
+    let session_port = config.port;
 
     // Create PTY
     let pty_system = portable_pty::native_pty_system();
@@ -665,6 +670,7 @@ fn run_session(
                                 last_output_at: last_output_at.load(Ordering::Relaxed),
                                 title: parser_title(&parser),
                                 cwd: parser_cwd(&parser),
+                                port: session_port,
                                 mode_flags: parser_mode_flags(&parser),
                             },
                         );
@@ -808,7 +814,16 @@ fn handle_hub_frame(
             if let Ok(resize) = frame.json::<serde_json::Value>() {
                 let rows = resize["rows"].as_u64().unwrap_or(24) as u16;
                 let cols = resize["cols"].as_u64().unwrap_or(80) as u16;
+                log::info!("[session] received resize from hub: {}x{}", cols, rows);
                 resize_pending.store(true, Ordering::Release);
+                if let Ok(mut p) = parser.lock() {
+                    p.resize(rows, cols);
+                    log::info!(
+                        "[session] parser resized before PTY writer: {}x{}",
+                        p.terminal().cols(),
+                        p.terminal().rows()
+                    );
+                }
                 let _ = writer_tx.send(PtyWriteCommand::Resize { rows, cols });
             }
         }
@@ -818,10 +833,19 @@ fn handle_hub_frame(
             let snapshot = parser
                 .lock()
                 .map(|p| {
-                    p.terminal().snapshot_export().unwrap_or_else(|| {
+                    let cols = p.terminal().cols();
+                    let rows = p.terminal().rows();
+                    let snapshot = p.terminal().snapshot_export().unwrap_or_else(|| {
                         log::error!("[session] snapshot_export failed");
                         Vec::new()
-                    })
+                    });
+                    log::info!(
+                        "[session] exported snapshot at {}x{} ({} bytes)",
+                        cols,
+                        rows,
+                        snapshot.len()
+                    );
+                    snapshot
                 })
                 .unwrap_or_default();
             let response = encode_frame(FRAME_SNAPSHOT, &snapshot);

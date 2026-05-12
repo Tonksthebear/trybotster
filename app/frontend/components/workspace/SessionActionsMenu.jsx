@@ -90,8 +90,7 @@ export default function SessionActionsMenu() {
 
   if (!openState) return null
 
-  const isAccessory = session?.session_type === 'accessory'
-  const canMove = !isAccessory
+  const canMove = !!session
   const canDelete = true
   const hasActionItems = sessionActions.length > 0
   const hasManageItems = canMove || canDelete

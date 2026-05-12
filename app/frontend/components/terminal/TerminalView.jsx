@@ -162,9 +162,13 @@ export default function TerminalView({ hubId, sessionUuid }) {
     }
 
     function onTermSize(cols, rows) {
-      if (state.connectPtyRequested || state.destroyed || !state.backendReady)
+      if (state.destroyed || !state.backendReady)
         return
       state.measuredSize = { cols, rows }
+      if (state.connectPtyRequested) {
+        if (cols > 1 && rows > 1) state.transport?.resize(cols, rows)
+        return
+      }
       if (state.connectPtyTimer) clearTimeout(state.connectPtyTimer)
       state.connectPtyTimer = setTimeout(() => {
         state.connectPtyTimer = null

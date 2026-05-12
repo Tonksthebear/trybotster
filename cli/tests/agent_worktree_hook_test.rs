@@ -151,7 +151,24 @@ fn new_agents_lua_vm() -> Lua {
         end
 
         package.preload["lib.accessory"] = function()
-            return {{ new = function() error("unexpected accessory spawn") end }}
+            return {{
+                new = function(config)
+                    push_order("accessory_new")
+                    _G.__accessory_new_config = config
+                    return {{
+                        session_uuid = "accessory-1",
+                        info = function()
+                            return {{
+                                session_uuid = "accessory-1",
+                                branch_name = config.branch_name,
+                                worktree_path = config.worktree_path,
+                                metadata = config.metadata,
+                                session_type = "accessory",
+                            }}
+                        end,
+                    }}
+                end,
+            }}
         end
 
         package.preload["lib.session_close_policy"] = function()
@@ -165,6 +182,66 @@ fn new_agents_lua_vm() -> Lua {
     .expect("load agents handler");
 
     lua
+}
+
+#[test]
+fn accessory_creation_can_attach_to_selected_worktree() {
+    let lua = new_agents_lua_vm();
+
+    lua.load(
+        r#"
+        agents_handler.handle_create_accessory(
+            nil,
+            nil,
+            "rails-server",
+            nil,
+            {
+                workspace_id = "ws-1",
+                workspace = "Feature A",
+            },
+            {
+                target_id = "target-jupiter",
+                target_path = "/repos/jupiter",
+                target_repo = "acme/jupiter",
+            },
+            nil,
+            "/repos/jupiter/.worktrees/feature-a",
+            "feature-a"
+        )
+        "#,
+    )
+    .exec()
+    .expect("create accessory in selected worktree");
+
+    let (order, worktree_path, branch_name, workspace_id, workspace_name, target_id): (
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+    ) = lua
+        .load(
+            r#"
+            local c = _G.__accessory_new_config
+            return
+                _G.__order[1],
+                c.worktree_path,
+                c.branch_name,
+                c.metadata.workspace_id,
+                c.metadata.workspace,
+                c.target_id
+            "#,
+        )
+        .eval()
+        .expect("read accessory spawn config");
+
+    assert_eq!(order, "accessory_new");
+    assert_eq!(worktree_path, "/repos/jupiter/.worktrees/feature-a");
+    assert_eq!(branch_name, "feature-a");
+    assert_eq!(workspace_id, "ws-1");
+    assert_eq!(workspace_name, "Feature A");
+    assert_eq!(target_id, "target-jupiter");
 }
 
 #[test]

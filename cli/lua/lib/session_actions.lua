@@ -29,6 +29,20 @@ local function copy_payload(source)
     return out
 end
 
+local function copy_worker_payload(source)
+    local out = {}
+    if type(source) ~= "table" then return out end
+    for k, v in pairs(source) do
+        if k ~= "client" and k ~= "sub_id"
+            and type(v) ~= "function"
+            and type(v) ~= "userdata"
+            and type(v) ~= "thread" then
+            out[k] = v
+        end
+    end
+    return out
+end
+
 local function call_or_value(value, session, action_id)
     if type(value) == "function" then
         return value(session, action_id)
@@ -292,6 +306,9 @@ function M.run(session_uuid, action_id, context)
     local payload = copy_payload(context)
     payload.session = session
     payload.action = action
+    local worker_payload = copy_worker_payload(context)
+    worker_payload.session = session
+    worker_payload.action = action
     local ok, result, err = require("lib.plugin_supervisor").invoke(
         entry.owner_plugin,
         "session_action:" .. action_id,
@@ -302,7 +319,7 @@ function M.run(session_uuid, action_id, context)
             handler_id = action_id,
             payload = {
                 session_uuid = session_uuid,
-                payload = payload,
+                payload = worker_payload,
             },
         },
         session_uuid,

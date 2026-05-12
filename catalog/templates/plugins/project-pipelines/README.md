@@ -39,6 +39,9 @@ The plugin is intentionally split across modules:
 - Review: structured reviewer output.
 - Finding: durable review issue, visible to all agents through context.
 - Artifact: durable evidence or external reference.
+- Checklist: durable workflow/rubric checkpoint list for a project, ticket, or
+  run. Checklists track evidence that the agent followed the workflow; the
+  vault remains the source of truth for project conventions.
 - Event: append-only audit record of workflow changes.
 
 ## Pipeline Definitions
@@ -78,6 +81,17 @@ Ticket and project MCP management:
 - `project_pipelines_add_project_target`
 - `project_pipelines_remove_project_target`
 - `project_pipelines_start_run`
+
+Checklist MCP management:
+
+- `project_pipelines_checklist_instructions`
+- `project_pipelines_create_checklist`
+- `project_pipelines_create_vault_checklist`
+- `project_pipelines_list_checklists`
+- `project_pipelines_get_checklist`
+- `project_pipelines_update_checklist`
+- `project_pipelines_add_checklist_item`
+- `project_pipelines_update_checklist_item`
 
 `project_pipelines_get_ticket` is the agent-facing ticket status view. It
 returns the ticket, project, runs, latest run, latest run steps, associated
@@ -130,6 +144,16 @@ Agents should call `project_pipelines_current_context` first. The context includ
 
 Agents submit evidence with `project_pipelines_submit_gate`, reviews with `project_pipelines_submit_review`, artifacts with `project_pipelines_add_artifact`, and move the run with `project_pipelines_request_step_advance`. If gates are not satisfied, advancement returns structured unmet gate prompts.
 
+Agents should use `project_pipelines_create_vault_checklist` when a ticket or
+run needs convention discipline without copying convention text into the
+pipeline. The default vault checklist asks for evidence that applicable vault
+notes were loaded, the plan was checked against those conventions, repo-approved
+verification ran, and new durable knowledge was captured or explicitly deemed
+unneeded. Checklist item evidence should name vault notes, commands, conflicts,
+waivers, or capture paths; the actual convention content stays in the vault.
+Agents can call `project_pipelines_checklist_instructions` to retrieve the
+recommended flow, default vault checklist items, statuses, and evidence shape.
+
 Review agents leave findings through `project_pipelines_submit_review`. Blocker and high findings keep `review_clear` gates blocked until each finding is resolved or waived with `project_pipelines_resolve_finding`.
 
 Agents ask for help through project-pipelines tools, not the generic Botster inbox. `project_pipelines_ask_human` creates a durable human question visible in the sidebar and ticket page. `project_pipelines_ask_agent` creates the same durable question and spawns an advisor agent. Answers are read with `project_pipelines_receive_question_answers` or from `project_pipelines_current_context`; question answers wake the asking session with a Project Pipelines notification, not a generic `receive_messages()` inbox doorbell.
@@ -141,6 +165,11 @@ When a run returns to an existing step agent, Project Pipelines sends both a str
 ## GUI
 
 The `Pipelines` surface shows tickets, runs, pipeline definitions, selected agent per step, reviews, findings, artifacts, recent events, questions, and plugin-owned sessions. When any question is open, the workspace plugin nav entry for Pipelines shows a notification marker.
+
+The overview is a human workbench, not a full internal state dump. It highlights
+questions that need answers, currently running pipeline runs, and PR/merge work
+that needs review or follow-up. Autonomous blocked loops stay inside the
+pipeline run flow unless they create a human question or merge/PR item.
 
 ### Plugin Entity Case Study
 
@@ -170,6 +199,8 @@ Dynamic state is published as plugin-owned entities:
 - `/project-pipelines.finding`
 - `/project-pipelines.artifact`
 - `/project-pipelines.question`
+- `/project-pipelines.checklist`
+- `/project-pipelines.checklist_item`
 - `/project-pipelines.event`
 
 The overview and detail pages render dynamic rows from plugin-owned entities
@@ -251,6 +282,12 @@ Pipeline edits mutate the shared pipeline definition. They affect future runs, n
 
 The plugin sidebar is ticket-first. It intentionally does not show active agents; terminals are reached through the ticket page so the user stays oriented around the work item.
 
+Ticket detail pages can spawn an additional agent or accessory in the ticket's
+worktree context. Project Pipelines first reuses a live associated session's
+worktree when one exists, then falls back to the ticket pipeline branch so
+manual support sessions stay attached to the ticket instead of forcing the user
+through the generic new-session flow.
+
 Ticket closure closes every Botster session associated with every run for that ticket without deleting worktrees. Step completion does not close agents; they remain available for inspection and for future prompts if a run returns to their step.
 
 Pipelines declare a merge policy: `direct` merges accepted work directly to
@@ -262,6 +299,15 @@ verify the ticket intent, review findings, runtime wiring, docs, tests, and
 removed/deprecated paths before merging. They should include `merge_commit`,
 `pr_url`, or `merge_summary` when calling `project_pipelines_close_ticket` with
 `merge_confirmed=true`.
+
+Tickets can be linked to provider pull requests through
+`project_pipelines_link_pr`. The link is provider-neutral (`provider`, `repo`,
+`pr_number`) so external plugins can emit lifecycle events without coupling to
+Project Pipelines internals. The GitHub plugin emits `pr_merged`; Project
+Pipelines listens for that event, finds a matching PR link, marks it merged, and
+closes the associated ticket with merge evidence. Agents should link the PR when
+it is opened or updated so the later merge event can complete the ticket without
+another human action.
 
 Every pipeline handoff should bias toward disciplined, verifiable work:
 assumptions are explicit, changes are surgical, speculative abstractions are

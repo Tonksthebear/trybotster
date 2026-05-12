@@ -15,7 +15,9 @@ if registry.by_id == nil then registry.by_id = {} end
 local message_handlers = state.get("plugin_assets.message_handlers", {})
 
 local function caller_plugin_key()
-    local name = rawget(_G, "_loading_plugin_key") or rawget(_G, "_loading_plugin_name")
+    local name = rawget(_G, "_loading_plugin_key")
+        or rawget(_G, "_loading_plugin_name")
+        or rawget(_G, "_plugin_worker_key")
     if type(name) == "string" and name ~= "" then return name end
     return "builtin"
 end
@@ -24,6 +26,29 @@ local function running_in_plugin_worker(plugin_key)
     return type(plugin_key) == "string"
         and plugin_key ~= ""
         and rawget(_G, "_plugin_worker_key") == plugin_key
+end
+
+local function register_entry(entry)
+    assert(type(entry) == "table", "plugin_assets._register: entry must be a table")
+    assert(type(entry.id) == "string" and entry.id ~= "",
+        "plugin_assets._register: id must be a non-empty string")
+    assert(type(entry.name) == "string" and entry.name ~= "",
+        "plugin_assets._register: name must be a non-empty string")
+    assert(type(entry.plugin_name) == "string" and entry.plugin_name ~= "",
+        "plugin_assets._register: plugin_name must be a non-empty string")
+    assert(type(entry.path) == "string" and entry.path ~= "",
+        "plugin_assets._register: path must be a non-empty string")
+    assert(type(entry.content_type) == "string" and entry.content_type ~= "",
+        "plugin_assets._register: content_type must be a non-empty string")
+
+    registry.by_id[entry.id] = {
+        id = entry.id,
+        name = entry.name,
+        plugin_name = entry.plugin_name,
+        path = entry.path,
+        content_type = entry.content_type,
+    }
+    return registry.by_id[entry.id]
 end
 
 local function normalize_message_result(result)
@@ -40,6 +65,13 @@ end
 
 local function sanitize_part(value)
     return tostring(value or ""):gsub("[^%w%._-]", "_")
+end
+
+local function plugin_key_from_asset_id(asset_id)
+    if type(asset_id) ~= "string" then return nil end
+    local plugin_key = asset_id:match("^([^:]+):")
+    if type(plugin_key) == "string" and plugin_key ~= "" then return plugin_key end
+    return nil
 end
 
 local function version_for(path)
@@ -69,13 +101,29 @@ function M.expose_file(name, path, opts)
     assert(type(content_type) == "string" and content_type ~= "",
         "plugin_assets.expose_file: content_type must be a non-empty string")
 
-    registry.by_id[asset_id] = {
+    local entry = register_entry({
         id = asset_id,
         name = name,
         plugin_name = plugin_name,
         path = path,
         content_type = content_type,
-    }
+    })
+
+    -- Surface renderers now run in plugin worker VMs. Browser asset reads still
+    -- resolve through the hub VM, so worker-created asset descriptors must be
+    -- mirrored to the parent hub registry before the iframe URL is returned.
+    local bridge = rawget(_G, "plugin_worker_parent_hub")
+    if rawget(_G, "_plugin_worker_key") == plugin_name
+        and type(bridge) == "table"
+        and type(bridge.request) == "function" then
+        local ok, err = pcall(bridge.request, {
+            type = "register_plugin_asset",
+            entry = entry,
+        }, 10000)
+        if not ok and log and log.warn then
+            log.warn("plugin_assets.expose_file: parent registration failed: " .. tostring(err))
+        end
+    end
 
     return "botster-plugin-asset://" .. asset_id .. "?v=" .. version_for(path)
 end
@@ -88,6 +136,23 @@ end
 function M.read(asset_id)
     local entry = M.get(asset_id)
     if not entry then
+        local plugin_key = plugin_key_from_asset_id(asset_id)
+        if rawget(_G, "_plugin_worker_key") == nil
+            and type(plugin_key) == "string"
+            and plugin_key ~= "builtin"
+            and type(__plugin_worker_invoke) == "function" then
+            local ok, result = pcall(
+                __plugin_worker_invoke,
+                plugin_key,
+                "plugin_asset_read",
+                asset_id,
+                nil,
+                { asset_id = asset_id },
+                2000)
+            if ok and type(result) == "table" then
+                return result, nil
+            end
+        end
         return nil, "Unknown plugin asset"
     end
     local content, err = fs.read(entry.path)
@@ -204,6 +269,10 @@ function M._invoke_message(plugin_name, action_name, message, ctx)
         error("plugin asset message handler not registered: " .. tostring(plugin_name) .. ":" .. tostring(action_name))
     end
     return normalize_message_result(handler_entry.handler(message, ctx or {}))
+end
+
+function M._register(entry)
+    return register_entry(entry)
 end
 
 function M.unregister_by_plugin(plugin_key)

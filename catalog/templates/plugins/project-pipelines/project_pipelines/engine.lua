@@ -256,6 +256,8 @@ function M.context_for(run_id, session_uuid)
         question_answers = repo.question_answers({ run_id = run.id, asked_by_session_uuid = session_uuid }),
         dependencies = repo.ticket_dependencies(run.ticket_id),
         blocking_dependencies = repo.blocking_ticket_dependencies(run.ticket_id),
+        ticket_checklists = repo.list_checklists{ scope = "ticket", owner_id = run.ticket_id },
+        run_checklists = repo.list_checklists{ scope = "run", owner_id = run.id },
         recent_events = repo.run_events(run.id, 25),
         assignment = assignment,
     }
@@ -278,6 +280,7 @@ local function spawn_step_agent(run, step)
         "Ticket: " .. (ticket and ticket.title or run.ticket_id),
         "Role instructions: " .. (step.prompt or ""),
         "Use the project_pipelines_current_context MCP tool to inspect ticket, run, gates, reviews, artifacts, findings, questions, and question answers.",
+        "Use Project Pipelines checklists to prove workflow discipline. Vault checklists should record which vault/project notes constrained the work, convention conflicts or none, verification evidence, and whether durable knowledge was captured.",
         "State assumptions explicitly in artifacts/reviews. If the ticket has multiple plausible meanings or you would need to ignore/waive part of it, ask a human question instead of choosing silently.",
         "Prefer the smallest surgical change that satisfies the ticket intent. Do not add speculative abstractions, optional configurability, broad refactors, or adjacent cleanup unless the ticket requires them.",
         "Define and preserve verifiable success criteria. Every changed line should trace to the ticket intent, a required convention, or cleanup made necessary by your own change.",

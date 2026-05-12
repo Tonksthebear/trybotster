@@ -178,7 +178,11 @@ fn plugin_owned_session_action_runs_in_plugin_worker_vm() {
                 end,
             }}
 
-            local ok_run, result = require("lib.session_actions").run("sess-worker", "demo.session.worker", {{ params = {{}} }})
+            local ok_run, result = require("lib.session_actions").run("sess-worker", "demo.session.worker", {{
+                client = {{ send = function() error("client should not cross worker boundary") end }},
+                sub_id = "sub-worker",
+                params = {{}},
+            }})
             assert(ok_run == true, tostring(result))
             assert(result == "worker:worker-session-plugin", tostring(result))
             return true
@@ -187,6 +191,385 @@ fn plugin_owned_session_action_runs_in_plugin_worker_vm() {
         ))
         .eval::<bool>()
         .unwrap();
+}
+
+#[test]
+fn plugin_owned_notification_claim_runs_in_plugin_worker_vm() {
+    // SAFETY: This integration filter runs this test in isolation and the
+    // worker VM must resolve the repository Lua modules instead of user config.
+    unsafe {
+        std::env::set_var(
+            "BOTSTER_LUA_PATH",
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua"),
+        )
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let plugin_dir = tmp.path().join("worker-notification-plugin");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    let init_path = plugin_dir.join("init.lua");
+    fs::write(
+        &init_path,
+        r#"
+        local notifications = require("lib.notifications")
+
+        notifications.claim({
+            name = "demo.notification.worker",
+            scope = { all_sessions = true },
+            capabilities = { "notifications.global_claim" },
+            timeout_ms = 250,
+            handler = function(intent)
+                local key = rawget(_G, "_plugin_worker_key")
+                if key then
+                    return {
+                        core = "replace",
+                        custom = {
+                            title = "worker:" .. key,
+                            body = intent.message,
+                            push = false,
+                        },
+                    }
+                end
+                return { core = "replace", custom = { title = "hub closure ran" } }
+            end,
+        })
+
+        return {}
+        "#,
+    )
+    .unwrap();
+
+    let runtime = LuaRuntime::new().unwrap();
+    runtime
+        .lua()
+        .load(format!(
+            r#"
+            local loader = require("hub.loader")
+            local ok, err = loader.load_plugin({init_path}, "worker-notification-plugin", {{ source = "device" }})
+            assert(ok, tostring(err))
+
+            local decision = require("lib.notifications").evaluate({{
+                session_uuid = "sess-worker",
+                message = "permission required",
+            }})
+            assert(decision.core == "replace", tostring(decision.core))
+            assert(decision.custom.title == "worker:worker-notification-plugin", decision.custom.title)
+            assert(decision.custom.body == "permission required", decision.custom.body)
+            return true
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval::<bool>()
+        .unwrap();
+}
+
+#[test]
+fn plugin_worker_session_action_can_prepare_plugin_command_on_parent_hub() {
+    // SAFETY: This integration filter runs this test in isolation and the
+    // worker VM must resolve the repository Lua modules instead of user config.
+    unsafe {
+        std::env::set_var(
+            "BOTSTER_LUA_PATH",
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua"),
+        )
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let plugin_dir = tmp.path().join("worker-parent-hub-plugin");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    let init_path = plugin_dir.join("init.lua");
+    fs::write(
+        &init_path,
+        r#"
+        local Hub = require("lib.hub")
+        local actions = require("lib.session_actions")
+
+        actions.register("demo.session.parent_hub", {
+            label = "Parent Hub",
+            timeout_ms = 2000,
+            run = function(session_uuid)
+                local parent = Hub.get()
+                parent:prepare_plugin_command({
+                    request_id = "prep-" .. session_uuid,
+                    command = "cloudflared",
+                    context = { parent_session_uuid = session_uuid },
+                })
+                return "queued"
+            end,
+        })
+
+        return {}
+        "#,
+    )
+    .unwrap();
+
+    let runtime = LuaRuntime::new().unwrap();
+    runtime
+        .lua()
+        .load(format!(
+            r#"
+            hub = hub or {{}}
+            hub.hub_id = hub.hub_id or function() return "hub-test" end
+            hub.server_id = hub.server_id or function() return "hub-test" end
+            local loader = require("hub.loader")
+            local ok, err = loader.load_plugin({init_path}, "worker-parent-hub-plugin", {{ source = "device" }})
+            assert(ok, tostring(err))
+
+            hub.prepare_plugin_command = function(opts)
+                _G.prepare_request = opts
+            end
+            package.loaded["lib.session"] = {{
+                get = function(session_uuid)
+                    return {{
+                        info = function()
+                            return {{ session_uuid = session_uuid, created_at = 1 }}
+                        end,
+                    }}
+                end,
+                all_info = function()
+                    return {{ {{ session_uuid = "sess-worker", created_at = 1 }} }}
+                end,
+            }}
+
+            local ok_run, result = require("lib.session_actions").run("sess-worker", "demo.session.parent_hub", {{ params = {{}} }})
+            assert(ok_run == true, tostring(result))
+            assert(result == "queued", tostring(result))
+            assert(prepare_request.request_id == "prep-sess-worker", tostring(prepare_request and prepare_request.request_id))
+            assert(prepare_request.command == "cloudflared", tostring(prepare_request and prepare_request.command))
+            assert(prepare_request.context.parent_session_uuid == "sess-worker")
+            return true
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval::<bool>()
+        .unwrap();
+}
+
+#[test]
+fn plugin_worker_session_get_can_resolve_system_connector_sessions() {
+    // SAFETY: This integration filter runs this test in isolation and the
+    // worker VM must resolve the repository Lua modules instead of user config.
+    unsafe {
+        std::env::set_var(
+            "BOTSTER_LUA_PATH",
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua"),
+        )
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let plugin_dir = tmp.path().join("worker-system-session-plugin");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    let init_path = plugin_dir.join("init.lua");
+    fs::write(
+        &init_path,
+        r#"
+        local Session = require("lib.session")
+        local actions = require("lib.session_actions")
+
+        actions.register("demo.session.system_lookup", {
+            label = "System Lookup",
+            timeout_ms = 2000,
+            run = function(_session_uuid, _action_id, params)
+                assert(rawget(_G, "_plugin_worker_parent_hub_id"), "parent hub bridge missing")
+                local connector_uuid = params.connector_uuid or (params.params and params.params.connector_uuid)
+                local connector = Session.get(connector_uuid)
+                if not connector then
+                    return nil, "connector missing: " .. tostring(connector_uuid)
+                end
+                return {
+                    session_uuid = connector.session_uuid,
+                    owner_plugin = connector.metadata and connector.metadata.owner_plugin,
+                    target_session_uuid = connector:get_meta("target_session_uuid"),
+                }
+            end,
+        })
+
+        return {}
+        "#,
+    )
+    .unwrap();
+
+    let runtime = LuaRuntime::new().unwrap();
+    runtime
+        .lua()
+        .load(format!(
+            r#"
+            hub = hub or {{}}
+            hub.hub_id = hub.hub_id or function() return "hub-test" end
+            hub.server_id = hub.server_id or function() return "hub-test" end
+
+            local loader = require("hub.loader")
+            local ok, err = loader.load_plugin({init_path}, "worker-system-session-plugin", {{ source = "device" }})
+            assert(ok, tostring(err))
+
+            local all_info_calls = {{}}
+            local Hub = require("lib.hub")
+            Hub._handle_worker_parent_request = function(payload)
+                assert(payload.type == "get_agent_list", tostring(payload.type))
+                local opts = payload.opts or {{}}
+                all_info_calls[#all_info_calls + 1] = opts
+                local rows = {{
+                    {{
+                        session_uuid = "parent-session",
+                        id = "parent-session",
+                        metadata = {{}},
+                    }},
+                    {{
+                        session_uuid = "connector-session",
+                        id = "connector-session",
+                        metadata = {{
+                            system_session = true,
+                            owner_plugin = "cloudflare-hosted-preview",
+                            system_kind = "cloudflare_hosted_preview_connector",
+                            target_session_uuid = "parent-session",
+                        }},
+                    }},
+                }}
+                return {{ result = rows }}
+            end
+
+            local response = __plugin_worker_invoke(
+                "worker-system-session-plugin",
+                "session_action",
+                "demo.session.system_lookup",
+                nil,
+                {{
+                    session_uuid = "parent-session",
+                    payload = {{ params = {{ connector_uuid = "connector-session" }} }},
+                }},
+                2000
+            )
+            assert(response.ok == true, tostring(response.error))
+            local result = response.result
+            assert(result.session_uuid == "connector-session", tostring(result.session_uuid))
+            assert(result.owner_plugin == "cloudflare-hosted-preview", tostring(result.owner_plugin))
+            assert(result.target_session_uuid == "parent-session", tostring(result.target_session_uuid))
+            assert(all_info_calls[#all_info_calls].include_system == true)
+            return true
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval::<bool>()
+        .unwrap();
+}
+
+#[test]
+fn plugin_worker_update_session_enqueues_parent_hub_command_without_blocking() {
+    // SAFETY: This integration filter runs this test in isolation and the
+    // worker VM must resolve the repository Lua modules instead of user config.
+    unsafe {
+        std::env::set_var(
+            "BOTSTER_LUA_PATH",
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua"),
+        )
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let plugin_dir = tmp.path().join("worker-update-session-plugin");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    let init_path = plugin_dir.join("init.lua");
+    let marker_path = tmp.path().join("parent-update-dispatched.txt");
+    fs::write(
+        &init_path,
+        r#"
+        local Hub = require("lib.hub")
+        local actions = require("lib.session_actions")
+
+        actions.register("demo.session.update_parent", {
+            label = "Update Parent",
+            timeout_ms = 2000,
+            run = function(session_uuid)
+                local result = Hub.get():update_session(session_uuid, {
+                    plugin_state = {
+                        cloudflare_hosted_preview = {
+                            status = "running",
+                            url = "https://preview.trycloudflare.com",
+                        },
+                    },
+                })
+                assert(result.status == "queued", tostring(result.status))
+                return result.status
+            end,
+        })
+
+        return {}
+        "#,
+    )
+    .unwrap();
+
+    let runtime = LuaRuntime::new().unwrap();
+    runtime
+        .lua()
+        .load(format!(
+            r#"
+            hub = hub or {{}}
+            hub.hub_id = hub.hub_id or function() return "hub-test" end
+            hub.server_id = hub.server_id or function() return "hub-test" end
+
+            local marker_path = {marker_path}
+            local Hub = require("lib.hub")
+            Hub._handle_worker_parent_request = function(payload)
+                if payload.type == "get_agent_list" then
+                    return {{
+                        result = {{
+                            {{
+                                session_uuid = "parent-session",
+                                id = "parent-session",
+                                port = 4567,
+                                metadata = {{}},
+                            }},
+                        }},
+                    }}
+                end
+                assert(payload.type == "hub_command", tostring(payload.type))
+                local command = payload.command
+                assert(command.type == "update_session", tostring(command.type))
+                assert(command.agent_id == "parent-session", tostring(command.agent_id))
+                assert(command.plugin_state.cloudflare_hosted_preview.status == "running")
+                local file = assert(io.open(marker_path, "w"))
+                file:write(command.plugin_state.cloudflare_hosted_preview.url)
+                file:close()
+                return {{
+                    result = {{
+                        ok = true,
+                        status = "queued",
+                        request_id = command.request_id,
+                    }},
+                }}
+            end
+
+            local loader = require("hub.loader")
+            local ok, err = loader.load_plugin({init_path}, "worker-update-session-plugin", {{ source = "device" }})
+            assert(ok, tostring(err))
+
+            local response = __plugin_worker_invoke(
+                "worker-update-session-plugin",
+                "session_action",
+                "demo.session.update_parent",
+                nil,
+                {{
+                    session_uuid = "parent-session",
+                    payload = {{ params = {{}} }},
+                }},
+                2000
+            )
+            assert(response.ok == true, tostring(response.error))
+            assert(response.result == "queued", tostring(response.result))
+            return true
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+            marker_path = serde_json::to_string(&marker_path.to_string_lossy()).unwrap(),
+        ))
+        .eval::<bool>()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !marker_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let marker = fs::read_to_string(marker_path).expect("parent update dispatch marker");
+    assert_eq!(marker, "https://preview.trycloudflare.com");
 }
 
 #[test]
@@ -317,11 +700,14 @@ fn plugin_owned_surface_route_runs_in_plugin_worker_vm() {
     let tmp = TempDir::new().unwrap();
     let plugin_dir = tmp.path().join("worker-surface-plugin");
     fs::create_dir_all(&plugin_dir).unwrap();
+    let asset_path = plugin_dir.join("graph.html");
+    fs::write(&asset_path, "<html>worker graph</html>").unwrap();
     let init_path = plugin_dir.join("init.lua");
     fs::write(
         &init_path,
         r#"
         local surfaces = require("lib.surfaces")
+        local plugin_assets = require("lib.plugin_assets")
 
         surfaces.register("worker_surface", {
             label = "Worker Surface",
@@ -332,10 +718,13 @@ fn plugin_owned_surface_route_runs_in_plugin_worker_vm() {
                     render = function(state, ctx)
                         local key = rawget(_G, "_plugin_worker_key")
                         if key then
+                            local asset_url = plugin_assets.expose_file("graph", __ASSET_PATH__, {
+                                content_type = "text/html",
+                            })
                             return {
                                 type = "text",
                                 props = {
-                                    text = "worker:" .. key .. ":" .. tostring(state.params.id) .. ":" .. ctx.path("/item/:id", { id = state.params.id }),
+                                    text = "worker:" .. key .. ":" .. tostring(state.params.id) .. ":" .. ctx.path("/item/:id", { id = state.params.id }) .. ":" .. asset_url,
                                 },
                             }
                         end
@@ -346,7 +735,11 @@ fn plugin_owned_surface_route_runs_in_plugin_worker_vm() {
         })
 
         return {}
-        "#,
+        "#
+        .replace(
+            "__ASSET_PATH__",
+            &serde_json::to_string(&asset_path.to_string_lossy()).unwrap(),
+        ),
     )
     .unwrap();
 
@@ -369,9 +762,13 @@ fn plugin_owned_surface_route_runs_in_plugin_worker_vm() {
             }})
             assert(tree.type == "text", tostring(tree.type))
             assert(
-                tree.props.text == "worker:worker-surface-plugin:42:/hubs/hub-test/worker_surface/item/42",
+                tree.props.text:match("^worker:worker%-surface%-plugin:42:/hubs/hub%-test/worker_surface/item/42:botster%-plugin%-asset://worker%-surface%-plugin:graph%?v="),
                 tostring(tree.props.text)
             )
+            local result, read_err = require("lib.plugin_assets").read("worker-surface-plugin:graph")
+            assert(result ~= nil, tostring(read_err))
+            assert(result.content == "<html>worker graph</html>", tostring(result and result.content))
+            assert(result.content_type == "text/html", tostring(result.content_type))
             return true
             "#,
             init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
@@ -698,6 +1095,65 @@ fn plugin_owned_timer_handler_runs_in_plugin_worker_vm() {
         ))
         .eval::<bool>()
         .unwrap();
+}
+
+#[test]
+fn plugin_owned_timer_fires_after_delay_in_plugin_worker_vm() {
+    // SAFETY: This integration filter runs this test in isolation and the
+    // worker VM must resolve the repository Lua modules instead of user config.
+    unsafe {
+        std::env::set_var(
+            "BOTSTER_LUA_PATH",
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua"),
+        )
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let plugin_dir = tmp.path().join("worker-timer-delay-plugin");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    let init_path = plugin_dir.join("init.lua");
+    let marker_path = tmp.path().join("timer-fired.txt");
+    fs::write(
+        &init_path,
+        format!(
+            r#"
+            local marker_path = {marker_path}
+            timer.after(0.05, function()
+                local key = rawget(_G, "_plugin_worker_key")
+                local file = assert(io.open(marker_path, "w"))
+                file:write(key or "hub")
+                file:close()
+            end)
+
+            return {{}}
+            "#,
+            marker_path = serde_json::to_string(&marker_path.to_string_lossy()).unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let runtime = LuaRuntime::new().unwrap();
+    runtime
+        .lua()
+        .load(format!(
+            r#"
+            local loader = require("hub.loader")
+            local ok, err = loader.load_plugin({init_path}, "worker-timer-delay-plugin", {{ source = "device" }})
+            assert(ok, tostring(err))
+            return true
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval::<bool>()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !marker_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    let marker = fs::read_to_string(marker_path).expect("plugin worker timer marker");
+    assert_eq!(marker, "worker-timer-delay-plugin");
 }
 
 #[test]

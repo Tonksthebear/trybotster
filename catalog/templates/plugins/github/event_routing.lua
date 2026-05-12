@@ -59,9 +59,73 @@ local function notify_agent(agent, payload)
     end
 end
 
+local function pr_payload(message, payload)
+    local pr = payload.pull_request or payload.pr or {}
+    local repo = message.repo
+        or payload.repo
+        or payload.repository_full_name
+        or (payload.repository and payload.repository.full_name)
+    local number = payload.pr_number
+        or payload.pull_request_number
+        or payload.number
+        or pr.number
+    local action = message.action or payload.action or message.event_type or payload.event_type
+    local merged = payload.merged == true or pr.merged == true or action == "merged" or action == "closed_merged"
+
+    if not number or not merged then
+        return nil
+    end
+
+    return {
+        provider = "github",
+        repo = repo,
+        pr_number = tonumber(number),
+        pr_url = payload.pr_url or payload.html_url or pr.html_url or pr.url,
+        head_branch = payload.head_branch or (pr.head and pr.head.ref),
+        base_branch = payload.base_branch or (pr.base and pr.base.ref),
+        merge_commit = payload.merge_commit or payload.merge_commit_sha or pr.merge_commit_sha,
+        merged_at = payload.merged_at or pr.merged_at,
+        raw_event_type = message.event_type or payload.event_type,
+    }
+end
+
+local function emit_pr_merged(event_repo, message, payload)
+    local event = pr_payload(message, payload)
+    if not event then
+        return false, false
+    end
+    event.repo = event.repo or event_repo
+    if not event.repo then
+        return true, false
+    end
+    if events and events.emit then
+        local ok, err = pcall(events.emit, "pr_merged", event)
+        if ok then
+            return true, true
+        end
+        log.warn("GitHub: failed to emit pr_merged event: " .. tostring(err))
+    end
+    return true, false
+end
+
+local function is_pr_lifecycle_message(message, payload)
+    local event_type = tostring(message.event_type or payload.event_type or "")
+    return event_type == "pull_request"
+        or event_type == "pull_request_review"
+        or event_type:find("^pr_") ~= nil
+        or payload.pull_request ~= nil
+        or payload.pr_number ~= nil
+end
+
 local function handle_message(default_repo, message, channel_id)
     local payload = message.payload or {}
     local event_repo = message.repo or default_repo
+    local pr_lifecycle_event = emit_pr_merged(event_repo, message, payload)
+
+    if pr_lifecycle_event and is_pr_lifecycle_message(message, payload) and not (payload.prompt or payload.context or payload.comment_body) then
+        action_cable.perform(channel_id, "ack", { id = message.id })
+        return
+    end
 
     if message.event_type == "agent_cleanup" then
         if payload.issue_number then

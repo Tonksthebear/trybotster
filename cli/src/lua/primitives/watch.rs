@@ -33,6 +33,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use anyhow::{anyhow, Result};
 use globset::{Glob, GlobMatcher};
@@ -41,6 +42,7 @@ use tokio::task::JoinHandle;
 
 use crate::file_watcher::{FileEventKind, FileWatcher};
 use crate::hub::events::HubEvent;
+use crate::lua::primitives::plugin_worker::PluginWorkerEventTx;
 
 /// A single active directory watch with its OS watcher and Lua callback.
 struct WatchEntry {
@@ -96,6 +98,8 @@ pub struct WatcherEntries {
     /// Needed because `watch.directory()` may be called during initialization
     /// (before `block_on`), when no implicit runtime context exists.
     tokio_handle: Option<tokio::runtime::Handle>,
+    /// Worker-local mailbox for watches owned by a plugin worker VM.
+    worker_event_tx: Option<PluginWorkerEventTx>,
 }
 
 impl WatcherEntries {
@@ -119,6 +123,11 @@ impl WatcherEntries {
     ) {
         self.hub_event_tx = Some(tx);
         self.tokio_handle = Some(handle);
+    }
+
+    /// Route watch events through the plugin worker mailbox.
+    pub(crate) fn set_plugin_worker_event_tx(&mut self, tx: PluginWorkerEventTx) {
+        self.worker_event_tx = Some(tx);
     }
 
     /// Stop all active watches, aborting forwarder tasks and dropping watchers.
@@ -353,10 +362,36 @@ pub fn register(lua: &Lua, registry: WatcherRegistry) -> Result<()> {
                 .map(|owner| entries.next_plugin_handler_id(owner));
             let route_to_worker = owner_plugin.is_some() && !is_plugin_worker_load(lua);
 
-            // Spawn a blocking forwarder task if the event channel and tokio
-            // handle are available. Uses the stored handle because this may
-            // be called during initialization (before block_on).
-            let forwarder_handle = if let (Some(ref tx), Some(ref handle)) =
+            // Spawn a blocking forwarder if an event sink is available. Worker
+            // watches use an OS thread so they do not occupy the hub runtime's
+            // blocking pool.
+            let forwarder_handle = if let Some(ref tx) = entries.worker_event_tx {
+                let rx = watcher.take_rx();
+                if let Some(rx) = rx {
+                    let tx = tx.clone();
+                    let watch_id = id.clone();
+                    let _ = thread::Builder::new()
+                        .name(format!("botster-plugin-watch-{watch_id}"))
+                        .spawn(move || {
+                            while let Ok(result) = rx.recv() {
+                                let events = match result {
+                                    Ok(event) => FileWatcher::classify_event(&event),
+                                    Err(e) => {
+                                        log::warn!("[watch] File watcher error: {e}");
+                                        continue;
+                                    }
+                                };
+                                if events.is_empty() {
+                                    continue;
+                                }
+                                if !tx.send_user_file_watch(watch_id.clone(), events) {
+                                    break;
+                                }
+                            }
+                        });
+                }
+                None
+            } else if let (Some(ref tx), Some(ref handle)) =
                 (&entries.hub_event_tx, &entries.tokio_handle)
             {
                 let rx = watcher.take_rx();

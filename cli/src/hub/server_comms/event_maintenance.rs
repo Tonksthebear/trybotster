@@ -236,6 +236,17 @@ impl Hub {
             .notify_pty_osc_event(&session_uuid, &session_name, &event);
     }
 
+    pub(super) fn handle_pty_output_event(
+        &mut self,
+        session_uuid: String,
+        session_name: String,
+        data: Vec<u8>,
+    ) {
+        self.record_volume_guardrail("pty_output.count", "pty_output.volume_burst");
+        self.lua
+            .notify_pty_output(&session_uuid, &session_name, &data);
+    }
+
     pub(super) fn handle_pty_process_exited(
         &mut self,
         session_uuid: String,

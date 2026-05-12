@@ -196,6 +196,38 @@ function M.agent_options(current)
     return options
 end
 
+function M.accessory_options(current, target_path)
+    local device_root = nil
+    if config and config.data_dir then
+        local ok, data_dir = pcall(config.data_dir)
+        if ok and data_dir then
+            device_root = data_dir
+        end
+    end
+
+    local seen = {}
+    local options = {}
+    local function add(name)
+        if name and name ~= "" and not seen[name] then
+            seen[name] = true
+            table.insert(options, { value = name, label = name })
+        end
+    end
+
+    add(current)
+    for _, name in ipairs(ConfigResolver.list_accessories(device_root, target_path)) do
+        add(name)
+    end
+    add("terminal")
+
+    table.sort(options, function(a, b)
+        if a.value == "terminal" then return true end
+        if b.value == "terminal" then return false end
+        return a.value < b.value
+    end)
+    return options
+end
+
 function M.targets()
     local now = os.time()
     if targets_cache.values and (now - targets_cache.loaded_at) <= 1 then
