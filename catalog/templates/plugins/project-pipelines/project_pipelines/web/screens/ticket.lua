@@ -539,6 +539,79 @@ local function run_rows(ticket_id, ctx, overview)
     return children
 end
 
+local function spawn_session_controls(ticket, _ctx, _overview)
+    if ticket.status == "closed" then
+        return { ui.text{ text = "Closed tickets cannot spawn new sessions.", size = "sm", tone = "muted" } }
+    end
+    if util.is_blank(ticket.target_id) then
+        return { ui.text{ text = "This ticket has no spawn target.", size = "sm", tone = "danger" } }
+    end
+
+    local draft = actions.draft(_ctx)
+    local prefix = "ticket_session_" .. ticket.id .. "_"
+    local session_type = draft[prefix .. "type"] or "agent"
+    local children = {
+        ui.stack{ direction = "vertical", gap = "3", children = {
+            view.row{
+                view.badge(view.target_label(ticket.target_id, ticket.target_path), "accent"),
+                ui.text{ text = "Spawn in this ticket's worktree context.", size = "sm", weight = "semibold" },
+            },
+            ui.select{
+                id = "ticket-" .. ticket.id .. "-spawn-type",
+                label = "Session type",
+                value = session_type,
+                options = {
+                    { value = "agent", label = "Agent" },
+                    { value = "accessory", label = "Accessory" },
+                },
+                on_change = view.field_action("project_pipelines.update_ticket_session_draft", {
+                    ticket_id = ticket.id,
+                    field = "type",
+                }),
+            },
+            ui.select{
+                id = "ticket-" .. ticket.id .. "-spawn-agent",
+                label = "Agent",
+                value = draft[prefix .. "agent_name"] or "codex",
+                options = view.agent_options(draft[prefix .. "agent_name"] or "codex"),
+                on_change = view.field_action("project_pipelines.update_ticket_session_draft", {
+                    ticket_id = ticket.id,
+                    field = "agent_name",
+                }),
+            },
+            ui.select{
+                id = "ticket-" .. ticket.id .. "-spawn-accessory",
+                label = "Accessory",
+                value = draft[prefix .. "accessory_name"] or "terminal",
+                options = view.accessory_options(draft[prefix .. "accessory_name"] or "terminal", ticket.target_path),
+                on_change = view.field_action("project_pipelines.update_ticket_session_draft", {
+                    ticket_id = ticket.id,
+                    field = "accessory_name",
+                }),
+            },
+            ui.textarea{
+                id = "ticket-" .. ticket.id .. "-spawn-prompt",
+                label = "Agent prompt",
+                placeholder = "Optional prompt for a manual agent session",
+                value = draft[prefix .. "prompt"] or "",
+                on_change = view.field_action("project_pipelines.update_ticket_session_draft", {
+                    ticket_id = ticket.id,
+                    field = "prompt",
+                }),
+            },
+            ui.button{
+                id = "ticket-" .. ticket.id .. "-spawn-session",
+                label = "Spawn session",
+                icon = "plus",
+                variant = "solid",
+                tone = "accent",
+                action = ui.action("project_pipelines.spawn_ticket_session", { ticket_id = ticket.id }),
+            },
+        } },
+    }
+    return children
+end
+
 function M.render(view_state, ctx)
     local params = view_state and view_state.params or {}
     local ticket = repo.get_ticket(params.ticket_id)
@@ -595,6 +668,7 @@ function M.render(view_state, ctx)
         table.insert(children, view.section("Merge", merge_children))
     end
     table.insert(children, view.section(open_run and "Pipeline" or "Move Into Pipeline", pipeline_start_controls(ticket, ctx, overview)))
+    table.insert(children, view.section("Spawn Session", spawn_session_controls(ticket, ctx, overview)))
     table.insert(children, view.section("Timeline", handoff_rows(latest_run, ctx, overview)))
     table.insert(children, view.section("Runs", run_rows(ticket.id, ctx, overview)))
     table.insert(children, view.section("Agent Terminals", session_rows(ticket.id, ctx, overview)))

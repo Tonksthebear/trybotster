@@ -44,6 +44,8 @@ use anyhow::{anyhow, Result};
 use mlua::{Lua, RegistryKey, Table, Value};
 use tokio::sync::mpsc;
 
+use crate::lua::primitives::plugin_worker::PluginWorkerEventTx;
+
 /// Maximum number of concurrent WebSocket connections.
 /// Prevents thread exhaustion from rapid-fire `websocket.connect()` calls.
 const MAX_CONCURRENT_CONNECTIONS: usize = 16;
@@ -124,6 +126,8 @@ pub struct WebSocketRegistryInner {
     /// Event channel sender for instant delivery to the Hub event loop.
     /// `None` in tests that don't wire up the full event bus.
     hub_event_tx: Option<crate::hub::events::HubEventTx>,
+    /// Worker-local mailbox for callbacks owned by a plugin worker VM.
+    worker_event_tx: Option<PluginWorkerEventTx>,
 }
 
 impl Default for WebSocketRegistryInner {
@@ -133,6 +137,7 @@ impl Default for WebSocketRegistryInner {
             pending_events: Vec::new(),
             next_id: 0,
             hub_event_tx: None,
+            worker_event_tx: None,
         }
     }
 }
@@ -155,13 +160,9 @@ impl WebSocketRegistryInner {
         self.hub_event_tx = Some(tx);
     }
 
-    /// Route WebSocket events through the registry-local fallback queue.
-    ///
-    /// Plugin worker runtimes own their Lua callback registry, so events
-    /// produced by worker-created sockets must be pumped by the worker loop
-    /// rather than delivered to the parent hub Lua runtime.
-    pub(crate) fn use_local_polling(&mut self) {
-        self.hub_event_tx = None;
+    /// Route WebSocket events through the plugin worker mailbox.
+    pub(crate) fn set_plugin_worker_event_tx(&mut self, tx: PluginWorkerEventTx) {
+        self.worker_event_tx = Some(tx);
     }
 
     /// Emit a WebSocket event through the event channel or shared vec.
@@ -169,7 +170,9 @@ impl WebSocketRegistryInner {
     /// If `hub_event_tx` is set (production), sends via the channel for
     /// instant delivery. Otherwise falls back to the shared vec (tests).
     fn emit_event(&mut self, event: WsEvent) {
-        if let Some(ref tx) = self.hub_event_tx {
+        if let Some(ref tx) = self.worker_event_tx {
+            tx.send_websocket_event(event);
+        } else if let Some(ref tx) = self.hub_event_tx {
             let _ = tx.send(crate::hub::events::HubEvent::WebSocketEvent(event));
         } else {
             self.pending_events.push(event);

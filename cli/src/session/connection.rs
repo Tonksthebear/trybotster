@@ -105,6 +105,7 @@ impl SessionConnection {
                 last_output_at: 0,
                 title: None,
                 cwd: None,
+                port: None,
                 mode_flags: ModeFlags::default(),
             },
         }

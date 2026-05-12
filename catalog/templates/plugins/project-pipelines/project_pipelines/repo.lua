@@ -70,6 +70,35 @@ local PROJECT_UPDATE_FIELDS = {
     status = true,
 }
 
+local CHECKLIST_UPDATE_FIELDS = {
+    name = true,
+    description = true,
+    source = true,
+}
+
+local CHECKLIST_ITEM_UPDATE_FIELDS = {
+    position = true,
+    prompt = true,
+    status = true,
+    source_ref = true,
+    evidence = true,
+}
+
+local PR_LINK_UPDATE_FIELDS = {
+    provider = true,
+    repo = true,
+    pr_number = true,
+    pr_url = true,
+    ticket_id = true,
+    run_id = true,
+    status = true,
+    head_branch = true,
+    base_branch = true,
+    merge_commit = true,
+    updated_at = true,
+    merged_at = true,
+}
+
 local function rows(sql, ...)
     local params = { ... }
     local result
@@ -284,6 +313,56 @@ local function decode_gate_row(gate)
     return decoded
 end
 
+local function assert_checklist_scope(scope)
+    if scope ~= "project" and scope ~= "ticket" and scope ~= "run" then
+        error("checklist scope must be project, ticket, or run")
+    end
+end
+
+local function normalize_checklist_status(status)
+    status = status or "pending"
+    if status ~= "pending" and status ~= "in_progress" and status ~= "blocked" and status ~= "skipped" and status ~= "done" then
+        error("checklist item status must be pending, in_progress, blocked, skipped, or done")
+    end
+    return status
+end
+
+local function normalize_pr_provider(provider)
+    if util.is_blank(provider) then
+        return "github"
+    end
+    return tostring(provider)
+end
+
+local function normalize_pr_status(status)
+    status = status or "open"
+    if status ~= "open" and status ~= "closed" and status ~= "merged" then
+        error("PR link status must be open, closed, or merged")
+    end
+    return status
+end
+
+local function encode_evidence(value)
+    if type(value) == "string" then
+        return value
+    end
+    return util.encode(value or {})
+end
+
+local function decode_checklist_item(row)
+    local decoded = util.copy(row or {})
+    decoded.evidence = util.decode(decoded.evidence, {})
+    return decoded
+end
+
+local function decode_checklist_items(items)
+    local out = {}
+    for _, item in ipairs(items or {}) do
+        out[#out + 1] = decode_checklist_item(item)
+    end
+    return out
+end
+
 local function insert_gate(attrs, now)
     util.assert_present(attrs.step_id, "step_id")
     util.assert_present(attrs.prompt, "gate prompt")
@@ -461,9 +540,363 @@ function M.ticket_status(ticket_id)
         sessions = M.ticket_session_uuids(ticket_id),
         dependencies = M.ticket_dependencies(ticket_id),
         blocking_dependencies = M.blocking_ticket_dependencies(ticket_id),
+        checklists = M.list_checklists{ scope = "ticket", owner_id = ticket_id },
         open_findings = latest_run and M.open_findings(latest_run.id) or {},
         open_questions = M.ticket_questions(ticket_id, "open"),
     }
+end
+
+function M.get_pr_link(link_id)
+    return db.pr_links:where{ id = link_id }
+end
+
+function M.find_pr_link(attrs)
+    attrs = attrs or {}
+    local provider = normalize_pr_provider(attrs.provider)
+    util.assert_present(attrs.repo, "repo")
+    util.assert_present(attrs.pr_number, "pr_number")
+    return first(
+        "SELECT * FROM pr_links WHERE provider = ? AND repo = ? AND pr_number = ? LIMIT 1",
+        provider,
+        attrs.repo,
+        tonumber(attrs.pr_number)
+    )
+end
+
+function M.list_pr_links(filters)
+    filters = filters or {}
+    local clauses = {}
+    local params = {}
+    if not util.is_blank(filters.ticket_id) then
+        clauses[#clauses + 1] = "ticket_id = ?"
+        params[#params + 1] = filters.ticket_id
+    end
+    if not util.is_blank(filters.run_id) then
+        clauses[#clauses + 1] = "run_id = ?"
+        params[#params + 1] = filters.run_id
+    end
+    if not util.is_blank(filters.status) then
+        clauses[#clauses + 1] = "status = ?"
+        params[#params + 1] = filters.status
+    end
+    if not util.is_blank(filters.provider) then
+        clauses[#clauses + 1] = "provider = ?"
+        params[#params + 1] = normalize_pr_provider(filters.provider)
+    end
+    if not util.is_blank(filters.repo) then
+        clauses[#clauses + 1] = "repo = ?"
+        params[#params + 1] = filters.repo
+    end
+
+    local sql = "SELECT * FROM pr_links"
+    if #clauses > 0 then
+        sql = sql .. " WHERE " .. table.concat(clauses, " AND ")
+    end
+    sql = sql .. " ORDER BY updated_at DESC, created_at DESC, id DESC"
+    if #params == 0 then
+        return rows(sql)
+    end
+    return rows(sql, table.unpack(params))
+end
+
+function M.link_pr(attrs)
+    attrs = attrs or {}
+    util.assert_present(attrs.ticket_id, "ticket_id")
+    util.assert_present(attrs.repo, "repo")
+    util.assert_present(attrs.pr_number, "pr_number")
+    if not M.get_ticket(attrs.ticket_id) then
+        error("ticket not found: " .. tostring(attrs.ticket_id))
+    end
+    if not util.is_blank(attrs.run_id) and not M.get_run(attrs.run_id) then
+        error("run not found: " .. tostring(attrs.run_id))
+    end
+
+    local now = util.now()
+    local provider = normalize_pr_provider(attrs.provider)
+    local existing = M.find_pr_link{
+        provider = provider,
+        repo = attrs.repo,
+        pr_number = attrs.pr_number,
+    }
+    local set = {
+        provider = provider,
+        repo = attrs.repo,
+        pr_number = tonumber(attrs.pr_number),
+        pr_url = attrs.pr_url,
+        ticket_id = attrs.ticket_id,
+        run_id = attrs.run_id,
+        status = normalize_pr_status(attrs.status),
+        head_branch = attrs.head_branch,
+        base_branch = attrs.base_branch,
+        merge_commit = attrs.merge_commit,
+        merged_at = attrs.merged_at,
+        updated_at = now,
+    }
+
+    local link
+    if existing then
+        db.pr_links:update{
+            where = { id = existing.id },
+            set = filter_update(set, PR_LINK_UPDATE_FIELDS),
+        }
+        link = M.get_pr_link(existing.id)
+    else
+        link = merge(set, {
+            id = attrs.id or util.id("pr"),
+            created_at = now,
+        })
+        db.pr_links:insert(link)
+    end
+
+    publish_entity("pr_link", link)
+    publish_entity("ticket", M.get_ticket(link.ticket_id))
+    M.append_event("ticket.pr_linked", {
+        ticket_id = link.ticket_id,
+        run_id = link.run_id,
+        payload = {
+            pr_link_id = link.id,
+            provider = link.provider,
+            repo = link.repo,
+            pr_number = link.pr_number,
+            pr_url = link.pr_url,
+        },
+    })
+    return link
+end
+
+function M.mark_pr_link_merged(link_id, attrs)
+    attrs = attrs or {}
+    local link = M.get_pr_link(link_id)
+    if not link then
+        error("PR link not found: " .. tostring(link_id))
+    end
+    local now = util.now()
+    db.pr_links:update{
+        where = { id = link_id },
+        set = {
+            status = "merged",
+            pr_url = attrs.pr_url or link.pr_url,
+            head_branch = attrs.head_branch or link.head_branch,
+            base_branch = attrs.base_branch or link.base_branch,
+            merge_commit = attrs.merge_commit or link.merge_commit,
+            merged_at = attrs.merged_at or now,
+            updated_at = now,
+        },
+    }
+    link = M.get_pr_link(link_id)
+    publish_entity("pr_link", link)
+    publish_entity("ticket", M.get_ticket(link.ticket_id))
+    M.append_event("ticket.pr_merged", {
+        ticket_id = link.ticket_id,
+        run_id = link.run_id,
+        payload = {
+            pr_link_id = link.id,
+            provider = link.provider,
+            repo = link.repo,
+            pr_number = link.pr_number,
+            pr_url = link.pr_url,
+            merge_commit = link.merge_commit,
+        },
+    })
+    return link
+end
+
+function M.list_checklists(filters)
+    filters = filters or {}
+    local clauses = {}
+    local params = {}
+    if not util.is_blank(filters.scope) then
+        clauses[#clauses + 1] = "scope = ?"
+        params[#params + 1] = filters.scope
+    end
+    if not util.is_blank(filters.owner_id) then
+        clauses[#clauses + 1] = "owner_id = ?"
+        params[#params + 1] = filters.owner_id
+    end
+    local sql = "SELECT * FROM checklists"
+    if #clauses > 0 then
+        sql = sql .. " WHERE " .. table.concat(clauses, " AND ")
+    end
+    sql = sql .. " ORDER BY updated_at DESC, created_at DESC, id DESC"
+    if #params == 0 then
+        return rows(sql)
+    end
+    return rows(sql, params)
+end
+
+function M.checklist_items(checklist_id)
+    return decode_checklist_items(rows("SELECT * FROM checklist_items WHERE checklist_id = ? ORDER BY position ASC, created_at ASC, id ASC", checklist_id))
+end
+
+function M.get_checklist(checklist_id)
+    local checklist = db.checklists:where{ id = checklist_id }
+    if not checklist then
+        return nil
+    end
+    checklist.items = M.checklist_items(checklist_id)
+    return checklist
+end
+
+function M.create_checklist(attrs)
+    assert_checklist_scope(attrs.scope)
+    util.assert_present(attrs.owner_id, "owner_id")
+    util.assert_present(attrs.name, "checklist name")
+    local now = util.now()
+    local checklist = {
+        id = attrs.id or util.id("checklist"),
+        scope = attrs.scope,
+        owner_id = attrs.owner_id,
+        name = attrs.name,
+        description = attrs.description or "",
+        source = attrs.source or "manual",
+        created_at = now,
+        updated_at = now,
+    }
+    with_transaction(function()
+        db.checklists:insert(checklist)
+        for index, item in ipairs(attrs.items or {}) do
+            util.assert_present(item.prompt, "checklist item prompt")
+            db.checklist_items:insert{
+                id = item.id or util.id("check"),
+                checklist_id = checklist.id,
+                position = item.position or index,
+                prompt = item.prompt,
+                status = normalize_checklist_status(item.status),
+                source_ref = item.source_ref,
+                evidence = encode_evidence(item.evidence),
+                created_at = now,
+                updated_at = now,
+                completed_at = item.status == "done" and now or nil,
+            }
+        end
+        M.append_event("checklist.created", {
+            ticket_id = attrs.scope == "ticket" and attrs.owner_id or nil,
+            run_id = attrs.scope == "run" and attrs.owner_id or nil,
+            payload = { checklist_id = checklist.id, scope = checklist.scope, owner_id = checklist.owner_id, source = checklist.source },
+        })
+    end)
+    publish_entity("checklist", checklist)
+    publish_entity_snapshot("checklist_item")
+    return M.get_checklist(checklist.id)
+end
+
+function M.create_vault_checklist(attrs)
+    local scope = attrs.scope or "ticket"
+    assert_checklist_scope(scope)
+    util.assert_present(attrs.owner_id, "owner_id")
+    local items = {
+        {
+            prompt = "Load applicable vault/project conventions before planning.",
+            source_ref = "vault:context",
+        },
+        {
+            prompt = "Check the implementation plan against the loaded conventions and record conflicts or 'none'.",
+            source_ref = "vault:plan-review",
+        },
+        {
+            prompt = "Verify with repo-approved commands and attach command evidence.",
+            source_ref = "vault:verification",
+        },
+        {
+            prompt = "Capture new durable project knowledge in the vault, or record why no capture was needed.",
+            source_ref = "vault:capture",
+        },
+    }
+    return M.create_checklist{
+        scope = scope,
+        owner_id = attrs.owner_id,
+        name = attrs.name or "Vault workflow checklist",
+        description = attrs.description or "Tracks whether the agent used the vault as the source of truth without duplicating conventions into Project Pipelines.",
+        source = "vault",
+        items = attrs.items or items,
+    }
+end
+
+function M.update_checklist(checklist_id, attrs)
+    local checklist = db.checklists:where{ id = checklist_id }
+    if not checklist then
+        error("checklist not found: " .. tostring(checklist_id))
+    end
+    local fields = filter_update(attrs or {}, CHECKLIST_UPDATE_FIELDS)
+    if not has_fields(fields) then
+        return M.get_checklist(checklist_id)
+    end
+    fields.updated_at = util.now()
+    db.checklists:update{ where = { id = checklist_id }, set = fields }
+    local updated = db.checklists:where{ id = checklist_id }
+    publish_entity("checklist", updated)
+    M.append_event("checklist.updated", {
+        ticket_id = updated.scope == "ticket" and updated.owner_id or nil,
+        run_id = updated.scope == "run" and updated.owner_id or nil,
+        payload = { checklist_id = checklist_id, fields = fields },
+    })
+    return M.get_checklist(checklist_id)
+end
+
+function M.add_checklist_item(attrs)
+    util.assert_present(attrs.checklist_id, "checklist_id")
+    util.assert_present(attrs.prompt, "checklist item prompt")
+    local checklist = db.checklists:where{ id = attrs.checklist_id }
+    if not checklist then
+        error("checklist not found: " .. tostring(attrs.checklist_id))
+    end
+    local now = util.now()
+    local item = {
+        id = attrs.id or util.id("check"),
+        checklist_id = attrs.checklist_id,
+        position = attrs.position or (#M.checklist_items(attrs.checklist_id) + 1),
+        prompt = attrs.prompt,
+        status = normalize_checklist_status(attrs.status),
+        source_ref = attrs.source_ref,
+        evidence = encode_evidence(attrs.evidence),
+        created_at = now,
+        updated_at = now,
+        completed_at = attrs.status == "done" and now or nil,
+    }
+    db.checklist_items:insert(item)
+    db.checklists:update{ where = { id = attrs.checklist_id }, set = { updated_at = now } }
+    publish_entity("checklist_item", decode_checklist_item(item))
+    publish_entity("checklist", db.checklists:where{ id = attrs.checklist_id })
+    M.append_event("checklist.item_created", {
+        ticket_id = checklist.scope == "ticket" and checklist.owner_id or nil,
+        run_id = checklist.scope == "run" and checklist.owner_id or nil,
+        payload = { checklist_id = attrs.checklist_id, item_id = item.id },
+    })
+    return decode_checklist_item(item)
+end
+
+function M.update_checklist_item(item_id, attrs)
+    local item = db.checklist_items:where{ id = item_id }
+    if not item then
+        error("checklist item not found: " .. tostring(item_id))
+    end
+    local checklist = db.checklists:where{ id = item.checklist_id }
+    local fields = filter_update(attrs or {}, CHECKLIST_ITEM_UPDATE_FIELDS)
+    if fields.status ~= nil then
+        fields.status = normalize_checklist_status(fields.status)
+        fields.completed_at = fields.status == "done" and util.now() or nil
+    end
+    if fields.evidence ~= nil then
+        fields.evidence = encode_evidence(fields.evidence)
+    end
+    if not has_fields(fields) then
+        return decode_checklist_item(item)
+    end
+    local now = util.now()
+    fields.updated_at = now
+    db.checklist_items:update{ where = { id = item_id }, set = fields }
+    if checklist then
+        db.checklists:update{ where = { id = checklist.id }, set = { updated_at = now } }
+        publish_entity("checklist", db.checklists:where{ id = checklist.id })
+    end
+    local updated = decode_checklist_item(db.checklist_items:where{ id = item_id })
+    publish_entity("checklist_item", updated)
+    M.append_event("checklist.item_updated", {
+        ticket_id = checklist and checklist.scope == "ticket" and checklist.owner_id or nil,
+        run_id = checklist and checklist.scope == "run" and checklist.owner_id or nil,
+        payload = { checklist_id = item.checklist_id, item_id = item_id, status = updated.status },
+    })
+    return updated
 end
 
 function M.create_ticket(attrs)

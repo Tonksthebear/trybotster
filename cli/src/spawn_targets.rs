@@ -30,7 +30,7 @@ pub struct SpawnTarget {
     /// Last update timestamp in RFC 3339 form.
     pub updated_at: String,
     /// Optional plugin whitelist for sessions in this target.
-    /// `None` means no plugins (deny-by-default).
+    /// `None` means no target-level plugin restriction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plugins: Option<Vec<String>>,
 }
@@ -64,6 +64,18 @@ pub struct SpawnTargetInspection {
     pub has_botster_dir: bool,
     /// Whether git worktree operations currently succeed for the path.
     pub supports_worktrees: bool,
+    /// Live git worktrees for this target's repository, excluding the main checkout.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub worktrees: Vec<GitWorktree>,
+}
+
+/// Live git worktree entry for an inspected spawn target.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GitWorktree {
+    /// Worktree filesystem path.
+    pub path: String,
+    /// Checked-out branch name when available.
+    pub branch: Option<String>,
 }
 
 /// Filesystem-backed spawn target registry.
@@ -85,6 +97,7 @@ struct GitCapabilities {
     current_branch: Option<String>,
     default_branch: Option<String>,
     supports_worktrees: bool,
+    worktrees: Vec<GitWorktree>,
 }
 
 static SPAWN_TARGETS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -295,6 +308,7 @@ impl SpawnTargetRegistry {
             default_branch: capabilities.default_branch,
             has_botster_dir: is_directory && resolved.join(".botster").is_dir(),
             supports_worktrees: capabilities.supports_worktrees,
+            worktrees: capabilities.worktrees,
         })
     }
 
@@ -368,6 +382,7 @@ impl GitCapabilities {
                         .to_string(),
                 )
             });
+        let worktrees = git_worktrees(path);
         let supports_worktrees = git_succeeds(path, ["worktree", "list", "--porcelain"]);
 
         Self {
@@ -377,6 +392,7 @@ impl GitCapabilities {
             current_branch,
             default_branch,
             supports_worktrees,
+            worktrees,
         }
     }
 }
@@ -472,6 +488,45 @@ where
         .current_dir(path)
         .output()
         .is_ok_and(|output| output.status.success())
+}
+
+fn git_worktrees(path: &Path) -> Vec<GitWorktree> {
+    let Some(output) = git_stdout(path, ["worktree", "list", "--porcelain"]) else {
+        return Vec::new();
+    };
+
+    let mut current_path = String::new();
+    let mut current_branch: Option<String> = None;
+    let mut worktrees = Vec::new();
+
+    let mut push_current = |current_path: &mut String, current_branch: &mut Option<String>| {
+        if current_path.is_empty() {
+            return;
+        }
+        let git_path = Path::new(current_path).join(".git");
+        if git_path.is_file() {
+            worktrees.push(GitWorktree {
+                path: current_path.clone(),
+                branch: current_branch.clone(),
+            });
+        }
+        current_path.clear();
+        *current_branch = None;
+    };
+
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            push_current(&mut current_path, &mut current_branch);
+            current_path = path.to_string();
+        } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+            current_branch = non_empty(branch.to_string());
+        } else if line.is_empty() {
+            push_current(&mut current_path, &mut current_branch);
+        }
+    }
+
+    push_current(&mut current_path, &mut current_branch);
+    worktrees
 }
 
 fn repo_name_from_remote(remote: &str) -> Option<String> {
@@ -644,6 +699,41 @@ mod tests {
             Some(repo_dir.canonicalize().unwrap().to_string_lossy().as_ref())
         );
         assert!(inspection.supports_worktrees);
+    }
+
+    #[test]
+    fn inspect_reports_target_scoped_worktrees() {
+        let temp = TempDir::new().unwrap();
+        let repo_dir = temp.path().join("repo");
+        let worktree_dir = temp.path().join("repo-feature-a");
+        fs::create_dir_all(&repo_dir).unwrap();
+
+        run_git(&repo_dir, &["init", "-b", "main"]);
+        run_git(&repo_dir, &["config", "user.email", "botster@example.test"]);
+        run_git(&repo_dir, &["config", "user.name", "Botster Test"]);
+        fs::write(repo_dir.join("README.md"), "test\n").unwrap();
+        run_git(&repo_dir, &["add", "README.md"]);
+        run_git(&repo_dir, &["commit", "-m", "initial"]);
+        run_git(
+            &repo_dir,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature-a",
+                worktree_dir.to_str().unwrap(),
+            ],
+        );
+
+        let registry = registry_for(&temp);
+        let inspection = registry.inspect(&repo_dir).unwrap();
+
+        assert_eq!(inspection.worktrees.len(), 1);
+        assert_eq!(
+            inspection.worktrees[0].path,
+            worktree_dir.canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(inspection.worktrees[0].branch.as_deref(), Some("feature-a"));
     }
 
     #[test]

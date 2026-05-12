@@ -141,4 +141,23 @@ describe('TerminalView Restty options', () => {
       restty.connectPty.mock.invocationCallOrder[0],
     )
   })
+
+  it('continues sending corrected measured sizes after the initial PTY connect', async () => {
+    render(<TerminalView hubId="hub-1" sessionUuid="session-1" />)
+
+    await waitFor(() => expect(lastResttyOptions).not.toBeNull())
+    await waitFor(() => expect(lastTransport).not.toBeNull())
+    vi.useFakeTimers()
+    lastResttyOptions.appOptions.callbacks.onBackend()
+    lastResttyOptions.appOptions.callbacks.onTermSize(80, 24)
+
+    act(() => {
+      vi.advanceTimersByTime(35)
+    })
+
+    lastTransport.resize.mockClear()
+    lastResttyOptions.appOptions.callbacks.onTermSize(132, 37)
+
+    expect(lastTransport.resize).toHaveBeenCalledWith(132, 37)
+  })
 })

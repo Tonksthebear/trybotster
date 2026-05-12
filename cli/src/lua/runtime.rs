@@ -741,9 +741,10 @@ impl LuaRuntime {
 
     /// Poll user file watches via periodic drain.
     ///
-    /// Hub production uses `HubEvent::UserFileWatch` from blocking subscription
-    /// tasks. Plugin worker runtimes do not own a Hub event queue, so they use
-    /// this periodic drain to keep plugin-owned watch callbacks in-worker.
+    /// Event-driven delivery is the production path. This remains as a
+    /// fallback for tests and legacy hub tick paths that do not install an
+    /// event sink.
+    #[allow(dead_code)]
     pub(crate) fn poll_user_file_watches(&self) -> usize {
         use super::primitives::watch;
         watch::poll_user_watches(&self.lua, &self.watcher_registry)
@@ -772,9 +773,10 @@ impl LuaRuntime {
 
     /// Poll HTTP responses via shared vec.
     ///
-    /// The hub uses `HubEvent::HttpResponse` from background threads. Plugin
-    /// workers do not own a hub event sender, so they pump their local async
-    /// HTTP callback queue directly from the worker loop.
+    /// Event-driven delivery is the production path. This remains as a
+    /// fallback for tests and legacy hub tick paths that do not install an
+    /// event sink.
+    #[allow(dead_code)]
     pub(crate) fn poll_http_responses(&self) -> usize {
         use super::primitives::http;
         http::poll_http_responses(&self.lua, &self.http_registry)
@@ -1425,9 +1427,10 @@ impl LuaRuntime {
 
     /// Poll WebSocket events via shared vec.
     ///
-    /// The hub uses `HubEvent::WebSocketEvent` from background threads. Plugin
-    /// workers do not own a hub event sender, so they pump their local
-    /// WebSocket callback queue directly from the worker loop.
+    /// Event-driven delivery is the production path. This remains as a
+    /// fallback for tests and legacy hub tick paths that do not install an
+    /// event sink.
+    #[allow(dead_code)]
     pub(crate) fn poll_websocket_events(&self) -> usize {
         primitives::websocket::poll_websocket_events(&self.lua, &self.websocket_registry)
     }
@@ -1489,22 +1492,27 @@ impl LuaRuntime {
             .set_hub_event_tx(tx, tokio_handle);
     }
 
-    /// Keep async callback delivery local to this runtime.
-    ///
-    /// Plugin workers share the parent's HubEvent sender for primitives that
-    /// need hub-owned scheduling, but HTTP/WebSocket callbacks are registry
-    /// keys in the worker Lua VM. Sending their completions to the parent hub
-    /// event loop makes the parent runtime log "unknown request_id" and drops
-    /// the callback.
-    pub(crate) fn use_local_async_callback_polling(&mut self) {
+    /// Route async primitive callbacks through the plugin worker mailbox.
+    pub(crate) fn set_plugin_worker_event_tx(
+        &mut self,
+        tx: primitives::plugin_worker::PluginWorkerEventTx,
+    ) {
         self.http_registry
             .lock()
             .expect("HttpAsyncEntries mutex poisoned")
-            .use_local_polling();
+            .set_plugin_worker_event_tx(tx.clone());
         self.websocket_registry
             .lock()
             .expect("WebSocketRegistry mutex poisoned")
-            .use_local_polling();
+            .set_plugin_worker_event_tx(tx.clone());
+        self.timer_registry
+            .lock()
+            .expect("TimerEntries mutex poisoned")
+            .set_plugin_worker_event_tx(tx.clone());
+        self.watcher_registry
+            .lock()
+            .expect("WatcherEntries mutex poisoned")
+            .set_plugin_worker_event_tx(tx);
     }
 
     /// Fire the Lua callback for a single completed HTTP response.
@@ -1898,6 +1906,36 @@ impl LuaRuntime {
 
         if let Err(e) = result {
             log::warn!("PTY OSC event hook failed: {}", e);
+        }
+    }
+
+    /// Dispatch observed PTY output to Lua hooks for sessions that explicitly
+    /// opted into output observation.
+    pub fn notify_pty_output(&self, session_uuid: &str, session_name: &str, data: &[u8]) {
+        let perf = lua_perf_enabled();
+        let total_started = Instant::now();
+        let result: mlua::Result<()> = (|| {
+            let ctx = self.lua.create_table()?;
+            ctx.set("session_uuid", session_uuid)?;
+            ctx.set("session_name", session_name)?;
+
+            let chunk = self.lua.create_string(data)?;
+            let hooks: mlua::Table = self.lua.globals().get("hooks")?;
+            let notify: mlua::Function = hooks.get("notify")?;
+            notify.call::<mlua::Value>(("pty_output", ctx, chunk))?;
+            if perf {
+                log::info!(
+                    "[PERF][lua] pty_output session_uuid={} bytes={} total_us={}",
+                    session_uuid,
+                    data.len(),
+                    total_started.elapsed().as_micros()
+                );
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = result {
+            log::warn!("PTY output hook failed: {}", e);
         }
     }
 
@@ -3670,6 +3708,64 @@ mod tests {
             .eval()
             .unwrap();
         assert_eq!(hook_session_uuid, "sess-0");
+    }
+
+    #[test]
+    fn test_notify_pty_output_fires_hook_with_context_and_bytes() {
+        let runtime = LuaRuntime::new().expect("Should create runtime");
+        runtime
+            .lua()
+            .load(
+                r#"
+                _pty_output_calls = {}
+                hooks = {
+                  notify = function(event_name, ctx, data)
+                    if event_name == "pty_output" then
+                      table.insert(_pty_output_calls, {
+                        session_uuid = ctx.session_uuid,
+                        session_name = ctx.session_name,
+                        data = data,
+                      })
+                    end
+                  end,
+                }
+                "#,
+            )
+            .exec()
+            .expect("install hook capture");
+
+        runtime.notify_pty_output(
+            "sess-output",
+            "cloudflare-preview",
+            b"ready https://x.trycloudflare.com",
+        );
+
+        let call_count: i64 = runtime
+            .lua()
+            .load("return #_pty_output_calls")
+            .eval()
+            .unwrap();
+        assert_eq!(call_count, 1);
+
+        let session_uuid: String = runtime
+            .lua()
+            .load("return _pty_output_calls[1].session_uuid")
+            .eval()
+            .unwrap();
+        let session_name: String = runtime
+            .lua()
+            .load("return _pty_output_calls[1].session_name")
+            .eval()
+            .unwrap();
+        let data: String = runtime
+            .lua()
+            .load("return _pty_output_calls[1].data")
+            .eval()
+            .unwrap();
+
+        assert_eq!(session_uuid, "sess-output");
+        assert_eq!(session_name, "cloudflare-preview");
+        assert!(data.contains("trycloudflare.com"));
     }
 
     #[test]

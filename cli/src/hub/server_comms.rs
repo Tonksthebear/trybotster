@@ -181,6 +181,13 @@ impl Hub {
             } => {
                 self.handle_pty_osc_event(session_uuid, session_name, event);
             }
+            HubEvent::PtyOutput {
+                session_uuid,
+                session_name,
+                data,
+            } => {
+                self.handle_pty_output_event(session_uuid, session_name, data);
+            }
             HubEvent::PtyProcessExited {
                 session_uuid,
                 session_name,
@@ -289,6 +296,12 @@ impl Hub {
             }
             HubEvent::LuaHubRequest(request) => {
                 self.handle_lua_hub_request_event(request);
+            }
+            HubEvent::PluginWorkerParentRequest(request) => {
+                crate::lua::primitives::plugin_worker::service_parent_request(
+                    self.lua.lua(),
+                    request,
+                );
             }
             HubEvent::LuaConnectionRequest(request) => {
                 self.handle_lua_connection_request_event(request);

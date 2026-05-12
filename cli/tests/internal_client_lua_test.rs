@@ -670,11 +670,18 @@ fn worker_boundary_hub_mutations_proxy_to_parent_command_queue() {
             events = {{ emit = function() end }}
 
             local seen = {{}}
+            local enqueued = {{}}
             plugin_worker_parent_hub = {{
               request = function(command)
                 assert(command.type == "hub_command")
+                assert(command.command.type ~= "update_session", "update_session must enqueue without blocking")
                 seen[#seen + 1] = command.command
                 return {{ result = {{ ok = true, status = "queued", request_id = command.command.request_id }} }}
+              end,
+              enqueue = function(command)
+                assert(command.type == "hub_command")
+                enqueued[#enqueued + 1] = command.command
+                return true
               end,
             }}
 
@@ -697,25 +704,30 @@ fn worker_boundary_hub_mutations_proxy_to_parent_command_queue() {
 
             local Hub = require("lib.hub")
             local h = Hub.get()
-            h:update_session("sess-1", {{ label = "Updated" }})
+            h:update_session("sess-1", {{
+              label = "Updated",
+              plugin_state = {{ cloudflare_hosted_preview = {{ status = "starting" }} }},
+            }})
             h:move_agent_workspace("sess-1", "workspace-2")
             h:rename_workspace("workspace-2", "Workspace 2")
             h:entity_upsert("workflow.item", {{ id = "item-1" }}, {{ owner_plugin = "workflow" }})
             h:delete_agent("sess-1", false)
 
-            assert(#seen == 5)
-            assert(seen[1].type == "update_session")
+            assert(#enqueued == 1)
+            assert(enqueued[1].type == "update_session")
+            assert(enqueued[1].agent_id == "sess-1")
+            assert(enqueued[1].plugin_state.cloudflare_hosted_preview.status == "starting")
+            assert(#seen == 4)
+            assert(seen[1].type == "move_agent_workspace")
             assert(seen[1].agent_id == "sess-1")
-            assert(seen[2].type == "move_agent_workspace")
-            assert(seen[2].agent_id == "sess-1")
+            assert(seen[1].workspace_id == "workspace-2")
+            assert(seen[2].type == "rename_workspace")
             assert(seen[2].workspace_id == "workspace-2")
-            assert(seen[3].type == "rename_workspace")
-            assert(seen[3].workspace_id == "workspace-2")
-            assert(seen[4].type == "plugin_entity_publish")
-            assert(seen[4].op == "upsert")
-            assert(seen[4].owner_plugin == "workflow")
-            assert(seen[5].type == "delete_agent")
-            assert(seen[5].agent_id == "sess-1")
+            assert(seen[3].type == "plugin_entity_publish")
+            assert(seen[3].op == "upsert")
+            assert(seen[3].owner_plugin == "workflow")
+            assert(seen[4].type == "delete_agent")
+            assert(seen[4].agent_id == "sess-1")
             return "ok"
             "#,
             dir = dir.display()
@@ -1219,6 +1231,53 @@ fn update_session_requires_an_actual_field() {
         )
         .eval()
         .expect("update_session should reject no-op updates");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn update_session_accepts_plugin_state() {
+    let lua = new_lua();
+
+    let result: String = lua
+        .load(
+            r#"
+            local seen_fields
+            local session = {
+              session_uuid = "sess-existing",
+              update = function(_, fields)
+                seen_fields = fields
+              end,
+            }
+            package.loaded["lib.agent"] = {
+              get = function(id)
+                if id == "sess-existing" then return session end
+              end,
+            }
+
+            require("handlers.commands")
+            local result = require("lib.internal_client").dispatch("test", {
+              type = "update_session",
+              request_id = "req-update",
+              session_uuid = "sess-existing",
+              plugin_state = {
+                cloudflare_hosted_preview = {
+                  status = "starting",
+                  provider = "cloudflare",
+                },
+              },
+            })
+
+            assert(result.frames[1].type == "command_response")
+            assert(result.frames[1].request_id == "req-update")
+            assert(result.frames[1].ok == true)
+            assert(seen_fields.plugin_state.cloudflare_hosted_preview.status == "starting")
+            assert(seen_fields.plugin_state.cloudflare_hosted_preview.provider == "cloudflare")
+            return "ok"
+            "#,
+        )
+        .eval()
+        .expect("update_session should accept plugin_state updates");
 
     assert_eq!(result, "ok");
 }

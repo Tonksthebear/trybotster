@@ -55,6 +55,19 @@ local step_schema = {
     required = { "name" },
 }
 
+local checklist_item_schema = {
+    type = "object",
+    properties = {
+        id = { type = "string" },
+        position = { type = "integer" },
+        prompt = { type = "string" },
+        status = { type = "string", enum = { "pending", "in_progress", "blocked", "skipped", "done" } },
+        source_ref = { type = "string" },
+        evidence = { type = "object" },
+    },
+    required = { "prompt" },
+}
+
 local function ok(value)
     return { ok = true, result = value }
 end
@@ -132,7 +145,7 @@ function M.register()
             },
         }, function(args)
             local role = args and args.role or "pipeline step"
-            return "You are operating as a Project Pipelines " .. role .. ". First call project_pipelines_current_context. Treat returned gate prompts as hard requirements. State assumptions explicitly, prefer surgical changes, avoid speculative abstractions, and define verifiable success criteria. Submit gate evidence, reviews, findings, and artifacts through the project_pipelines_* MCP tools. Request advancement only after required evidence proves the actual production/user/runtime path changed. Do not leave dead, deprecated, or unwired code behind."
+            return "You are operating as a Project Pipelines " .. role .. ". First call project_pipelines_current_context. Treat returned gate prompts and checklist items as hard workflow requirements. State assumptions explicitly, prefer surgical changes, avoid speculative abstractions, and define verifiable success criteria. Use vault checklists to record which vault/project notes constrained the work instead of copying conventions into the pipeline. Submit gate evidence, reviews, findings, artifacts, and checklist evidence through the project_pipelines_* MCP tools. When a provider PR is opened for the ticket, call project_pipelines_link_pr so later pr_merged events can close the ticket automatically. Request advancement only after required evidence proves the actual production/user/runtime path changed. Do not leave dead, deprecated, or unwired code behind."
         end)
 
         mcp.prompt("project-pipelines-review-role", {
@@ -231,6 +244,56 @@ function M.register()
         },
     }, function(params)
         return sync_ok(repo.delete_ticket(params.ticket_id))
+    end)
+
+    tool("project_pipelines_link_pr", {
+        description = "Link a provider pull request to a ticket so provider-neutral pr_merged events can close the ticket after merge.",
+        input_schema = {
+            type = "object",
+            properties = {
+                ticket_id = { type = "string" },
+                run_id = { type = "string" },
+                provider = { type = "string", default = "github" },
+                repo = { type = "string", description = "Repository name such as owner/repo." },
+                pr_number = { type = "integer" },
+                pr_url = { type = "string" },
+                status = { type = "string", enum = { "open", "closed", "merged" } },
+                head_branch = { type = "string" },
+                base_branch = { type = "string" },
+            },
+            required = { "ticket_id", "repo", "pr_number" },
+        },
+    }, function(params)
+        return sync_ok(repo.link_pr(params))
+    end)
+
+    tool("project_pipelines_list_pr_links", {
+        description = "List pull requests linked to pipeline tickets or runs.",
+        input_schema = {
+            type = "object",
+            properties = {
+                ticket_id = { type = "string" },
+                run_id = { type = "string" },
+                provider = { type = "string" },
+                repo = { type = "string" },
+                status = { type = "string", enum = { "open", "closed", "merged" } },
+            },
+        },
+    }, function(params)
+        return ok(repo.list_pr_links(params or {}))
+    end)
+
+    tool("project_pipelines_get_pr_link", {
+        description = "Get a linked pull request by Project Pipelines PR link id.",
+        input_schema = {
+            type = "object",
+            properties = {
+                pr_link_id = { type = "string" },
+            },
+            required = { "pr_link_id" },
+        },
+    }, function(params)
+        return ok(repo.get_pr_link(params.pr_link_id))
     end)
 
     tool("project_pipelines_create_project", {
@@ -652,6 +715,187 @@ function M.register()
             return ok(repo.blocking_ticket_dependencies(params.ticket_id))
         end
         return ok(repo.ticket_dependencies(params.ticket_id))
+    end)
+
+    tool("project_pipelines_create_checklist", {
+        description = "Create a durable checklist for a project, ticket, or run. Use prompts as workflow checkpoints; keep project conventions in the vault and attach evidence that they were read/applied.",
+        input_schema = {
+            type = "object",
+            properties = {
+                scope = { type = "string", enum = { "project", "ticket", "run" } },
+                owner_id = { type = "string" },
+                name = { type = "string" },
+                description = { type = "string" },
+                source = { type = "string" },
+                items = { type = "array", items = checklist_item_schema },
+            },
+            required = { "scope", "owner_id", "name" },
+        },
+    }, function(params)
+        return sync_ok(repo.create_checklist(params))
+    end)
+
+    tool("project_pipelines_checklist_instructions", {
+        description = "Return instructions for using Project Pipelines checklists with the vault as the source of truth for conventions.",
+        input_schema = {
+            type = "object",
+            properties = {},
+        },
+    }, function()
+        return ok({
+            purpose = "Use Project Pipelines checklists to track workflow evidence. Keep actual project conventions in the vault; do not copy convention text into checklist prompts.",
+            recommended_flow = {
+                "Call project_pipelines_create_vault_checklist for the ticket or run.",
+                "Read the applicable vault/project notes before planning.",
+                "Mark checklist items as in_progress or done with project_pipelines_update_checklist_item.",
+                "Attach evidence that names notes read, convention conflicts or none, verification commands, and capture paths.",
+                "Use gates for advancement enforcement and checklists for workflow/rubric visibility.",
+            },
+            default_vault_items = {
+                {
+                    source_ref = "vault:context",
+                    prompt = "Load applicable vault/project conventions before planning.",
+                    evidence = {
+                        notes_read = { "vault note or file path" },
+                        summary = "Short note on which conventions constrain this ticket.",
+                    },
+                },
+                {
+                    source_ref = "vault:plan-review",
+                    prompt = "Check the implementation plan against the loaded conventions and record conflicts or 'none'.",
+                    evidence = {
+                        conflicts = {},
+                        decision = "none, adjusted plan, or human question/waiver",
+                    },
+                },
+                {
+                    source_ref = "vault:verification",
+                    prompt = "Verify with repo-approved commands and attach command evidence.",
+                    evidence = {
+                        commands = { "command and result" },
+                        gaps = "Any skipped verification and why.",
+                    },
+                },
+                {
+                    source_ref = "vault:capture",
+                    prompt = "Capture new durable project knowledge in the vault, or record why no capture was needed.",
+                    evidence = {
+                        capture_path = "vault inbox path, or nil",
+                        reason = "What was captured or why no durable knowledge was discovered.",
+                    },
+                },
+            },
+            statuses = { "pending", "in_progress", "blocked", "skipped", "done" },
+            tools = {
+                create_default = "project_pipelines_create_vault_checklist",
+                create_custom = "project_pipelines_create_checklist",
+                list = "project_pipelines_list_checklists",
+                inspect = "project_pipelines_get_checklist",
+                update_item = "project_pipelines_update_checklist_item",
+            },
+        })
+    end)
+
+    tool("project_pipelines_create_vault_checklist", {
+        description = "Create the standard vault workflow checklist for a project, ticket, or run without copying vault conventions into the pipeline.",
+        input_schema = {
+            type = "object",
+            properties = {
+                scope = { type = "string", enum = { "project", "ticket", "run" } },
+                owner_id = { type = "string" },
+                name = { type = "string" },
+                description = { type = "string" },
+            },
+            required = { "owner_id" },
+        },
+    }, function(params)
+        return sync_ok(repo.create_vault_checklist(params))
+    end)
+
+    tool("project_pipelines_list_checklists", {
+        description = "List checklists, optionally filtered by project, ticket, or run owner.",
+        input_schema = {
+            type = "object",
+            properties = {
+                scope = { type = "string", enum = { "project", "ticket", "run" } },
+                owner_id = { type = "string" },
+            },
+        },
+    }, function(params)
+        return ok(repo.list_checklists(params))
+    end)
+
+    tool("project_pipelines_get_checklist", {
+        description = "Get one checklist with ordered checklist items and their evidence.",
+        input_schema = {
+            type = "object",
+            properties = {
+                checklist_id = { type = "string" },
+            },
+            required = { "checklist_id" },
+        },
+    }, function(params)
+        return ok(repo.get_checklist(params.checklist_id))
+    end)
+
+    tool("project_pipelines_update_checklist", {
+        description = "Update checklist metadata.",
+        input_schema = {
+            type = "object",
+            properties = {
+                checklist_id = { type = "string" },
+                name = { type = "string" },
+                description = { type = "string" },
+                source = { type = "string" },
+            },
+            required = { "checklist_id" },
+        },
+    }, function(params)
+        local fields = {}
+        for _, field in ipairs({ "name", "description", "source" }) do
+            if params[field] ~= nil then fields[field] = params[field] end
+        end
+        return sync_ok(repo.update_checklist(params.checklist_id, fields))
+    end)
+
+    tool("project_pipelines_add_checklist_item", {
+        description = "Add a checkpoint to an existing checklist.",
+        input_schema = {
+            type = "object",
+            properties = {
+                checklist_id = { type = "string" },
+                position = { type = "integer" },
+                prompt = { type = "string" },
+                status = { type = "string", enum = { "pending", "in_progress", "blocked", "skipped", "done" } },
+                source_ref = { type = "string" },
+                evidence = { type = "object" },
+            },
+            required = { "checklist_id", "prompt" },
+        },
+    }, function(params)
+        return sync_ok(repo.add_checklist_item(params))
+    end)
+
+    tool("project_pipelines_update_checklist_item", {
+        description = "Update one checklist item status and evidence. Use evidence to list vault notes read, convention conflicts, verification commands, or capture paths.",
+        input_schema = {
+            type = "object",
+            properties = {
+                item_id = { type = "string" },
+                position = { type = "integer" },
+                prompt = { type = "string" },
+                status = { type = "string", enum = { "pending", "in_progress", "blocked", "skipped", "done" } },
+                source_ref = { type = "string" },
+                evidence = { type = "object" },
+            },
+            required = { "item_id" },
+        },
+    }, function(params)
+        local fields = {}
+        for _, field in ipairs({ "position", "prompt", "status", "source_ref", "evidence" }) do
+            if params[field] ~= nil then fields[field] = params[field] end
+        end
+        return sync_ok(repo.update_checklist_item(params.item_id, fields))
     end)
 
     tool("project_pipelines_current_context", {

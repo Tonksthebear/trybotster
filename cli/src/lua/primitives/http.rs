@@ -64,6 +64,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Result};
 use mlua::{Lua, LuaSerdeExt, MultiValue, Table, Value};
 
+use crate::lua::primitives::plugin_worker::PluginWorkerEventTx;
+
 /// Default request timeout in milliseconds.
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 
@@ -122,6 +124,8 @@ pub struct HttpAsyncEntries {
     /// Event channel sender for instant delivery to the Hub event loop.
     /// `None` in tests that don't wire up the full event bus.
     hub_event_tx: Option<crate::hub::events::HubEventTx>,
+    /// Worker-local mailbox for callbacks owned by a plugin worker VM.
+    worker_event_tx: Option<PluginWorkerEventTx>,
     /// Shared HTTP client reused across all async requests.
     ///
     /// `reqwest::blocking::Client` is an `Arc` internally — cloning it is cheap
@@ -141,6 +145,7 @@ impl Default for HttpAsyncEntries {
             next_id: 0,
             in_flight: 0,
             hub_event_tx: None,
+            worker_event_tx: None,
             client: reqwest::blocking::Client::new(),
         }
     }
@@ -155,13 +160,9 @@ impl HttpAsyncEntries {
         self.hub_event_tx = Some(tx);
     }
 
-    /// Route completed responses through the registry-local fallback queue.
-    ///
-    /// Plugin worker runtimes cannot receive `HubEvent::HttpResponse` on the
-    /// parent hub event loop because their Lua callbacks live in the worker VM.
-    /// They poll this local queue from the worker thread instead.
-    pub(crate) fn use_local_polling(&mut self) {
-        self.hub_event_tx = None;
+    /// Route completed responses through the plugin worker mailbox.
+    pub(crate) fn set_plugin_worker_event_tx(&mut self, tx: PluginWorkerEventTx) {
+        self.worker_event_tx = Some(tx);
     }
 
     /// Emit a completed response through the event channel or shared vec.
@@ -169,7 +170,9 @@ impl HttpAsyncEntries {
     /// If `hub_event_tx` is set (production), sends via the channel for
     /// instant delivery. Otherwise falls back to the shared vec (tests).
     fn emit_response(&mut self, response: CompletedHttpResponse) {
-        if let Some(ref tx) = self.hub_event_tx {
+        if let Some(ref tx) = self.worker_event_tx {
+            tx.send_http_response(response);
+        } else if let Some(ref tx) = self.hub_event_tx {
             let _ = tx.send(crate::hub::events::HubEvent::HttpResponse(response));
         } else {
             self.responses.push(response);

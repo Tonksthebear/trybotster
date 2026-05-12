@@ -304,6 +304,8 @@ commands.register("create_accessory", function(client, sub_id, command)
     local workspace_id = command.workspace_id
     local workspace_name = command.workspace_name
     local agent_name = command.agent_name
+    local from_worktree = command.from_worktree
+    local branch_name = command.branch
     local target, target_err = resolve_command_target(command)
     if not target then
         send_command_error(client, sub_id, "error", target_err)
@@ -320,7 +322,8 @@ commands.register("create_accessory", function(client, sub_id, command)
     end
 
     local accessory, err = require("handlers.agents").handle_create_accessory(
-        workspace_id, workspace_name, accessory_name, agent_name, metadata, target, session_config
+        workspace_id, workspace_name, accessory_name, agent_name, metadata, target,
+        session_config, from_worktree, branch_name
     )
     if err then
         send_command_response(client, sub_id, command, { ok = false, error = err })
@@ -331,8 +334,9 @@ commands.register("create_accessory", function(client, sub_id, command)
         session_uuid = accessory and accessory.session_uuid or nil,
         id = accessory and accessory.session_uuid or nil,
     })
-    log.info(string.format("Create accessory request: %s (workspace: %s, target: %s)",
-        accessory_name, tostring(workspace_id or workspace_name or "none"), tostring(target.target_id)))
+    log.info(string.format("Create accessory request: %s (workspace: %s, worktree: %s, target: %s)",
+        accessory_name, tostring(workspace_id or workspace_name or "none"),
+        tostring(from_worktree or "target-root"), tostring(target.target_id)))
 end, { description = "Create an accessory session (no AI autonomy)" })
 
 commands.register("list_owned_sessions", function(client, sub_id, command)
@@ -479,6 +483,7 @@ commands.register("update_session", function(client, sub_id, command)
     if command.label ~= nil then fields.label = command.label end
     if command.task ~= nil then fields.task = command.task end
     if command.metadata ~= nil then fields.metadata = command.metadata end
+    if command.plugin_state ~= nil then fields.plugin_state = command.plugin_state end
     if command.owner_plugin ~= nil then fields.owner_plugin = command.owner_plugin end
     if command.visibility ~= nil then fields.visibility = command.visibility end
     if command.surface ~= nil then fields.surface = command.surface end

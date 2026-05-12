@@ -230,6 +230,7 @@ impl EventCallbacks {
                 plugin_key
             );
         }
+        self.plugin_handler_counters.remove(plugin_key);
         count
     }
 
@@ -546,6 +547,46 @@ mod tests {
         callbacks.unregister(&lua, "nonexistent_id");
 
         assert_eq!(callbacks.callback_count(), 0);
+    }
+
+    #[test]
+    fn test_unregister_by_plugin_resets_handler_counter() {
+        let lua = Lua::new();
+        let mut callbacks = EventCallbacks::new();
+
+        let func1 = lua.create_function(|_, ()| Ok(())).unwrap();
+        let func2 = lua.create_function(|_, ()| Ok(())).unwrap();
+        callbacks
+            .register(
+                &lua,
+                "plugin_command_prepared",
+                func1,
+                Some("cloudflare".to_string()),
+            )
+            .unwrap();
+        callbacks
+            .register(
+                &lua,
+                "process_exited",
+                func2,
+                Some("cloudflare".to_string()),
+            )
+            .unwrap();
+
+        assert_eq!(callbacks.unregister_by_plugin(&lua, "cloudflare"), 2);
+
+        let func3 = lua.create_function(|_, ()| Ok(())).unwrap();
+        callbacks
+            .register(
+                &lua,
+                "plugin_command_prepared",
+                func3,
+                Some("cloudflare".to_string()),
+            )
+            .unwrap();
+        let entries = callbacks.get_entries("plugin_command_prepared");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].handler_id.as_deref(), Some("cloudflare:event_0"));
     }
 
     #[test]

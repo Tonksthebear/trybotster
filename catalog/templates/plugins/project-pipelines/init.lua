@@ -11,6 +11,7 @@ for _, module_name in ipairs({
     "project_pipelines.repo",
     "project_pipelines.entities",
     "project_pipelines.engine",
+    "project_pipelines.github_integration",
     "project_pipelines.mcp",
     "project_pipelines.web.ui",
     "project_pipelines.web.actions",
@@ -27,6 +28,7 @@ end
 
 local repo = require("project_pipelines.repo")
 local engine = require("project_pipelines.engine")
+local github_integration = require("project_pipelines.github_integration")
 local mcp_tools = require("project_pipelines.mcp")
 local surface = require("project_pipelines.web.surface")
 
@@ -45,6 +47,16 @@ if events and events.on then
         local ok, err = pcall(engine.handle_command_gate_completed, data)
         if not ok then
             log.warn("[project-pipelines] command_gate_completed handler failed: " .. tostring(err))
+        end
+    end)
+
+    if _G.__project_pipelines_pr_merged_sub and events.off then
+        pcall(events.off, _G.__project_pipelines_pr_merged_sub)
+    end
+    _G.__project_pipelines_pr_merged_sub = events.on("pr_merged", function(data)
+        local ok, err = pcall(github_integration.handle_pr_merged, data)
+        if not ok then
+            log.warn("[project-pipelines] pr_merged handler failed: " .. tostring(err))
         end
     end)
 end

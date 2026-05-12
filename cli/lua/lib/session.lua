@@ -42,7 +42,19 @@ local function proxy_session_info(info)
     if type(info) ~= "table" then return info end
     if info.__botster_session_proxy then return info end
     info.__botster_session_proxy = true
+    if type(info.metadata) ~= "table" then info.metadata = {} end
     info.info = function(self) return self end
+    info.get_meta = function(self, key)
+        local metadata = type(self.metadata) == "table" and self.metadata or {}
+        return metadata[key]
+    end
+    info.set_meta = function(self, key, value)
+        if type(self.metadata) ~= "table" then self.metadata = {} end
+        self.metadata[key] = value
+        return require("lib.hub").get():update_session(self.session_uuid or self.id, {
+            metadata = self.metadata,
+        })
+    end
     info.update = function(self, fields)
         return require("lib.hub").get():update_session(self.session_uuid or self.id, fields or {})
     end
@@ -543,6 +555,7 @@ function Session._init(self, config)
         session_name = session_name,
         label = self.label or "",
         workspace_id = self._workspace_id,
+        observe_output = self.metadata and self.metadata.observe_output == true,
     })
     if reg_ok then
         log.info(string.format("Session %s: registered with HandleCache index %s",
@@ -611,7 +624,13 @@ function Session._init_recovered(self, config)
     self.output_activity = "idle"
     self.session         = config.handle
     self._session_config = nil
-    self._port           = nil
+    self._port           = config.port
+    if self._port == nil and config.handle and type(config.handle.port) == "function" then
+        local ok, handle_port = pcall(function() return config.handle:port() end)
+        if ok then
+            self._port = handle_port
+        end
+    end
     self._workspace_id   = config.workspace_id
     self._workspace_name = config.workspace_name
     self._workspace_metadata = {}
@@ -1226,7 +1245,7 @@ end
 -- @return Session subclass instance or nil
 function Session.get(session_uuid)
     if plugin_worker_hub_proxy_enabled() then
-        for _, sess in ipairs(proxy_session_list()) do
+        for _, sess in ipairs(proxy_session_list({ include_system = true })) do
             if sess.session_uuid == session_uuid or sess.id == session_uuid then
                 return sess
             end

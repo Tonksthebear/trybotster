@@ -268,12 +268,15 @@ export class HubTransport extends HubRoute {
     workspaceId = null,
     workspaceName = null,
     targetId = null,
+    options = {},
   ) {
     return this.sendCommand("create_accessory", {
       accessory_name: accessoryName,
       workspace_id: workspaceId,
       workspace_name: workspaceName,
       target_id: targetId,
+      from_worktree: options.fromWorktree || options.from_worktree || null,
+      branch: options.branch || null,
     });
   }
 

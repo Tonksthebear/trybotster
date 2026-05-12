@@ -30,13 +30,16 @@
 //! `timer.cancel` returns `true` if the timer was found, `false` otherwise.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
 use mlua::prelude::*;
 
 use crate::hub::events::HubEvent;
+use crate::lua::primitives::plugin_worker::PluginWorkerEventTx;
 
 /// A single timer entry in the registry.
 struct TimerEntry {
@@ -57,6 +60,8 @@ struct TimerEntry {
     /// `None` in test mode where timers use deadline-based polling via
     /// [`poll_timers`]. Aborted on [`timer.cancel()`] to stop the task.
     task_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Cancellation flag for worker-owned std threads.
+    cancel_flag: Option<Arc<AtomicBool>>,
 }
 
 /// Registry of active timers.
@@ -79,6 +84,8 @@ pub struct TimerEntries {
     hub_event_tx: Option<crate::hub::events::HubEventTx>,
     /// Tokio runtime handle for spawning timer tasks from sync Lua closures.
     tokio_handle: Option<tokio::runtime::Handle>,
+    /// Worker-local mailbox for timers owned by a plugin worker VM.
+    worker_event_tx: Option<PluginWorkerEventTx>,
 }
 
 fn timer_perf_enabled() -> bool {
@@ -154,6 +161,7 @@ impl Default for TimerEntries {
             plugin_handler_counters: HashMap::new(),
             hub_event_tx: None,
             tokio_handle: None,
+            worker_event_tx: None,
         }
     }
 }
@@ -193,6 +201,45 @@ impl TimerEntries {
         self.hub_event_tx = Some(tx);
         self.tokio_handle = Some(handle);
     }
+
+    /// Route timer firings through the plugin worker mailbox.
+    pub(crate) fn set_plugin_worker_event_tx(&mut self, tx: PluginWorkerEventTx) {
+        self.worker_event_tx = Some(tx);
+    }
+}
+
+fn spawn_worker_timer_once(
+    tx: PluginWorkerEventTx,
+    timer_id: String,
+    duration: Duration,
+    cancel_flag: Arc<AtomicBool>,
+) {
+    let _ = thread::Builder::new()
+        .name(format!("botster-plugin-timer-{timer_id}"))
+        .spawn(move || {
+            thread::sleep(duration);
+            if !cancel_flag.load(Ordering::SeqCst) {
+                let _ = tx.send_timer_fired(timer_id);
+            }
+        });
+}
+
+fn spawn_worker_timer_repeating(
+    tx: PluginWorkerEventTx,
+    timer_id: String,
+    interval: Duration,
+    cancel_flag: Arc<AtomicBool>,
+) {
+    let _ = thread::Builder::new()
+        .name(format!("botster-plugin-timer-{timer_id}"))
+        .spawn(move || {
+            while !cancel_flag.load(Ordering::SeqCst) {
+                thread::sleep(interval);
+                if cancel_flag.load(Ordering::SeqCst) || !tx.send_timer_fired(timer_id.clone()) {
+                    break;
+                }
+            }
+        });
 }
 
 /// Thread-safe handle to the timer registry.
@@ -249,9 +296,18 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
 
             let duration = Duration::from_secs_f64(seconds);
 
-            // Spawn tokio task for instant delivery if event channel is available.
-            let task_handle = match (&entries.hub_event_tx, &entries.tokio_handle) {
-                (Some(tx), Some(handle)) => {
+            // Spawn a delivery task when an event sink is available.
+            let cancel_flag = entries.worker_event_tx.as_ref().map(|tx| {
+                let cancel_flag = Arc::new(AtomicBool::new(false));
+                spawn_worker_timer_once(tx.clone(), id.clone(), duration, cancel_flag.clone());
+                cancel_flag
+            });
+            let task_handle = match (
+                cancel_flag.is_none(),
+                &entries.hub_event_tx,
+                &entries.tokio_handle,
+            ) {
+                (true, Some(tx), Some(handle)) => {
                     let tx = tx.clone();
                     let timer_id = id.clone();
                     Some(handle.spawn(async move {
@@ -272,6 +328,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                     repeat_interval: None,
                     cancelled: false,
                     task_handle,
+                    cancel_flag,
                 },
             ));
 
@@ -303,10 +360,18 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                 .as_deref()
                 .map(|owner| next_plugin_handler_id(&mut entries, owner));
 
-            // Spawn looping tokio task for instant delivery if event channel
-            // is available. The task runs until cancelled via `handle.abort()`.
-            let task_handle = match (&entries.hub_event_tx, &entries.tokio_handle) {
-                (Some(tx), Some(handle)) => {
+            // Spawn looping delivery task if an event sink is available.
+            let cancel_flag = entries.worker_event_tx.as_ref().map(|tx| {
+                let cancel_flag = Arc::new(AtomicBool::new(false));
+                spawn_worker_timer_repeating(tx.clone(), id.clone(), interval, cancel_flag.clone());
+                cancel_flag
+            });
+            let task_handle = match (
+                cancel_flag.is_none(),
+                &entries.hub_event_tx,
+                &entries.tokio_handle,
+            ) {
+                (true, Some(tx), Some(handle)) => {
                     let tx = tx.clone();
                     let timer_id = id.clone();
                     Some(handle.spawn(async move {
@@ -336,6 +401,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                     repeat_interval: Some(interval),
                     cancelled: false,
                     task_handle,
+                    cancel_flag,
                 },
             ));
 
@@ -371,8 +437,18 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                 // Refresh a single slot for this ID instead of appending a new
                 // cancelled entry every reset. Hot paths such as PTY idle
                 // detection call after_idle on nearly every output chunk.
-                let task_handle = match (&entries.hub_event_tx, &entries.tokio_handle) {
-                    (Some(tx), Some(handle)) => {
+                let cancel_flag = entries.worker_event_tx.as_ref().map(|tx| {
+                    let cancel_flag = Arc::new(AtomicBool::new(false));
+                    spawn_worker_timer_once(tx.clone(), id.clone(), duration, cancel_flag.clone());
+                    cancel_flag
+                });
+
+                let task_handle = match (
+                    cancel_flag.is_none(),
+                    &entries.hub_event_tx,
+                    &entries.tokio_handle,
+                ) {
+                    (true, Some(tx), Some(handle)) => {
                         let tx = tx.clone();
                         let timer_id = id.clone();
                         Some(handle.spawn(async move {
@@ -389,6 +465,9 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                     if let Some(handle) = entry.task_handle.take() {
                         handle.abort();
                     }
+                    if let Some(flag) = entry.cancel_flag.take() {
+                        flag.store(true, Ordering::SeqCst);
+                    }
                     let old_key = std::mem::replace(&mut entry.callback_key, callback_key);
                     let _ = lua.remove_registry_value(old_key);
                     entry.handler_id = handler_id;
@@ -397,6 +476,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                     entry.repeat_interval = None;
                     entry.cancelled = false;
                     entry.task_handle = task_handle;
+                    entry.cancel_flag = cancel_flag;
                 } else {
                     entries.entries.push((
                         id.clone(),
@@ -408,6 +488,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                             repeat_interval: None,
                             cancelled: false,
                             task_handle,
+                            cancel_flag,
                         },
                     ));
                 }
@@ -437,6 +518,9 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                     // Abort the spawned timer task if running (production mode).
                     if let Some(handle) = entry.task_handle.take() {
                         handle.abort();
+                    }
+                    if let Some(flag) = entry.cancel_flag.take() {
+                        flag.store(true, Ordering::SeqCst);
                     }
                     return Ok(true);
                 }
@@ -610,7 +694,7 @@ pub(crate) fn fire_single_timer(lua: &Lua, registry: &TimerRegistry, timer_id: &
     let total_started = Instant::now();
 
     // Phase 1: look up entry under lock, clone callback, handle one-shot.
-    let fired_timer = {
+    let (fired_timer, one_shot) = {
         let mut entries = registry.lock().expect("TimerEntries mutex poisoned");
 
         let entry_pos = entries
@@ -623,17 +707,38 @@ pub(crate) fn fire_single_timer(lua: &Lua, registry: &TimerRegistry, timer_id: &
             return;
         };
 
+        let worker_local_timer = entries.worker_event_tx.is_some();
         let entry = &mut entries.entries[pos].1;
 
-        let fired = if let (Some(owner_plugin), Some(handler_id)) =
-            (&entry.owner_plugin, &entry.handler_id)
-        {
-            FiredTimer::Plugin {
-                owner_plugin: owner_plugin.clone(),
-                handler_id: handler_id.clone(),
+        let fired = if !worker_local_timer {
+            if let (Some(owner_plugin), Some(handler_id)) = (&entry.owner_plugin, &entry.handler_id)
+            {
+                FiredTimer::Plugin {
+                    owner_plugin: owner_plugin.clone(),
+                    handler_id: handler_id.clone(),
+                }
+            } else {
+                // Clone the callback for firing outside the lock.
+                let callback = match lua.registry_value::<LuaFunction>(&entry.callback_key) {
+                    Ok(cb) => cb,
+                    Err(e) => {
+                        log::warn!("[timer] Failed to retrieve callback for {timer_id}: {e}");
+                        return;
+                    }
+                };
+                let cloned_key = match lua.create_registry_value(callback) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        log::warn!("[timer] Failed to clone callback for {timer_id}: {e}");
+                        return;
+                    }
+                };
+                FiredTimer::Local(cloned_key)
             }
         } else {
-            // Clone the callback for firing outside the lock.
+            // Plugin worker timers are already executing inside the worker VM,
+            // so their callbacks should run locally instead of re-entering
+            // the worker dispatch bridge.
             let callback = match lua.registry_value::<LuaFunction>(&entry.callback_key) {
                 Ok(cb) => cb,
                 Err(e) => {
@@ -651,13 +756,9 @@ pub(crate) fn fire_single_timer(lua: &Lua, registry: &TimerRegistry, timer_id: &
             FiredTimer::Local(cloned_key)
         };
 
-        if entry.repeat_interval.is_none() {
-            // One-shot: mark for removal.
-            entry.cancelled = true;
-        }
-        // Repeating timers keep the entry alive; the looping task sends again.
+        let one_shot = entry.repeat_interval.is_none();
 
-        fired
+        (fired, one_shot)
     };
     let lookup_done = Instant::now();
     // Lock released — callback can safely call timer functions.
@@ -681,9 +782,16 @@ pub(crate) fn fire_single_timer(lua: &Lua, registry: &TimerRegistry, timer_id: &
         let _ = lua.remove_registry_value(key);
     }
 
-    // Phase 4: remove cancelled entries and clean up their registry keys.
+    // Phase 4: mark completed one-shot timers, then remove cancelled entries
+    // and clean up their registry keys. Plugin-owned timers must remain
+    // registered until after the worker VM has looked up the handler.
     {
         let mut entries = registry.lock().expect("TimerEntries mutex poisoned");
+        if one_shot {
+            if let Some((_, entry)) = entries.entries.iter_mut().find(|(id, _)| id == timer_id) {
+                entry.cancelled = true;
+            }
+        }
         let removed: Vec<_> = entries.entries.drain_filter_compat();
         for (_, entry) in removed {
             let _ = lua.remove_registry_value(entry.callback_key);

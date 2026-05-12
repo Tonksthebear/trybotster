@@ -7,7 +7,7 @@ import {
   it,
   vi,
 } from 'vitest'
-import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 
 vi.mock('../lib/actions', () => ({
   ACTION: {
@@ -22,6 +22,7 @@ vi.mock('../lib/actions', () => ({
 
 import * as hubBridge from '../lib/hub-bridge'
 import { dispatch as localDispatch } from '../lib/actions'
+import { _resetUiActionLifecycleForTests } from '../ui_contract/action_lifecycle_store'
 import { useSessionActionStore, useSessionStore } from '../store/entities'
 import UiTree, { useUiTreeDispatch } from '../components/UiTree'
 import SessionActionsMenu from '../components/workspace/SessionActionsMenu'
@@ -111,6 +112,7 @@ afterEach(() => {
   vi.restoreAllMocks()
   useSessionStore.getState()._reset()
   useSessionActionStore.getState()._reset()
+  _resetUiActionLifecycleForTests()
 })
 
 describe('<SessionActionsMenu> interceptor', () => {
@@ -203,5 +205,47 @@ describe('<SessionActionsMenu> interceptor', () => {
     await Promise.resolve()
     await Promise.resolve()
     expect(fakeTransport.sendCommand).toHaveBeenCalled()
+  })
+
+  it('shows move action for accessory sessions', async () => {
+    useSessionStore.setState({
+      byId: {
+        's-1': {
+          id: 's-1',
+          session_uuid: 'u-1',
+          session_type: 'accessory',
+        },
+      },
+      order: ['s-1'],
+      snapshotSeq: 2,
+    })
+
+    render(
+      <UiTree hubId="hub-1" targetSurface="workspace_panel">
+        <SessionActionsMenu />
+      </UiTree>,
+    )
+
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'workspace_panel',
+        tree: MENU_TRIGGER_TREE,
+      })
+    })
+
+    const trigger = await screen.findByRole('button', {
+      name: 'Session actions',
+    })
+    await waitFor(() => expect(trigger).not.toBeDisabled())
+    fireEvent.click(trigger)
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    })
+
+    expect(screen.getByRole('menuitem', {
+      name: /Move to workspace/i,
+    })).toBeInTheDocument()
   })
 })

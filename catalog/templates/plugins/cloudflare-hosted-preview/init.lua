@@ -9,8 +9,8 @@
 --
 -- The Cloudflare quick-tunnel lifecycle is plugin-owned: this module registers
 -- a generic session action, owns the hidden connector session, watches
--- cloudflared output, probes URL readiness, and mirrors action state onto the
--- parent session.
+-- cloudflared output, probes URL readiness, and mirrors only a reachable URL
+-- onto the parent session.
 
 local Hub = require("lib.hub")
 local Session = require("lib.session")
@@ -27,13 +27,22 @@ local CLOUDFLARED_INSTALL_URL =
 local MISSING_BINARY_ERROR =
     "Hosted preview requires cloudflared to be installed on this machine."
 local QUICK_TUNNEL_CONFIG_BASENAME = "botster-cloudflared-quick.yml"
-local PROBE_TIMEOUT_SECS = 15.0
+local URL_DISCOVERY_TIMEOUT_SECS = 20.0
+local URL_READY_RETRY_SECS = 1.0
+local URL_READY_DNS_TIMEOUT_MS = 3000
 
 local connector_output_buffers = state.get("cloudflare_hosted_preview.connector_output_buffers", {})
+local connector_records = state.get("cloudflare_hosted_preview.connector_records", {})
+local parents_by_uuid = state.get("cloudflare_hosted_preview.parents_by_uuid", {})
+local url_wait_ids = state.get("cloudflare_hosted_preview.url_wait_ids", {})
+local readiness_wait_ids = state.get("cloudflare_hosted_preview.readiness_wait_ids", {})
 local prepare_seq = state.get("cloudflare_hosted_preview.prepare_seq", { value = 0 })
+local url_wait_seq = state.get("cloudflare_hosted_preview.url_wait_seq", { value = 0 })
+local readiness_seq = state.get("cloudflare_hosted_preview.readiness_seq", { value = 0 })
 local event_subs = {}
 
 local M = {}
+local close_connector
 
 local function metadata_flag(value)
     return value == true or value == "true"
@@ -46,11 +55,68 @@ local function session_port(session)
     return port
 end
 
-local function trycloudflare_url_from_text(text)
+local function shallow_copy(tbl)
+    local out = {}
+    if type(tbl) == "table" then
+        for key, value in pairs(tbl) do
+            out[key] = value
+        end
+    end
+    return out
+end
+
+local function cache_parent(parent)
+    if parent and parent.session_uuid then
+        parents_by_uuid[parent.session_uuid] = parent
+    end
+    return parent
+end
+
+local function cache_connector(session_uuid, metadata, parent)
+    if type(session_uuid) ~= "string" or session_uuid == "" then return nil end
+    local record = connector_records[session_uuid] or {}
+    record.session_uuid = session_uuid
+    record.metadata = shallow_copy(metadata or record.metadata)
+    record.parent_uuid = record.metadata.target_session_uuid or (parent and parent.session_uuid)
+    record.parent = cache_parent(parent) or record.parent or (record.parent_uuid and parents_by_uuid[record.parent_uuid])
+    connector_records[session_uuid] = record
+    return record
+end
+
+local function connector_meta(record, key)
+    local metadata = type(record) == "table" and record.metadata or nil
+    return type(metadata) == "table" and metadata[key] or nil
+end
+
+local function set_connector_meta(record, key, value)
+    if type(record) ~= "table" or not record.session_uuid then return false end
+    if type(record.metadata) ~= "table" then record.metadata = {} end
+    record.metadata[key] = value
+    local ok = pcall(function()
+        Hub.get():update_session(record.session_uuid, { metadata = record.metadata })
+    end)
+    return ok
+end
+
+local function normalize_terminal_text(text)
     if type(text) ~= "string" or text == "" then
+        return ""
+    end
+
+    return text
+        :gsub("\27%][^\7]*\7", "")
+        :gsub("\27%][^\27]*\27\\", "")
+        :gsub("\27%[[0-?]*[ -/]*[@-~]", "")
+        :gsub("\r", "\n")
+end
+
+local function trycloudflare_url_from_text(text)
+    text = normalize_terminal_text(text)
+    if text == "" then
         return nil
     end
-    local host = text:match("https://([%w%-]+%.trycloudflare%.com)")
+
+    local host = text:match("https?://([%w%-]+%.trycloudflare%.com)")
     if not host then
         return nil
     end
@@ -114,7 +180,186 @@ local function update_parent_preview(parent, extras)
         end
     end
     plugin_state[PLUGIN_STATE_KEY] = preview_state_for(parent, extras)
+    parent.plugin_state = plugin_state
     parent:update({ plugin_state = plugin_state })
+end
+
+local function next_url_wait_id(connector)
+    url_wait_seq.value = (tonumber(url_wait_seq.value) or 0) + 1
+    return tostring(connector.session_uuid) .. ":" .. tostring(url_wait_seq.value)
+end
+
+local function next_readiness_wait_id(connector)
+    readiness_seq.value = (tonumber(readiness_seq.value) or 0) + 1
+    return tostring(connector.session_uuid) .. ":" .. tostring(readiness_seq.value)
+end
+
+local function mark_preview_running(connector, parent, url, hostname)
+    if not connector or not parent then
+        return false
+    end
+
+    set_connector_meta(connector, "preview_url", url)
+    set_connector_meta(connector, "preview_hostname", hostname)
+    set_connector_meta(connector, "preview_pending_url", false)
+    url_wait_ids[connector.session_uuid] = nil
+    readiness_wait_ids[connector.session_uuid] = nil
+    update_parent_preview(parent, {
+        status = "running",
+        error = false,
+        install_url = false,
+        url = url,
+        connector_session_uuid = connector.session_uuid,
+        prepare_request_id = false,
+    })
+    return true
+end
+
+local function preview_readiness_still_current(connector_uuid, parent_uuid, url, wait_id)
+    local connector = connector_uuid and connector_records[connector_uuid] or nil
+    local parent = connector and connector.parent or (parent_uuid and parents_by_uuid[parent_uuid]) or nil
+    if not connector or not parent or not M.is_connector(connector) then
+        return nil, nil, false
+    end
+
+    local hosted = preview_state_for(parent)
+    local current = hosted.connector_session_uuid == connector.session_uuid
+        and connector_meta(connector, "preview_pending_url") == url
+        and readiness_wait_ids[connector.session_uuid] == wait_id
+    return connector, parent, current
+end
+
+local function dns_ready_from_response(resp)
+    if not resp or tonumber(resp.status) ~= 200 or type(resp.body) ~= "string" then
+        return false
+    end
+
+    local ok, body = pcall(json.decode, resp.body)
+    if not ok or type(body) ~= "table" or tonumber(body.Status) ~= 0 then
+        return false
+    end
+
+    local answers = body.Answer
+    if type(answers) ~= "table" then
+        return false
+    end
+
+    for _, answer in ipairs(answers) do
+        local answer_type = type(answer) == "table" and tonumber(answer.type) or nil
+        if answer_type == 1 or answer_type == 28 then
+            return true
+        end
+    end
+    return false
+end
+
+local function begin_preview_readiness(connector, parent, url, hostname)
+    if not connector or not parent or type(url) ~= "string" or url == "" then
+        return false
+    end
+
+    local wait_id = next_readiness_wait_id(connector)
+    url_wait_ids[connector.session_uuid] = nil
+    readiness_wait_ids[connector.session_uuid] = wait_id
+    set_connector_meta(connector, "preview_pending_url", url)
+    set_connector_meta(connector, "preview_hostname", hostname)
+    update_parent_preview(parent, {
+        status = "starting",
+        error = false,
+        install_url = false,
+        url = false,
+        connector_session_uuid = connector.session_uuid,
+        prepare_request_id = false,
+    })
+
+    local function attempt()
+        local current_connector, current_parent, current =
+            preview_readiness_still_current(connector.session_uuid, parent.session_uuid, url, wait_id)
+        if not current then
+            return
+        end
+
+        local _, request_err = http.request({
+            method = "GET",
+            url = "https://cloudflare-dns.com/dns-query?name=" .. hostname .. "&type=A",
+            headers = {
+                ["Accept"] = "application/dns-json",
+            },
+            timeout_ms = URL_READY_DNS_TIMEOUT_MS,
+        }, function(resp, err)
+            local still_connector, still_parent, still_current =
+                preview_readiness_still_current(connector.session_uuid, parent.session_uuid, url, wait_id)
+            if not still_current then
+                return
+            end
+
+            if dns_ready_from_response(resp) then
+                mark_preview_running(still_connector, still_parent, url, hostname)
+                return
+            end
+
+            timer.after(URL_READY_RETRY_SECS, attempt)
+        end)
+
+        if request_err then
+            timer.after(URL_READY_RETRY_SECS, attempt)
+        end
+    end
+
+    attempt()
+    return true
+end
+
+local function url_wait_still_current(connector_uuid, parent_uuid, wait_id)
+    local connector = connector_uuid and connector_records[connector_uuid] or nil
+    local parent = connector and connector.parent or (parent_uuid and parents_by_uuid[parent_uuid]) or nil
+    if not connector or not parent or not M.is_connector(connector) then
+        return nil, nil, false
+    end
+
+    local hosted = preview_state_for(parent)
+    local current = hosted.connector_session_uuid == connector.session_uuid
+        and not connector_meta(connector, "preview_url")
+        and url_wait_ids[connector.session_uuid] == wait_id
+    return connector, parent, current
+end
+
+local function finish_url_discovery_timeout(connector_uuid, parent_uuid, wait_id)
+    local connector, parent, current = url_wait_still_current(connector_uuid, parent_uuid, wait_id)
+    if not current then
+        return false
+    end
+
+    url_wait_ids[connector.session_uuid] = nil
+    update_parent_preview(parent, {
+        status = "error",
+        error = "Cloudflare quick tunnel did not emit a preview URL",
+        install_url = false,
+        url = false,
+        connector_session_uuid = false,
+        prepare_request_id = false,
+    })
+    close_connector(connector)
+    return true
+end
+
+local function schedule_url_discovery_timeout(connector, parent)
+    if not connector or not parent then
+        return false
+    end
+    if connector_meta(connector, "preview_url") then
+        return true
+    end
+    if url_wait_ids[connector.session_uuid] then
+        return true
+    end
+
+    local wait_id = next_url_wait_id(connector)
+    url_wait_ids[connector.session_uuid] = wait_id
+    timer.after(URL_DISCOVERY_TIMEOUT_SECS, function()
+        finish_url_discovery_timeout(connector.session_uuid, parent.session_uuid, wait_id)
+    end)
+    return true
 end
 
 function M.is_connector(subject)
@@ -125,23 +370,53 @@ function M.is_connector(subject)
 end
 
 function M.find_connector(parent_uuid)
-    if not parent_uuid then return nil end
+    local connectors = M.find_connectors(parent_uuid)
+    return connectors and connectors[1] or nil
+end
+
+function M.find_connectors(parent_uuid)
+    local connectors = {}
+    if not parent_uuid then return connectors end
     for _, session in ipairs(Session.list()) do
         if M.is_connector(session)
             and session:get_meta("target_session_uuid") == parent_uuid
             and session.status ~= "closed" then
-            return session
+            connectors[#connectors + 1] = session
         end
     end
-    return nil
+    return connectors
 end
 
-local function close_connector(connector)
+close_connector = function(connector)
     if not connector then return end
-    connector_output_buffers[connector.session_uuid] = nil
+    local session_uuid = connector.session_uuid
+    connector_output_buffers[session_uuid] = nil
+    connector_records[session_uuid] = nil
+    url_wait_ids[session_uuid] = nil
+    readiness_wait_ids[session_uuid] = nil
     pcall(function()
-        connector:close(false)
+        if type(connector.close) == "function" then
+            connector:close(false)
+        elseif session_uuid then
+            local session = Session.get(session_uuid)
+            if session and type(session.close) == "function" then
+                session:close(false)
+            end
+        end
     end)
+end
+
+local function close_connectors_for_parent(parent_uuid)
+    local closed = {}
+    for _, connector in ipairs(M.find_connectors(parent_uuid) or {}) do
+        closed[connector.session_uuid] = true
+        close_connector(connector)
+    end
+    for session_uuid, record in pairs(connector_records) do
+        if not closed[session_uuid] and connector_meta(record, "target_session_uuid") == parent_uuid then
+            close_connector(record)
+        end
+    end
 end
 
 function M.disable_by_parent_uuid(parent_uuid, opts)
@@ -150,15 +425,15 @@ function M.disable_by_parent_uuid(parent_uuid, opts)
     if parent and opts.clear_parent ~= false then
         update_parent_preview(parent, {
             status = "inactive",
-            error = nil,
-            install_url = nil,
-            url = nil,
-            connector_session_uuid = nil,
+            error = false,
+            install_url = false,
+            url = false,
+            connector_session_uuid = false,
             prepare_request_id = false,
         })
     end
 
-    close_connector(M.find_connector(parent_uuid))
+    close_connectors_for_parent(parent_uuid)
 end
 
 function M.disable(parent)
@@ -189,9 +464,9 @@ local function start_connector(parent, prepared)
         update_parent_preview(parent, {
             status = "error",
             error = error_message,
-            install_url = nil,
-            url = nil,
-            connector_session_uuid = nil,
+            install_url = false,
+            url = false,
+            connector_session_uuid = false,
             prepare_request_id = false,
         })
         return nil, error_message
@@ -202,15 +477,15 @@ local function start_connector(parent, prepared)
         update_parent_preview(parent, {
             status = "error",
             error = error_message,
-            install_url = nil,
-            url = nil,
-            connector_session_uuid = nil,
+            install_url = false,
+            url = false,
+            connector_session_uuid = false,
             prepare_request_id = false,
         })
         return nil, error_message
     end
 
-    if M.find_connector(parent.session_uuid) then
+    if #(M.find_connectors(parent.session_uuid) or {}) > 0 then
         M.disable_by_parent_uuid(parent.session_uuid, { clear_parent = false })
     end
 
@@ -224,6 +499,7 @@ local function start_connector(parent, prepared)
         hosted_preview_provider = "cloudflare",
         target_session_uuid = parent.session_uuid,
         target_forward_port = session_port(parent),
+        observe_output = true,
     }, TargetContext.from_session(parent))
 
     local ok, result = pcall(function()
@@ -252,9 +528,9 @@ local function start_connector(parent, prepared)
         update_parent_preview(parent, {
             status = "error",
             error = error_message,
-            install_url = nil,
-            url = nil,
-            connector_session_uuid = nil,
+            install_url = false,
+            url = false,
+            connector_session_uuid = false,
             prepare_request_id = false,
         })
         return nil, error_message
@@ -266,9 +542,9 @@ local function start_connector(parent, prepared)
     end
     update_parent_preview(parent, {
         status = "starting",
-        error = nil,
-        install_url = nil,
-        url = nil,
+        error = false,
+        install_url = false,
+        url = false,
         connector_session_uuid = session_uuid,
         prepare_request_id = session_uuid and false or request_id,
     })
@@ -284,20 +560,21 @@ function M.enable(parent)
         return nil, "Parent session has no forwarded port"
     end
 
-    if M.find_connector(parent.session_uuid) then
+    if #(M.find_connectors(parent.session_uuid) or {}) > 0 then
         M.disable_by_parent_uuid(parent.session_uuid, { clear_parent = false })
     end
 
     local request_id = next_prepare_request_id(parent)
+    cache_parent(parent)
     update_parent_preview(parent, {
         status = "starting",
-        error = nil,
-        install_url = nil,
-        url = nil,
-        connector_session_uuid = nil,
+        error = false,
+        install_url = false,
+        url = false,
+        connector_session_uuid = false,
         prepare_request_id = request_id,
     })
-    hub.prepare_plugin_command({
+    Hub.get():prepare_plugin_command({
         request_id = request_id,
         command = cloudflared_command(),
         config_path = quick_tunnel_config_path(),
@@ -314,7 +591,8 @@ function M.handle_plugin_command_prepared(data)
     local request_id = data and data.request_id or nil
     local context = data and data.context or nil
     local parent_uuid = type(context) == "table" and context.parent_session_uuid or nil
-    local parent = parent_uuid and Session.get(parent_uuid) or nil
+    local parent = parent_uuid and (parents_by_uuid[parent_uuid] or Session.get(parent_uuid)) or nil
+    cache_parent(parent)
     if not parent or type(request_id) ~= "string" then
         return false
     end
@@ -326,7 +604,7 @@ function M.handle_plugin_command_prepared(data)
 
     if data.error then
         local error_message = tostring(data.error)
-        local install_url = nil
+        local install_url = false
         if data.error_kind == "command_missing" then
             error_message = MISSING_BINARY_ERROR
             install_url = CLOUDFLARED_INSTALL_URL
@@ -335,8 +613,8 @@ function M.handle_plugin_command_prepared(data)
             status = "error",
             error = error_message,
             install_url = install_url,
-            url = nil,
-            connector_session_uuid = nil,
+            url = false,
+            connector_session_uuid = false,
             prepare_request_id = false,
         })
         return true
@@ -357,7 +635,9 @@ function M.handle_agent_created(info)
         return false
     end
 
-    local parent = metadata.target_session_uuid and Session.get(metadata.target_session_uuid) or nil
+    local parent = metadata.target_session_uuid
+        and (parents_by_uuid[metadata.target_session_uuid] or Session.get(metadata.target_session_uuid))
+        or nil
     local session_uuid = info.session_uuid or info.id
     if not parent or not session_uuid then
         return false
@@ -369,25 +649,43 @@ function M.handle_agent_created(info)
     end
 
     connector_output_buffers[session_uuid] = ""
+    local connector = cache_connector(session_uuid, metadata, parent)
     update_parent_preview(parent, {
         status = "starting",
-        error = nil,
-        install_url = nil,
-        url = nil,
+        error = false,
+        install_url = false,
+        url = false,
         connector_session_uuid = session_uuid,
         prepare_request_id = false,
     })
+    if connector then
+        schedule_url_discovery_timeout(connector, parent)
+    end
     return true
 end
 
 function M.handle_output(ctx, data)
     local session_uuid = ctx and ctx.session_uuid or nil
-    local connector = session_uuid and Session.get(session_uuid) or nil
+    local connector = session_uuid and connector_records[session_uuid] or nil
+    if not connector and ctx and type(ctx.metadata) == "table" then
+        local parent_uuid = ctx.metadata.target_session_uuid
+        local parent = parent_uuid and parents_by_uuid[parent_uuid] or nil
+        connector = cache_connector(session_uuid, ctx.metadata, parent)
+    end
     if not connector or not M.is_connector(connector) then
         return false
     end
-    if connector:get_meta("preview_url") then
+    if connector_meta(connector, "preview_url") then
         return true
+    end
+    if connector_meta(connector, "preview_pending_url") then
+        return true
+    end
+
+    local parent_uuid = connector_meta(connector, "target_session_uuid")
+    local parent = connector.parent or (parent_uuid and parents_by_uuid[parent_uuid]) or nil
+    if parent then
+        schedule_url_discovery_timeout(connector, parent)
     end
 
     local chunk = tostring(data or "")
@@ -402,8 +700,6 @@ function M.handle_output(ctx, data)
         return true
     end
 
-    local parent_uuid = connector:get_meta("target_session_uuid")
-    local parent = parent_uuid and Session.get(parent_uuid) or nil
     if not parent then
         return true
     end
@@ -413,79 +709,23 @@ function M.handle_output(ctx, data)
         return true
     end
 
-    if connector:get_meta("preview_url") == url then
+    if connector_meta(connector, "preview_url") == url then
         return true
     end
-    connector:set_meta("preview_url", url)
-    connector:set_meta("preview_hostname", hostname)
-
-    update_parent_preview(parent, {
-        status = "starting",
-        error = nil,
-        install_url = nil,
-        url = nil,
-        connector_session_uuid = connector.session_uuid,
-        prepare_request_id = false,
-    })
-    hub.probe_url_ready(
-        connector.session_uuid,
-        parent.session_uuid,
-        url,
-        hostname,
-        PROBE_TIMEOUT_SECS
-    )
-    return true
-end
-
-function M.handle_url_ready(data)
-    local connector_uuid = data and data.connector_session_uuid or nil
-    local parent_uuid = data and data.parent_session_uuid or nil
-    local url = data and data.url or nil
-    local connector = connector_uuid and Session.get(connector_uuid) or nil
-    local parent = parent_uuid and Session.get(parent_uuid) or nil
-    if not connector or not parent or not M.is_connector(connector) then
-        return false
-    end
-
-    local hosted = preview_state_for(parent)
-    if hosted.connector_session_uuid ~= connector.session_uuid then
-        return false
-    end
-    if connector:get_meta("preview_url") ~= url then
-        return false
-    end
-
-    if data.ready then
-        update_parent_preview(parent, {
-            status = "running",
-            url = url,
-            error = nil,
-            install_url = nil,
-            connector_session_uuid = connector.session_uuid,
-            prepare_request_id = false,
-        })
-    else
-        update_parent_preview(parent, {
-            status = "error",
-            error = data.error or "Preview never became reachable",
-            install_url = nil,
-            url = nil,
-            connector_session_uuid = connector.session_uuid,
-            prepare_request_id = false,
-        })
-    end
+    begin_preview_readiness(connector, parent, url, hostname)
     return true
 end
 
 function M.handle_process_exited(data)
     local session_uuid = data and data.session_uuid or nil
-    local connector = session_uuid and Session.get(session_uuid) or nil
+    local connector = session_uuid and (connector_records[session_uuid] or Session.get(session_uuid)) or nil
     if not connector or not M.is_connector(connector) then
         return false
     end
 
-    local parent_uuid = connector:get_meta("target_session_uuid")
-    local parent = parent_uuid and Session.get(parent_uuid) or nil
+    local parent_uuid = connector_meta(connector, "target_session_uuid")
+        or (type(connector.get_meta) == "function" and connector:get_meta("target_session_uuid"))
+    local parent = connector.parent or (parent_uuid and (parents_by_uuid[parent_uuid] or Session.get(parent_uuid))) or nil
     local hosted = parent and preview_state_for(parent) or nil
     local still_owned = parent and type(hosted) == "table"
         and hosted.connector_session_uuid == connector.session_uuid
@@ -501,10 +741,10 @@ function M.handle_process_exited(data)
     if still_owned then
         update_parent_preview(parent, {
             status = "error",
-            url = nil,
+            url = false,
             error = error_message,
-            install_url = nil,
-            connector_session_uuid = nil,
+            install_url = false,
+            connector_session_uuid = false,
             prepare_request_id = false,
         })
     end
@@ -517,6 +757,9 @@ function M.handle_session_closing(session)
 
     if M.is_connector(session) then
         connector_output_buffers[session.session_uuid] = nil
+        connector_records[session.session_uuid] = nil
+        url_wait_ids[session.session_uuid] = nil
+        readiness_wait_ids[session.session_uuid] = nil
         return
     end
 
@@ -533,33 +776,34 @@ function M.reconcile()
             if not parent then
                 close_connector(session)
             else
-                local url = session:get_meta("preview_url")
-                local hostname = session:get_meta("preview_hostname")
-                if url and hostname then
-                    update_parent_preview(parent, {
-                        status = "starting",
-                        url = nil,
-                        error = nil,
-                        install_url = nil,
-                        connector_session_uuid = session.session_uuid,
-                        prepare_request_id = false,
-                    })
-                    hub.probe_url_ready(
-                        session.session_uuid,
-                        parent.session_uuid,
-                        url,
-                        hostname,
-                        PROBE_TIMEOUT_SECS
-                    )
+                cache_parent(parent)
+                local hosted = preview_state_for(parent)
+                if hosted.status == "error" or hosted.status == "inactive" then
+                    close_connector(session)
+                elseif type(hosted.connector_session_uuid) == "string"
+                    and hosted.connector_session_uuid ~= session.session_uuid then
+                    close_connector(session)
                 else
-                    update_parent_preview(parent, {
-                        status = "starting",
-                        url = nil,
-                        error = nil,
-                        install_url = nil,
-                        connector_session_uuid = session.session_uuid,
-                        prepare_request_id = false,
-                    })
+                    local connector = cache_connector(session.session_uuid, session.metadata, parent)
+                    local url = session:get_meta("preview_url")
+                    local hostname = session:get_meta("preview_hostname")
+                    if url and hostname then
+                        mark_preview_running(connector, parent, url, hostname)
+                    elseif session:get_meta("preview_pending_url") and hostname then
+                        begin_preview_readiness(connector, parent, session:get_meta("preview_pending_url"), hostname)
+                    else
+                        connector_output_buffers[session.session_uuid] =
+                            connector_output_buffers[session.session_uuid] or ""
+                        update_parent_preview(parent, {
+                            status = "starting",
+                            url = false,
+                            error = false,
+                            install_url = false,
+                            connector_session_uuid = session.session_uuid,
+                            prepare_request_id = false,
+                        })
+                        schedule_url_discovery_timeout(connector, parent)
+                    end
                 end
             end
         end
@@ -571,10 +815,10 @@ function M.reconcile()
                 and not hosted.connector_session_uuid then
                 update_parent_preview(session, {
                     status = "inactive",
-                    error = nil,
-                    install_url = nil,
-                    url = nil,
-                    connector_session_uuid = nil,
+                    error = false,
+                    install_url = false,
+                    url = false,
+                    connector_session_uuid = false,
                     prepare_request_id = false,
                 })
             end
@@ -647,16 +891,8 @@ hooks.on("pty_output", PLUGIN_NAME .. ".cloudflared_output", function(ctx, data)
     M.handle_output(ctx, data)
 end)
 
-hooks.on("before_agent_close", PLUGIN_NAME .. ".close_connector", function(session)
-    M.handle_session_closing(session)
-end)
-
 hooks.on("agent_created", PLUGIN_NAME .. ".connector_created", function(info)
     M.handle_agent_created(info)
-end)
-
-event_subs[#event_subs + 1] = events.on("url_probe_ready", function(data)
-    M.handle_url_ready(data)
 end)
 
 event_subs[#event_subs + 1] = events.on("plugin_command_prepared", function(data)
@@ -672,7 +908,6 @@ M.reconcile()
 function M._before_reload()
     SessionActions.unregister(ACTION_ID)
     hooks.off("pty_output", PLUGIN_NAME .. ".cloudflared_output")
-    hooks.off("before_agent_close", PLUGIN_NAME .. ".close_connector")
     hooks.off("agent_created", PLUGIN_NAME .. ".connector_created")
     for _, sub in ipairs(event_subs) do
         events.off(sub)

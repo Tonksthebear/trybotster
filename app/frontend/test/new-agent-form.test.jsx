@@ -161,4 +161,36 @@ describe('NewAgentForm', () => {
       agent_name: 'codex',
     }))
   })
+
+  it('creates an agent in a selected existing worktree', async () => {
+    const user = userEvent.setup()
+    mockHub.ensureAgentConfig.mockResolvedValue({ agents: ['codex'], accessories: [], workspaces: [] })
+
+    renderNewAgentForm()
+
+    await act(async () => {
+      useWorktreeStore.getState().applySnapshot(
+        [
+          {
+            worktree_path: '/wt/feature-a',
+            path: '/wt/feature-a',
+            target_id: 'target-1',
+            branch: 'feature-a',
+          },
+        ],
+        1,
+      )
+    })
+
+    await user.click(screen.getByText('feature-a'))
+    await screen.findByText('Codex')
+    await user.click(screen.getByText('Create Agent'))
+
+    expect(mockHub.sendCommand).toHaveBeenCalledWith('create_agent', expect.objectContaining({
+      target_id: 'target-1',
+      from_worktree: '/wt/feature-a',
+      branch: 'feature-a',
+      agent_name: 'codex',
+    }))
+  })
 })

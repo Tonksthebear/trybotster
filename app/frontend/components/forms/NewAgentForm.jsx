@@ -33,7 +33,7 @@ export default function NewAgentForm({ hubId }) {
   const [step, setStep] = useState(1)
   const [pendingSelection, setPendingSelection] = useState(null)
   const [selectionLabel, setSelectionLabel] = useState('')
-  const [newBranchInput, setNewBranchInput] = useState('')
+  const [newWorktreeInput, setNewWorktreeInput] = useState('')
   const [promptInput, setPromptInput] = useState('')
   const [selectedAgent, setSelectedAgent] = useState('')
   // { id: string|null, name: string|null } | null
@@ -135,7 +135,7 @@ export default function NewAgentForm({ hubId }) {
       setStep(1)
       setPendingSelection(null)
       setSelectionLabel('')
-      setNewBranchInput('')
+      setNewWorktreeInput('')
       setPromptInput('')
       setSelectedAgent('')
       setWorkspaceChoice(null)
@@ -157,7 +157,7 @@ export default function NewAgentForm({ hubId }) {
   function selectWorktree(worktree) {
     setPendingSelection({ type: 'existing', path: worktree.path, branch: worktree.branch })
     const label = worktree.issue_number ? `Issue #${worktree.issue_number}` : worktree.branch
-    goToStep2(label)
+    goToStep2(label || worktree.path)
   }
 
   function selectMainBranch() {
@@ -165,8 +165,8 @@ export default function NewAgentForm({ hubId }) {
     goToStep2('main branch')
   }
 
-  function selectNewBranch() {
-    const value = newBranchInput.trim()
+  function selectNewWorktree() {
+    const value = newWorktreeInput.trim()
     if (!value) return
     setPendingSelection({ type: 'new', issueOrBranch: value })
     goToStep2(value)
@@ -204,8 +204,8 @@ export default function NewAgentForm({ hubId }) {
     setSubmitting(true)
 
     if (pendingSelection.type === 'existing') {
-      sent = await hub.sendCommand('reopen_worktree', {
-        path: pendingSelection.path,
+      sent = await hub.sendCommand('create_agent', {
+        from_worktree: pendingSelection.path,
         branch: pendingSelection.branch,
         prompt,
         agent_name: agentName,
@@ -241,10 +241,10 @@ export default function NewAgentForm({ hubId }) {
   }
 
   const targetPrompt = selectedTargetId
-    ? 'Spawn target selected. Now choose main, an existing worktree, or a new branch.'
+    ? 'Spawn target selected. Now choose main, an existing worktree, or create a worktree.'
     : spawnTargets.length === 0
       ? 'Add a spawn target in Device Settings before creating an agent.'
-      : 'Choose a spawn target to unlock worktree and branch selection.'
+      : 'Choose a spawn target to unlock worktree selection.'
 
   return (
     <Dialog open={open} onClose={close} size="lg" data-testid="new-agent-modal">
@@ -300,7 +300,7 @@ export default function NewAgentForm({ hubId }) {
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider">
-                      Existing worktrees
+                      Connect to existing git worktree
                     </p>
                     <button
                       type="button"
@@ -343,31 +343,31 @@ export default function NewAgentForm({ hubId }) {
                 <div className="text-center py-4 text-zinc-500 text-sm">No existing worktrees</div>
               )}
 
-              {/* New branch input */}
+              {/* New worktree input */}
               <div>
                 <p className="text-xs font-medium text-zinc-400 uppercase tracking-wider mb-2">
-                  New branch or issue
+                  Worktree
                 </p>
                 <div className="flex gap-2">
                   <div className="flex-1">
                     <Input
-                      value={newBranchInput}
-                      onChange={(e) => setNewBranchInput(e.target.value)}
-                      placeholder="Branch name or issue #"
+                      value={newWorktreeInput}
+                      onChange={(e) => setNewWorktreeInput(e.target.value)}
+                      placeholder="Worktree name"
                       onKeyDown={(e) => {
                         if (e.key === 'Enter') {
                           e.preventDefault()
-                          selectNewBranch()
+                          selectNewWorktree()
                         }
                       }}
                     />
                   </div>
                   <Button
                     outline
-                    onClick={selectNewBranch}
-                    disabled={!newBranchInput.trim()}
+                    onClick={selectNewWorktree}
+                    disabled={!newWorktreeInput.trim()}
                   >
-                    Go
+                    Create
                   </Button>
                 </div>
               </div>

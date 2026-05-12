@@ -190,11 +190,12 @@ impl PtySessionHandle {
     /// * `cols` - Terminal column count (read from session manifest on restart)
     /// * `hub_event_tx` - Hub event sender for message delivery tasks
     #[must_use]
-    pub(crate) fn new_minimal(
+    pub(crate) fn new_minimal_with_port(
         rows: u16,
         cols: u16,
         hub_event_tx: HubEventSender,
         _color_cache: super::hub::SharedColorCache,
+        port: Option<u16>,
     ) -> Self {
         let (event_tx, _) = broadcast::channel(64);
         let shared_state = Arc::new(Mutex::new(SharedPtyState {
@@ -211,7 +212,7 @@ impl PtySessionHandle {
             kitty_enabled: Arc::new(AtomicBool::new(false)),
             cursor_visible: Arc::new(AtomicBool::new(true)),
             resize_pending: Arc::new(AtomicBool::new(false)),
-            port: None,
+            port,
             delivery: Arc::new(std::sync::OnceLock::new()),
             hub_event_tx,
             last_output_at: Arc::new(AtomicU64::new(0)),
@@ -1680,6 +1681,29 @@ mod tests {
             .eval()
             .expect("port should return number");
         assert_eq!(result, 8080);
+    }
+
+    #[test]
+    fn test_minimal_pty_session_handle_port_with_value() {
+        let lua = Lua::new();
+        let color_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let handle = PtySessionHandle::new_minimal_with_port(
+            24,
+            80,
+            crate::lua::primitives::new_hub_event_sender(),
+            color_cache,
+            Some(4321),
+        );
+
+        lua.globals()
+            .set("session", handle)
+            .expect("Failed to set session");
+
+        let result: u16 = lua
+            .load("return session:port()")
+            .eval()
+            .expect("port should return number");
+        assert_eq!(result, 4321);
     }
 
     #[test]
