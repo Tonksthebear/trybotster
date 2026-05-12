@@ -260,6 +260,7 @@ function M.dispatch(envelope, ctx)
     local message = nil
     local error_message = nil
     local navigate = nil
+    local presentation = nil
 
     local slot = registry[envelope.id]
     if slot then
@@ -293,6 +294,7 @@ function M.dispatch(envelope, ctx)
                 if type(result.message) == "string" then message = result.message end
                 if type(result.error) == "string" then error_message = result.error end
                 if type(result.navigate) == "table" then navigate = result.navigate end
+                if type(result.presentation) == "table" then presentation = result.presentation end
             elseif result == M.HANDLED then
                 handled_count = handled_count + 1
             elseif type(result) == "table" and result.__ui_action_result == true then
@@ -301,6 +303,7 @@ function M.dispatch(envelope, ctx)
                 if type(result.message) == "string" then message = result.message end
                 if type(result.error) == "string" then error_message = result.error end
                 if type(result.navigate) == "table" then navigate = result.navigate end
+                if type(result.presentation) == "table" then presentation = result.presentation end
             end
             -- Any other return value: observed but not consumed. Fall
             -- through to remaining handlers (observer semantics).
@@ -310,7 +313,7 @@ function M.dispatch(envelope, ctx)
     if handled_count > 0 then
         return {
             handled = true, via = "handler", ok = ok_result,
-            message = message, error = error_message, navigate = navigate,
+            message = message, error = error_message, navigate = navigate, presentation = presentation,
             handler_count = handler_count, handled_count = handled_count,
         }
     end

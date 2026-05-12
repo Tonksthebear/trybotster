@@ -3,7 +3,7 @@
 -- @category plugins
 -- @dest plugins/project-pipelines/project_pipelines/web/screens/home.lua
 -- @scope device
--- @version 1.0.0
+-- @version 1.1.0
 
 local view = require("project_pipelines.web.ui")
 local repo = require("project_pipelines.repo")
@@ -126,6 +126,30 @@ local function project_button(project_id, ctx)
     }
 end
 
+local function latest_ticket_pr_link(ticket_id, run_id)
+    local links = {}
+    if not util.is_blank(run_id) then
+        links = repo.list_pr_links{ run_id = run_id }
+    end
+    if #links == 0 then
+        links = repo.list_pr_links{ ticket_id = ticket_id }
+    end
+    return links[1]
+end
+
+local function pr_link_label(link)
+    if not link then
+        return nil
+    end
+    if not util.is_blank(link.pr_url) then
+        return link.pr_url
+    end
+    if not util.is_blank(link.repo) and not util.is_blank(link.pr_number) then
+        return tostring(link.repo) .. "#" .. tostring(link.pr_number)
+    end
+    return "PR linked"
+end
+
 local function running_pipeline_rows(ctx)
     local children = {}
     for _, run in ipairs(repo.list_runs(40)) do
@@ -192,10 +216,13 @@ local function merge_work_rows(ctx)
             local merge_events = repo.ticket_events(ticket.id, "ticket.merge_requested", 1)
             local artifact = repo.latest_merge_pr_artifact(run.id)
             local payload = artifact and util.decode(artifact.payload, {}) or {}
-            local pr_url = artifact and (artifact.uri or payload.pr_url) or nil
+            local link = latest_ticket_pr_link(ticket.id, run.id)
+            local pr_url = (link and link.pr_url) or (artifact and (artifact.uri or payload.pr_url) or nil)
+            local pr_status = link and link.status or nil
+            local pr_label = pr_link_label(link) or pr_url
             local merge_payload = merge_events[1] and util.decode(merge_events[1].payload, {}) or {}
             local session_uuid = merge_payload.session_uuid
-            local label = pr_url and "PR needs review" or (#merge_events > 0 and "merge agent running" or "ready for merge")
+            local label = pr_label and (pr_status == "merged" and "PR merged" or "PR needs review") or (#merge_events > 0 and "merge agent running" or "ready for merge")
             local actions = { ticket_button(ticket, ctx) }
             local project_action = project_button(ticket.project_id, ctx)
             if project_action then
@@ -232,11 +259,11 @@ local function merge_work_rows(ctx)
             children[#children + 1] = view.panel{
                 ui.stack{ direction = "vertical", gap = "2", children = {
                     view.row{
-                        view.badge(label, pr_url and "danger" or "accent"),
+                        view.badge(label, pr_label and "danger" or "accent"),
                         ui.text{ text = ticket.title, size = "sm", weight = "semibold" },
                     },
                     ui.text{
-                        text = pr_url or session_label(session_uuid, "No PR recorded yet."),
+                        text = pr_label or session_label(session_uuid, "No PR recorded yet."),
                         size = "xs",
                         tone = "muted",
                     },

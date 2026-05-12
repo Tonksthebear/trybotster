@@ -20,6 +20,9 @@ export const useUiPresentationStore = create((set, get) => ({
    *  to panel without a layout reload). Undefined means "use the surface's
    *  declared density". */
   densityOverride: undefined,
+  /** Browser-local values keyed by hub/surface/key. Used for ephemeral
+   * plugin-surface state such as dialog open flags. */
+  localValues: {},
 
   setSelectedSessionId(id) {
     set({ selectedSessionId: id })
@@ -52,12 +55,52 @@ export const useUiPresentationStore = create((set, get) => ({
     set({ densityOverride: value })
   },
 
+  localKey(hubId, targetSurface, key) {
+    return `${hubId || ''}:${targetSurface || ''}:${key || ''}`
+  },
+
+  localValue(hubId, targetSurface, key, fallback = null) {
+    const scopedKey = get().localKey(hubId, targetSurface, key)
+    return Object.prototype.hasOwnProperty.call(get().localValues, scopedKey)
+      ? get().localValues[scopedKey]
+      : fallback
+  },
+
+  setLocalValue(hubId, targetSurface, key, value) {
+    if (!key) return
+    const scopedKey = get().localKey(hubId, targetSurface, key)
+    set((state) => ({
+      localValues: {
+        ...state.localValues,
+        [scopedKey]: value,
+      },
+    }))
+  },
+
+  clearLocalValue(hubId, targetSurface, key) {
+    if (!key) return
+    const scopedKey = get().localKey(hubId, targetSurface, key)
+    if (!Object.prototype.hasOwnProperty.call(get().localValues, scopedKey)) return
+    set((state) => {
+      const next = { ...state.localValues }
+      delete next[scopedKey]
+      return { localValues: next }
+    })
+  },
+
+  toggleLocalValue(hubId, targetSurface, key, fallback = false) {
+    if (!key) return
+    const current = get().localValue(hubId, targetSurface, key, fallback)
+    get().setLocalValue(hubId, targetSurface, key, !current)
+  },
+
   /** Test-only — reset to defaults. */
   _reset() {
     set({
       selectedSessionId: null,
       collapsedWorkspaceIds: new Set(),
       densityOverride: undefined,
+      localValues: {},
     })
   },
 }))

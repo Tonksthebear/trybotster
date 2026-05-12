@@ -156,20 +156,26 @@ function Client:handle_subscribe(msg)
     local existing = self.subscriptions[sub_id]
     if existing then
         if existing.channel == channel and existing.session_uuid == session_uuid then
-            local rows = params.rows or 24
-            local cols = params.cols or 80
+            local rows = params.rows or existing.rows or 24
+            local cols = params.cols or existing.cols or 80
+            existing.rows = rows
+            existing.cols = cols
             local recreated = false
+            local stale_noop = false
             if channel == "terminal" and session_uuid then
                 local existing_terminal_subscription = self.terminal_subscriptions[sub_id]
-                if (not existing_terminal_subscription) or (not existing_terminal_subscription:is_active()) then
-                    if existing_terminal_subscription then
-                        existing_terminal_subscription:stop()
-                    end
-                    terminal_clients.update(session_uuid, self.peer_id, rows, cols)
+                terminal_clients.update(session_uuid, self.peer_id, rows, cols)
+                if not existing_terminal_subscription then
                     self:setup_terminal_subscription(sub_id, session_uuid, rows, cols)
                     recreated = true
+                elseif existing_terminal_subscription:is_active() then
+                    -- The active data-plane subscription already owns this peer/session.
+                    -- A replay only needs geometry reconciliation and an ack.
                 else
-                    terminal_clients.update(session_uuid, self.peer_id, rows, cols)
+                    -- A stale Lua handle can appear when teardown/reconnect messages
+                    -- cross in flight. Do not stop/recreate here: exact duplicate
+                    -- subscribes are idempotent at the browser peer/session level.
+                    stale_noop = true
                 end
             end
 
@@ -177,6 +183,10 @@ function Client:handle_subscribe(msg)
                 log.info(string.format(
                     "Duplicate subscribe recreated stale subscription: %s (peer=%s)",
                     sub_id:sub(1, 16), self.peer_id:sub(1, 8)))
+            elseif stale_noop then
+                log.debug(string.format(
+                    "Duplicate subscribe ignored stale terminal handle: %s -> %s (peer=%s)",
+                    sub_id:sub(1, 16), channel, self.peer_id:sub(1, 8)))
             else
                 log.debug(string.format(
                     "Duplicate subscribe no-op: %s -> %s (peer=%s)",

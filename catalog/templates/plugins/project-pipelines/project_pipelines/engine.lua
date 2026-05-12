@@ -3,11 +3,12 @@
 -- @category plugins
 -- @dest plugins/project-pipelines/project_pipelines/engine.lua
 -- @scope device
--- @version 1.0.0
+-- @version 1.1.0
 
 local repo = require("project_pipelines.repo")
 local util = require("project_pipelines.util")
 local entities = require("project_pipelines.entities")
+local notification_policy = require("project_pipelines.notification_policy")
 local Hub = require("lib.hub")
 local Agent = require("lib.agent")
 
@@ -75,6 +76,28 @@ local function run_base_attrs(params, ticket_id)
         base_ref = params.base_ref or inferred.base_ref,
         base_target_path = params.base_target_path or inferred.base_target_path,
     }
+end
+
+local function run_merge_policy(run)
+    local pipeline = run and repo.get_pipeline(run.pipeline_id) or {}
+    local merge_policy = pipeline.merge_policy or "direct"
+    if merge_policy ~= "direct" and merge_policy ~= "pr" then
+        return "direct"
+    end
+    return merge_policy
+end
+
+local function live_ticket_worktree(ticket_id)
+    for _, session_uuid in ipairs(repo.ticket_session_uuids(ticket_id)) do
+        local session = Agent.get(session_uuid)
+        if session and session.info then
+            local ok, info = pcall(session.info, session)
+            if ok and info and not util.is_blank(info.worktree_path) then
+                return info.worktree_path, info.branch_name, info.workspace_id, info.workspace_name
+            end
+        end
+    end
+    return nil, nil, nil, nil
 end
 
 local M = {}
@@ -395,6 +418,12 @@ function M.ask_human(params, context)
         asked_by_session_uuid = resolved.session_uuid,
         blocking = params.blocking ~= false,
     }
+    notification_policy.notify_question_asked({
+        question = question,
+        ticket = resolved.ticket,
+        run = resolved.run,
+        step_id = resolved.step_id,
+    })
     refresh_surfaces()
     return question
 end
@@ -520,11 +549,7 @@ function M.request_merge(params, context)
     if not run or run.status ~= "done" then
         error("ticket must have a completed latest run before merge")
     end
-    local pipeline = repo.get_pipeline(run.pipeline_id) or {}
-    local merge_policy = pipeline.merge_policy or "direct"
-    if merge_policy ~= "direct" and merge_policy ~= "pr" then
-        merge_policy = "direct"
-    end
+    local merge_policy = run_merge_policy(run)
     for _, event in ipairs(repo.ticket_events(ticket.id, "ticket.merge_requested", 5)) do
         local payload = util.decode(event.payload, {})
         if payload.session_uuid and Agent.get(payload.session_uuid) then
@@ -565,8 +590,10 @@ function M.request_merge(params, context)
             or "If direct merge is blocked by conflicts or repo state, add a blocker artifact or ask a human question and wait.",
         "If there are conflicts, incomplete intent coverage, ignored findings, dead/deprecated code, unwired implementation, stale documentation, stale tests, or verification failures, do not merge. Add a project_pipelines_add_artifact blocker summary with exact files, lines when available, and verification attempted; ask a human question only when a waiver or product decision is genuinely needed.",
         "Do not accept pre-existing failures unless you prove with exact evidence they are unrelated to this ticket.",
-        "After a successful merge or PR creation, add a project_pipelines_add_artifact summary with the merge commit or PR URL.",
-        "Close the ticket only when the merge process is genuinely complete by calling project_pipelines_close_ticket with merge_confirmed=true and include merge_commit, pr_url, or merge_summary when available.",
+        "After a successful direct merge or PR creation, add a project_pipelines_add_artifact summary with the merge commit or PR URL.",
+        merge_policy == "pr"
+            and "Do not close the ticket after opening or updating a PR. Link the PR with project_pipelines_link_pr, then leave the ticket open until the provider pr_merged event closes it."
+            or "Close the ticket only when the direct merge is genuinely complete by calling project_pipelines_close_ticket with merge_confirmed=true and include merge_commit or merge_summary when available.",
     }, "\n\n")
 
     local request_id = string.format("%s:%s:merge:agent", OWNER, ticket.id)
@@ -618,6 +645,89 @@ function M.request_merge(params, context)
     return { ticket = ticket, run = run, merge_policy = merge_policy, agent = created, request_id = request_id }
 end
 
+function M.spawn_ticket_session(params, context)
+    params = params or {}
+    local ticket = repo.get_ticket(util.assert_present(params.ticket_id, "ticket_id"))
+    if not ticket then
+        error("ticket not found: " .. tostring(params.ticket_id))
+    end
+    if util.is_blank(ticket.target_id) then
+        error("ticket has no spawn target")
+    end
+
+    local latest_run = repo.latest_ticket_run(ticket.id)
+    local branch = ticket_branch_for(ticket, latest_run and latest_run.id or nil)
+    local from_worktree, branch_name, workspace_id, workspace_name = live_ticket_worktree(ticket.id)
+    local request_id = params.request_id or ("project-pipelines:" .. ticket.id .. ":manual:" .. tostring(os.time()))
+    local session_type = params.session_type or "agent"
+    local result
+
+    if session_type == "accessory" then
+        local accessory_name = params.accessory_name or "terminal"
+        result = Hub.get():create_accessory{
+            request_id = request_id,
+            accessory_name = accessory_name,
+            target_id = ticket.target_id,
+            target_path = ticket.target_path,
+            workspace_id = params.workspace_id or workspace_id,
+            workspace_name = params.workspace_name or workspace_name or ticket_workspace_name(ticket, latest_run and latest_run.id),
+            from_worktree = from_worktree,
+            branch = branch_name or branch,
+            metadata = {
+                owner_plugin = OWNER,
+                visibility = "plugin",
+                surface = SURFACE,
+                ticket_id = ticket.id,
+                run_id = latest_run and latest_run.id or nil,
+                role = "manual-accessory",
+            },
+        }
+        repo.append_event("ticket.manual_accessory_requested", {
+            run_id = latest_run and latest_run.id or nil,
+            ticket_id = ticket.id,
+            payload = { request_id = request_id, accessory_name = accessory_name, session_uuid = result and result.session_uuid },
+        })
+    else
+        local prompt = params.prompt
+        if util.is_blank(prompt) then
+            prompt = table.concat({
+                "You are joining a Project Pipelines ticket worktree.",
+                "Ticket: " .. ticket.title,
+                "Call project_pipelines_get_ticket and project_pipelines_current_context if this ticket has a run.",
+                "Stay within the ticket intent and coordinate through Project Pipelines tools.",
+            }, "\n\n")
+        end
+        result = Hub.get():create_agent{
+            request_id = request_id,
+            agent_name = params.agent_name or "codex",
+            issue_or_branch = branch,
+            from_worktree = from_worktree,
+            target_id = ticket.target_id,
+            target_path = ticket.target_path,
+            workspace_id = params.workspace_id or workspace_id,
+            workspace_name = params.workspace_name or workspace_name or ticket_workspace_name(ticket, latest_run and latest_run.id),
+            label = "Assist - " .. ticket.title,
+            prompt = prompt,
+            metadata = {
+                owner_plugin = OWNER,
+                visibility = "plugin",
+                surface = SURFACE,
+                ticket_id = ticket.id,
+                run_id = latest_run and latest_run.id or nil,
+                role = "manual-agent",
+            },
+        }
+        repo.append_event("ticket.manual_agent_requested", {
+            run_id = latest_run and latest_run.id or nil,
+            ticket_id = ticket.id,
+            payload = { request_id = request_id, agent_name = params.agent_name or "codex", session_uuid = result and result.session_uuid },
+        })
+    end
+
+    refresh_surfaces(context)
+    return { ticket = ticket, run = latest_run, session = result, request_id = request_id, session_type = session_type }
+end
+
 function M.close_ticket(ticket_id, attrs)
     util.assert_present(ticket_id, "ticket_id")
     attrs = attrs or {}
@@ -628,6 +738,16 @@ function M.close_ticket(ticket_id, attrs)
     local latest_run = repo.latest_ticket_run(ticket_id)
     if latest_run and latest_run.status == "done" and attrs.merge_confirmed ~= true then
         error("completed pipeline work must be merged before closing; start merge or close with merge_confirmed=true from the merge agent")
+    end
+    if latest_run and latest_run.status == "done" and attrs.merge_confirmed == true and run_merge_policy(latest_run) == "pr" then
+        local open_links = repo.list_pr_links{ ticket_id = ticket_id, status = "open" }
+        if #open_links > 0 then
+            error("PR-backed tickets close only after the linked PR is merged; linked PR is still open")
+        end
+        local merged_links = repo.list_pr_links{ ticket_id = ticket_id, status = "merged" }
+        if #merged_links == 0 then
+            error("PR-backed tickets close only after Project Pipelines has a linked merged PR")
+        end
     end
 
     local closed_sessions = {}
@@ -721,6 +841,11 @@ function M.activate_step(run, step)
     if not step then
         repo.update_run(run.id, { status = "done", current_step_id = nil, current_run_step_id = nil })
         repo.append_event("run.completed", { run_id = run.id, ticket_id = run.ticket_id, payload = {} })
+        notification_policy.notify_phase_transition({
+            run_id = run.id,
+            ticket_id = run.ticket_id,
+            ticket = repo.get_ticket(run.ticket_id),
+        })
         local merge_ok, merge_result = pcall(function()
             return M.request_merge({ ticket_id = run.ticket_id }, {})
         end)
@@ -742,6 +867,13 @@ function M.activate_step(run, step)
         run_id = run.id,
         ticket_id = run.ticket_id,
         payload = { step_id = step.id, run_step_id = visit.id, sequence = visit.sequence, kind = step.kind, name = step.name },
+    })
+    notification_policy.notify_phase_transition({
+        run_id = run.id,
+        ticket_id = run.ticket_id,
+        ticket = repo.get_ticket(run.ticket_id),
+        step = step,
+        run_step = visit,
     })
 
     if step.kind == "agent" then

@@ -104,7 +104,7 @@ export class HubTransport extends HubRoute {
 
     switch (message.type) {
       case "ui_action_result":
-        receiveUiActionResult(message);
+        receiveUiActionResult(message, { hubId: this.getHubId() });
         this.emit("uiActionResult", message);
         break;
 

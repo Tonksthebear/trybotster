@@ -646,6 +646,7 @@ commands.register("ui_action", function(client, sub_id, command)
             message = result.message,
             error = result.error,
             navigate = result.navigate,
+            presentation = result.presentation,
         })
     end
     if type(envelope) ~= "table" then

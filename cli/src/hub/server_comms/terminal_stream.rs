@@ -140,17 +140,13 @@ impl Hub {
                 rows: spec.rows,
                 cols: spec.cols,
             });
-        let subscribe_result =
-            spec.pty_handle
-                .enqueue_session_io_request(SessionIoRequest::SubscribeTerminal {
-                    subscription: TerminalOutputSubscription {
-                        subscription_key: subscription_key.clone(),
-                        subscription_id: spec.subscription_id.clone(),
-                        worker: spec.worker.clone(),
-                        output_prefix: spec.output_prefix.clone(),
-                        filter: spec.filter.to_session_io_filter(),
-                    },
-                });
+        let live_subscription = TerminalOutputSubscription {
+            subscription_key: subscription_key.clone(),
+            subscription_id: spec.subscription_id.clone(),
+            worker: spec.worker.clone(),
+            output_prefix: spec.output_prefix.clone(),
+            filter: spec.filter.to_session_io_filter(),
+        };
         let snapshot_result =
             spec.pty_handle
                 .enqueue_session_io_request(SessionIoRequest::GetInitialSnapshot {
@@ -165,18 +161,18 @@ impl Hub {
                         kitty_enabled: spec.pty_handle.kitty_enabled(),
                         payload_mode,
                         confirm_subscription: spec.confirm_subscription,
+                        live_subscription: Some(live_subscription),
                     },
                 });
 
-        if resize_result.is_err() || snapshot_result.is_err() || subscribe_result.is_err() {
+        if resize_result.is_err() || snapshot_result.is_err() {
             log::warn!(
-                "[{}] Session I/O attach request failed for {} session {}: resize={:?} snapshot={:?} subscribe={:?}",
+                "[{}] Session I/O attach request failed for {} session {}: resize={:?} snapshot={:?}",
                 spec.log_prefix,
                 spec.client_label,
                 spec.session_uuid,
                 resize_result.err(),
-                snapshot_result.err(),
-                subscribe_result.err()
+                snapshot_result.err()
             );
             let _ = spec.worker.try_send(ClientWorkerMessage::ControlFrame(
                 crate::worker::client::ClientControlFrame::TerminalAttach {

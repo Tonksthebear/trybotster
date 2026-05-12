@@ -31,6 +31,7 @@ import {
   type UiActionTransport,
 } from '..'
 import type { UiNode, UiViewport } from '../types'
+import { useUiPresentationStore } from '../../store/ui-presentation-store'
 
 const REGULAR_FINE: UiViewport = {
   widthClass: 'expanded',
@@ -42,6 +43,7 @@ afterEach(() => {
   cleanup()
   vi.mocked(localDispatch).mockClear()
   _resetUiActionLifecycleForTests()
+  useUiPresentationStore.getState()._reset()
 })
 
 function selectButton(label: string): UiNode {
@@ -154,6 +156,27 @@ describe('createTransportDispatch — Phase 2c default', () => {
     expect(screen.getByText('Selected')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Open ticket' }))
     expect(window.location.pathname).toBe('/pipelines/tickets/t1')
+  })
+
+  it('applies presentation side effects from successful ui_action_result frames', () => {
+    useUiPresentationStore
+      .getState()
+      .setLocalValue('hub-7', 'pipelines', 'ticket-1-spawn-open', true)
+
+    receiveUiActionResult({
+      type: 'ui_action_result',
+      v: 1,
+      action_request_id: 'ua_missing_source_is_ok',
+      action_id: 'project_pipelines.spawn_ticket_session',
+      target_surface: 'pipelines',
+      ok: true,
+      presentation: { clear: 'ticket-1-spawn-open' },
+    }, { hubId: 'hub-7' })
+
+    expect(useUiPresentationStore
+      .getState()
+      .localValue('hub-7', 'pipelines', 'ticket-1-spawn-open', false),
+    ).toBe(false)
   })
 
   it('pushes session URL into history on session.select success (hub handles focus, browser owns route)', () => {
@@ -363,7 +386,7 @@ describe('createTransportDispatch — Phase 2c default', () => {
     expect(localDispatch).toHaveBeenCalledOnce()
     expect(localDispatch).toHaveBeenCalledWith({
       action: 'botster.session.create.request',
-      payload: { hubId: 'hub-local' },
+      payload: { hubId: 'hub-local', targetSurface: 'workspace_sidebar' },
     })
   })
 
@@ -392,7 +415,11 @@ describe('createTransportDispatch — Phase 2c default', () => {
     expect(localDispatch).toHaveBeenCalledOnce()
     expect(localDispatch).toHaveBeenCalledWith({
       action: 'botster.workspace.toggle',
-      payload: { hubId: 'hub-mixed', workspaceId: 'ws-1' },
+      payload: {
+        hubId: 'hub-mixed',
+        targetSurface: 'workspace_panel',
+        workspaceId: 'ws-1',
+      },
     })
   })
 })

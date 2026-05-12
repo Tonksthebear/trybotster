@@ -1154,7 +1154,7 @@ fn render_dialog(
     actions: &mut ActionTable,
     stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
-    let props = decode_props::<DialogProps>(&node.props, viewport, "dialog")?;
+    let props = decode_dialog_props(&node.props, viewport)?;
 
     let mut rows: Vec<RenderNode> = Vec::with_capacity(3);
     let mut constraints: Vec<Constraint> = Vec::with_capacity(3);
@@ -1284,6 +1284,24 @@ fn render_standalone_menu_item(
     _stores: Option<&TuiEntityStores>,
 ) -> Result<RenderNode> {
     render_standalone_list_item(node, viewport, actions)
+}
+
+fn decode_dialog_props(
+    props: &JsonMap<String, JsonValue>,
+    viewport: &UiViewport,
+) -> Result<DialogProps> {
+    let mut resolved = resolve_props(props, viewport);
+    if let Some(JsonValue::Object(open)) = resolved.get("open") {
+        if open.get("$local").and_then(JsonValue::as_str).is_some() {
+            let default = open
+                .get("default")
+                .cloned()
+                .unwrap_or(JsonValue::Bool(false));
+            resolved.insert("open".to_string(), default);
+        }
+    }
+    serde_json::from_value(JsonValue::Object(resolved))
+        .map_err(|err| anyhow!("ui_contract_adapter: failed to decode `dialog` props: {err}"))
 }
 
 // =============================================================================

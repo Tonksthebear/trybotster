@@ -3,7 +3,7 @@
 -- @category plugins
 -- @dest plugins/project-pipelines/project_pipelines/repo.lua
 -- @scope device
--- @version 1.0.0
+-- @version 1.1.0
 
 local db = require("project_pipelines.db")
 local util = require("project_pipelines.util")

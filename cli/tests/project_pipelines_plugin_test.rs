@@ -20,6 +20,327 @@ fn project_root_dir() -> PathBuf {
 }
 
 #[test]
+fn catalog_plugin_project_pipelines_notification_policy_scopes_to_owned_sessions() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local claim = nil
+            local pushes = {{}}
+            push = {{
+              send = function(payload)
+                pushes[#pushes + 1] = payload
+              end,
+            }}
+            package.loaded["lib.notifications"] = {{
+              claim = function(opts)
+                claim = opts
+              end,
+            }}
+            package.loaded["lib.surfaces"] = {{
+              path = function(surface, path, params)
+                assert(surface == "pipelines")
+                assert(path == "/tickets/:ticket_id")
+                return "/hubs/hub-test/pipelines/tickets/" .. params.ticket_id
+              end,
+            }}
+
+            local policy = require("project_pipelines.notification_policy")
+            policy.register()
+
+            assert(claim.name == "project_pipelines.notification_policy")
+            assert(claim.scope.owner_plugin == "project-pipelines")
+            assert(claim.scope.all_sessions == nil)
+
+            local suppressed = claim.handler({{ message = "Task complete" }})
+            assert(suppressed.core == "suppress")
+            assert(suppressed.reason == "project_pipelines_routine_cli_notification")
+
+            local permission = claim.handler({{ message = "Permission needed" }})
+            assert(permission.core == "replace")
+            assert(permission.reason == "project_pipelines_allowed_permission")
+
+            local approval = claim.handler({{ body = "Approval requested before command" }})
+            assert(approval.core == "replace")
+            assert(approval.reason == "project_pipelines_allowed_approval_requested")
+
+            local edit = policy.evaluate({{ title = "Codex wants to edit files" }})
+            assert(edit.core == "replace")
+            assert(edit.reason == "project_pipelines_allowed_wants_to_edit")
+
+            local phase_text = policy.evaluate({{ message = "Phase changed to review" }})
+            assert(phase_text.core == "suppress")
+
+            policy.notify_phase_transition({{
+              run_id = "run-1",
+              ticket_id = "ticket-1",
+              ticket = {{ title = "Ship feature" }},
+              step = {{ name = "Review" }},
+            }})
+            assert(pushes[1].kind == "project_pipelines_phase_transition")
+            assert(pushes[1].title == "Pipeline phase changed")
+            assert(pushes[1].body:match("Review"))
+
+            policy.notify_question_asked({{
+              question = {{ id = "question-1", ticket_id = "ticket-1", question = "Which path should I take?" }},
+              ticket = {{ title = "Ship feature" }},
+            }})
+            assert(pushes[2].kind == "project_pipelines_question")
+            assert(pushes[2].title == "Pipeline question asked")
+            assert(pushes[2].body:match("Which path should I take"))
+
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines notification policy behavior");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_pr_policy_rejects_closing_open_pr() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() end,
+              notify_question_asked = function() end,
+            }}
+            package.loaded["lib.hub"] = {{ get = function() return {{}} end }}
+            package.loaded["lib.agent"] = {{ get = function() return nil end }}
+
+            package.loaded["project_pipelines.repo"] = {{
+              get_ticket = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{ id = "ticket-1", title = "Ship via PR", status = "open" }}
+              end,
+              latest_ticket_run = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipeline-1", status = "done" }}
+              end,
+              get_pipeline = function(pipeline_id)
+                assert(pipeline_id == "pipeline-1")
+                return {{ id = "pipeline-1", merge_policy = "pr" }}
+              end,
+              list_pr_links = function(filters)
+                assert(filters.ticket_id == "ticket-1")
+                if filters.status == "merged" then return {{}} end
+                if filters.status == "open" then
+                  return {{ {{ id = "pr-1", ticket_id = "ticket-1", status = "open", repo = "owner/repo", pr_number = 42 }} }}
+                end
+                return {{}}
+              end,
+              ticket_session_uuids = function()
+                error("close should reject before closing sessions")
+              end,
+              close_ticket = function()
+                error("open linked PR must not close ticket")
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            local ok, err = pcall(engine.close_ticket, "ticket-1", {{ merge_confirmed = true, pr_url = "https://github.com/owner/repo/pull/42" }})
+            assert(ok == false)
+            assert(tostring(err):match("linked PR is still open"))
+
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("PR-policy tickets should not close while linked PR is open");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_can_spawn_ticket_session_from_engine() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local created_agent = nil
+            local appended = nil
+
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() end,
+              notify_question_asked = function() end,
+            }}
+            package.loaded["lib.agent"] = {{
+              get = function()
+                return {{
+                  info = function()
+                    return {{
+                      worktree_path = "/tmp/ticket-worktree",
+                      branch_name = "project-pipelines/ticket-1",
+                      workspace_id = "workspace-1",
+                      workspace_name = "Pipeline - Ship",
+                    }}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  create_agent = function(_, opts)
+                    created_agent = opts
+                    return {{ session_uuid = "session-1", status = "queued" }}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              get_ticket = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{ id = "ticket-1", title = "Ship", target_id = "target-1", target_path = "/repo" }}
+              end,
+              latest_ticket_run = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{ id = "run-1", ticket_id = "ticket-1" }}
+              end,
+              ticket_session_uuids = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{ "existing-session" }}
+              end,
+              append_event = function(kind, event)
+                appended = {{ kind = kind, event = event }}
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            local result = engine.spawn_ticket_session({{ ticket_id = "ticket-1", agent_name = "codex" }}, {{}})
+            assert(result.session.session_uuid == "session-1")
+            assert(created_agent.from_worktree == "/tmp/ticket-worktree")
+            assert(created_agent.issue_or_branch == "project-pipelines/ticket-1")
+            assert(created_agent.metadata.owner_plugin == "project-pipelines")
+            assert(created_agent.metadata.ticket_id == "ticket-1")
+            assert(appended.kind == "ticket.manual_agent_requested")
+
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines should expose a clean engine spawn path");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_home_shows_linked_pr_records() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            ui = {{
+              bind = function(path) return {{ bind = path }} end,
+              action = function(name, payload) return {{ name = name, payload = payload }} end,
+              list_item = function(props) return {{ type = "list_item", props = props }} end,
+              text = function(props) return {{ type = "text", props = props }} end,
+              badge = function(props) return {{ type = "badge", props = props }} end,
+              status_dot = function(props) return {{ type = "status_dot", props = props }} end,
+              button = function(props) return {{ type = "button", props = props }} end,
+              list = function(props) return {{ type = "list", props = props }} end,
+              bind_list = function(props) return {{ type = "bind_list", props = props }} end,
+              stack = function(props) return {{ type = "stack", props = props }} end,
+            }}
+
+            package.loaded["project_pipelines.web.ui"] = {{
+              page_header = function(props) return {{ type = "page_header", props = props }} end,
+              panel = function(child) return {{ type = "panel", child = child }} end,
+              section = function(title, children) return {{ type = "section", title = title, children = children }} end,
+              empty = function(title, description) return {{ type = "empty", title = title, description = description }} end,
+              badge = function(text, tone) return {{ type = "badge", text = text, tone = tone }} end,
+              row = function(children) return {{ type = "row", children = children }} end,
+              action_row = function(children) return {{ type = "action_row", children = children }} end,
+              session_info = function() return nil end,
+            }}
+
+            package.loaded["project_pipelines.repo"] = {{
+              list_runs = function() return {{}} end,
+              visible_tickets = function()
+                return {{ {{ id = "ticket-1", title = "Polish customer order and status experience", status = "open" }} }}
+              end,
+              latest_ticket_run = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipeline-1", status = "done" }}
+              end,
+              ticket_events = function()
+                return {{}}
+              end,
+              latest_merge_pr_artifact = function()
+                return nil
+              end,
+              list_pr_links = function(filters)
+                assert(filters.run_id == "run-1" or filters.ticket_id == "ticket-1")
+                return {{ {{ id = "pr-1", ticket_id = "ticket-1", run_id = "run-1", status = "open", repo = "owner/repo", pr_number = 42, pr_url = "https://github.test/owner/repo/pull/42" }} }}
+              end,
+              get_pipeline = function(id) return {{ id = id, name = "Pipeline" }} end,
+              get_ticket = function(id) return {{ id = id, title = "Ticket " .. id }} end,
+              get_step = function() return nil end,
+              get_run_step_visit = function() return nil end,
+            }}
+
+            local function contains_text(node, needle)
+              if type(node) ~= "table" then return false end
+              if node.props and node.props.text == needle then return true end
+              if node.text == needle then return true end
+              if node.label == needle then return true end
+              for _, value in pairs(node) do
+                if contains_text(value, needle) then return true end
+              end
+              return false
+            end
+
+            local home = require("project_pipelines.web.screens.home")
+            local tree = home.render({{}}, {{ path = function(path) return "/pipelines" .. path end }})
+            assert(contains_text(tree, "https://github.test/owner/repo/pull/42"))
+            assert(contains_text(tree, "PR needs review"))
+            assert(not contains_text(tree, "No PR recorded yet."))
+
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines home should show linked PR rows");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_closes_linked_ticket_on_pr_merged_event() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");

@@ -65,18 +65,11 @@ fn drain_initial_webrtc_terminal_attach_requests(
             crate::worker::session_io::SessionIoRequest::Resize { .. }
         )
     });
-    let subscription = match recv_session_io_request_matching(rx, |request| {
-        matches!(
-            request,
-            crate::worker::session_io::SessionIoRequest::SubscribeTerminal { .. }
-        )
-    }) {
-        crate::worker::session_io::SessionIoRequest::SubscribeTerminal { subscription } => {
-            subscription
-        }
-        other => panic!("expected SubscribeTerminal request, got {other:?}"),
-    };
     let delivery = recv_terminal_initial_snapshot_delivery(rx);
+    let subscription = delivery
+        .live_subscription
+        .clone()
+        .expect("initial snapshot should activate live subscription after delivery");
     (subscription, delivery)
 }
 
@@ -721,12 +714,6 @@ pub(super) fn test_webrtc_first_attach_queues_measured_resize_before_snapshot() 
         )),
         crate::worker::session_io::SessionIoRequest::Resize { .. }
     ));
-    let _ = recv_session_io_request_matching(&mut session_io_rx, |request| {
-        matches!(
-            request,
-            crate::worker::session_io::SessionIoRequest::SubscribeTerminal { .. }
-        )
-    });
     let delivery = recv_terminal_initial_snapshot_delivery(&mut session_io_rx);
     assert_eq!(delivery.subscription_id, "terminal_first_attach");
     assert!(matches!(

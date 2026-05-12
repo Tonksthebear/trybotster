@@ -3,7 +3,7 @@
 # @category plugins
 # @dest plugins/project-pipelines/README.md
 # @scope device
-# @version 1.0.0
+# @version 1.1.0
 
 # Project Pipelines
 
@@ -253,6 +253,11 @@ browser components:
 - Detail rows use `ui.bind_list{ where = { ... } }` for filtered children when
   they need dynamic entity-backed rows. Keep `ui_tree_snapshot` for route
   scaffolding, current-path controls, and other presentation structure.
+- Ephemeral browser-only state uses `ui.local_state(key, default)` with
+  `botster.presentation.set`, `botster.presentation.clear`, or
+  `botster.presentation.toggle`. Use this for modal open flags and local
+  disclosure state; do not encode those states in routes, plugin entities, or
+  plugin DB tables.
 
 Before restyling visible Catalyst primitives, inspect `tmp/tailwind_plus_preview`
 if it exists in the worktree. If the directory is absent, use the vendored
@@ -269,6 +274,11 @@ only change collection data should publish entity snapshots or deltas instead
 of forcing a fresh `ui_tree_snapshot`. Detail screens render presentation
 snapshots for route scaffolding and controls, but dynamic model rows are
 entity-backed through `ui.bind` / `ui.bind_list`.
+
+Ticket spawn dialogs are browser-local presentation state. The ticket detail
+screen opens them with `botster.presentation.set` and binds dialog `open` to
+`ui.local_state`; successful spawn actions return `presentation.clear` for the
+dialog keys while leaving navigation on the current ticket route.
 
 Routes:
 

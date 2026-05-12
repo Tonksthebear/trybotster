@@ -2,6 +2,7 @@ import React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen, fireEvent } from '@testing-library/react'
 import { UiTreeBody, createRawDispatch } from '..'
+import { createTransportDispatch } from '../dispatch'
 import type { UiAction, UiNode, UiViewport } from '../types'
 import {
   _resetUiActionLifecycleForTests,
@@ -11,11 +12,13 @@ import {
   applyEntityFrame,
   _resetEntityStoresForTest,
 } from '../../store/entities'
+import { useUiPresentationStore } from '../../store/ui-presentation-store'
 
 afterEach(() => {
   cleanup()
   _resetEntityStoresForTest()
   _resetUiActionLifecycleForTests()
+  useUiPresentationStore.getState()._reset()
 })
 
 const REGULAR_FINE: UiViewport = {
@@ -862,6 +865,68 @@ describe('ui_contract registry — dialog', () => {
     expect(
       container.querySelector('[role="dialog"]')?.getAttribute('data-presentation'),
     ).toBe('fullscreen')
+  })
+
+  it('dialog open can be driven by browser-local presentation state', () => {
+    const dispatch = createTransportDispatch({
+      transport: null,
+      hubId: 'hub-1',
+      targetSurface: 'pipelines',
+    })
+    const node: UiNode = {
+      type: 'stack',
+      props: { direction: 'vertical' },
+      children: [
+        {
+          type: 'button',
+          props: {
+            label: 'Open',
+            action: {
+              id: 'botster.presentation.set',
+              payload: { key: 'ticket-1-spawn-open', value: true },
+            },
+          },
+        },
+        {
+          type: 'dialog',
+          props: {
+            open: { $local: 'ticket-1-spawn-open', default: false },
+            title: 'Spawn agent',
+            presentation: 'auto',
+          },
+          slots: {
+            body: [{ type: 'text', props: { text: 'Dialog body' } }],
+            footer: [
+              {
+                type: 'button',
+                props: {
+                  label: 'Close',
+                  action: {
+                    id: 'botster.presentation.clear',
+                    payload: { key: 'ticket-1-spawn-open' },
+                  },
+                },
+              },
+            ],
+          },
+        },
+      ],
+    }
+    render(
+      <UiTreeBody
+        node={node}
+        dispatch={dispatch}
+        viewport={REGULAR_FINE}
+        hubId="hub-1"
+        targetSurface="pipelines"
+      />,
+    )
+
+    expect(screen.queryByRole('dialog')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: 'Open' }))
+    expect(screen.getByRole('dialog', { name: 'Spawn agent' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Close' }))
+    expect(screen.queryByRole('dialog')).toBeNull()
   })
 })
 

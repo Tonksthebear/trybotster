@@ -3,7 +3,7 @@
 -- @category plugins
 -- @dest plugins/project-pipelines/project_pipelines/web/screens/new.lua
 -- @scope device
--- @version 1.0.0
+-- @version 1.1.0
 
 local repo = require("project_pipelines.repo")
 local view = require("project_pipelines.web.ui")
