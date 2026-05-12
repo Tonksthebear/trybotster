@@ -519,6 +519,56 @@ pub(super) fn test_webrtc_worker_handle_registered_and_removed_with_subscription
 }
 
 #[test]
+pub(super) fn test_duplicate_webrtc_terminal_attach_reuses_active_subscription_without_snapshot() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let session_uuid = "sess-webrtc-duplicate-attach";
+    let subscription_id = "terminal_duplicate_attach";
+    let key = format!("browser-duplicate:{session_uuid}");
+
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
+    let _command_rx =
+        install_test_browser_worker(&mut hub, "browser-duplicate", session_uuid, subscription_id);
+
+    let req = test_browser_subscription_request("browser-duplicate", session_uuid, subscription_id);
+    assert!(hub.try_attach_browser_terminal_subscription(&req));
+    let (subscription, _delivery) =
+        drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
+    assert_eq!(subscription.subscription_key, key);
+
+    assert!(hub.try_attach_browser_terminal_subscription(&req));
+
+    let mut saw_resize = false;
+    while let Ok(request) = session_io_rx.try_recv() {
+        match request {
+            crate::worker::session_io::SessionIoRequest::Resize { .. } => {
+                saw_resize = true;
+            }
+            crate::worker::session_io::SessionIoRequest::SubscribeTerminal { .. } => {
+                panic!("duplicate attach must not create a second terminal subscription")
+            }
+            crate::worker::session_io::SessionIoRequest::GetInitialSnapshot { .. } => {
+                panic!("duplicate attach must not request a second initial snapshot")
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_resize,
+        "duplicate attach should still apply the latest size"
+    );
+    assert!(
+        hub.terminal_subscription_peers.contains_key(&key),
+        "active terminal subscription should remain registered"
+    );
+}
+
+#[test]
 pub(super) fn test_webrtc_terminal_subscribe_routes_attach_through_browser_worker() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let browser_identity = "browser-subscribe-worker";

@@ -32,6 +32,8 @@ export class WebRtcPtyTransport {
   #onFocusReportingChanged = null;
   #desiredSize = null; // { cols, rows }
   #resizeTimer = null;
+  #destroyed = false;
+  #connectGeneration = 0;
 
   constructor({ hubId, sessionUuid }) {
     this.#hubId = hubId;
@@ -43,6 +45,8 @@ export class WebRtcPtyTransport {
    * (subscribing to the CLI's terminal channel) and wires up events.
    */
   async connect(options) {
+    if (this.#destroyed) return;
+    const generation = ++this.#connectGeneration;
     const requestedSize = this.#connectSize(options);
     this.disconnect();
     this.#desiredSize = requestedSize;
@@ -55,7 +59,7 @@ export class WebRtcPtyTransport {
     const existingConn = HubConnectionManager.get(termKey);
     const hadSubscription = existingConn?.hasSubscription?.() ?? false;
 
-    this.#terminalConn = await HubConnectionManager.acquire(
+    const terminalConn = await HubConnectionManager.acquire(
       TerminalConnection,
       termKey,
       {
@@ -66,6 +70,12 @@ export class WebRtcPtyTransport {
       },
     );
 
+    if (this.#destroyed || generation !== this.#connectGeneration) {
+      terminalConn?.release?.();
+      return;
+    }
+
+    this.#terminalConn = terminalConn;
     this.#awaitingReconnectSnapshot = hadSubscription;
     this.#wireEvents();
     await this.#terminalConn.sendResize(requestedSize.cols, requestedSize.rows);
@@ -140,6 +150,8 @@ export class WebRtcPtyTransport {
   set onFocusReportingChanged(callback) { this.#onFocusReportingChanged = callback; }
 
   destroy() {
+    this.#destroyed = true;
+    this.#connectGeneration++;
     this.disconnect();
     this.#desiredSize = null;
     this.#onReconnect = null;

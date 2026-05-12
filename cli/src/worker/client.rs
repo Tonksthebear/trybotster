@@ -46,6 +46,8 @@ pub enum ClientConnectionHealth {
 /// Known terminal attach states sent to clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TerminalAttachState {
+    /// Terminal attach is queued until the session data plane becomes available.
+    Pending,
     /// Terminal is attached or the snapshot/stream will follow.
     Attached,
     /// Terminal exists but its backing process is reconnecting.
@@ -61,6 +63,7 @@ impl TerminalAttachState {
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Pending => "pending",
             Self::Attached => "attached",
             Self::Reconnecting => "reconnecting",
             Self::NotReady => "not_ready",
@@ -74,6 +77,7 @@ impl TryFrom<&str> for TerminalAttachState {
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
         match value {
+            "pending" => Ok(Self::Pending),
             "attached" => Ok(Self::Attached),
             "reconnecting" => Ok(Self::Reconnecting),
             "not_ready" => Ok(Self::NotReady),

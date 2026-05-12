@@ -122,6 +122,18 @@ impl Hub {
             }
         };
 
+        log::info!(
+            "[{}] Queue session I/O terminal attach for {} session {} subscription={} key={} resize={}x{} snapshot_request={}",
+            spec.log_prefix,
+            spec.client_label,
+            spec.session_uuid,
+            spec.subscription_id,
+            subscription_key,
+            spec.cols,
+            spec.rows,
+            request_id
+        );
+
         let resize_result = spec
             .pty_handle
             .enqueue_session_io_request(SessionIoRequest::Resize {

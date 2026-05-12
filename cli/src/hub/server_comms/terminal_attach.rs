@@ -80,6 +80,45 @@ impl Hub {
 
         let pty_handle = session_handle.pty().clone();
 
+        let Some(worker) = self.browser_client_workers.get(&req.peer_id).cloned() else {
+            log::warn!(
+                "[WebRTC] Cannot attach terminal for peer {} without browser worker",
+                &req.peer_id[..req.peer_id.len().min(8)]
+            );
+            return false;
+        };
+
+        if self
+            .terminal_subscription_peers
+            .contains_key(&subscription_key)
+        {
+            let _ = pty_handle.enqueue_session_io_request(
+                crate::worker::session_io::SessionIoRequest::Resize {
+                    rows: req.rows,
+                    cols: req.cols,
+                },
+            );
+            let _ = worker.try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::BoundaryJson(serde_json::json!({
+                    "type": "subscribed",
+                    "subscriptionId": req.subscription_id.clone(),
+                })),
+            ));
+            Self::send_worker_terminal_attach_state(
+                &worker,
+                &req.subscription_id,
+                &req.session_uuid,
+                "attached",
+            );
+            log::debug!(
+                "[WebRTC] Reused active terminal subscription for {} resize={}x{}",
+                subscription_key,
+                req.cols,
+                req.rows
+            );
+            return true;
+        }
+
         // Stop any existing subscription for this key.
         if self
             .terminal_subscription_peers
@@ -101,13 +140,6 @@ impl Hub {
         let subscription_id = req.subscription_id.clone();
 
         let _guard = self.tokio_runtime.enter();
-        let Some(worker) = self.browser_client_workers.get(&peer_id).cloned() else {
-            log::warn!(
-                "[WebRTC] Cannot attach terminal for peer {} without browser worker",
-                &peer_id[..peer_id.len().min(8)]
-            );
-            return false;
-        };
         let attached = self.start_terminal_client_subscription(TerminalClientSubscription {
             pty_handle: pty_handle.clone(),
             worker,

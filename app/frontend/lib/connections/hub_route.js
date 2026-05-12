@@ -30,9 +30,11 @@ export class HubRoute {
   #unsubscribers = [];
   #signalingConnected = false;
   #subscriptionPending = null;
+  #subscriptionGeneration = 0;
   #sessionPending = null;
   #connectPending = null;
   #reconnectTimer = null;
+  #idle = false;
   #destroyed = false;
   #browserSocketObserverCleanup = null;
   #peerHealthDirty = false;
@@ -62,6 +64,7 @@ export class HubRoute {
   async initialize() {
     if (this.#destroyed) return;
 
+    this.#idle = false;
     this.#setState(ConnectionState.LOADING);
     await this.#ensureMatrix();
     await this.#refreshIdentity();
@@ -73,6 +76,7 @@ export class HubRoute {
   async reacquire() {
     if (this.#destroyed) return;
 
+    this.#idle = false;
     if (!this.#listenersBound) {
       this.#bindBridgeListeners();
     }
@@ -119,6 +123,7 @@ export class HubRoute {
   }
 
   notifyIdle() {
+    this.#idle = true;
     this.#clearReconnectTimer();
     this.#clearSubscription();
 
@@ -376,7 +381,8 @@ export class HubRoute {
           this.#peerHealthDirty = false;
           this.#missedPeerPongs = 0;
           if (event.mode) this.#setConnectionMode(event.mode);
-          this.#ensureSubscribed().catch((error) => {
+          if (this.#idle) return;
+          this.#ensureSubscribed({ replay: true }).catch((error) => {
             console.error(`[${this.constructor.name}] Subscribe failed after peer connect:`, error);
             this.#scheduleReconnect();
           });
@@ -492,6 +498,7 @@ export class HubRoute {
 
   async #ensureConnected() {
     if (this.#destroyed) return;
+    if (this.#idle) return;
     if (this.errorCode === "session_invalid") return;
     if (!this.#hubConnected) return;
     if (!this.identityKey) return;
@@ -510,7 +517,9 @@ export class HubRoute {
       }
 
       if (this.subscriptionId) {
+        const replaySubscription = this.#peerHealthDirty;
         this.#peerHealthDirty = false;
+        await this.#ensureSubscribed({ replay: replaySubscription });
         this.#setState(ConnectionState.CONNECTED);
         return;
       }
@@ -527,7 +536,7 @@ export class HubRoute {
       // Reused shared peers may already be connected and therefore not emit a
       // fresh connection:state event for this route. Ensure the route's
       // subscription exists even when connectPeer() is effectively a no-op.
-      await this.#ensureSubscribed();
+      await this.#ensureSubscribed({ replay: true });
       this.#peerHealthDirty = false;
     })();
 
@@ -682,8 +691,16 @@ export class HubRoute {
     }
   }
 
-  async #ensureSubscribed() {
+  async #ensureSubscribed({ replay = false } = {}) {
+    if (this.#idle || this.#destroyed) return;
+
     if (this.subscriptionId) {
+      this.#setupSubscriptionListeners();
+      if (replay) {
+        return this.#sendSubscribe(this.subscriptionId, this.#subscriptionGeneration, {
+          resetMissedPongs: false,
+        });
+      }
       this.#setState(ConnectionState.CONNECTED);
       return;
     }
@@ -693,22 +710,54 @@ export class HubRoute {
     }
 
     this.subscriptionId = this.computeSubscriptionId();
+    const subscriptionId = this.subscriptionId;
+    const generation = this.#subscriptionGeneration;
     this.#setupSubscriptionListeners();
     if (localStorage.getItem("botster:debug:webrtcTiming") === "1") {
       console.warn(`[HubRoute] WebRTC subscribe start for hub ${this.getHubId()}`);
+    }
+
+    this.#subscriptionPending = this.#sendSubscribe(subscriptionId, generation, {
+      resetMissedPongs: true,
+    });
+
+    return this.#subscriptionPending;
+  }
+
+  #sendSubscribe(subscriptionId, generation, { resetMissedPongs = false } = {}) {
+    if (this.#subscriptionPending) {
+      return this.#subscriptionPending;
     }
 
     this.#subscriptionPending = bridge.send("subscribe", {
       hubId: this.getHubId(),
       channel: this.channelName(),
       params: this.channelParams(),
-      subscriptionId: this.subscriptionId,
+      subscriptionId,
     }).then(() => {
-      this.#missedPeerPongs = 0;
+      if (
+        this.#destroyed ||
+        generation !== this.#subscriptionGeneration ||
+        this.subscriptionId !== subscriptionId
+      ) {
+        bridge.clearSubscriptionListeners(subscriptionId);
+        bridge.send("unsubscribe", { subscriptionId }).catch(() => {});
+        return;
+      }
+      if (resetMissedPongs) {
+        this.#missedPeerPongs = 0;
+      }
+      const wasConnected = this.state === ConnectionState.CONNECTED;
       this.#setState(ConnectionState.CONNECTED);
-      this.emit("connected", this);
+      if (!wasConnected) {
+        this.emit("connected", this);
+      }
     }).catch((error) => {
-      this.#clearSubscription();
+      if (this.subscriptionId === subscriptionId) {
+        this.#clearSubscription();
+      } else {
+        bridge.clearSubscriptionListeners(subscriptionId);
+      }
       throw error;
     }).finally(() => {
       this.#subscriptionPending = null;
@@ -744,6 +793,7 @@ export class HubRoute {
   }
 
   #clearSubscription() {
+    this.#subscriptionGeneration++;
     const subscriptionId = this.subscriptionId;
     this.subscriptionId = null;
     this.#resolvePeerProbe(false);
