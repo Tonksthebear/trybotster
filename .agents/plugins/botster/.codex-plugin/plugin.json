@@ -1,6 +1,6 @@
 {
   "name": "botster",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "description": "Botster agent integration with MCP server configuration and workflow skills.",
   "author": {
     "name": "Botster",
@@ -16,7 +16,7 @@
   "interface": {
     "displayName": "Botster",
     "shortDescription": "Connect agents to the local Botster hub.",
-    "longDescription": "Installs the Botster MCP server configuration and gives agents focused Botster skills for first-agent setup, TUI customization, hub behavior, Botster plugin customization, and MCP tool authoring.",
+    "longDescription": "Installs the Botster MCP server configuration and gives agents focused Botster skills for first-agent setup, TUI customization, hub behavior, Botster plugin customization, scoped notification policy ownership, and MCP tool authoring.",
     "developerName": "Botster",
     "category": "Developer Tools",
     "capabilities": ["MCP", "Skills"],

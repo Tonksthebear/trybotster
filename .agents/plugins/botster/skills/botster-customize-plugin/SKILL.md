@@ -94,6 +94,7 @@ Event-driven primitives:
 - `mcp`
 - `update`
 - `push`
+- `lib.notifications` for scoped PTY notification observation and ownership
 
 ## Session Actions, Agent Spawns, And Command Gates
 
@@ -182,13 +183,104 @@ Recover plugin-owned sessions after reload with
 `Hub.get():list_owned_sessions("projects")`. It returns the same session-array
 shape for local and remote hubs.
 
+## Notification Policy Ownership
+
+Use `lib.notifications` when a plugin needs to observe, suppress, or replace
+PTY notification delivery for sessions it owns. Do not intercept
+`pty_notification` for suppression; by the time that hook fires, core delivery
+has already been accepted. The notification policy path is:
+
+```text
+_pty_notification_raw -> enrichment -> lib.notifications -> pty_notification
+```
+
+Observers watch matching notification intents without changing default behavior.
+Claims take ownership for matching intents and return a declarative decision.
+The hub still owns matching, timeouts, fallback behavior, badge mutation, web
+push, and transient UI events. Plugin handlers run in the plugin worker.
+
+```lua
+local notifications = require("lib.notifications")
+
+notifications.observe({
+  name = "projects.audit_notifications",
+  scope = { owner_plugin = "projects" },
+  phase = "both", -- "before", "after", or "both"
+  handler = function(phase, intent, decision)
+    log.info(string.format(
+      "notification %s for %s: %s",
+      phase,
+      tostring(intent.session_uuid),
+      tostring(decision and decision.core or "pending")
+    ))
+  end,
+})
+
+notifications.claim({
+  name = "projects.pipeline_notifications",
+  scope = { owner_plugin = "projects" },
+  handler = function(intent)
+    if intent.message and intent.message:find("handled by pipeline", 1, true) then
+      return { core = "suppress", reason = "projects_pipeline_handled" }
+    end
+
+    return {
+      core = "replace", -- "default", "suppress", or "replace"
+      reason = "projects_pipeline_alert",
+      custom = {
+        kind = "projects_alert",
+        title = "Pipeline needs review",
+        body = intent.message or intent.body,
+        push = true,
+        transient = true,
+        badge = true,
+      },
+    }
+  end,
+})
+```
+
+Scope options:
+
+- `session_uuid = "sess-..."` — one exact session.
+- `sessions = { "sess-a", "sess-b" }` — explicit session set.
+- `owner_plugin = "projects"` — sessions spawned with matching
+  `metadata.owner_plugin`.
+- `surface = "projects"` — sessions bound to a plugin surface.
+- `all_sessions = true` — every session notification.
+
+All-session scopes are powerful and require explicit capability declarations:
+
+```lua
+notifications.observe({
+  name = "auditor.all_notifications",
+  scope = { all_sessions = true },
+  capabilities = { "notifications.global_observe" },
+  handler = function(phase, intent, decision) end,
+})
+
+notifications.claim({
+  name = "policy.all_notifications",
+  scope = { all_sessions = true },
+  capabilities = { "notifications.global_claim" },
+  handler = function(intent)
+    return { core = "default" }
+  end,
+})
+```
+
+Use global observe for audit/telemetry and global claim only for plugins that
+are intentionally replacing Botster's default notification policy. A failed
+claim falls back to default behavior.
+
 Hook observers:
 
 - `agent_created`
 - `agent_deleted`
 - `agent_lifecycle`
-- `_pty_notification_raw`
-- `pty_notification`
+- `_pty_notification_raw` — internal raw signal before enrichment and policy.
+- `pty_notification` — final delivery after notification policy accepts.
+- `pty_notification_suppressed` — final suppression after notification policy.
 - `pty_title_changed`
 - `pty_cwd_changed`
 - `pty_prompt`
