@@ -156,6 +156,10 @@ pub struct TerminalInitialSnapshotDelivery {
     /// Whether the transport needs a subscription confirmation after the
     /// initial snapshot has been delivered.
     pub confirm_subscription: bool,
+    /// Live output subscription to activate immediately after the snapshot
+    /// barrier has been delivered. PTY output before the snapshot frame is
+    /// represented by the snapshot; output after the frame follows live.
+    pub live_subscription: Option<TerminalOutputSubscription>,
 }
 
 impl TerminalOutputFilter {

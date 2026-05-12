@@ -636,12 +636,13 @@ impl SessionIoRuntime {
                 let _ = delivery.worker.try_send(
                     crate::worker::client::ClientWorkerMessage::ControlFrame(
                         crate::worker::client::ClientControlFrame::TerminalAttach {
-                            subscription_id: delivery.subscription_id,
+                            subscription_id: delivery.subscription_id.clone(),
                             session_uuid: self.session_uuid.clone(),
                             state: crate::worker::client::TerminalAttachState::Reconnecting,
                         },
                     ),
                 );
+                self.activate_live_subscription_after_snapshot(&delivery);
             } else {
                 let _ = delivery.worker.try_send(
                     crate::worker::client::ClientWorkerMessage::ControlFrame(
@@ -718,11 +719,30 @@ impl SessionIoRuntime {
             .worker
             .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
                 crate::worker::client::ClientControlFrame::TerminalAttach {
-                    subscription_id: delivery.subscription_id,
+                    subscription_id: delivery.subscription_id.clone(),
                     session_uuid: self.session_uuid.clone(),
                     state: crate::worker::client::TerminalAttachState::Attached,
                 },
             ));
+        self.activate_live_subscription_after_snapshot(&delivery);
+    }
+
+    fn activate_live_subscription_after_snapshot(
+        &mut self,
+        delivery: &TerminalInitialSnapshotDelivery,
+    ) {
+        let Some(subscription) = delivery.live_subscription.clone() else {
+            return;
+        };
+        log::info!(
+            "[session-io] register terminal subscription after initial snapshot for {} subscription={} key={}",
+            self.session_uuid,
+            subscription.subscription_id,
+            subscription.subscription_key
+        );
+        if let Ok(mut subscriptions) = self.terminal_subscriptions.lock() {
+            subscriptions.insert(subscription.subscription_key.clone(), subscription);
+        }
     }
 
     fn report_initial_snapshot_backpressure(&self, delivery: &TerminalInitialSnapshotDelivery) {
@@ -1190,6 +1210,7 @@ mod tests {
                         kitty_enabled: false,
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: false,
+                        live_subscription: None,
                     },
                 })
                 .await
@@ -1229,6 +1250,108 @@ mod tests {
     }
 
     #[test]
+    fn initial_snapshot_barrier_delivers_snapshot_before_following_live_output() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (request_tx, mut event_rx, _response_rx, _hub_rx, _alive) =
+            spawn_test_worker_with_requests(reader);
+        let (client_tx, mut client_rx) =
+            tokio_mpsc::channel::<crate::worker::client::ClientWorkerMessage>(8);
+        let worker = crate::worker::client::ClientWorkerHandle {
+            client_id: crate::client::ClientId::Socket("client".to_string()),
+            tx: client_tx,
+        };
+        let live_subscription = TerminalOutputSubscription {
+            subscription_key: "client:sess-test-io".to_string(),
+            subscription_id: "terminal_sess-test-io".to_string(),
+            worker: worker.clone(),
+            output_prefix: Vec::new(),
+            filter: crate::worker::session_io::TerminalOutputFilter::None,
+        };
+
+        block_on_with_timeout(async {
+            request_tx
+                .send(SessionIoRequest::GetInitialSnapshot {
+                    delivery: crate::worker::session_io::TerminalInitialSnapshotDelivery {
+                        request_id: "initial-ordered".to_string(),
+                        subscription_key: "client:sess-test-io".to_string(),
+                        session_uuid: "sess-test-io".to_string(),
+                        subscription_id: "terminal_sess-test-io".to_string(),
+                        worker,
+                        rows: 24,
+                        cols: 80,
+                        kitty_enabled: false,
+                        payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
+                        confirm_subscription: false,
+                        live_subscription: Some(live_subscription),
+                    },
+                })
+                .await
+                .expect("request ordered initial snapshot");
+        });
+        std::thread::sleep(Duration::from_millis(10));
+
+        writer
+            .write_all(&encode_frame(FRAME_PTY_OUTPUT, b"live-before-snapshot"))
+            .expect("write pre-snapshot output frame");
+        assert_eq!(recv_output(&mut event_rx), b"live-before-snapshot");
+        assert!(
+            client_rx.try_recv().is_err(),
+            "live output must not reach client before initial snapshot"
+        );
+
+        writer
+            .write_all(&encode_frame(FRAME_SNAPSHOT, b"ordered-snapshot"))
+            .expect("write snapshot frame");
+        let message = block_on_with_timeout(async {
+            client_rx
+                .recv()
+                .await
+                .expect("client worker initial snapshot")
+        });
+        assert!(
+            matches!(
+                message,
+                crate::worker::client::ClientWorkerMessage::ControlFrame(
+                    crate::worker::client::ClientControlFrame::Scrollback { .. }
+                )
+            ),
+            "initial snapshot must be delivered before any live terminal bytes"
+        );
+
+        writer
+            .write_all(&encode_frame(FRAME_PTY_OUTPUT, b"live-after-snapshot"))
+            .expect("write post-snapshot output frame");
+        assert_eq!(recv_output(&mut event_rx), b"live-after-snapshot");
+        let message = block_on_with_timeout(async {
+            client_rx
+                .recv()
+                .await
+                .expect("client worker terminal attach")
+        });
+        assert!(
+            matches!(
+                message,
+                crate::worker::client::ClientWorkerMessage::ControlFrame(
+                    crate::worker::client::ClientControlFrame::TerminalAttach { .. }
+                )
+            ),
+            "terminal attach control should remain ordered after the snapshot"
+        );
+        let message = block_on_with_timeout(async {
+            client_rx
+                .recv()
+                .await
+                .expect("client worker live terminal bytes")
+        });
+        match message {
+            crate::worker::client::ClientWorkerMessage::TerminalBytes { data, .. } => {
+                assert_eq!(data, b"live-after-snapshot");
+            }
+            other => panic!("expected live terminal bytes after snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn empty_live_initial_snapshot_confirms_subscription_before_reconnecting_attach() {
         let session_uuid = "sess-test-io".to_string();
         let socket_path =
@@ -1261,6 +1384,7 @@ mod tests {
                         kitty_enabled: false,
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: true,
+                        live_subscription: None,
                     },
                 })
                 .await

@@ -355,6 +355,40 @@ filtered child collections into the tree snapshot just to get per-record rows.
 through `entity_snapshot`, `entity_upsert`, `entity_patch`, and
 `entity_remove`.
 
+## Browser-Local Presentation State
+
+Use `ui.local_state(key, default)` for ephemeral per-client presentation state:
+modal open flags, disclosure toggles, focused panes, and similar browser-only
+UI affordances. Local state is scoped by hub and surface in the browser. The TUI
+resolver treats the binding as its default value so plugin trees remain
+cross-client without adding a second model path.
+
+```lua
+ui.button{
+  text = "Spawn agent",
+  action = ui.action("botster.presentation.set", {
+    key = "ticket-123-spawn-agent-open",
+    value = true,
+  }),
+}
+
+ui.dialog{
+  open = ui.local_state("ticket-123-spawn-agent-open", false),
+  title = "Spawn agent",
+  children = { ... },
+}
+```
+
+Plugins can change these values with `botster.presentation.set`,
+`botster.presentation.clear`, and `botster.presentation.toggle`. Action results
+may also return `presentation = { clear = { "key-a", "key-b" } }` or
+`presentation = { set = { { key = "key-a", value = true } } }` to clean up local
+state after hub-side work succeeds.
+
+Do not encode modal state in plugin routes, plugin entities, or `plugin.db`.
+Those paths represent shared navigation or durable model state and can force
+surface reloads or leak one browser's UI state to other clients.
+
 When registering outside plugin load tests or helper modules, pass
 `owner_plugin = "kanban"`. During normal plugin loading, Botster supplies the
 owner context from the plugin manifest/display name; repo-sourced loader keys

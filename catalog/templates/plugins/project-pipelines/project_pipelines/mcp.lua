@@ -3,7 +3,7 @@
 -- @category plugins
 -- @dest plugins/project-pipelines/project_pipelines/mcp.lua
 -- @scope device
--- @version 1.0.0
+-- @version 1.1.0
 
 local repo = require("project_pipelines.repo")
 local engine = require("project_pipelines.engine")
@@ -650,8 +650,27 @@ function M.register()
         return ok(engine.request_merge(params, context))
     end)
 
+    tool("project_pipelines_spawn_ticket_session", {
+        description = "Spawn an agent or accessory in a ticket's worktree context. Reuses a live ticket worktree when available, otherwise opens the ticket branch.",
+        input_schema = {
+            type = "object",
+            properties = {
+                ticket_id = { type = "string" },
+                session_type = { type = "string", enum = { "agent", "accessory" }, default = "agent" },
+                agent_name = { type = "string" },
+                accessory_name = { type = "string" },
+                prompt = { type = "string" },
+                workspace_id = { type = "string" },
+                workspace_name = { type = "string" },
+            },
+            required = { "ticket_id" },
+        },
+    }, function(params, context)
+        return ok(engine.spawn_ticket_session(params, context))
+    end)
+
     tool("project_pipelines_close_ticket", {
-        description = "Close a ticket. Completed pipeline work requires merge_confirmed=true and should be called by the merge agent only after merge or PR completion. When merge_confirmed is true, include merge_commit, pr_url, or merge_summary when available so the ticket keeps a merge artifact.",
+        description = "Close a ticket. Completed pipeline work requires merge_confirmed=true. PR-policy tickets close only after Project Pipelines has a linked merged PR, normally from a provider pr_merged event. When merge_confirmed is true, include merge_commit, pr_url, or merge_summary when available so the ticket keeps a merge artifact.",
         input_schema = {
             type = "object",
             properties = {

@@ -3,7 +3,7 @@
 -- @category plugins
 -- @dest plugins/project-pipelines/project_pipelines/web/screens/ticket.lua
 -- @scope device
--- @version 1.0.0
+-- @version 1.1.0
 
 local repo = require("project_pipelines.repo")
 local util = require("project_pipelines.util")
@@ -464,17 +464,39 @@ local function merge_controls(ticket, ctx, overview)
     local pipeline = overview and overview.pipelines_by_id and overview.pipelines_by_id[run.pipeline_id] or repo.get_pipeline(run.pipeline_id) or {}
     local merge_policy = pipeline.merge_policy or "direct"
     local policy_label = merge_policy == "pr" and "PR via Botster MCP" or "direct merge to main"
+    local pr_links = repo.list_pr_links{ ticket_id = ticket.id }
+    local pr_link = pr_links[1]
+    local pr_label = nil
+    if pr_link then
+        if not util.is_blank(pr_link.pr_url) then
+            pr_label = pr_link.pr_url
+        elseif not util.is_blank(pr_link.repo) and not util.is_blank(pr_link.pr_number) then
+            pr_label = tostring(pr_link.repo) .. "#" .. tostring(pr_link.pr_number)
+        else
+            pr_label = "PR linked"
+        end
+    end
     local children = {
         view.panel{
             ui.stack{ direction = "vertical", gap = "2", children = {
                 view.row{
-                    view.badge(#failed_events > 0 and "merge blocked" or (#merge_events > 0 and "merge running" or "merge queued"), #failed_events > 0 and "danger" or "success"),
+                    view.badge(pr_link and ("PR " .. tostring(pr_link.status or "linked")) or (#failed_events > 0 and "merge blocked" or (#merge_events > 0 and "merge running" or "merge queued")), #failed_events > 0 and "danger" or "success"),
                     ui.text{ text = "Merge policy: " .. policy_label, size = "sm", weight = "semibold" },
                 },
-                ui.text{ text = "Completed runs automatically spawn a merge acceptance agent. The ticket closes only after merge confirmation is recorded.", size = "sm", tone = "muted" },
+                ui.text{ text = pr_label or "Completed runs automatically spawn a merge acceptance agent. The ticket closes only after merge confirmation is recorded.", size = "sm", tone = "muted" },
             } },
         },
     }
+    if pr_link and not util.is_blank(pr_link.pr_url) then
+        table.insert(children, ui.button{
+            id = "ticket-" .. tostring(ticket.id) .. "-linked-pr",
+            label = "Open PR",
+            icon = "external-link",
+            variant = "solid",
+            tone = "accent",
+            action = ui.action("botster.url.open", { url = pr_link.pr_url }),
+        })
+    end
     if #merge_events > 0 then
         local payload = util.decode(merge_events[1].payload, {})
         table.insert(children, ui.text{ text = payload.session_uuid and ("Merge agent running: " .. payload.session_uuid) or "Merge agent has been requested.", size = "sm", tone = "muted" })
@@ -549,65 +571,123 @@ local function spawn_session_controls(ticket, _ctx, _overview)
 
     local draft = actions.draft(_ctx)
     local prefix = "ticket_session_" .. ticket.id .. "_"
-    local session_type = draft[prefix .. "type"] or "agent"
+    local agent_dialog_key = "ticket-" .. ticket.id .. "-spawn-agent-open"
+    local accessory_dialog_key = "ticket-" .. ticket.id .. "-spawn-accessory-open"
+    local function spawn_context_row()
+        return view.row{
+            view.badge(view.target_label(ticket.target_id, ticket.target_path), "accent"),
+            ui.text{ text = "Spawn in this ticket's worktree context.", size = "sm", weight = "semibold" },
+        }
+    end
+    local agent_body = {
+        spawn_context_row(),
+        ui.select{
+            id = "ticket-" .. ticket.id .. "-spawn-agent",
+            label = "Agent",
+            value = draft[prefix .. "agent_name"] or "codex",
+            options = view.agent_options(draft[prefix .. "agent_name"] or "codex"),
+            on_change = view.field_action("project_pipelines.update_ticket_session_draft", {
+                ticket_id = ticket.id,
+                field = "agent_name",
+            }),
+        },
+        ui.textarea{
+            id = "ticket-" .. ticket.id .. "-spawn-prompt",
+            label = "Agent prompt",
+            placeholder = "Optional prompt for this agent session",
+            value = draft[prefix .. "prompt"] or "",
+            on_change = view.field_action("project_pipelines.update_ticket_session_draft", {
+                ticket_id = ticket.id,
+                field = "prompt",
+            }),
+        },
+    }
+    local accessory_body = {
+        spawn_context_row(),
+        ui.select{
+            id = "ticket-" .. ticket.id .. "-spawn-accessory",
+            label = "Accessory",
+            value = draft[prefix .. "accessory_name"] or "terminal",
+            options = view.accessory_options(draft[prefix .. "accessory_name"] or "terminal", ticket.target_path),
+            on_change = view.field_action("project_pipelines.update_ticket_session_draft", {
+                ticket_id = ticket.id,
+                field = "accessory_name",
+            }),
+        },
+    }
+
     local children = {
-        ui.stack{ direction = "vertical", gap = "3", children = {
-            view.row{
-                view.badge(view.target_label(ticket.target_id, ticket.target_path), "accent"),
-                ui.text{ text = "Spawn in this ticket's worktree context.", size = "sm", weight = "semibold" },
-            },
-            ui.select{
-                id = "ticket-" .. ticket.id .. "-spawn-type",
-                label = "Session type",
-                value = session_type,
-                options = {
-                    { value = "agent", label = "Agent" },
-                    { value = "accessory", label = "Accessory" },
-                },
-                on_change = view.field_action("project_pipelines.update_ticket_session_draft", {
-                    ticket_id = ticket.id,
-                    field = "type",
-                }),
-            },
-            ui.select{
-                id = "ticket-" .. ticket.id .. "-spawn-agent",
-                label = "Agent",
-                value = draft[prefix .. "agent_name"] or "codex",
-                options = view.agent_options(draft[prefix .. "agent_name"] or "codex"),
-                on_change = view.field_action("project_pipelines.update_ticket_session_draft", {
-                    ticket_id = ticket.id,
-                    field = "agent_name",
-                }),
-            },
-            ui.select{
-                id = "ticket-" .. ticket.id .. "-spawn-accessory",
-                label = "Accessory",
-                value = draft[prefix .. "accessory_name"] or "terminal",
-                options = view.accessory_options(draft[prefix .. "accessory_name"] or "terminal", ticket.target_path),
-                on_change = view.field_action("project_pipelines.update_ticket_session_draft", {
-                    ticket_id = ticket.id,
-                    field = "accessory_name",
-                }),
-            },
-            ui.textarea{
-                id = "ticket-" .. ticket.id .. "-spawn-prompt",
-                label = "Agent prompt",
-                placeholder = "Optional prompt for a manual agent session",
-                value = draft[prefix .. "prompt"] or "",
-                on_change = view.field_action("project_pipelines.update_ticket_session_draft", {
-                    ticket_id = ticket.id,
-                    field = "prompt",
-                }),
-            },
+        view.action_row{
             ui.button{
-                id = "ticket-" .. ticket.id .. "-spawn-session",
-                label = "Spawn session",
-                icon = "plus",
+                id = "ticket-" .. ticket.id .. "-open-spawn-agent",
+                label = "Spawn agent",
+                icon = "command-line",
                 variant = "solid",
                 tone = "accent",
-                action = ui.action("project_pipelines.spawn_ticket_session", { ticket_id = ticket.id }),
+                action = ui.action("botster.presentation.set", { key = agent_dialog_key, value = true }),
             },
-        } },
+            ui.button{
+                id = "ticket-" .. ticket.id .. "-open-spawn-accessory",
+                label = "Spawn accessory",
+                icon = "wrench-screwdriver",
+                variant = "ghost",
+                action = ui.action("botster.presentation.set", { key = accessory_dialog_key, value = true }),
+            },
+        },
+        ui.dialog{
+            open = ui.local_state(agent_dialog_key, false),
+            title = "Spawn agent",
+            presentation = "auto",
+            body = {
+                ui.stack{ direction = "vertical", gap = "3", children = agent_body },
+            },
+            footer = {
+                ui.button{
+                    id = "ticket-" .. ticket.id .. "-cancel-spawn-agent",
+                    label = "Cancel",
+                    variant = "ghost",
+                    action = ui.action("botster.presentation.clear", { key = agent_dialog_key }),
+                },
+                ui.button{
+                    id = "ticket-" .. ticket.id .. "-spawn-agent-session",
+                    label = "Spawn agent",
+                    icon = "plus",
+                    variant = "solid",
+                    tone = "accent",
+                    action = ui.action("project_pipelines.spawn_ticket_session", {
+                        ticket_id = ticket.id,
+                        session_type = "agent",
+                    }),
+                },
+            },
+        },
+        ui.dialog{
+            open = ui.local_state(accessory_dialog_key, false),
+            title = "Spawn accessory",
+            presentation = "auto",
+            body = {
+                ui.stack{ direction = "vertical", gap = "3", children = accessory_body },
+            },
+            footer = {
+                ui.button{
+                    id = "ticket-" .. ticket.id .. "-cancel-spawn-accessory",
+                    label = "Cancel",
+                    variant = "ghost",
+                    action = ui.action("botster.presentation.clear", { key = accessory_dialog_key }),
+                },
+                ui.button{
+                    id = "ticket-" .. ticket.id .. "-spawn-accessory-session",
+                    label = "Spawn accessory",
+                    icon = "plus",
+                    variant = "solid",
+                    tone = "accent",
+                    action = ui.action("project_pipelines.spawn_ticket_session", {
+                        ticket_id = ticket.id,
+                        session_type = "accessory",
+                    }),
+                },
+            },
+        },
     }
     return children
 end

@@ -1,4 +1,5 @@
 import { useSyncExternalStore } from 'react'
+import { useUiPresentationStore } from '../store/ui-presentation-store'
 
 export type UiActionLifecycleResult = {
   action_request_id: string
@@ -13,6 +14,7 @@ export type UiActionLifecycleResult = {
     label?: string
     path?: string
   }
+  presentation?: unknown
 }
 
 export type UiActionLifecycleSnapshot = {
@@ -123,13 +125,16 @@ export function failUiActionLifecycle(requestId: string, message: string) {
   })
 }
 
-export function receiveUiActionResult(message: unknown) {
+export function receiveUiActionResult(
+  message: unknown,
+  scope?: { hubId?: string },
+) {
   if (!message || typeof message !== 'object') return
   const frame = message as Record<string, unknown>
   const requestId = frame.action_request_id
   const actionId = frame.action_id
   if (typeof requestId !== 'string' || typeof actionId !== 'string') return
-  settle(requestId, {
+  const result = {
     action_request_id: requestId,
     action_id: actionId,
     target_surface: typeof frame.target_surface === 'string' ? frame.target_surface : undefined,
@@ -139,7 +144,15 @@ export function receiveUiActionResult(message: unknown) {
     message: typeof frame.message === 'string' ? frame.message : undefined,
     error: typeof frame.error === 'string' ? frame.error : undefined,
     navigate: parseNavigate(frame.navigate),
-  })
+    presentation: frame.presentation,
+  }
+  if (result.ok) {
+    applyPresentationResult(result.presentation, {
+      hubId: scope?.hubId,
+      targetSurface: result.target_surface,
+    })
+  }
+  settle(requestId, result)
 }
 
 function parseNavigate(value: unknown) {
@@ -149,6 +162,32 @@ function parseNavigate(value: unknown) {
   return {
     path: nav.path,
     label: typeof nav.label === 'string' ? nav.label : undefined,
+  }
+}
+
+function applyPresentationResult(
+  value: unknown,
+  scope: { hubId?: string; targetSurface?: string },
+) {
+  if (!value || typeof value !== 'object') return
+  const presentation = value as Record<string, unknown>
+  const store = useUiPresentationStore.getState()
+  const clear = presentation.clear
+  const clearKeys = Array.isArray(clear) ? clear : clear ? [clear] : []
+  for (const key of clearKeys) {
+    if (typeof key === 'string') {
+      store.clearLocalValue(scope.hubId, scope.targetSurface, key)
+    }
+  }
+
+  const setValue = presentation.set
+  const setEntries = Array.isArray(setValue) ? setValue : setValue ? [setValue] : []
+  for (const entry of setEntries) {
+    if (!entry || typeof entry !== 'object') continue
+    const item = entry as Record<string, unknown>
+    if (typeof item.key === 'string') {
+      store.setLocalValue(scope.hubId, scope.targetSurface, item.key, item.value)
+    }
   }
 }
 

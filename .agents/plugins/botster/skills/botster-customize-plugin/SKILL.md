@@ -359,6 +359,36 @@ surfaces.register("vault_sidebar", {
 })
 ```
 
+### Browser-Local Presentation State
+
+Use `ui.local_state(key, default)` for per-browser UI state such as modal open
+flags, disclosure toggles, and focused panes. Change it with the local
+presentation actions:
+
+```lua
+ui.button{
+  text = "Open modal",
+  action = ui.action("botster.presentation.set", {
+    key = "ticket-42-spawn-open",
+    value = true,
+  }),
+}
+
+ui.dialog{
+  open = ui.local_state("ticket-42-spawn-open", false),
+  title = "Spawn agent",
+  children = { ... },
+}
+```
+
+Close local state with `botster.presentation.clear` or
+`botster.presentation.toggle`. A successful hub action can return
+`action.result{ presentation = { clear = { "ticket-42-spawn-open" } } }`.
+
+Do not put modal open/close flags in plugin routes, plugin DB, or plugin-owned
+entities. Routes represent navigation, and plugin entities/DB tables represent
+durable shared model state.
+
 ### Plugin-Owned Sessions
 
 When a plugin owns sessions that should not appear as normal workspace sessions,

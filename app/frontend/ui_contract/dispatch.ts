@@ -51,6 +51,9 @@ const LOCAL_ONLY_ACTIONS = new Set<string>([
   // nav entries for plugin-registered surfaces). Hub has no
   // server-side meaning for this action — it's pure browser navigation.
   'botster.nav.open',
+  'botster.presentation.set',
+  'botster.presentation.clear',
+  'botster.presentation.toggle',
 ])
 
 function dispatchLocal(
@@ -109,6 +112,7 @@ export function createTransportDispatch(
     if (action.disabled === true) return
     const mergedPayload = {
       hubId,
+      targetSurface,
       ...(action.payload ?? {}),
     } as Record<string, unknown>
 

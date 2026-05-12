@@ -92,6 +92,7 @@ pub fn register(lua: &Lua) -> Result<()> {
     register_hidden(lua, &ui)?;
     // Wire protocol — reactive data sentinels for plugin layouts.
     register_bind(lua, &ui)?;
+    register_local(lua, &ui)?;
     register_bind_list(lua, &ui)?;
 
     lua.globals()
@@ -377,6 +378,31 @@ fn register_bind(lua: &Lua, ui: &Table) -> Result<()> {
     Ok(())
 }
 
+/// `ui.local_state(key, default)` — browser-local presentation state sentinel.
+///
+/// Web clients resolve this against the local presentation store scoped by
+/// hub + target surface. TUI/non-browser clients resolve to `default`.
+fn register_local(lua: &Lua, ui: &Table) -> Result<()> {
+    let constructor = lua
+        .create_function(|lua, (key, default): (String, Value)| {
+            if key.is_empty() {
+                return Err(mlua::Error::RuntimeError(
+                    "ui.local_state: key must be a non-empty string".to_string(),
+                ));
+            }
+            let out = lua.create_table()?;
+            out.set("$local", key)?;
+            if !matches!(default, Value::Nil) {
+                out.set("default", default)?;
+            }
+            Ok(out)
+        })
+        .map_err(|e| anyhow!("Failed to create ui.local_state: {e}"))?;
+    ui.set("local_state", constructor)
+        .map_err(|e| anyhow!("Failed to attach ui.local_state: {e}"))?;
+    Ok(())
+}
+
 /// `ui.bind_list{ source, where, item_template }` — wire protocol sentinel for
 /// reactive list expansion. Emits a `$kind = "bind_list"` envelope:
 ///
@@ -626,9 +652,11 @@ fn validate(_lua: &Lua, kind: Primitive, node: &Table) -> mlua::Result<()> {
             })?;
             match props.get::<Value>("open")? {
                 Value::Boolean(_) => {}
+                Value::Table(table) if is_local_sentinel_table(&table) => {}
                 _ => {
                     return Err(mlua::Error::RuntimeError(
-                        "ui.dialog requires `open` (boolean)".to_string(),
+                        "ui.dialog requires `open` (boolean or ui.local_state sentinel)"
+                            .to_string(),
                     ));
                 }
             }
@@ -690,6 +718,10 @@ fn is_bind_sentinel(value: &Value) -> bool {
         }
     }
     count == 1 && has_bind
+}
+
+fn is_local_sentinel_table(t: &Table) -> bool {
+    matches!(t.get::<Value>("$local"), Ok(Value::String(_)))
 }
 
 fn require_prop(node: &Table, key: &str, ctor: &str) -> mlua::Result<()> {
@@ -1840,6 +1872,32 @@ mod tests {
         assert_eq!(
             v,
             json!({ "$bind": "/project-pipelines.ticket/ticket-1/title" })
+        );
+    }
+
+    #[test]
+    fn local_emits_presentation_state_sentinel() {
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.local_state("ticket-1-spawn-open", false)"#,
+        );
+        assert_eq!(
+            v,
+            json!({ "$local": "ticket-1-spawn-open", "default": false })
+        );
+    }
+
+    #[test]
+    fn dialog_accepts_local_open_sentinel() {
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.dialog{ open = ui.local_state("ticket-1-spawn-open", false), title = "Spawn" }"#,
+        );
+        assert_eq!(
+            v["props"]["open"],
+            json!({ "$local": "ticket-1-spawn-open", "default": false })
         );
     }
 

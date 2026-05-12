@@ -127,6 +127,33 @@ describe('WebRtcPtyTransport', () => {
     vi.useRealTimers()
   })
 
+  it('reuses its owned terminal connection across repeated connect calls', async () => {
+    const conn = fakeTerminalConnection()
+    conn.hasSubscription.mockReturnValue(true)
+    mocks.acquire.mockResolvedValue(conn)
+    const transport = new WebRtcPtyTransport({
+      hubId: 'hub-1',
+      sessionUuid: 'session-1',
+    })
+
+    await transport.connect({
+      rows: 24,
+      cols: 80,
+      callbacks: {},
+    })
+    await transport.connect({
+      rows: 30,
+      cols: 100,
+      callbacks: {},
+    })
+
+    expect(mocks.acquire).toHaveBeenCalledTimes(1)
+    expect(conn.release).not.toHaveBeenCalled()
+    expect(conn.sendResize).toHaveBeenCalledWith(80, 24)
+    expect(conn.sendResize).toHaveBeenCalledWith(100, 30)
+    expect(conn.requestSnapshot).toHaveBeenCalledWith({ cols: 100, rows: 30 })
+  })
+
   it('does not subscribe a stale terminal when destroyed during async connect', async () => {
     let resolveAcquire
     const conn = fakeTerminalConnection()

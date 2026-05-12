@@ -356,6 +356,13 @@ export type NewSessionButtonProps = {
  */
 export type UiBind = { $bind: string }
 
+/**
+ * Wire shape of a `$local` sentinel. May appear at any prop-value position.
+ * Resolved by web clients against browser-local presentation state scoped to
+ * hub + target surface. Non-browser renderers use `default`.
+ */
+export type UiLocal = { $local: string; default?: unknown }
+
 /** Wire shape of a `$kind = "bind_list"` envelope. */
 export type UiBindList = {
   $kind: 'bind_list'
@@ -412,6 +419,13 @@ export function isBindSentinel(value: unknown): value is UiBind {
   if (value === null || typeof value !== 'object') return false
   const v = value as Record<string, unknown>
   return Object.keys(v).length === 1 && typeof v.$bind === 'string'
+}
+
+/** Returns true when `value` is a `$local` sentinel object. */
+export function isLocalSentinel(value: unknown): value is UiLocal {
+  if (value === null || typeof value !== 'object') return false
+  const v = value as Record<string, unknown>
+  return typeof v.$local === 'string'
 }
 
 /** Returns true when `value` is a `$kind = "bind_list"` envelope. */

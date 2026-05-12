@@ -16,7 +16,11 @@ import type {
 } from './types'
 import { isBindList, isConditional } from './types'
 import { matchesCondition, useViewport } from './viewport'
-import { resolveBindings, useBindingInvalidation } from './binding'
+import {
+  resolveBindings,
+  useBindingInvalidation,
+  useLocalInvalidation,
+} from './binding'
 
 function childArray(value: UiChild[] | UiChild | null | undefined): UiChild[] {
   if (value == null) return []
@@ -108,7 +112,10 @@ function renderInternal(
 export function renderNode(node: UiNode, ctx: RenderContext): ReactElement {
   let resolved: UiNode
   try {
-    resolved = resolveBindings(node) as UiNode
+    resolved = resolveBindings(node, {
+      hubId: ctx.hubId,
+      targetSurface: ctx.targetSurface,
+    }) as UiNode
   } catch {
     resolved = node
   }
@@ -153,6 +160,7 @@ export function UiTreeBody({
 }: UiTreeBodyProps): ReactElement {
   const liveViewport = useViewport()
   useBindingInvalidation(node)
+  useLocalInvalidation(node, hubId, targetSurface)
   const effectiveViewport = viewport ?? liveViewport
   const ctx: RenderContext = {
     viewport: effectiveViewport,

@@ -34,6 +34,8 @@ use crate::tui::entity_stores::TuiEntityStores;
 
 /// Sentinel key marking a `$bind` lookup.
 pub const BIND_SENTINEL_KEY: &str = "$bind";
+/// Sentinel key marking browser-local presentation state.
+pub const LOCAL_SENTINEL_KEY: &str = "$local";
 /// Sentinel value for `bind_list` (under the shared `$kind` discriminator).
 pub const BIND_LIST_KIND: &str = "bind_list";
 /// Item-relative path prefix for `@/<field>` inside a `bind_list` template.
@@ -81,6 +83,13 @@ fn resolve_bindings_inner(
                 resolve_bindings_inner(value, stores, item_context);
                 return;
             }
+            // Detect $local sentinel. The TUI has no browser-local
+            // presentation store, so it resolves to the sentinel default.
+            if let Some(replacement) = try_resolve_local(map) {
+                *value = replacement;
+                resolve_bindings_inner(value, stores, item_context);
+                return;
+            }
             // Detect bind_list sentinel — object with $kind == "bind_list".
             if is_bind_list(map) {
                 *value = expand_bind_list(map, stores, item_context);
@@ -107,6 +116,13 @@ fn resolve_bindings_inner(
         }
         _ => {}
     }
+}
+
+fn try_resolve_local(map: &JsonMap<String, JsonValue>) -> Option<JsonValue> {
+    if !map.contains_key(LOCAL_SENTINEL_KEY) {
+        return None;
+    }
+    Some(map.get("default").cloned().unwrap_or(JsonValue::Null))
 }
 
 fn try_resolve_bind(

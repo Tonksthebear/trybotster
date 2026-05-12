@@ -15,6 +15,9 @@ const ACTION = {
   // { path, hubId? }. When `hubId` is present the path is prefixed with
   // `/hubs/<id>`; callers that emit pre-qualified absolute paths can omit.
   NAV_OPEN: 'botster.nav.open',
+  PRESENTATION_SET: 'botster.presentation.set',
+  PRESENTATION_CLEAR: 'botster.presentation.clear',
+  PRESENTATION_TOGGLE: 'botster.presentation.toggle',
 }
 
 // Validate that a URL uses a safe protocol (http/https only)
@@ -126,6 +129,34 @@ const handlers = {
     if (window.location.pathname === target) return
     window.history.pushState({}, '', target)
     window.dispatchEvent(new PopStateEvent('popstate'))
+  },
+
+  [ACTION.PRESENTATION_SET](payload) {
+    useUiPresentationStore
+      .getState()
+      .setLocalValue(
+        payload.hubId,
+        payload.targetSurface,
+        payload.key,
+        payload.value,
+      )
+  },
+
+  [ACTION.PRESENTATION_CLEAR](payload) {
+    useUiPresentationStore
+      .getState()
+      .clearLocalValue(payload.hubId, payload.targetSurface, payload.key)
+  },
+
+  [ACTION.PRESENTATION_TOGGLE](payload) {
+    useUiPresentationStore
+      .getState()
+      .toggleLocalValue(
+        payload.hubId,
+        payload.targetSurface,
+        payload.key,
+        payload.default ?? false,
+      )
   },
 }
 

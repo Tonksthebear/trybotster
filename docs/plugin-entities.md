@@ -126,6 +126,36 @@ bind against the absolute entity path.
 
 Missing scalar values resolve to `null`. Missing list sources resolve to `[]`.
 
+## Presentation State Boundary
+
+Plugin entities are for durable, shared model state. Browser-local presentation
+state belongs in `ui.local_state(key, default)` and the `botster.presentation.*`
+actions instead. Use that path for modal open flags, disclosure toggles, and
+other per-client UI state that should not reload a plugin route or publish to
+other clients.
+
+```lua
+ui.button{
+  text = "Open dialog",
+  action = ui.action("botster.presentation.set", {
+    key = "ticket-123-dialog-open",
+    value = true,
+  }),
+}
+
+ui.dialog{
+  open = ui.local_state("ticket-123-dialog-open", false),
+  title = "Dialog",
+  children = { ... },
+}
+```
+
+Do not add plugin entity families, plugin DB tables, route segments, or
+client-specific refresh commands just to open or close local UI. Mutators that
+finish hub-side work may return
+`action.result{ presentation = { clear = { "ticket-123-dialog-open" } } }` to
+reset local presentation keys after success.
+
 ## Action Feedback Lifecycle
 
 Button and icon-button submitters use the generic `ui_action` request/response
@@ -177,6 +207,8 @@ renderer-specific pending flags.
 - Use `entity_patch` only for top-level sparse changes.
 - Keep `ui_tree_snapshot` focused on route structure, stable node ids, and
   controls; bind durable values from entity stores.
+- Use `ui.local_state` and `botster.presentation.*` for per-browser modal,
+  disclosure, or focus state.
 - Use `ui.bind_list{ where = { ... } }` for filtered child collections.
 - Give repeated submitters stable node `id` values so `ui_action_result`
   feedback scopes to the clicked control.

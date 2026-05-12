@@ -22,11 +22,14 @@ import React, { useMemo, useSyncExternalStore, type ReactNode } from 'react'
 import {
   isBindList,
   isBindSentinel,
+  isLocalSentinel,
   type UiBindList,
   type UiBind,
+  type UiLocal,
   type UiNode,
 } from './types'
 import { storeFor } from '../store/entities'
+import { useUiPresentationStore } from '../store/ui-presentation-store'
 
 const ITEM_RELATIVE_PREFIX = '@'
 
@@ -40,6 +43,10 @@ type EntityStoreHook = {
   getState: () => EntityState
 }
 type ItemContext = EntityRecord | undefined
+type LocalScope = {
+  hubId?: string
+  targetSurface?: string
+}
 
 /**
  * Walk `value` (a wire-shape JSON tree) and return a deep copy with every
@@ -49,15 +56,19 @@ type ItemContext = EntityRecord | undefined
  * The walker never errors — missing entity / field / store all resolve to
  * `null`, which the React renderers handle as "field absent".
  */
-export function resolveBindings(value: unknown): unknown {
-  return resolveBindingsInner(value, undefined)
+export function resolveBindings(value: unknown, localScope?: LocalScope): unknown {
+  return resolveBindingsInner(value, undefined, localScope)
 }
 
-function resolveBindingsInner(value: unknown, item: ItemContext): unknown {
+function resolveBindingsInner(
+  value: unknown,
+  item: ItemContext,
+  localScope?: LocalScope,
+): unknown {
   if (Array.isArray(value)) {
     const out: unknown[] = []
     for (const v of value) {
-      const resolved = resolveBindingsInner(v, item)
+      const resolved = resolveBindingsInner(v, item, localScope)
       if (Array.isArray(resolved)) {
         out.push(...resolved)
       } else {
@@ -72,8 +83,11 @@ function resolveBindingsInner(value: unknown, item: ItemContext): unknown {
   if (isBindSentinel(value)) {
     return resolvePath(value.$bind, item)
   }
+  if (isLocalSentinel(value)) {
+    return resolveLocal(value, localScope)
+  }
   if (isBindList(value)) {
-    return expandBindList(value, item)
+    return expandBindList(value, item, localScope)
   }
   // Only walk plain objects (those produced by JSON.parse / object literals).
   // Class instances (e.g. the `Boom` test fixture in ui-tree.test.jsx that
@@ -83,7 +97,7 @@ function resolveBindingsInner(value: unknown, item: ItemContext): unknown {
   if (!isPlainObject(value)) return value
   const out: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    out[k] = resolveBindingsInner(v, item)
+    out[k] = resolveBindingsInner(v, item, localScope)
   }
   return out
 }
@@ -94,7 +108,11 @@ function isPlainObject(value: unknown): boolean {
   return proto === Object.prototype || proto === null
 }
 
-function expandBindList(envelope: UiBindList, parentItem: ItemContext): unknown[] {
+function expandBindList(
+  envelope: UiBindList,
+  parentItem: ItemContext,
+  localScope?: LocalScope,
+): unknown[] {
   const entityType = envelope.source.replace(/^\//, '')
   const store = (storeFor(entityType) as EntityStoreHook).getState()
   const out: unknown[] = []
@@ -103,12 +121,23 @@ function expandBindList(envelope: UiBindList, parentItem: ItemContext): unknown[
     if (record == null) continue
     if (!matchesWhere(record, envelope.where)) continue
     // Per-item resolution shadows the outer item context.
-    const expanded = resolveBindingsInner(envelope.item_template, record)
+    const expanded = resolveBindingsInner(envelope.item_template, record, localScope)
     if (expanded != null) out.push(expanded)
   }
   // `parentItem` deliberately not threaded down — bind_list always shadows.
   void parentItem
   return out
+}
+
+function resolveLocal(envelope: UiLocal, localScope?: LocalScope): unknown {
+  return useUiPresentationStore
+    .getState()
+    .localValue(
+      localScope?.hubId,
+      localScope?.targetSurface,
+      envelope.$local,
+      envelope.default ?? null,
+    )
 }
 
 function matchesWhere(record: EntityRecord, where: Record<string, unknown> | undefined): boolean {
@@ -272,11 +301,19 @@ export function findBindSentinels(props: Record<string, unknown>): UiBind[] {
   return out
 }
 
+export function findLocalSentinels(value: unknown): UiLocal[] {
+  const out: UiLocal[] = []
+  walk(value, (v) => {
+    if (isLocalSentinel(v)) out.push(v)
+  })
+  return out
+}
+
 // Tree walker used by tests + diagnostics.
 export function countBindings(value: unknown): number {
   let count = 0
   walk(value, (v) => {
-    if (isBindSentinel(v) || isBindList(v)) count += 1
+    if (isBindSentinel(v) || isBindList(v) || isLocalSentinel(v)) count += 1
   })
   return count
 }
@@ -313,6 +350,33 @@ export function useBindingInvalidation(value: unknown): void {
       return () => {
         for (const unsubscribe of unsubscribers) unsubscribe()
       }
+    },
+    getSnapshot,
+    getSnapshot,
+  )
+}
+
+export function useLocalInvalidation(
+  value: unknown,
+  hubId?: string,
+  targetSurface?: string,
+): void {
+  const keys = useMemo(
+    () => findLocalSentinels(value).map((sentinel) => sentinel.$local).sort(),
+    [value],
+  )
+  const getSnapshot = () =>
+    keys
+      .map((key) => {
+        const state = useUiPresentationStore.getState()
+        const scopedKey = state.localKey(hubId, targetSurface, key)
+        return `${scopedKey}:${JSON.stringify(state.localValues[scopedKey])}`
+      })
+      .join('\u0000')
+  useSyncExternalStore(
+    (onStoreChange) => {
+      if (keys.length === 0) return () => {}
+      return useUiPresentationStore.subscribe(onStoreChange)
     },
     getSnapshot,
     getSnapshot,

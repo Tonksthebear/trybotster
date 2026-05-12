@@ -756,6 +756,23 @@ fn dialog_closed_renders_empty_placeholder() {
     ));
 }
 
+#[test]
+fn dialog_local_open_resolves_to_default_in_tui() {
+    let lua = new_ui_lua();
+    let (render, _) = render_lua(
+        &lua,
+        r#"return ui.dialog{ open = ui.local_state("ticket-1-spawn-open", false), title = "Hidden" }"#,
+        &regular_viewport(),
+    );
+    assert!(matches!(
+        render,
+        RenderNode::Widget {
+            widget_type: WidgetType::Empty,
+            ..
+        }
+    ));
+}
+
 // =============================================================================
 // Responsive resolution
 // =============================================================================

@@ -3,7 +3,7 @@
 -- @category plugins
 -- @dest plugins/project-pipelines/init.lua
 -- @scope device
--- @version 1.0.0
+-- @version 1.1.0
 
 for _, module_name in ipairs({
     "project_pipelines.util",
@@ -12,6 +12,7 @@ for _, module_name in ipairs({
     "project_pipelines.entities",
     "project_pipelines.engine",
     "project_pipelines.github_integration",
+    "project_pipelines.notification_policy",
     "project_pipelines.mcp",
     "project_pipelines.web.ui",
     "project_pipelines.web.actions",
@@ -29,6 +30,7 @@ end
 local repo = require("project_pipelines.repo")
 local engine = require("project_pipelines.engine")
 local github_integration = require("project_pipelines.github_integration")
+local notification_policy = require("project_pipelines.notification_policy")
 local mcp_tools = require("project_pipelines.mcp")
 local surface = require("project_pipelines.web.surface")
 
@@ -36,6 +38,7 @@ local M = {}
 
 repo.prune_legacy_seed_data()
 engine.register_entities()
+notification_policy.register()
 mcp_tools.register()
 surface.register()
 

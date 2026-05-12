@@ -15,7 +15,8 @@ source.
 
 ## Included
 
-- Version `0.1.10` — plugin authoring guidance includes scoped notification
+- Version `0.1.11` — plugin authoring guidance includes browser-local
+  presentation state for plugin UI and scoped notification
   policy ownership, all-session capability gates, and plugin-worker execution
   boundaries for notification handlers.
 - `.codex-plugin/plugin.json` — plugin manifest.

@@ -48,6 +48,9 @@ export class WebRtcPtyTransport {
     if (this.#destroyed) return;
     const generation = ++this.#connectGeneration;
     const requestedSize = this.#connectSize(options);
+    const termKey = TerminalConnection.key(this.#hubId, this.#sessionUuid);
+    const existingConn = this.#terminalConn ?? HubConnectionManager.get(termKey);
+    const hadSubscription = existingConn?.hasSubscription?.() ?? false;
     this.disconnect();
     this.#desiredSize = requestedSize;
     this.#callbacks = options.callbacks;
@@ -55,20 +58,19 @@ export class WebRtcPtyTransport {
       `[WebRtcPtyTransport] connect start hub=${this.#hubId} session=${this.#sessionUuid} size=${requestedSize.cols}x${requestedSize.rows}`,
     );
 
-    const termKey = TerminalConnection.key(this.#hubId, this.#sessionUuid);
-    const existingConn = HubConnectionManager.get(termKey);
-    const hadSubscription = existingConn?.hasSubscription?.() ?? false;
-
-    const terminalConn = await HubConnectionManager.acquire(
-      TerminalConnection,
-      termKey,
-      {
-        hubId: this.#hubId,
-        sessionUuid: this.#sessionUuid,
-        rows: requestedSize.rows,
-        cols: requestedSize.cols,
-      },
-    );
+    let terminalConn = this.#terminalConn;
+    if (!terminalConn) {
+      terminalConn = await HubConnectionManager.acquire(
+        TerminalConnection,
+        termKey,
+        {
+          hubId: this.#hubId,
+          sessionUuid: this.#sessionUuid,
+          rows: requestedSize.rows,
+          cols: requestedSize.cols,
+        },
+      );
+    }
 
     if (this.#destroyed || generation !== this.#connectGeneration) {
       terminalConn?.release?.();
@@ -233,6 +235,12 @@ export class WebRtcPtyTransport {
   }
 
   #connectSize(options) {
+    if (this.#terminalConn && options?.cols && options?.rows) {
+      return {
+        cols: options.cols,
+        rows: options.rows,
+      };
+    }
     return this.#desiredSize ?? {
       cols: options.cols,
       rows: options.rows,

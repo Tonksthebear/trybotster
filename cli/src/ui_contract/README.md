@@ -228,6 +228,36 @@ ui.action("botster.session.select", { sessionUuid = "sess-…" })
 -- => { id = "botster.session.select", payload = { sessionUuid = "sess-…" } }
 ```
 
+### Browser-local presentation state
+
+Plugin surfaces can bind ephemeral browser-local state with `ui.local_state(key,
+default)`. This is for presentation only: modal open flags, local disclosure
+state, and similar per-browser UI state. It is scoped by hub and target surface,
+is not sent to Lua/hub, and resets on browser reload.
+
+```lua
+ui.button{
+  label = "Open",
+  action = ui.action("botster.presentation.set", {
+    key = "ticket-1-spawn-open",
+    value = true,
+  }),
+}
+
+ui.dialog{
+  open = ui.local_state("ticket-1-spawn-open", false),
+  title = "Spawn agent",
+  footer = {
+    ui.button{
+      label = "Cancel",
+      action = ui.action("botster.presentation.clear", {
+        key = "ticket-1-spawn-open",
+      }),
+    },
+  },
+}
+```
+
 ### Slots
 
 Any primitive with semantic regions uses the `slots` key, not positional
