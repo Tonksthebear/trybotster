@@ -167,8 +167,7 @@ M.primitives = {
             { sig = "hub.quit()",                  desc = "Request hub shutdown" },
             { sig = "hub.graceful_restart()",      desc = "Restart hub (sessions survive)" },
             { sig = "hub.resolve_command_path(command)", desc = "Resolve an executable against the live PATH" },
-            { sig = "hub.prepare_plugin_command(opts)", desc = "Async plugin command prep; fires plugin_command_prepared with error_kind=command_blank|command_missing|config_write_failed|task_failed" },
-            { sig = "hub.probe_url_ready(connector_uuid, parent_uuid, url, hostname, timeout_secs?)", desc = "Plugin-facing DNS + HTTPS readiness gate for public URLs" },
+            { sig = "Hub.get():prepare_plugin_command(opts)", desc = "Async plugin command prep; fires plugin_command_prepared with error_kind=command_blank|command_missing|config_write_failed|task_failed" },
         },
     },
     {
@@ -300,8 +299,9 @@ M.hooks = {
         { name = "pty_cwd_changed",        data = "{session_uuid, session_name, cwd}",       desc = "Working directory changed (OSC 7)" },
         { name = "pty_prompt",             data = "{session_uuid, session_name, mark, exit_code?, command?}", desc = "Shell prompt mark (OSC 133). mark: prompt_start|command_start|command_executed|command_finished" },
         { name = "pty_cursor_visibility",  data = "{session_uuid, session_name, visible}",   desc = "Cursor shown/hidden (DECTCEM)" },
-        { name = "_pty_notification_raw",  data = "{session_uuid, session_name, type, message?, title?, body?}", desc = "Raw PTY notification before enrichment (internal)" },
-        { name = "pty_notification",       data = "{session_uuid, type, message?, title?, body?, has_focus, already_notified, display_name}", desc = "Enriched PTY notification (bell, OSC 9, OSC 777)" },
+        { name = "_pty_notification_raw",  data = "{session_uuid, session_name, type, message?, title?, body?}", desc = "Raw PTY notification before enrichment and scoped notification policy (internal)" },
+        { name = "pty_notification",       data = "{session_uuid, type, message?, title?, body?, has_focus, already_notified, notification_policy?, notification_owner?}", desc = "Final PTY notification delivery after scoped policy accepts" },
+        { name = "pty_notification_suppressed", data = "{session_uuid, type, message?, title?, body?, notification_policy?, notification_owner?}", desc = "Final PTY notification suppression after scoped policy rejects delivery" },
         { name = "pty_input",             data = "{session_uuid}",                           desc = "Keystroke cleared a pending notification" },
 
         -- Commands

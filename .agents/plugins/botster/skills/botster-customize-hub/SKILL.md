@@ -39,13 +39,49 @@ hooks.intercept("before_agent_create", "my_plugin.guard", function(params)
 end, { timeout_ms = 50 })
 ```
 
+### Notification Policy
+
+For PTY notification behavior, prefer `lib.notifications` over raw hook
+interception. Plugins can observe matching notifications without changing
+defaults, or claim ownership and return `default`, `suppress`, or `replace`.
+Scoped claims can target one session, a session set, sessions owned by a plugin,
+or a plugin surface. All-session observe/claim requires explicit capabilities:
+`notifications.global_observe` or `notifications.global_claim`.
+
+Notification claim and observer handlers execute in the plugin worker. The hub
+still owns enrichment, matching, timeout/fallback, badge mutation, web push, and
+transient UI delivery.
+
+```lua
+local notifications = require("lib.notifications")
+
+notifications.claim({
+  name = "my_plugin.owned_session_notifications",
+  scope = { owner_plugin = "my_plugin" },
+  handler = function(intent)
+    return {
+      core = "replace",
+      reason = "my_plugin_owned",
+      custom = {
+        title = "Plugin alert",
+        body = intent.message or intent.body,
+        push = true,
+        transient = true,
+        badge = true,
+      },
+    }
+  end,
+})
+```
+
 ### Available Observer Hooks
 
 - `agent_created` — agent spawned; broadcasts to all clients.
 - `agent_deleted` — agent removed; broadcasts to all clients.
 - `agent_lifecycle` — lifecycle stage changes.
-- `_pty_notification_raw` — internal raw notification enrichment.
-- `pty_notification` — web push notification hook.
+- `_pty_notification_raw` — internal raw notification before enrichment/policy.
+- `pty_notification` — final notification delivery after policy accepts.
+- `pty_notification_suppressed` — final notification suppression after policy.
 - `pty_title_changed` — OSC 0/2 title changed.
 - `pty_cwd_changed` — OSC 7 cwd changed.
 - `pty_prompt` — OSC 133/633 prompt marks.

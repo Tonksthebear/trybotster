@@ -25,6 +25,7 @@ local Session = require("lib.session")
 local terminal_clients = require("lib.terminal_clients")
 local EB = require("lib.entity_broadcast")
 local surfaces = require("lib.surfaces")
+local notifications = require("lib.notifications")
 
 -- Shared client registry - all transports register here
 local clients = state.get("connections.clients", {})
@@ -45,6 +46,26 @@ local OSC_SESSION_UPDATE_DEBOUNCE_SECS = 0.5
 local OUTPUT_ACTIVITY_POLL_SECS = 0.5
 local OUTPUT_ACTIVITY_ACTIVE_WINDOW_MS = 3000
 local output_activity_timer_id = nil
+
+local function notification_text(info)
+    info = info or {}
+    return table.concat({
+        tostring(info.message or ""),
+        tostring(info.title or ""),
+        tostring(info.body or ""),
+    }, "\n")
+end
+
+local function should_emit_pty_notification(info)
+    local text = notification_text(info):lower()
+    if text:find("permission", 1, true) then
+        return true, "permission"
+    end
+    if text:find("phase", 1, true) then
+        return true, "phase"
+    end
+    return false, "suppressed"
+end
 
 -- ============================================================================
 -- Client Registry
@@ -289,16 +310,54 @@ hooks.on("_pty_notification_raw", "enrich_and_dispatch", function(info)
         and terminal_clients.is_any_focused(agent.session_uuid) or false
 
     info.session_uuid = agent and agent.session_uuid or nil
+    info.session_owner_plugin = agent and agent.owner_plugin or nil
+    info.session_surface = agent and agent.surface or nil
+    info.session_visibility = agent and agent.visibility or nil
+
+    local decision = notifications.evaluate(info)
+    info.notification_owner = decision.owner
+    info.notification_owner_plugin = decision.owner_plugin
+    info.notification_decision = decision.core
+
+    if decision.core == "suppress" then
+        info.notification_policy = decision.reason or "owner_suppressed"
+        hooks.notify("pty_notification_suppressed", info)
+        notifications.notify_observers("after", info, decision)
+        return
+    end
+
+    local should_emit = true
+    local reason = decision.reason or decision.core
+    if decision.core == "default" then
+        should_emit, reason = should_emit_pty_notification(info)
+    elseif decision.core == "replace" then
+        info.notification_delivery = decision.custom or decision.notification or {}
+        reason = decision.reason or "owner_replaced"
+    end
+
+    info.notification_policy = reason
+    if not should_emit then
+        hooks.notify("pty_notification_suppressed", info)
+        notifications.notify_observers("after", info, decision)
+        return
+    end
 
     hooks.notify("pty_notification", info)
+    notifications.notify_observers("after", info, decision)
 end)
 
 -- Send a web push notification when a PTY notification (bell) fires, AND ship
 -- a `transient_event` envelope to every hub-channel subscriber so toast
 -- handlers fire on the browser and the TUI's notification overlay updates.
 hooks.on("pty_notification", "push_notification", function(info)
-    if info.has_focus then return end
-    if info.already_notified then return end
+    local delivery = info.notification_delivery or {}
+    if type(delivery) ~= "table" then delivery = {} end
+    local custom_delivery = type(delivery) == "table" and next(delivery) ~= nil
+
+    if not custom_delivery then
+        if info.has_focus then return end
+        if info.already_notified then return end
+    end
 
     local hub_id = hub.server_id()
     local agent = (info.session_uuid and Agent.get(info.session_uuid))
@@ -318,20 +377,23 @@ hooks.on("pty_notification", "push_notification", function(info)
         url = string.format("/hubs/%s", hub_id)
     end
 
-    local title = "Agent alert"
+    local title = delivery.title or "Agent alert"
     if agent then
         local repo_short = agent.repo and agent.repo:match("/(.+)$") or agent.repo
-        if agent:get_meta("issue_number") then
+        if delivery.title then
+            title = delivery.title
+        elseif agent:get_meta("issue_number") then
             title = string.format("%s #%s", repo_short or "agent", agent:get_meta("issue_number"))
         elseif repo_short then
             title = repo_short
         end
     end
-    local body = info.message or info.body or "Your attention is needed"
+    local body = delivery.body or info.message or info.body or "Your attention is needed"
+    if delivery.url then url = delivery.url end
 
     -- Set notification flag — Session:update will emit an entity_patch for
     -- the badge state separately.
-    if agent then
+    if agent and delivery.badge ~= false then
         agent:update({ notification = true })
     end
 
@@ -340,26 +402,30 @@ hooks.on("pty_notification", "push_notification", function(info)
         if a.notification then badge_count = badge_count + 1 end
     end
 
-    push.send({
-        kind = "agent_alert",
-        title = title,
-        body = body,
-        url = url,
-        sessionUuid = agent and agent.session_uuid or nil,
-        app_badge = badge_count,
-    })
+    if delivery.push ~= false then
+        push.send({
+            kind = delivery.kind or "agent_alert",
+            title = title,
+            body = body,
+            url = url,
+            sessionUuid = delivery.sessionUuid or (agent and agent.session_uuid or nil),
+            app_badge = badge_count,
+        })
+    end
 
     -- Wire protocol — transient_event delivers the toast/banner copy.
     -- Web → toast + drop. TUI → notification overlay + drop. Future
     -- transient event types reuse this envelope.
-    broadcast_frame_to_hub({
-        v = 2,
-        type = "transient_event",
-        event_type = "pty_notification",
-        session_uuid = info.session_uuid,
-        title = title,
-        body = body,
-    })
+    if delivery.transient ~= false then
+        broadcast_frame_to_hub({
+            v = 2,
+            type = "transient_event",
+            event_type = delivery.event_type or "pty_notification",
+            session_uuid = info.session_uuid,
+            title = title,
+            body = body,
+        })
+    end
 end)
 
 -- Clear a pending notification on a session by session_uuid.
@@ -651,6 +717,7 @@ local M = {
     broadcast_frame_to_hub = broadcast_frame_to_hub,
     broadcast_ui_tree_snapshots = broadcast_ui_tree_snapshots,
     broadcast_ui_route_registry = broadcast_ui_route_registry,
+    should_emit_pty_notification = should_emit_pty_notification,
 }
 
 -- Lifecycle hooks for hot-reload

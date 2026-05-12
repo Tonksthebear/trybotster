@@ -49,7 +49,8 @@ existing session.
 | `agent_deleted` | `connections.lua` | Agent removed, broadcasts to all clients |
 | `agent_lifecycle` | `connections.lua` | Lifecycle stage changes (creating_worktree, etc.) |
 | `_pty_notification_raw` | `connections.lua` | Internal: enriches raw notification with focus state |
-| `pty_notification` | `connections.lua` | Sends web push notification |
+| `pty_notification` | `connections.lua` | Final PTY notification delivery after scoped policy evaluation |
+| `pty_notification_suppressed` | `connections.lua` | Final PTY notification suppression after scoped policy evaluation |
 | `pty_title_changed` | `connections.lua` | OSC 0/2 title change -> updates agent.title, broadcasts |
 | `pty_cwd_changed` | `connections.lua` | OSC 7 cwd change -> updates agent.cwd, broadcasts |
 | `pty_prompt` | `connections.lua` | OSC 133/633 prompt marks |
@@ -120,3 +121,44 @@ These are `LuaRuntime` methods called from the Rust event loop that invoke Lua c
 | `_on_pty_input(session_uuid)` | PTY input hot path, clears notifications |
 | `_clear_session_notification(session_uuid)` | Explicit notification clear |
 | `_set_pty_focused(session_uuid, peer_id, focused)` | Focus state tracking |
+
+## Scoped Notification Policies
+
+Use `lib.notifications` when a plugin needs session-scoped or global
+notification behavior. Observers watch matching notification intents without
+changing delivery. Claims own delivery decisions for matching notifications.
+Plugin-owned observer and claim handlers run in the plugin worker; the hub owns
+matching, timeouts, fallback behavior, badge updates, push delivery, and
+transient UI events.
+
+```lua
+local notifications = require("lib.notifications")
+
+notifications.observe({
+  name = "my_plugin.audit",
+  scope = { session_uuid = "sess-..." }, -- or all_sessions/owner_plugin/surface
+  -- all_sessions also requires capabilities = { "notifications.global_observe" }
+  handler = function(phase, intent, decision)
+    -- phase is "before" or "after"; return value is ignored.
+  end,
+})
+
+notifications.claim({
+  name = "my_plugin.policy",
+  scope = { owner_plugin = "my_plugin" },
+  -- all_sessions also requires capabilities = { "notifications.global_claim" }
+  handler = function(intent)
+    return {
+      core = "replace", -- "default", "suppress", or "replace"
+      reason = "my_plugin_handled",
+      custom = {
+        title = "Needs review",
+        body = intent.message,
+        push = true,
+        transient = true,
+        badge = true,
+      },
+    }
+  end,
+})
+```

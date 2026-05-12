@@ -15,8 +15,9 @@ source.
 
 ## Included
 
-- Version `0.1.9` — command-routing guidance reflects the canonical
-  `client.lua` ingress and explicit `create_agent` spawn behavior.
+- Version `0.1.10` — plugin authoring guidance includes scoped notification
+  policy ownership, all-session capability gates, and plugin-worker execution
+  boundaries for notification handlers.
 - `.codex-plugin/plugin.json` — plugin manifest.
 - `.claude-plugin/plugin.json` — Claude Code plugin manifest.
 - `.mcp.json` — single MCP server named `botster`.
@@ -27,7 +28,8 @@ source.
   Includes browser surface registration, core plugin navigation, Heroicons icon
   names, route-scoped plugin sidebars, plugin-owned session metadata, and
   surface-local terminal routing, plus sandboxed custom HTML views through
-  plugin assets, iframes, and fullscreen plugin route layouts.
+  plugin assets, iframes, fullscreen plugin route layouts, and scoped
+  notification policy ownership.
 - `skills/botster-customize-mcp/SKILL.md` — MCP tools/prompts from plugins.
 
 ## MCP Server

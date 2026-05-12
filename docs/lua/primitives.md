@@ -713,3 +713,40 @@ update.install() -> {success, error, ...}
 ```lua
 push.send({title, body, url, ...})    -- web push notifications
 ```
+
+### `lib.notifications`
+```lua
+local notifications = require("lib.notifications")
+
+notifications.observe({
+  name = "plugin.audit",
+  scope = { session_uuid = "sess-..." }, -- also supports sessions, owner_plugin, surface, all_sessions
+  -- all_sessions requires capabilities = { "notifications.global_observe" }
+  phase = "both",                        -- "before", "after", or "both"
+  handler = function(phase, intent, decision) end,
+})
+
+notifications.claim({
+  name = "plugin.owner",
+  scope = { owner_plugin = "plugin" },
+  -- all_sessions requires capabilities = { "notifications.global_claim" }
+  handler = function(intent)
+    return {
+      core = "default", -- "default", "suppress", or "replace"
+      reason = "optional_debug_reason",
+      custom = {
+        title = "Custom title",
+        body = intent.message,
+        push = true,
+        transient = true,
+        badge = true,
+      },
+    }
+  end,
+})
+```
+
+Observers never change delivery. Claims provide one effective owner decision for
+matching notifications. Plugin-owned handlers execute in the plugin worker; the
+hub owns session badge mutation, web push, transient UI events, and fallback to
+default behavior on handler errors/timeouts.
