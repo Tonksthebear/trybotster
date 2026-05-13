@@ -142,6 +142,32 @@ describe('TerminalView Restty options', () => {
     )
   })
 
+  it('opens the PTY when the terminal size is measured before the renderer backend is ready', async () => {
+    render(<TerminalView hubId="hub-1" sessionUuid="session-1" />)
+
+    await waitFor(() => expect(lastResttyOptions).not.toBeNull())
+    await waitFor(() => expect(lastTransport).not.toBeNull())
+    vi.useFakeTimers()
+    lastResttyOptions.appOptions.callbacks.onTermSize(140, 38)
+
+    act(() => {
+      vi.advanceTimersByTime(35)
+    })
+
+    const restty = lastResttyOptions.__instance
+    expect(restty.connectPty).not.toHaveBeenCalled()
+
+    lastResttyOptions.appOptions.callbacks.onBackend()
+
+    act(() => {
+      vi.advanceTimersByTime(35)
+    })
+
+    expect(lastTransport.resize).toHaveBeenCalledWith(140, 38)
+    expect(restty.updateSize).toHaveBeenCalledWith(true)
+    expect(restty.connectPty).toHaveBeenCalled()
+  })
+
   it('continues sending corrected measured sizes after the initial PTY connect', async () => {
     render(<TerminalView hubId="hub-1" sessionUuid="session-1" />)
 

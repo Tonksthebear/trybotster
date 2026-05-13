@@ -29,6 +29,20 @@ local function log_perf(message)
     end
 end
 
+local function removed_manual_session_set(ticket_id)
+    local removed = {}
+    if util.is_blank(ticket_id) then
+        return removed
+    end
+    for _, event in ipairs(M.ticket_events(ticket_id, "ticket.manual_session_removed", 200)) do
+        local payload = util.decode(event.payload, {})
+        if not util.is_blank(payload.session_uuid) then
+            removed[payload.session_uuid] = true
+        end
+    end
+    return removed
+end
+
 local PIPELINE_UPDATE_FIELDS = {
     name = true,
     description = true,
@@ -206,6 +220,25 @@ local function remove_entity(entity_key, id)
     local ok, entities = pcall(require, "project_pipelines.entities")
     if ok and entities and entities.types and entities.types[entity_key] and type(entities.remove) == "function" then
         pcall(entities.remove, entities.types[entity_key], id)
+    end
+end
+
+local function publish_ticket_project_family(ticket_id, depends_on_ticket_id)
+    local ticket = M.get_ticket(ticket_id)
+    if not ticket then
+        return
+    end
+
+    if util.is_blank(ticket.project_id) then
+        publish_entity("ticket", ticket)
+        if not util.is_blank(depends_on_ticket_id) and depends_on_ticket_id ~= ticket_id then
+            publish_entity("ticket", M.get_ticket(depends_on_ticket_id))
+        end
+        return
+    end
+
+    for _, related in ipairs(M.project_tickets(ticket.project_id)) do
+        publish_entity("ticket", related)
     end
 end
 
@@ -916,7 +949,6 @@ function M.create_ticket(attrs)
     }
     db.tickets:insert(ticket)
     publish_entity("ticket", ticket)
-    publish_entity_snapshot("ticket")
     M.append_event("ticket.created", { ticket_id = ticket.id, payload = ticket })
     return ticket
 end
@@ -950,7 +982,7 @@ function M.add_ticket_dependency(ticket_id, depends_on_ticket_id)
     }
     db.ticket_dependencies:insert(dependency)
     publish_entity("ticket_dependency", dependency)
-    publish_entity_snapshot("ticket")
+    publish_ticket_project_family(ticket_id, depends_on_ticket_id)
     M.append_event("ticket.dependency_added", {
         ticket_id = ticket_id,
         payload = { dependency_id = dependency.id, depends_on_ticket_id = depends_on_ticket_id },
@@ -966,7 +998,7 @@ function M.remove_ticket_dependency(dependency_id)
     end
     db:eval("DELETE FROM ticket_dependencies WHERE id = ?", dependency_id)
     remove_entity("ticket_dependency", dependency_id)
-    publish_entity_snapshot("ticket")
+    publish_ticket_project_family(dependency.ticket_id, dependency.depends_on_ticket_id)
     M.append_event("ticket.dependency_removed", {
         ticket_id = dependency.ticket_id,
         payload = { dependency_id = dependency.id, depends_on_ticket_id = dependency.depends_on_ticket_id },
@@ -1282,6 +1314,8 @@ function M.create_pipeline(attrs)
     util.assert_present(attrs.id, "pipeline id")
     util.assert_present(attrs.name, "pipeline name")
     local now = util.now()
+    local published_step_ids = {}
+    local published_gate_ids = {}
     local pipeline = {
         id = attrs.id,
         name = attrs.name,
@@ -1310,7 +1344,8 @@ function M.create_pipeline(attrs)
             step_attrs.on_approved_step_id = nil
             step_attrs.on_changes_requested_step_id = nil
             step_attrs.on_blocked_step_id = nil
-            insert_step(step_attrs, now)
+            local inserted = insert_step(step_attrs, now)
+            published_step_ids[#published_step_ids + 1] = inserted.id
         end
         for index, step in ipairs(attrs.steps or {}) do
             local transition_updates = {}
@@ -1334,12 +1369,19 @@ function M.create_pipeline(attrs)
             for _, gate in ipairs(step.gates or {}) do
                 local gate_attrs = util.copy(gate)
                 gate_attrs.step_id = step_ids[index]
-                insert_gate(gate_attrs, now)
+                local inserted = insert_gate(gate_attrs, now)
+                published_gate_ids[#published_gate_ids + 1] = inserted.id
             end
         end
         M.append_event("pipeline.created", { payload = pipeline })
     end)
     publish_entity("pipeline", M.get_pipeline(pipeline.id))
+    for _, step_id in ipairs(published_step_ids) do
+        publish_entity("pipeline_step", M.get_step(step_id))
+    end
+    for _, gate_id in ipairs(published_gate_ids) do
+        publish_entity("pipeline_gate", decode_gate_row(M.get_gate(gate_id)))
+    end
     return pipeline
 end
 
@@ -1351,6 +1393,7 @@ function M.create_step(attrs)
     end
     local now = util.now()
     local step
+    local gate_ids = {}
     with_transaction(function()
         local step_attrs = util.copy(attrs)
         step_attrs.position = step_attrs.position or (#M.pipeline_steps(attrs.pipeline_id) + 1)
@@ -1358,13 +1401,17 @@ function M.create_step(attrs)
         for _, gate in ipairs(attrs.gates or {}) do
             local gate_attrs = util.copy(gate)
             gate_attrs.step_id = step.id
-            insert_gate(gate_attrs, now)
+            local inserted = insert_gate(gate_attrs, now)
+            gate_ids[#gate_ids + 1] = inserted.id
         end
         M.append_event("pipeline.step_created", {
             payload = { pipeline_id = step.pipeline_id, step_id = step.id },
         })
     end)
     publish_entity("pipeline_step", M.get_step(step.id))
+    for _, gate_id in ipairs(gate_ids) do
+        publish_entity("pipeline_gate", decode_gate_row(M.get_gate(gate_id)))
+    end
     return M.get_step(step.id)
 end
 
@@ -1389,6 +1436,10 @@ function M.delete_step(step_id)
     if gate_usage and tonumber(gate_usage.count or 0) > 0 then
         error("cannot delete pipeline step with existing gate results: " .. tostring(step_id))
     end
+    local gate_ids = {}
+    for _, gate in ipairs(M.step_gates(step_id)) do
+        gate_ids[#gate_ids + 1] = gate.id
+    end
     with_transaction(function()
         db:eval("DELETE FROM pipeline_gates WHERE step_id = ?", step_id)
         db:eval("DELETE FROM pipeline_steps WHERE id = ?", step_id)
@@ -1396,6 +1447,9 @@ function M.delete_step(step_id)
             payload = { pipeline_id = step.pipeline_id, step_id = step_id },
         })
     end)
+    for _, gate_id in ipairs(gate_ids) do
+        remove_entity("pipeline_gate", gate_id)
+    end
     remove_entity("pipeline_step", step_id)
     return step
 end
@@ -1442,12 +1496,26 @@ function M.delete_pipeline(pipeline_id)
     if usage and tonumber(usage.count or 0) > 0 then
         error("cannot delete pipeline with existing run history: " .. tostring(pipeline_id))
     end
+    local step_ids = {}
+    local gate_ids = {}
+    for _, step in ipairs(M.pipeline_steps(pipeline_id)) do
+        step_ids[#step_ids + 1] = step.id
+        for _, gate in ipairs(M.step_gates(step.id)) do
+            gate_ids[#gate_ids + 1] = gate.id
+        end
+    end
     with_transaction(function()
         db:eval("DELETE FROM pipeline_gates WHERE step_id IN (SELECT id FROM pipeline_steps WHERE pipeline_id = ?)", pipeline_id)
         db:eval("DELETE FROM pipeline_steps WHERE pipeline_id = ?", pipeline_id)
         db:eval("DELETE FROM pipelines WHERE id = ?", pipeline_id)
         M.append_event("pipeline.deleted", { payload = { pipeline_id = pipeline_id } })
     end)
+    for _, gate_id in ipairs(gate_ids) do
+        remove_entity("pipeline_gate", gate_id)
+    end
+    for _, step_id in ipairs(step_ids) do
+        remove_entity("pipeline_step", step_id)
+    end
     remove_entity("pipeline", pipeline_id)
     return pipeline
 end
@@ -1578,6 +1646,7 @@ end
 function M.ticket_session_uuids(ticket_id)
     local seen = {}
     local uuids = {}
+    local removed_manual_sessions = removed_manual_session_set(ticket_id)
     for _, step in ipairs(M.ticket_run_steps(ticket_id)) do
         if step.agent_session_uuid and step.agent_session_uuid ~= "" and not seen[step.agent_session_uuid] then
             seen[step.agent_session_uuid] = true
@@ -1585,9 +1654,15 @@ function M.ticket_session_uuids(ticket_id)
         end
     end
     for _, event in ipairs(M.ticket_events(ticket_id, nil, 100)) do
-        if event.kind == "ticket.merge_requested" or event.kind == "ticket.merge_agent_linked" or event.kind == "question.agent_linked" then
+        if event.kind == "ticket.merge_requested"
+            or event.kind == "ticket.merge_agent_linked"
+            or event.kind == "ticket.manual_session_linked"
+            or event.kind == "question.agent_linked" then
             local payload = util.decode(event.payload, {})
             local uuid = payload.session_uuid
+            if event.kind == "ticket.manual_session_linked" and removed_manual_sessions[uuid] then
+                uuid = nil
+            end
             if uuid and uuid ~= "" and not seen[uuid] then
                 seen[uuid] = true
                 table.insert(uuids, uuid)
@@ -1602,6 +1677,7 @@ function M.ticket_session_uuids_by_ticket(ticket_ids)
     local by_ticket = {}
     local seen = {}
     local all_uuids = {}
+    local removed_by_ticket = {}
 
     local function add(ticket_id, uuid)
         if util.is_blank(ticket_id) or util.is_blank(uuid) then
@@ -1629,11 +1705,24 @@ function M.ticket_session_uuids_by_ticket(ticket_ids)
     for _, event in ipairs(rows([[SELECT ticket_id, payload
                                   FROM events
                                   WHERE ticket_id IS NOT NULL
+                                    AND kind = 'ticket.manual_session_removed']] .. event_filter, event_params)) do
+        local payload = util.decode(event.payload, {})
+        if not util.is_blank(event.ticket_id) and not util.is_blank(payload.session_uuid) then
+            removed_by_ticket[event.ticket_id] = removed_by_ticket[event.ticket_id] or {}
+            removed_by_ticket[event.ticket_id][payload.session_uuid] = true
+        end
+    end
+    for _, event in ipairs(rows([[SELECT ticket_id, payload
+                                  FROM events
+                                  WHERE ticket_id IS NOT NULL
                                     AND kind IN ('ticket.merge_requested',
                                                  'ticket.merge_agent_linked',
+                                                 'ticket.manual_session_linked',
                                                  'question.agent_linked')]] .. event_filter, event_params)) do
         local payload = util.decode(event.payload, {})
-        add(event.ticket_id, payload.session_uuid)
+        if not (removed_by_ticket[event.ticket_id] and removed_by_ticket[event.ticket_id][payload.session_uuid]) then
+            add(event.ticket_id, payload.session_uuid)
+        end
     end
 
     return by_ticket, all_uuids
@@ -1654,6 +1743,7 @@ function M.ticket_session_links_for_uuids(session_uuids)
     local uuid_filter, params = id_filter("rs.agent_session_uuid", session_uuids)
     local links = {}
     local seen = {}
+    local removed_by_ticket = {}
 
     local function add(uuid, ticket)
         if util.is_blank(uuid) or not ticket or util.is_blank(ticket.id) then
@@ -1666,6 +1756,17 @@ function M.ticket_session_links_for_uuids(session_uuids)
         seen[uuid][ticket.id] = true
         links[uuid] = links[uuid] or {}
         table.insert(links[uuid], ticket)
+    end
+
+    for _, event in ipairs(rows([[SELECT ticket_id, payload
+                                  FROM events
+                                  WHERE ticket_id IS NOT NULL
+                                    AND kind = 'ticket.manual_session_removed']])) do
+        local payload = util.decode(event.payload, {})
+        if wanted[payload.session_uuid] then
+            removed_by_ticket[event.ticket_id] = removed_by_ticket[event.ticket_id] or {}
+            removed_by_ticket[event.ticket_id][payload.session_uuid] = true
+        end
     end
 
     for _, row in ipairs(rows([[SELECT rs.agent_session_uuid, t.*
@@ -1686,11 +1787,12 @@ function M.ticket_session_links_for_uuids(session_uuids)
                                   WHERE e.ticket_id IS NOT NULL
                                     AND e.kind IN ('ticket.merge_requested',
                                                    'ticket.merge_agent_linked',
+                                                   'ticket.manual_session_linked',
                                                    'question.agent_linked')
                                   ORDER BY t.updated_at DESC, t.created_at DESC]])) do
         local payload = util.decode(event.payload, {})
         local uuid = payload.session_uuid
-        if wanted[uuid] then
+        if wanted[uuid] and not (removed_by_ticket[event.ticket_id] and removed_by_ticket[event.ticket_id][uuid]) then
             event.payload = nil
             add(uuid, event)
         end

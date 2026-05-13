@@ -15,14 +15,74 @@ local mcp_proxy = require("mcp_proxy")
 local notifications = require("notifications")
 local event_routing = require("event_routing")
 
-local repo = hub.detect_repo()
+local function normalize_repo(repo)
+    if type(repo) ~= "string" then
+        return nil
+    end
+    repo = repo:gsub("^%s+", ""):gsub("%s+$", "")
+    repo = repo:gsub("^git@github%.com:", "")
+    repo = repo:gsub("^https://github%.com/", "")
+    repo = repo:gsub("^http://github%.com/", "")
+    repo = repo:gsub("%.git$", "")
+    if repo:match("^[%w_.-]+/[%w_.-]+$") then
+        return repo
+    end
+    return nil
+end
+
+local function add_repo(out, seen, repo)
+    repo = normalize_repo(repo)
+    if not repo or seen[repo] then
+        return
+    end
+    seen[repo] = true
+    out[#out + 1] = repo
+end
+
+local function detect_spawn_target_repos()
+    local out = {}
+    local seen = {}
+    local repo = hub.detect_repo()
+    add_repo(out, seen, repo)
+
+    local registry = rawget(_G, "spawn_targets")
+    if type(registry) ~= "table" or type(registry.list) ~= "function" then
+        return out
+    end
+
+    local ok, targets = pcall(registry.list)
+    if not ok or type(targets) ~= "table" then
+        return out
+    end
+
+    for _, target in ipairs(targets) do
+        if type(target) == "table" and target.enabled ~= false then
+            add_repo(out, seen, target.repo or target.target_repo)
+            if type(target.path) == "string" and target.path ~= "" then
+                local inspected = nil
+                if type(registry.inspect) == "function" then
+                    local inspect_ok, result = pcall(registry.inspect, target.path)
+                    if inspect_ok and type(result) == "table" then
+                        inspected = result
+                    end
+                end
+                add_repo(out, seen, inspected and inspected.repo_name)
+                add_repo(out, seen, hub.detect_repo(target.path))
+            end
+        end
+    end
+
+    return out
+end
+
+local repos = detect_spawn_target_repos()
 
 mcp_proxy.start()
 notifications.register()
 
-if repo then
-    event_routing.start(repo)
-    log.info(string.format("GitHub plugin loaded for %s", repo))
+if #repos > 0 then
+    event_routing.start(repos)
+    log.info(string.format("GitHub plugin loaded for %s", table.concat(repos, ", ")))
 else
     log.info("GitHub plugin loaded without repo event routing")
 end

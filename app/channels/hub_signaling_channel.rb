@@ -39,7 +39,7 @@ class HubSignalingChannel < ApplicationCable::Channel
     # Paired browsers connect signaling with their long-term identity key.
     # Ask the CLI for a fresh signed bundle right away so the first offer can
     # use a new session without an extra browser-request round trip.
-    unless @browser_identity.start_with?("anon:")
+    if @hub.active? && !@browser_identity.start_with?("anon:")
       ActionCable.server.broadcast(
         "hub_command:#{@hub.id}",
         { type: "bundle_request", browser_identity: @browser_identity }

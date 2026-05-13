@@ -20,6 +20,28 @@ module Integrations
 
           Rails.logger.info "Processing closed PR #{repo_full_name}##{pr_number}"
 
+          if merged?
+            create_pull_request_lifecycle_message(
+              repo: repo_full_name,
+              pr_number: pr_number,
+              payload: {
+                action: "closed",
+                repo: repo_full_name,
+                repository_full_name: repo_full_name,
+                pr_number: pr_number,
+                pull_request_number: pr_number,
+                pr_url: pr_url,
+                html_url: pr_url,
+                head_branch: payload.dig("pull_request", "head", "ref"),
+                base_branch: payload.dig("pull_request", "base", "ref"),
+                merge_commit: merge_commit_sha,
+                merge_commit_sha: merge_commit_sha,
+                merged: true,
+                merged_at: merged_at
+              }
+            )
+          end
+
           create_cleanup_message(
             repo: repo_full_name,
             number: pr_number,
@@ -70,6 +92,18 @@ module Integrations
 
         def pr_url
           payload.dig("pull_request", "html_url")
+        end
+
+        def merged?
+          payload.dig("pull_request", "merged") == true
+        end
+
+        def merged_at
+          payload.dig("pull_request", "merged_at")
+        end
+
+        def merge_commit_sha
+          payload.dig("pull_request", "merge_commit_sha")
         end
       end
     end

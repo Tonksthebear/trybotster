@@ -98,6 +98,16 @@ local function set_connector_meta(record, key, value)
     return ok
 end
 
+local function session_meta(subject, key)
+    if type(subject) ~= "table" then return nil end
+    if type(subject.get_meta) == "function" then
+        local ok, value = pcall(function() return subject:get_meta(key) end)
+        if ok then return value end
+    end
+    local metadata = subject.metadata
+    return type(metadata) == "table" and metadata[key] or nil
+end
+
 local function normalize_terminal_text(text)
     if type(text) ~= "string" or text == "" then
         return ""
@@ -215,6 +225,20 @@ local function mark_preview_running(connector, parent, url, hostname)
     return true
 end
 
+local function parent_allows_readiness_result(parent, connector)
+    local hosted = preview_state_for(parent)
+    local current_uuid = hosted.connector_session_uuid
+    if current_uuid == connector.session_uuid then
+        return true
+    end
+    if current_uuid == nil and hosted.status == nil then
+        return true
+    end
+    return false
+end
+
+local reconcile_connector_session
+
 local function preview_readiness_still_current(connector_uuid, parent_uuid, url, wait_id)
     local connector = connector_uuid and connector_records[connector_uuid] or nil
     local parent = connector and connector.parent or (parent_uuid and parents_by_uuid[parent_uuid]) or nil
@@ -222,8 +246,7 @@ local function preview_readiness_still_current(connector_uuid, parent_uuid, url,
         return nil, nil, false
     end
 
-    local hosted = preview_state_for(parent)
-    local current = hosted.connector_session_uuid == connector.session_uuid
+    local current = parent_allows_readiness_result(parent, connector)
         and connector_meta(connector, "preview_pending_url") == url
         and readiness_wait_ids[connector.session_uuid] == wait_id
     return connector, parent, current
@@ -645,6 +668,13 @@ function M.handle_agent_created(info)
 
     local hosted = preview_state_for(parent)
     if hosted.prepare_request_id ~= metadata.request_id then
+        if hosted.status == nil or hosted.connector_session_uuid == session_uuid then
+            return reconcile_connector_session({
+                session_uuid = session_uuid,
+                metadata = metadata,
+                get_meta = function(self, key) return self.metadata and self.metadata[key] end,
+            }, parent)
+        end
         return false
     end
 
@@ -768,6 +798,49 @@ function M.handle_session_closing(session)
     end
 end
 
+reconcile_connector_session = function(session, parent)
+    if not session or not parent then
+        return false
+    end
+
+    cache_parent(parent)
+    local hosted = preview_state_for(parent)
+    if hosted.status == "error" or hosted.status == "inactive" then
+        close_connector(session)
+        return true
+    end
+    if type(hosted.connector_session_uuid) == "string"
+        and hosted.connector_session_uuid ~= session.session_uuid then
+        close_connector(session)
+        return true
+    end
+
+    local connector = cache_connector(session.session_uuid, session.metadata, parent)
+    local url = session_meta(session, "preview_url")
+    local hostname = session_meta(session, "preview_hostname")
+    if url and hostname then
+        return mark_preview_running(connector, parent, url, hostname)
+    end
+
+    local pending_url = session_meta(session, "preview_pending_url")
+    if pending_url and hostname then
+        return begin_preview_readiness(connector, parent, pending_url, hostname)
+    end
+
+    connector_output_buffers[session.session_uuid] =
+        connector_output_buffers[session.session_uuid] or ""
+    update_parent_preview(parent, {
+        status = "starting",
+        url = false,
+        error = false,
+        install_url = false,
+        connector_session_uuid = session.session_uuid,
+        prepare_request_id = false,
+    })
+    schedule_url_discovery_timeout(connector, parent)
+    return true
+end
+
 function M.reconcile()
     for _, session in ipairs(Session.list()) do
         if M.is_connector(session) then
@@ -776,35 +849,7 @@ function M.reconcile()
             if not parent then
                 close_connector(session)
             else
-                cache_parent(parent)
-                local hosted = preview_state_for(parent)
-                if hosted.status == "error" or hosted.status == "inactive" then
-                    close_connector(session)
-                elseif type(hosted.connector_session_uuid) == "string"
-                    and hosted.connector_session_uuid ~= session.session_uuid then
-                    close_connector(session)
-                else
-                    local connector = cache_connector(session.session_uuid, session.metadata, parent)
-                    local url = session:get_meta("preview_url")
-                    local hostname = session:get_meta("preview_hostname")
-                    if url and hostname then
-                        mark_preview_running(connector, parent, url, hostname)
-                    elseif session:get_meta("preview_pending_url") and hostname then
-                        begin_preview_readiness(connector, parent, session:get_meta("preview_pending_url"), hostname)
-                    else
-                        connector_output_buffers[session.session_uuid] =
-                            connector_output_buffers[session.session_uuid] or ""
-                        update_parent_preview(parent, {
-                            status = "starting",
-                            url = false,
-                            error = false,
-                            install_url = false,
-                            connector_session_uuid = session.session_uuid,
-                            prepare_request_id = false,
-                        })
-                        schedule_url_discovery_timeout(connector, parent)
-                    end
-                end
+                reconcile_connector_session(session, parent)
             end
         end
     end

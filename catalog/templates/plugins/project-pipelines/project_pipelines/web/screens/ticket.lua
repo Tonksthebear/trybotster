@@ -123,8 +123,19 @@ end
 local function session_rows(ticket_id, ctx, overview)
     local children = {}
     local seen = {}
+    local removed_manual_sessions = {}
 
-    local function add_session(uuid, label, status)
+    for _, event in ipairs(overview and overview.events or repo.ticket_events(ticket_id, nil, 100)) do
+        if event.kind == "ticket.manual_session_removed" then
+            local payload = util.decode(event.payload, {})
+            if not util.is_blank(payload.session_uuid) then
+                removed_manual_sessions[payload.session_uuid] = true
+            end
+        end
+    end
+
+    local function add_session(uuid, label, status, opts)
+        opts = opts or {}
         if uuid and uuid ~= "" and not seen[uuid] then
             seen[uuid] = true
             local info = view.session_info(uuid)
@@ -142,9 +153,12 @@ local function session_rows(ticket_id, ctx, overview)
             end
             local panel_children = {
                 view.row(header),
-                ui.text{ text = uuid, size = "xs", tone = "muted" },
             }
             if alive then
+                table.insert(panel_children, ui.session_row{
+                    session_uuid = uuid,
+                    density = "panel",
+                })
                 table.insert(panel_children, ui.button{
                     id = "ticket-" .. ticket_id .. "-terminal-" .. uuid,
                     label = "Open terminal",
@@ -156,7 +170,21 @@ local function session_rows(ticket_id, ctx, overview)
                     }),
                 })
             else
+                table.insert(panel_children, ui.text{ text = uuid, size = "xs", tone = "muted" })
                 table.insert(panel_children, ui.text{ text = "Terminal session is closed.", size = "xs", tone = "muted" })
+            end
+            if opts.manual == true then
+                table.insert(panel_children, ui.button{
+                    id = "ticket-" .. ticket_id .. "-delete-manual-session-" .. uuid,
+                    label = alive and "Close session" or "Remove session",
+                    icon = "trash",
+                    variant = "outline",
+                    tone = "danger",
+                    action = ui.action("project_pipelines.delete_manual_ticket_session", {
+                        ticket_id = ticket_id,
+                        session_uuid = uuid,
+                    }),
+                })
             end
             table.insert(children, view.panel{
                 ui.stack{ direction = "vertical", gap = "2", children = panel_children },
@@ -171,6 +199,13 @@ local function session_rows(ticket_id, ctx, overview)
         if event.kind == "ticket.merge_requested" or event.kind == "ticket.merge_agent_linked" then
             local payload = util.decode(event.payload, {})
             add_session(payload.session_uuid, "Merge agent", "merge")
+        elseif event.kind == "ticket.manual_session_linked" then
+            local payload = util.decode(event.payload, {})
+            if not removed_manual_sessions[payload.session_uuid] then
+                local session_type = payload.session_type or (payload.role == "manual-accessory" and "accessory" or "agent")
+                local name = payload.agent_name or payload.accessory_name or session_type
+                add_session(payload.session_uuid, "Manual " .. session_type .. " - " .. name, "manual", { manual = true })
+            end
         elseif event.kind == "question.agent_linked" then
             local payload = util.decode(event.payload, {})
             add_session(payload.session_uuid, "Question advisor", "question")

@@ -57,6 +57,7 @@
 // Rust guideline compliant 2026-02
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
@@ -85,6 +86,9 @@ pub type ActionCableCallbackRegistry = Arc<Mutex<HashMap<String, mlua::RegistryK
 pub fn new_callback_registry() -> ActionCableCallbackRegistry {
     Arc::new(Mutex::new(HashMap::new()))
 }
+
+static ACTION_CABLE_CONNECTION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
+static ACTION_CABLE_CHANNEL_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // =============================================================================
 // Request types (Lua -> Hub via HubEvent channel)
@@ -505,16 +509,11 @@ pub(crate) fn register_action_cable(
         .create_table()
         .map_err(|e| anyhow!("Failed to create action_cable table: {e}"))?;
 
-    // Shared ID counters for connection and channel IDs
-    let conn_counter: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
-    let ch_counter: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
-
     // action_cable.connect(opts?) -> connection_id
     //
     // Options table:
     //   crypto: boolean (default false) - enable auto-decryption of signal envelopes
     let tx = Arc::clone(&hub_event_tx);
-    let connect_counter = Arc::clone(&conn_counter);
     let connect_fn = lua
         .create_function(move |_, opts: Option<Table>| {
             let crypto = opts
@@ -522,14 +521,10 @@ pub(crate) fn register_action_cable(
                 .and_then(|t| t.get::<bool>("crypto").ok())
                 .unwrap_or(false);
 
-            let connection_id = {
-                let mut counter = connect_counter
-                    .lock()
-                    .expect("ActionCable connection counter mutex poisoned");
-                let id = format!("ac_conn_{counter}");
-                *counter += 1;
-                id
-            };
+            let connection_id = format!(
+                "ac_conn_{}",
+                ACTION_CABLE_CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+            );
 
             send_ac_event(
                 &tx,
@@ -553,7 +548,6 @@ pub(crate) fn register_action_cable(
     // and sends a Subscribe request (without the callback) via HubEvent channel.
     // This matches the pattern used by HTTP, Timer, WebSocket, and Watch registries.
     let tx = Arc::clone(&hub_event_tx);
-    let subscribe_counter = Arc::clone(&ch_counter);
     let cb_registry = Arc::clone(&callback_registry);
     let subscribe_fn = lua
         .create_function(
@@ -576,14 +570,10 @@ pub(crate) fn register_action_cable(
                     ))
                 })?;
 
-                let channel_id = {
-                    let mut counter = subscribe_counter
-                        .lock()
-                        .expect("ActionCable channel counter mutex poisoned");
-                    let id = format!("ac_ch_{counter}");
-                    *counter += 1;
-                    id
-                };
+                let channel_id = format!(
+                    "ac_ch_{}",
+                    ACTION_CABLE_CHANNEL_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
+                );
 
                 // Store callback in registry (Lua-thread-pinned).
                 {
@@ -884,8 +874,60 @@ mod tests {
         let id1: String = lua.load(r#"return action_cable.connect()"#).eval().unwrap();
         let id2: String = lua.load(r#"return action_cable.connect()"#).eval().unwrap();
 
-        assert_eq!(id1, "ac_conn_0");
-        assert_eq!(id2, "ac_conn_1");
+        assert_ne!(id1, id2);
+        assert!(id1.starts_with("ac_conn_"));
+        assert!(id2.starts_with("ac_conn_"));
+    }
+
+    #[test]
+    fn test_ids_are_unique_across_lua_runtimes() {
+        let (tx, _rx) = setup_with_channel();
+
+        let lua_a = Lua::new();
+        register_action_cable(&lua_a, Arc::clone(&tx), new_callback_registry())
+            .expect("Should register action_cable primitives");
+
+        let lua_b = Lua::new();
+        register_action_cable(&lua_b, tx, new_callback_registry())
+            .expect("Should register action_cable primitives");
+
+        let conn_a: String = lua_a
+            .load(r#"return action_cable.connect()"#)
+            .eval()
+            .unwrap();
+        let conn_b: String = lua_b
+            .load(r#"return action_cable.connect()"#)
+            .eval()
+            .unwrap();
+        let ch_a: String = lua_a
+            .load(
+                r#"
+                return action_cable.subscribe(
+                    "conn-a",
+                    "HubCommandChannel",
+                    { hub_id = "test-hub" },
+                    function(msg) end
+                )
+                "#,
+            )
+            .eval()
+            .unwrap();
+        let ch_b: String = lua_b
+            .load(
+                r#"
+                return action_cable.subscribe(
+                    "conn-b",
+                    "Github::EventsChannel",
+                    { repo = "owner/repo" },
+                    function(msg) end
+                )
+                "#,
+            )
+            .eval()
+            .unwrap();
+
+        assert_ne!(conn_a, conn_b);
+        assert_ne!(ch_a, ch_b);
     }
 
     #[test]

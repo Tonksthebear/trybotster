@@ -167,8 +167,6 @@ function M.register()
             { path = "/new-project", render = screen_new.project },
             { path = "/projects/:project_id", render = screen_project.render },
             { path = "/projects/:project_id/new-ticket", render = screen_new.project_ticket },
-            { path = "/tickets/:ticket_id/spawn", render = screen_ticket.render },
-            { path = "/tickets/:ticket_id/spawn/:session_type", render = screen_ticket.render },
             { path = "/tickets/:ticket_id", render = screen_ticket.render },
             { path = "/tickets/:ticket_id/sessions/:session_uuid", layout = "fullscreen", render = screen_ticket.session },
             { path = "/pipelines", render = screen_pipelines.index },

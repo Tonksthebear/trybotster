@@ -159,26 +159,54 @@ local function handle_message(default_repo, message, channel_id)
     action_cable.perform(channel_id, "ack", { id = message.id })
 end
 
-function M.start(repo)
+local function normalize_repos(repos)
+    if type(repos) == "string" then
+        repos = { repos }
+    end
+    local out = {}
+    local seen = {}
+    for _, repo in ipairs(repos or {}) do
+        if type(repo) == "string" and repo ~= "" and not seen[repo] then
+            seen[repo] = true
+            out[#out + 1] = repo
+        end
+    end
+    return out
+end
+
+function M.start(repos)
     M.stop()
 
+    local normalized_repos = normalize_repos(repos)
+    if #normalized_repos == 0 then
+        return
+    end
+
     routing_state.conn = action_cable.connect()
-    routing_state.channel = action_cable.subscribe(
-        routing_state.conn,
-        "Github::EventsChannel",
-        { repo = repo },
-        function(message, channel_id)
-            handle_message(repo, message, channel_id)
-        end
-    )
+    routing_state.routes = {}
+    for _, repo in ipairs(normalized_repos) do
+        local channel = action_cable.subscribe(
+            routing_state.conn,
+            "Github::EventsChannel",
+            { repo = repo },
+            function(message, channel_id)
+                handle_message(repo, message, channel_id)
+            end
+        )
+        routing_state.routes[#routing_state.routes + 1] = {
+            repo = repo,
+            channel = channel,
+        }
+    end
 end
 
 function M.stop()
     if routing_state.conn then
         action_cable.close(routing_state.conn)
         routing_state.conn = nil
-        routing_state.channel = nil
     end
+    routing_state.routes = nil
+    routing_state.channel = nil
 end
 
 return M

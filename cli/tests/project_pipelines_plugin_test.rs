@@ -182,7 +182,7 @@ fn catalog_plugin_project_pipelines_can_spawn_ticket_session_from_engine() {
             package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
 
             local created_agent = nil
-            local appended = nil
+            local appended = {{}}
 
             package.loaded["project_pipelines.entities"] = {{
               register = function() end,
@@ -229,8 +229,13 @@ fn catalog_plugin_project_pipelines_can_spawn_ticket_session_from_engine() {
                 assert(ticket_id == "ticket-1")
                 return {{ "existing-session" }}
               end,
+              ticket_events = function(ticket_id, kind)
+                assert(ticket_id == "ticket-1")
+                assert(kind == "ticket.manual_session_linked")
+                return {{}}
+              end,
               append_event = function(kind, event)
-                appended = {{ kind = kind, event = event }}
+                table.insert(appended, {{ kind = kind, event = event }})
               end,
             }}
 
@@ -241,7 +246,10 @@ fn catalog_plugin_project_pipelines_can_spawn_ticket_session_from_engine() {
             assert(created_agent.issue_or_branch == "project-pipelines/ticket-1")
             assert(created_agent.metadata.owner_plugin == "project-pipelines")
             assert(created_agent.metadata.ticket_id == "ticket-1")
-            assert(appended.kind == "ticket.manual_agent_requested")
+            assert(appended[1].kind == "ticket.manual_agent_requested")
+            assert(appended[2].kind == "ticket.manual_session_linked")
+            assert(appended[2].event.ticket_id == "ticket-1")
+            assert(appended[2].event.payload.session_uuid == "session-1")
 
             return "ok"
             "#,
@@ -249,6 +257,146 @@ fn catalog_plugin_project_pipelines_can_spawn_ticket_session_from_engine() {
         ))
         .eval()
         .expect("Project Pipelines should expose a clean engine spawn path");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_links_async_manual_session_creation() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local appended = nil
+            package.loaded["project_pipelines.repo"] = {{
+              ticket_events = function(ticket_id, kind)
+                assert(ticket_id == "ticket-1")
+                assert(kind == "ticket.manual_session_linked")
+                return {{}}
+              end,
+              append_event = function(kind, event)
+                appended = {{ kind = kind, event = event }}
+              end,
+            }}
+            package.loaded["project_pipelines.entities"] = {{}}
+            package.loaded["project_pipelines.notification_policy"] = {{}}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{}}
+              end,
+            }}
+            package.loaded["lib.agent"] = {{
+              get = function()
+                return nil
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            engine.handle_agent_created({{
+              session_uuid = "sess-manual",
+              session_type = "accessory",
+              session_name = "rails-server",
+              request_id = "project-pipelines:ticket-1:manual:123",
+              metadata = {{
+                request_id = "project-pipelines:ticket-1:manual:123",
+                run_id = "run-1",
+                role = "manual-accessory",
+              }},
+            }})
+
+            assert(appended.kind == "ticket.manual_session_linked")
+            assert(appended.event.ticket_id == "ticket-1")
+            assert(appended.event.run_id == "run-1")
+            assert(appended.event.payload.session_uuid == "sess-manual")
+            assert(appended.event.payload.request_id == "project-pipelines:ticket-1:manual:123")
+            assert(appended.event.payload.session_type == "accessory")
+            assert(appended.event.payload.accessory_name == "rails-server")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("manual session creation should be linked back to the ticket");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_deletes_only_manual_ticket_sessions() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+    botster::lua::primitives::json::register(&lua).expect("register json");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local deleted = nil
+            local appended = nil
+            package.loaded["project_pipelines.repo"] = {{
+              get_ticket = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{ id = "ticket-1", title = "Ship" }}
+              end,
+              ticket_events = function(ticket_id, kind)
+                assert(ticket_id == "ticket-1")
+                if kind == "ticket.manual_session_linked" then
+                  return {{
+                    {{ kind = kind, payload = '{{"session_uuid":"sess-manual"}}' }},
+                  }}
+                end
+                if kind == "ticket.manual_session_removed" then
+                  return {{}}
+                end
+                error("unexpected event kind " .. tostring(kind))
+              end,
+              append_event = function(kind, event)
+                appended = {{ kind = kind, event = event }}
+              end,
+            }}
+            package.loaded["project_pipelines.entities"] = {{}}
+            package.loaded["project_pipelines.notification_policy"] = {{}}
+            package.loaded["lib.agent"] = {{
+              get = function(session_uuid)
+                assert(session_uuid == "sess-manual")
+                return {{ session_uuid = session_uuid }}
+              end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  delete_agent = function(_, session_uuid, delete_worktree)
+                    deleted = {{ session_uuid = session_uuid, delete_worktree = delete_worktree }}
+                    return "Delete requested"
+                  end,
+                }}
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            local result = engine.delete_manual_ticket_session({{ ticket_id = "ticket-1", session_uuid = "sess-manual" }}, {{}})
+
+            assert(result.removed == true)
+            assert(result.closed == true)
+            assert(deleted.session_uuid == "sess-manual")
+            assert(deleted.delete_worktree == false)
+            assert(appended.kind == "ticket.manual_session_removed")
+            assert(appended.event.ticket_id == "ticket-1")
+            assert(appended.event.payload.session_uuid == "sess-manual")
+            assert(appended.event.payload.closed == true)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("manual ticket sessions should be deletable without deleting the worktree");
 
     assert_eq!(result, "ok");
 }
@@ -338,6 +486,41 @@ fn catalog_plugin_project_pipelines_home_shows_linked_pr_records() {
         .expect("Project Pipelines home should show linked PR rows");
 
     assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_spawn_modal_uses_local_presentation_state() {
+    let root = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let ticket_screen =
+        std::fs::read_to_string(root.join("project_pipelines/web/screens/ticket.lua"))
+            .expect("read ticket screen");
+    let surface = std::fs::read_to_string(root.join("project_pipelines/web/surface.lua"))
+        .expect("read surface");
+    let actions = std::fs::read_to_string(root.join("project_pipelines/web/actions.lua"))
+        .expect("read actions");
+
+    assert!(ticket_screen.contains("ui.local_state(agent_dialog_key, false)"));
+    assert!(ticket_screen.contains("botster.presentation.set"));
+    assert!(ticket_screen.contains("botster.presentation.clear"));
+    assert!(ticket_screen.contains("project_pipelines.spawn_ticket_session"));
+    assert!(
+        !surface.contains("/tickets/:ticket_id/spawn"),
+        "spawn modal state should not be encoded as a plugin route"
+    );
+    assert!(
+        actions.contains("presentation = {") && actions.contains("-spawn-agent-open"),
+        "successful spawn should clear browser-local modal state"
+    );
+    assert!(
+        ticket_screen.contains("ui.session_row"),
+        "ticket-owned session rows should use the native session row so generic plugin session actions stay available"
+    );
+    let engine =
+        std::fs::read_to_string(root.join("project_pipelines/engine.lua")).expect("read engine");
+    assert!(
+        engine.contains("set_surface_subpath") && !engine.contains("broadcast_ui_tree_snapshots"),
+        "ticket session presentation changes may rerender the active surface but must not broadcast data-only tree snapshots"
+    );
 }
 
 #[test]
@@ -632,6 +815,36 @@ fn catalog_plugin_project_pipelines_mcp_mutators_return_without_bulk_snapshot_pu
         .expect("project pipelines MCP mutators should not publish bulk snapshots synchronously");
 
     assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_repo_publishes_targeted_entity_deltas() {
+    let root = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let repo = std::fs::read_to_string(root.join("project_pipelines/repo.lua"))
+        .expect("read project pipelines repo");
+
+    assert!(
+        !repo.contains("publish_entity_snapshot(\"ticket\")"),
+        "ticket mutations should publish targeted ticket entity upserts, not full ticket snapshots"
+    );
+    assert!(
+        repo.contains("local function publish_ticket_project_family"),
+        "dependency mutations should republish only the affected ticket family"
+    );
+    assert!(
+        repo.contains("publish_entity(\"pipeline_step\", M.get_step(step_id))"),
+        "pipeline creation should upsert created step entities after transitions are persisted"
+    );
+    assert!(
+        repo.contains("publish_entity(\"pipeline_gate\", decode_gate_row(M.get_gate(gate_id)))"),
+        "pipeline and step creation should upsert created gate entities"
+    );
+    assert!(
+        repo.contains("remove_entity(\"pipeline_gate\", gate_id)")
+            && repo.contains("remove_entity(\"pipeline_step\", step_id)")
+            && repo.contains("remove_entity(\"pipeline\", pipeline_id)"),
+        "pipeline deletion should remove child gate and step entities before the pipeline entity"
+    );
 }
 
 #[test]

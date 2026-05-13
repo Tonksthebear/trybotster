@@ -174,6 +174,22 @@ describe("HubRoute peer health probes", () => {
     expect(disconnectPeerCalls()).toHaveLength(0);
   });
 
+  it("does not replay an active subscription after a successful visibility probe", async () => {
+    mocks.bridge.sendCalls.length = 0;
+    mocks.bridge.send.mockClear();
+
+    document.dispatchEvent(new Event("visibilitychange"));
+    await flushPromises();
+    route.processMessage({ type: "dc_pong" });
+    await flushPromises();
+
+    expect(disconnectPeerCalls()).toHaveLength(0);
+    expect(
+      mocks.bridge.sendCalls.filter(([type]) => type === "subscribe"),
+    ).toHaveLength(0);
+    expect(route.subscriptionId).toBe("hub:hub-1");
+  });
+
   it("replays subscribe when an existing route sees a peer connected event", async () => {
     mocks.bridge.sendCalls.length = 0;
     mocks.bridge.send.mockClear();
