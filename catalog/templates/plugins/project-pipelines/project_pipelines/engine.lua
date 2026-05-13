@@ -111,9 +111,19 @@ function M.publish_entity_snapshots()
 end
 
 local function refresh_surfaces(ctx)
-    -- Data changes now flow through plugin-owned entity frames. Route/tree
-    -- snapshots remain structural and are sent only by the generic surface
-    -- subscription path, not by Project Pipelines mutators.
+    if ctx and ctx.client and type(ctx.client.set_surface_subpath) == "function" then
+        local subpath = "/"
+        if type(ctx.client.surface_subpaths) == "table" and type(ctx.client.surface_subpaths[SURFACE]) == "string" then
+            subpath = ctx.client.surface_subpaths[SURFACE]
+        end
+        pcall(ctx.client.set_surface_subpath, ctx.client, SURFACE, subpath, { rebroadcast = true })
+        return ctx
+    end
+
+    local ok_snapshot, TreeSnapshot = pcall(require, "lib.tree_snapshot")
+    if ok_snapshot and TreeSnapshot and type(TreeSnapshot.invalidate) == "function" then
+        pcall(TreeSnapshot.invalidate, SURFACE)
+    end
     return ctx
 end
 
@@ -645,6 +655,32 @@ function M.request_merge(params, context)
     return { ticket = ticket, run = run, merge_policy = merge_policy, agent = created, request_id = request_id }
 end
 
+local function link_manual_ticket_session(ticket_id, session_uuid, request_id, attrs)
+    if util.is_blank(ticket_id) or util.is_blank(session_uuid) or util.is_blank(request_id) then
+        return false
+    end
+    for _, event in ipairs(repo.ticket_events(ticket_id, "ticket.manual_session_linked", 25)) do
+        local payload = util.decode(event.payload, {})
+        if payload.session_uuid == session_uuid and payload.request_id == request_id then
+            return false
+        end
+    end
+    attrs = attrs or {}
+    repo.append_event("ticket.manual_session_linked", {
+        ticket_id = ticket_id,
+        run_id = attrs.run_id,
+        payload = {
+            session_uuid = session_uuid,
+            request_id = request_id,
+            session_type = attrs.session_type,
+            role = attrs.role,
+            agent_name = attrs.agent_name,
+            accessory_name = attrs.accessory_name,
+        },
+    })
+    return true
+end
+
 function M.spawn_ticket_session(params, context)
     params = params or {}
     local ticket = repo.get_ticket(util.assert_present(params.ticket_id, "ticket_id"))
@@ -687,6 +723,12 @@ function M.spawn_ticket_session(params, context)
             ticket_id = ticket.id,
             payload = { request_id = request_id, accessory_name = accessory_name, session_uuid = result and result.session_uuid },
         })
+        link_manual_ticket_session(ticket.id, result and result.session_uuid, request_id, {
+            run_id = latest_run and latest_run.id or nil,
+            session_type = "accessory",
+            role = "manual-accessory",
+            accessory_name = accessory_name,
+        })
     else
         local prompt = params.prompt
         if util.is_blank(prompt) then
@@ -722,10 +764,63 @@ function M.spawn_ticket_session(params, context)
             ticket_id = ticket.id,
             payload = { request_id = request_id, agent_name = params.agent_name or "codex", session_uuid = result and result.session_uuid },
         })
+        link_manual_ticket_session(ticket.id, result and result.session_uuid, request_id, {
+            run_id = latest_run and latest_run.id or nil,
+            session_type = "agent",
+            role = "manual-agent",
+            agent_name = params.agent_name or "codex",
+        })
     end
 
     refresh_surfaces(context)
     return { ticket = ticket, run = latest_run, session = result, request_id = request_id, session_type = session_type }
+end
+
+function M.delete_manual_ticket_session(params, context)
+    params = params or {}
+    local ticket_id = util.assert_present(params.ticket_id, "ticket_id")
+    local session_uuid = util.assert_present(params.session_uuid, "session_uuid")
+    local ticket = repo.get_ticket(ticket_id)
+    if not ticket then
+        error("ticket not found: " .. tostring(ticket_id))
+    end
+
+    local linked = false
+    for _, event in ipairs(repo.ticket_events(ticket_id, "ticket.manual_session_linked", 200)) do
+        local payload = util.decode(event.payload, {})
+        if payload.session_uuid == session_uuid then
+            linked = true
+            break
+        end
+    end
+    if not linked then
+        error("session is not a manual ticket session")
+    end
+
+    for _, event in ipairs(repo.ticket_events(ticket_id, "ticket.manual_session_removed", 200)) do
+        local payload = util.decode(event.payload, {})
+        if payload.session_uuid == session_uuid then
+            refresh_surfaces(context)
+            return { ticket = ticket, session_uuid = session_uuid, removed = true, already_removed = true }
+        end
+    end
+
+    local session = Agent.get(session_uuid)
+    if session then
+        Hub.get():delete_agent(session_uuid, false)
+    end
+
+    repo.append_event("ticket.manual_session_removed", {
+        ticket_id = ticket_id,
+        run_id = params.run_id,
+        payload = {
+            session_uuid = session_uuid,
+            reason = params.reason,
+            closed = session ~= nil,
+        },
+    })
+    refresh_surfaces(context)
+    return { ticket = ticket, session_uuid = session_uuid, removed = true, closed = session ~= nil }
 end
 
 function M.close_ticket(ticket_id, attrs)
@@ -1221,6 +1316,23 @@ function M.handle_agent_created(info)
                 payload = { session_uuid = session_uuid, request_id = request_id },
             })
             refresh_surfaces()
+        end
+        return
+    end
+
+    local manual_ticket_id = tostring(request_id):match("^" .. lua_pattern_escape(OWNER) .. ":(.-):manual:.*$")
+    if not util.is_blank(manual_ticket_id) then
+        local session_uuid = info.session_uuid or info.uuid or info.id
+        if not util.is_blank(session_uuid) then
+            if link_manual_ticket_session(manual_ticket_id, session_uuid, request_id, {
+                run_id = metadata.run_id,
+                session_type = info.session_type,
+                role = metadata.role,
+                agent_name = info.agent_name,
+                accessory_name = info.session_name,
+            }) then
+                refresh_surfaces()
+            end
         end
         return
     end

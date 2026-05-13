@@ -161,26 +161,34 @@ export default function TerminalView({ hubId, sessionUuid }) {
       sendFocusState()
     }
 
+    function scheduleConnectPty() {
+      if (state.connectPtyRequested || state.destroyed || !state.backendReady)
+        return
+      const size = state.measuredSize
+      if (!size || size.cols <= 1 || size.rows <= 1) return
+      if (state.connectPtyTimer) clearTimeout(state.connectPtyTimer)
+      state.connectPtyTimer = setTimeout(() => {
+        state.connectPtyTimer = null
+        if (state.connectPtyRequested || state.destroyed || !state.backendReady)
+          return
+        const nextSize = state.measuredSize
+        if (!nextSize || nextSize.cols <= 1 || nextSize.rows <= 1) return
+        state.connectPtyRequested = true
+        state.transport?.resize(nextSize.cols, nextSize.rows)
+        state.restty?.updateSize(true)
+        state.restty?.connectPty()
+      }, CONNECT_DEBOUNCE_MS)
+    }
+
     function onTermSize(cols, rows) {
-      if (state.destroyed || !state.backendReady)
+      if (state.destroyed)
         return
       state.measuredSize = { cols, rows }
       if (state.connectPtyRequested) {
         if (cols > 1 && rows > 1) state.transport?.resize(cols, rows)
         return
       }
-      if (state.connectPtyTimer) clearTimeout(state.connectPtyTimer)
-      state.connectPtyTimer = setTimeout(() => {
-        state.connectPtyTimer = null
-        if (state.connectPtyRequested || state.destroyed || !state.backendReady)
-          return
-        const size = state.measuredSize
-        if (!size || size.cols <= 1 || size.rows <= 1) return
-        state.connectPtyRequested = true
-        state.transport?.resize(size.cols, size.rows)
-        state.restty?.updateSize(true)
-        state.restty?.connectPty()
-      }, CONNECT_DEBOUNCE_MS)
+      scheduleConnectPty()
     }
 
     async function sendFile(blob) {
@@ -589,6 +597,8 @@ export default function TerminalView({ hubId, sessionUuid }) {
             onBackend: () => {
               state.backendReady = true
               if (!isMobile) state.restty?.focus()
+              state.restty?.updateSize(true)
+              scheduleConnectPty()
             },
             onTermSize: (cols, rows) => onTermSize(cols, rows),
           },

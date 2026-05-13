@@ -46,6 +46,7 @@ class HubsControllerTest < ActionDispatch::IntegrationTest
     hub = Hub.find(json["id"])
     assert_equal identifier, hub.identifier
     assert_equal users(:primary_user), hub.user
+    refute hub.alive?, "Hub should not be advertised online until HubCommandChannel subscribes"
   end
 
   test "POST /hubs ignores name param from CLI registration" do

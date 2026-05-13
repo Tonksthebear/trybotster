@@ -663,6 +663,45 @@ module Github
       assert_equal true, message.payload["is_pr"]
     end
 
+    test "merged pull_request creates lifecycle message for plugin event routing" do
+      payload = {
+        action: "closed",
+        pull_request: {
+          number: 71,
+          title: "Merged PR",
+          body: "Done",
+          html_url: "https://github.com/test/repo/pull/71",
+          merged: true,
+          merged_at: "2026-05-12T22:46:52Z",
+          merge_commit_sha: "abc123",
+          head: { ref: "feature-branch" },
+          base: { ref: "main" },
+          user: { login: "merger" }
+        },
+        repository: { full_name: "test/repo" }
+      }
+
+      body, signature = sign_webhook_payload(payload)
+
+      assert_difference "Integrations::Github::Message.count", 2 do
+        post "/github/webhooks",
+          params: body,
+          headers: {
+            "Content-Type" => "application/json",
+            "X-GitHub-Event" => "pull_request",
+            "X-Hub-Signature-256" => signature
+          }
+      end
+
+      lifecycle = Integrations::Github::Message.where(event_type: "pull_request").last
+      assert_equal 71, lifecycle.issue_number
+      assert_equal "test/repo", lifecycle.repo
+      assert_equal true, lifecycle.payload["merged"]
+      assert_equal "abc123", lifecycle.payload["merge_commit"]
+      assert_equal "feature-branch", lifecycle.payload["head_branch"]
+      assert_equal "main", lifecycle.payload["base_branch"]
+    end
+
     test "pull_request opened with @trybotster mention creates message" do
       payload = {
         action: "opened",

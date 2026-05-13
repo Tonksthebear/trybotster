@@ -513,13 +513,16 @@ export class HubRoute {
         const healthy = await this.#probeExistingPeer();
         if (!healthy) {
           await this.#rebuildPeer("probe_failed");
+        } else {
+          this.#peerHealthDirty = false;
+          this.#setState(ConnectionState.CONNECTED);
+          return;
         }
       }
 
       if (this.subscriptionId) {
-        const replaySubscription = this.#peerHealthDirty;
         this.#peerHealthDirty = false;
-        await this.#ensureSubscribed({ replay: replaySubscription });
+        await this.#ensureSubscribed();
         this.#setState(ConnectionState.CONNECTED);
         return;
       }

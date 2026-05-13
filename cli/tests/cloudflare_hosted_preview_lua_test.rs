@@ -621,6 +621,281 @@ fn catalog_plugin_cloudflare_readiness_failures_keep_preview_starting() {
 }
 
 #[test]
+fn catalog_plugin_cloudflare_reconcile_promotes_pending_connector_without_parent_state() {
+    let lua = new_lua();
+    let plugin_source = std::fs::read_to_string(plugin_path()).expect("read plugin");
+
+    let ok: bool = lua
+        .load(
+            r#"
+            local store = {}
+            package.loaded["hub.state"] = {
+              get = function(key, default)
+                if store[key] == nil then store[key] = default end
+                return store[key]
+              end,
+              set = function(key, value) store[key] = value end,
+            }
+
+            local sessions = {}
+            package.loaded["lib.entity_model"] = {
+              upsert_session_action = function(_action) end,
+              remove_session_action = function(_session_uuid, _action_id) end,
+            }
+            package.loaded["lib.target_context"] = {
+              from_session = function(_session) return {} end,
+              with_metadata = function(metadata, _context) return metadata or {} end,
+            }
+            package.loaded["lib.session"] = {
+              list = function()
+                local out = {}
+                for _, session in pairs(sessions) do out[#out + 1] = session end
+                return out
+              end,
+              get = function(uuid) return sessions[uuid] end,
+              all_info = function()
+                return {
+                  { session_uuid = "parent-reconcile", id = "parent-reconcile", session_type = "agent", port = 4567 },
+                }
+              end,
+            }
+            package.loaded["lib.hub"] = {
+              get = function()
+                return {
+                  update_session = function(_, uuid, fields)
+                    local session = sessions[uuid]
+                    if session and fields.metadata then
+                      session.metadata = fields.metadata
+                    end
+                    if session and fields.plugin_state then
+                      session.plugin_state = fields.plugin_state
+                    end
+                    _G.last_update_session = { uuid = uuid, fields = fields }
+                  end,
+                  prepare_plugin_command = function(_, _opts) error("no prepare expected") end,
+                }
+              end,
+            }
+
+            hooks = { on = function(_name, _key, _fn) end }
+            events = {
+              on = function(name, fn)
+                _G.event_handlers = _G.event_handlers or {}
+                _G.event_handlers[name] = fn
+                return name
+              end,
+              off = function(_sub) end,
+            }
+            json = {
+              decode = function(raw)
+                if raw:match('"Status"%s*:%s*0') then
+                  return { Status = 0, Answer = { { type = 1, data = "104.21.1.1" } } }
+                end
+                return {}
+              end,
+            }
+            http = {
+              request = function(opts, cb)
+                _G.last_probe = opts
+                _G.probe_callback = cb
+                return "request-1", nil
+              end,
+            }
+            timer = { after = function(seconds, cb) _G.last_timer = { seconds = seconds, cb = cb }; return "timer" end }
+            hub = {}
+
+            local parent = {
+              session_uuid = "parent-reconcile",
+              _port = 4567,
+              metadata = {},
+              update = function(self, fields)
+                self.plugin_state = fields.plugin_state
+                _G.last_parent_update = fields
+              end,
+            }
+            sessions[parent.session_uuid] = parent
+            sessions["conn-reconcile"] = {
+              session_uuid = "conn-reconcile",
+              status = "active",
+              metadata = {
+                system_session = true,
+                system_kind = "cloudflare_hosted_preview_connector",
+                owner_plugin = "cloudflare-hosted-preview",
+                target_session_uuid = "parent-reconcile",
+                preview_pending_url = "https://ready.trycloudflare.com",
+                preview_hostname = "ready.trycloudflare.com",
+              },
+              get_meta = function(self, key) return self.metadata[key] end,
+              set_meta = function(self, key, value) self.metadata[key] = value end,
+              close = function(self) self.status = "closed" end,
+            }
+            _G.test_sessions = sessions
+        "#,
+        )
+        .exec()
+        .map(|()| {
+            lua.load(&plugin_source)
+                .set_name("@cloudflare-hosted-preview/init.lua")
+                .exec()
+                .expect("load plugin");
+            lua.load(
+                r#"
+                local preview = test_sessions["parent-reconcile"].plugin_state.cloudflare_hosted_preview
+                assert(preview.status == "starting", preview.status)
+                assert(preview.connector_session_uuid == "conn-reconcile", tostring(preview.connector_session_uuid))
+                assert(last_probe.url == "https://cloudflare-dns.com/dns-query?name=ready.trycloudflare.com&type=A")
+
+                test_sessions["parent-reconcile"].plugin_state = nil
+                probe_callback({ status = 200, body = '{"Status":0,"Answer":[{"type":1,"data":"104.21.1.1"}]}', headers = {} }, nil)
+
+                preview = test_sessions["parent-reconcile"].plugin_state.cloudflare_hosted_preview
+                assert(preview.status == "running", preview.status)
+                assert(preview.url == "https://ready.trycloudflare.com", tostring(preview.url))
+                assert(preview.connector_session_uuid == "conn-reconcile", tostring(preview.connector_session_uuid))
+                assert(test_sessions["conn-reconcile"].metadata.preview_url == "https://ready.trycloudflare.com")
+                assert(test_sessions["conn-reconcile"].metadata.preview_pending_url == false)
+                return true
+            "#,
+            )
+            .eval()
+            .expect("pending connector reconcile scenario should run")
+        })
+        .expect("install stubs");
+
+    assert!(ok);
+}
+
+#[test]
+fn catalog_plugin_cloudflare_recovered_connector_restores_parent_action_state() {
+    let lua = new_lua();
+    let plugin_source = std::fs::read_to_string(plugin_path()).expect("read plugin");
+
+    let ok: bool = lua
+        .load(
+            r#"
+            local store = {}
+            package.loaded["hub.state"] = {
+              get = function(key, default)
+                if store[key] == nil then store[key] = default end
+                return store[key]
+              end,
+              set = function(key, value) store[key] = value end,
+            }
+
+            local sessions = {}
+            local upserts = {}
+            package.loaded["lib.entity_model"] = {
+              upsert_session_action = function(action) upserts[#upserts + 1] = action end,
+              remove_session_action = function(_session_uuid, _action_id) end,
+            }
+            package.loaded["lib.target_context"] = {
+              from_session = function(_session) return {} end,
+              with_metadata = function(metadata, _context) return metadata or {} end,
+            }
+            package.loaded["lib.session"] = {
+              list = function() return {} end,
+              get = function(uuid) return sessions[uuid] end,
+              all_info = function()
+                return {
+                  { session_uuid = "parent-recovered", id = "parent-recovered", session_type = "agent", port = 4567 },
+                }
+              end,
+            }
+            package.loaded["lib.hub"] = {
+              get = function()
+                return {
+                  update_session = function(_, uuid, fields)
+                    local session = sessions[uuid]
+                    if session and fields.metadata then session.metadata = fields.metadata end
+                  end,
+                  prepare_plugin_command = function(_, _opts) error("no prepare expected") end,
+                }
+              end,
+            }
+
+            hooks = {
+              on = function(name, key, fn)
+                _G.hook_handlers = _G.hook_handlers or {}
+                _G.hook_handlers[name .. ":" .. key] = fn
+              end,
+            }
+            events = {
+              on = function(name, fn)
+                _G.event_handlers = _G.event_handlers or {}
+                _G.event_handlers[name] = fn
+                return name
+              end,
+              off = function(_sub) end,
+            }
+            http = { request = function() error("no readiness probe expected") end }
+            timer = { after = function() error("no timer expected") end }
+            hub = {}
+
+            local parent = {
+              session_uuid = "parent-recovered",
+              _port = 4567,
+              metadata = {},
+              update = function(self, fields)
+                self.plugin_state = fields.plugin_state
+                _G.last_parent_update = fields
+                require("lib.session_actions").publish_for_session(self)
+              end,
+            }
+            sessions[parent.session_uuid] = parent
+            local connector_metadata = {
+              system_session = true,
+              system_kind = "cloudflare_hosted_preview_connector",
+              owner_plugin = "cloudflare-hosted-preview",
+              request_id = "parent-recovered:1",
+              target_session_uuid = "parent-recovered",
+              preview_url = "https://recovered.trycloudflare.com",
+              preview_hostname = "recovered.trycloudflare.com",
+            }
+            sessions["conn-recovered"] = {
+              session_uuid = "conn-recovered",
+              metadata = connector_metadata,
+              get_meta = function(self, key) return self.metadata[key] end,
+              set_meta = function(self, key, value) self.metadata[key] = value end,
+              close = function(self) self.status = "closed" end,
+            }
+            _G.recovered_info = {
+              session_uuid = "conn-recovered",
+              metadata = connector_metadata,
+            }
+            _G.test_sessions = sessions
+            _G.test_upserts = upserts
+        "#,
+        )
+        .exec()
+        .map(|()| {
+            lua.load(&plugin_source)
+                .set_name("@cloudflare-hosted-preview/init.lua")
+                .exec()
+                .expect("load plugin");
+            lua.load(
+                r#"
+                hook_handlers["agent_created:cloudflare-hosted-preview.connector_created"](recovered_info)
+
+                local preview = test_sessions["parent-recovered"].plugin_state.cloudflare_hosted_preview
+                assert(preview.status == "running", preview.status)
+                assert(preview.url == "https://recovered.trycloudflare.com", tostring(preview.url))
+                assert(preview.connector_session_uuid == "conn-recovered", tostring(preview.connector_session_uuid))
+                assert(test_sessions["conn-recovered"].metadata.preview_url == "https://recovered.trycloudflare.com")
+                assert(test_sessions["conn-recovered"].metadata.preview_pending_url == false)
+                assert(test_upserts[#test_upserts].status == "running", tostring(test_upserts[#test_upserts].status))
+                assert(test_upserts[#test_upserts].url == "https://recovered.trycloudflare.com", tostring(test_upserts[#test_upserts].url))
+                return true
+            "#,
+            )
+            .eval()
+            .expect("recovered connector scenario should run")
+        })
+        .expect("install stubs");
+
+    assert!(ok);
+}
+
+#[test]
 fn catalog_plugin_cloudflare_closes_all_existing_connectors_before_retry() {
     let lua = new_lua();
     let plugin_source = std::fs::read_to_string(plugin_path()).expect("read plugin");

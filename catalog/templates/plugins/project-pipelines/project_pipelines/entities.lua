@@ -261,6 +261,7 @@ local function build_ticket_notification_counts(repo, view)
     local uuid_by_ticket = {}
     local seen_by_ticket = {}
     local all_uuids = {}
+    local removed_by_ticket = {}
 
     local function add(ticket_id, uuid)
         if not ticket_id or not uuid or uuid == "" then
@@ -288,14 +289,28 @@ local function build_ticket_notification_counts(repo, view)
         add(row.ticket_id, row.agent_session_uuid)
     end
 
+    for _, event in ipairs(rows([[SELECT ticket_id, payload
+                                  FROM events
+                                  WHERE ticket_id IS NOT NULL
+                                    AND kind = 'ticket.manual_session_removed']])) do
+        local payload = decode(event.payload, {})
+        if not util.is_blank(event.ticket_id) and not util.is_blank(payload.session_uuid) then
+            removed_by_ticket[event.ticket_id] = removed_by_ticket[event.ticket_id] or {}
+            removed_by_ticket[event.ticket_id][payload.session_uuid] = true
+        end
+    end
+
     for _, event in ipairs(rows([[SELECT ticket_id, kind, payload
                                   FROM events
                                   WHERE ticket_id IS NOT NULL
                                     AND kind IN ('ticket.merge_requested',
                                                  'ticket.merge_agent_linked',
+                                                 'ticket.manual_session_linked',
                                                  'question.agent_linked')]])) do
         local payload = decode(event.payload, {})
-        add(event.ticket_id, payload.session_uuid)
+        if not (removed_by_ticket[event.ticket_id] and removed_by_ticket[event.ticket_id][payload.session_uuid]) then
+            add(event.ticket_id, payload.session_uuid)
+        end
     end
 
     local Agent = nil

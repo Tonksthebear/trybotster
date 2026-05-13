@@ -38,6 +38,18 @@ local function refresh(ctx)
     engine.refresh_surfaces(ctx)
 end
 
+local function rerender_current_surface(ctx, fallback_subpath)
+    if not ctx or not ctx.client or type(ctx.client.set_surface_subpath) ~= "function" then
+        return
+    end
+    local surface = ctx.target_surface or "pipelines"
+    local subpath = fallback_subpath or "/"
+    if type(ctx.client.surface_subpaths) == "table" and type(ctx.client.surface_subpaths[surface]) == "string" then
+        subpath = ctx.client.surface_subpaths[surface]
+    end
+    pcall(ctx.client.set_surface_subpath, ctx.client, surface, subpath, { rebroadcast = true })
+end
+
 local function draft_key(ctx)
     return (ctx and ctx.sub_id) or "default"
 end
@@ -235,27 +247,6 @@ function M.register()
         return action.HANDLED
     end)
 
-    action.on("project_pipelines.open_ticket_session_modal", "project_pipelines.open_ticket_session_modal", function(envelope, ctx)
-        local payload = value_payload(envelope)
-        if payload.ticket_id then
-            local draft = current_draft(ctx)
-            local prefix = "ticket_session_" .. payload.ticket_id .. "_"
-            draft[prefix .. "modal_open"] = true
-            draft[prefix .. "type"] = draft[prefix .. "type"] or payload.session_type or "agent"
-            refresh(ctx)
-        end
-        return action.HANDLED
-    end)
-
-    action.on("project_pipelines.close_ticket_session_modal", "project_pipelines.close_ticket_session_modal", function(envelope, ctx)
-        local payload = value_payload(envelope)
-        if payload.ticket_id then
-            current_draft(ctx)["ticket_session_" .. payload.ticket_id .. "_modal_open"] = false
-            refresh(ctx)
-        end
-        return action.HANDLED
-    end)
-
     action.on("project_pipelines.spawn_ticket_session", "project_pipelines.spawn_ticket_session", function(envelope, ctx)
         local payload = value_payload(envelope)
         if util.is_blank(payload.ticket_id) then
@@ -300,7 +291,6 @@ function M.register()
         end
 
         draft[prefix .. "prompt"] = nil
-        draft[prefix .. "modal_open"] = false
         refresh(ctx)
         return action.result{
             message = "Session requested.",
@@ -311,6 +301,29 @@ function M.register()
                 },
             },
         }
+    end)
+
+    action.on("project_pipelines.delete_manual_ticket_session", "project_pipelines.delete_manual_ticket_session", function(envelope, ctx)
+        local payload = value_payload(envelope)
+        if util.is_blank(payload.ticket_id) then
+            return action.result{ ok = false, error = "ticket_id is required" }
+        end
+        if util.is_blank(payload.session_uuid) then
+            return action.result{ ok = false, error = "session_uuid is required" }
+        end
+
+        local ok, result = pcall(engine.delete_manual_ticket_session, {
+            ticket_id = payload.ticket_id,
+            session_uuid = payload.session_uuid,
+            run_id = payload.run_id,
+            reason = payload.reason or "Removed from Project Pipelines ticket UI.",
+        }, ctx)
+        refresh(ctx)
+        if not ok then
+            return action.result{ ok = false, error = tostring(result) }
+        end
+        rerender_current_surface(ctx, "/tickets/" .. payload.ticket_id)
+        return action.result{ message = result.closed and "Session closed." or "Session removed." }
     end)
 
     action.on("project_pipelines.close_ticket", "project_pipelines.close_ticket", function(envelope, ctx)

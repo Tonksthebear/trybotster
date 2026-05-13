@@ -133,10 +133,10 @@ fn catalog_plugin_github_template_starts_event_routing_when_repo_is_detected() {
     let init_path = plugin_root.join("init.lua");
 
     let lua = create_lua_vm();
-    let routed_repo: Option<String> = lua
+    let routed_repos: Vec<String> = lua
         .load(format!(
             r#"
-            _G.__github_test = {{ routed_repo = nil }}
+            _G.__github_test = {{ routed_repos = nil }}
             package.preload["mcp_proxy"] = function()
               return {{
                 start = function() end,
@@ -148,7 +148,7 @@ fn catalog_plugin_github_template_starts_event_routing_when_repo_is_detected() {
             end
             package.preload["event_routing"] = function()
               return {{
-                start = function(repo) _G.__github_test.routed_repo = repo end,
+                start = function(repos) _G.__github_test.routed_repos = repos end,
                 stop = function() end,
               }}
             end
@@ -157,14 +157,133 @@ fn catalog_plugin_github_template_starts_event_routing_when_repo_is_detected() {
 
             local chunk = assert(loadfile({init_path}))
             chunk()
-            return _G.__github_test.routed_repo
+            return _G.__github_test.routed_repos
             "#,
             init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
         ))
         .eval()
         .expect("GitHub plugin should route events for detected repo");
 
-    assert_eq!(routed_repo.as_deref(), Some("owner/repo"));
+    assert_eq!(routed_repos, vec!["owner/repo"]);
+}
+
+#[test]
+fn catalog_plugin_github_template_starts_event_routing_for_spawn_target_repos() {
+    let plugin_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates/plugins/github");
+    let init_path = plugin_root.join("init.lua");
+
+    let lua = create_lua_vm();
+    let routed_repos: Vec<String> = lua
+        .load(format!(
+            r#"
+            _G.__github_test = {{ routed_repos = nil }}
+            package.preload["mcp_proxy"] = function()
+              return {{
+                start = function() end,
+                stop = function() end,
+              }}
+            end
+            package.preload["notifications"] = function()
+              return {{ register = function() end }}
+            end
+            package.preload["event_routing"] = function()
+              return {{
+                start = function(repos) _G.__github_test.routed_repos = repos end,
+                stop = function() end,
+              }}
+            end
+            hub = {{
+              detect_repo = function(path)
+                if path == "/repos/two" then return "owner/two" end
+                return nil
+              end
+            }}
+            spawn_targets = {{
+              list = function()
+                return {{
+                  {{ path = "/repos/one", enabled = true }},
+                  {{ path = "/repos/two", enabled = true }},
+                  {{ path = "/repos/disabled", enabled = false }},
+                }}
+              end,
+              inspect = function(path)
+                if path == "/repos/one" then
+                  return {{ repo_name = "owner/one" }}
+                end
+                return {{}}
+              end,
+            }}
+            log = {{ info = function(_) end }}
+
+            local chunk = assert(loadfile({init_path}))
+            chunk()
+            return _G.__github_test.routed_repos
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval()
+        .expect("GitHub plugin should route events for spawn target repos");
+
+    assert_eq!(routed_repos, vec!["owner/one", "owner/two"]);
+}
+
+#[test]
+fn catalog_plugin_github_template_normalizes_spawn_target_repos() {
+    let plugin_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates/plugins/github");
+    let init_path = plugin_root.join("init.lua");
+
+    let lua = create_lua_vm();
+    let routed_repos: Vec<String> = lua
+        .load(format!(
+            r#"
+            _G.__github_test = {{ routed_repos = nil }}
+            package.preload["mcp_proxy"] = function()
+              return {{
+                start = function() end,
+                stop = function() end,
+              }}
+            end
+            package.preload["notifications"] = function()
+              return {{ register = function() end }}
+            end
+            package.preload["event_routing"] = function()
+              return {{
+                start = function(repos) _G.__github_test.routed_repos = repos end,
+                stop = function() end,
+              }}
+            end
+            hub = {{
+              detect_repo = function()
+                return "https://github.com/owner/current.git"
+              end
+            }}
+            spawn_targets = {{
+              list = function()
+                return {{
+                  {{ repo = "git@github.com:owner/current.git", enabled = true }},
+                  {{ repo = "https://github.com/owner/second.git", enabled = true }},
+                  {{ repo = "not-a-github-repo", enabled = true }},
+                }}
+              end,
+            }}
+            log = {{ info = function(_) end }}
+
+            local chunk = assert(loadfile({init_path}))
+            chunk()
+            return _G.__github_test.routed_repos
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval()
+        .expect("GitHub plugin should normalize routed repos");
+
+    assert_eq!(routed_repos, vec!["owner/current", "owner/second"]);
 }
 
 #[test]
@@ -620,6 +739,56 @@ fn catalog_plugin_github_event_routing_template_uses_hub_api_ingress() {
     assert!(
         !template.contains(r#"events.emit("command_message""#),
         "GitHub template must not use the legacy command_message bypass"
+    );
+}
+
+#[test]
+fn catalog_plugin_github_event_routing_template_shares_one_action_cable_connection() {
+    let template_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates/plugins/github/event_routing.lua");
+    let template_path = template_path.to_str().unwrap();
+
+    let lua = create_lua_vm();
+
+    let result: JsonValue = lua
+        .load(format!(
+            r#"
+            package.loaded["lib.agent"] = {{ find_by_workspace = function() return {{}} end }}
+            package.loaded["hub.state"] = {{ get = function() return {{}} end }}
+            package.loaded["lib.hub"] = {{ get = function() return {{}} end }}
+
+            local connects = 0
+            local channels = {{}}
+            action_cable = {{
+              connect = function()
+                connects = connects + 1
+                return "conn-" .. tostring(connects)
+              end,
+              subscribe = function(conn, _, params, _)
+                channels[#channels + 1] = {{ conn = conn, repo = params.repo }}
+                return "chan-" .. tostring(#channels)
+              end,
+              close = function() end,
+            }}
+
+            local routing = dofile("{template_path}")
+            routing.start({{ "owner/one", "owner/two", "owner/one" }})
+            return {{ connects = connects, channels = channels }}
+            "#
+        ))
+        .eval()
+        .and_then(|value: Value| lua.from_value(value))
+        .expect("GitHub event routing should share one ActionCable connection");
+
+    assert_eq!(result["connects"], json!(1));
+    assert_eq!(
+        result["channels"],
+        json!([
+            { "conn": "conn-1", "repo": "owner/one" },
+            { "conn": "conn-1", "repo": "owner/two" },
+        ])
     );
 }
 

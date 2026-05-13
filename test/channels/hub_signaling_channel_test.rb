@@ -86,6 +86,16 @@ class HubSignalingChannelTest < ActionCable::Channel::TestCase
     assert subscription.confirmed?
   end
 
+  test "subscribe does not request a bundle while hub is offline" do
+    @hub.update!(alive: false)
+
+    assert_broadcasts("hub_command:#{@hub.id}", 0) do
+      subscribe hub_id: @hub.id, browser_identity: @browser_identity
+    end
+
+    assert subscription.confirmed?
+  end
+
   test "rejects subscription without hub_id" do
     subscribe browser_identity: @browser_identity
 
