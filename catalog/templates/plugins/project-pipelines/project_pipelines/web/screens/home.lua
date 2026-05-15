@@ -182,7 +182,7 @@ function M.render(_view_state, ctx)
                     empty_template = view.empty(
                         "No tickets ready to merge",
                         "Completed runs waiting on PR or merge work will appear here.",
-                        "git-pull-request"
+                        "code-bracket"
                     ),
                 },
             } },
@@ -222,7 +222,7 @@ function M.render(_view_state, ctx)
                     item_template = pipeline_template(),
                     empty_template = view.empty(
                         "No pipelines yet",
-                        "Ask an agent to create one with the Project Pipelines MCP tools.",
+                        "Visit Pipeline index to create one, or ask an agent via the Project Pipelines MCP tools.",
                         "queue-list"
                     ),
                 },
