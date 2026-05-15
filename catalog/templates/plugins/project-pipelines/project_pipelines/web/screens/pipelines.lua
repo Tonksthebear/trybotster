@@ -39,10 +39,12 @@ function M.index(_view_state, ctx)
         ui.bind_list{
             source = "/project-pipelines.pipeline",
             item_template = pipeline_card_template(),
+            empty_template = view.empty(
+                "No pipelines yet",
+                "Ask an agent to create one with the Project Pipelines MCP tools.",
+                "queue-list"
+            ),
         },
-        -- TODO(entity-shape): ui.bind_list has no empty_template/empty_state hook yet,
-        -- so an entity-backed index cannot show the legacy empty state without
-        -- reintroducing a render-time pipeline list query.
     }
 
     return ui.stack{ direction = "vertical", gap = "4", children = children }

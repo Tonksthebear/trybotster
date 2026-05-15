@@ -369,6 +369,7 @@ export type UiBindList = {
   source: string
   where?: Record<string, unknown>
   item_template: UiNode
+  empty_template?: UiNode
 }
 
 // ---------- Primitive type-name union ----------
