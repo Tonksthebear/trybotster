@@ -573,6 +573,35 @@ local function question_entity(question)
     return entity
 end
 
+local function ticket_dependency_entity(dependency)
+    local entity = copy(dependency)
+    local ticket = nil
+    if util.is_blank(entity.depends_on_title) or util.is_blank(entity.depends_on_status) then
+        ticket = rows("SELECT id, title, status FROM tickets WHERE id = ? LIMIT 1", dependency.depends_on_ticket_id)[1]
+    end
+    entity.depends_on_title = entity.depends_on_title or (ticket and ticket.title) or dependency.depends_on_ticket_id
+    entity.depends_on_status = entity.depends_on_status or (ticket and ticket.status) or "missing"
+    local view = with_view()
+    entity.depends_on_label = view and view.status_label(entity.depends_on_status) or tostring(entity.depends_on_status or "")
+    entity.depends_on_tone = entity.depends_on_status == "closed" and "success" or "danger"
+    return entity
+end
+
+local function pr_link_entity(link)
+    local entity = copy(link)
+    entity.has_pr_url = not util.is_blank(entity.pr_url)
+    if not util.is_blank(entity.pr_url) then
+        entity.label = entity.pr_url
+    elseif not util.is_blank(entity.repo) and not util.is_blank(entity.pr_number) then
+        entity.label = tostring(entity.repo) .. "#" .. tostring(entity.pr_number)
+    else
+        entity.label = "PR linked"
+    end
+    entity.status_label = "PR " .. tostring(entity.status or "linked")
+    entity.status_tone = entity.status == "merged" and "success" or "accent"
+    return entity
+end
+
 local function artifact_entity(artifact)
     local entity = copy(artifact)
     entity.payload = decode(artifact.payload, {})
@@ -620,12 +649,16 @@ local ENTITY = {
     },
     [M.types.ticket_dependency] = {
         all = function()
-            return rows([[SELECT td.*, t.title AS depends_on_title, t.status AS depends_on_status
-                          FROM ticket_dependencies td
-                          LEFT JOIN tickets t ON t.id = td.depends_on_ticket_id
-                          ORDER BY td.created_at ASC, td.id ASC]])
+            local out = {}
+            for _, dependency in ipairs(rows([[SELECT td.*, t.title AS depends_on_title, t.status AS depends_on_status
+                                               FROM ticket_dependencies td
+                                               LEFT JOIN tickets t ON t.id = td.depends_on_ticket_id
+                                               ORDER BY td.created_at ASC, td.id ASC]])) do
+                out[#out + 1] = ticket_dependency_entity(dependency)
+            end
+            return out
         end,
-        one = copy,
+        one = ticket_dependency_entity,
     },
     [M.types.pipeline] = {
         all = function()
@@ -715,9 +748,13 @@ local ENTITY = {
     },
     [M.types.pr_link] = {
         all = function()
-            return rows("SELECT * FROM pr_links ORDER BY updated_at DESC, created_at DESC, id DESC")
+            local out = {}
+            for _, link in ipairs(rows("SELECT * FROM pr_links ORDER BY updated_at DESC, created_at DESC, id DESC")) do
+                out[#out + 1] = pr_link_entity(link)
+            end
+            return out
         end,
-        one = copy,
+        one = pr_link_entity,
     },
     [M.types.event] = {
         all = function()
