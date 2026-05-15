@@ -1313,7 +1313,7 @@ fn catalog_plugin_project_pipelines_home_bind_lists_use_entity_empty_templates()
 }
 
 #[test]
-fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_home_bindings() {
+fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_screen_bindings() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
 
@@ -1359,58 +1359,94 @@ fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_
               error("contract entity type was not registered: " .. tostring(entity_type))
             end
 
-            local file = assert(io.open("{home_path}", "r"))
-            local home = file:read("*a")
-            file:close()
+            assert(contract.screens.home == contract.home_screen)
 
-            local contract_source_counts = {{}}
-            local contract_sources = {{}}
-            local contract_fields = {{}}
-            local contract_where_fields_by_source = {{}}
-            for _, section in ipairs(contract.home_screen) do
-              contract_source_counts[section.source] = (contract_source_counts[section.source] or 0) + 1
-              contract_sources[section.source] = true
-              contract_where_fields_by_source[section.source] = contract_where_fields_by_source[section.source] or {{}}
-              for _, field in ipairs(section.fields or {{}}) do
-                contract_fields[field] = true
-              end
-              for _, field in ipairs(section.where_fields or {{}}) do
-                contract_where_fields_by_source[section.source][field] = true
-              end
+            local function read(path)
+              local file = assert(io.open(path, "r"))
+              local body = file:read("*a")
+              file:close()
+              return body
             end
 
-            local actual_source_counts = {{}}
-            local current_source = nil
-            for line in home:gmatch("[^\n]+") do
-              local source = line:match('source%s*=%s*"([^"]+)"')
-              if source then
-                current_source = source
-                assert(contract_sources[source], "home bind_list source missing from contract: " .. source)
-                actual_source_counts[source] = (actual_source_counts[source] or 0) + 1
-              end
-              for field in line:gmatch("([%w_]+)%s*=") do
-                if line:match("where%s*=") and field ~= "where" then
-                  assert(current_source and contract_where_fields_by_source[current_source] and contract_where_fields_by_source[current_source][field],
-                    "home where field missing from contract for " .. tostring(current_source) .. ": " .. field)
+            local function screen_contract(screen_name)
+              local sections = assert(contract.screens[screen_name], "missing screen contract: " .. screen_name)
+              local source_counts = {{}}
+              local sources = {{}}
+              local fields = {{}}
+              local where_fields_by_source = {{}}
+              for _, section in ipairs(sections) do
+                assert(section.name and section.name ~= "", "screen contract section missing name: " .. screen_name)
+                assert(section.source and section.source ~= "", "screen contract section missing source: " .. section.name)
+                sources[section.source] = true
+                where_fields_by_source[section.source] = where_fields_by_source[section.source] or {{}}
+                if section.mode ~= "record" then
+                  source_counts[section.source] = (source_counts[section.source] or 0) + 1
+                end
+                for _, field in ipairs(section.fields or {{}}) do
+                  fields[field] = true
+                end
+                for _, field in ipairs(section.where_fields or {{}}) do
+                  where_fields_by_source[section.source][field] = true
                 end
               end
+              return source_counts, sources, fields, where_fields_by_source
             end
-            for source, expected_count in pairs(contract_source_counts) do
-              assert(actual_source_counts[source] == expected_count,
-                "home source count drift for " .. source .. ": expected "
-                  .. tostring(expected_count) .. " got " .. tostring(actual_source_counts[source]))
+
+            local function assert_screen_bindings(screen_name, path)
+              local body = read(path)
+              local contract_source_counts, contract_sources, contract_fields, contract_where_fields_by_source =
+                screen_contract(screen_name)
+              local actual_source_counts = {{}}
+              local current_source = nil
+              for line in body:gmatch("[^\n]+") do
+                local source = line:match('source%s*=%s*"([^"]+)"')
+                if source then
+                  current_source = source
+                  assert(contract_sources[source],
+                    screen_name .. " bind_list source missing from contract: " .. source)
+                  actual_source_counts[source] = (actual_source_counts[source] or 0) + 1
+                end
+                for field in line:gmatch("([%w_]+)%s*=") do
+                  if line:match("where%s*=") and field ~= "where" then
+                    assert(current_source and contract_where_fields_by_source[current_source] and contract_where_fields_by_source[current_source][field],
+                      screen_name .. " where field missing from contract for " .. tostring(current_source) .. ": " .. field)
+                  end
+                end
+              end
+              for source, expected_count in pairs(contract_source_counts) do
+                assert(actual_source_counts[source] == expected_count,
+                  screen_name .. " source count drift for " .. source .. ": expected "
+                    .. tostring(expected_count) .. " got " .. tostring(actual_source_counts[source]))
+              end
+              for field in body:gmatch('ui%.bind%("%@/([%w_]+)"%)') do
+                assert(contract_fields[field], screen_name .. " bound field missing from contract: " .. field)
+              end
+              for field in body:gmatch('ui%.bind%([^%)]*"%/([%w_]+)"') do
+                assert(contract_fields[field], screen_name .. " bound field path missing from contract: " .. field)
+              end
             end
-            for field in home:gmatch('ui%.bind%("%@/([%w_]+)"%)') do
-              assert(contract_fields[field], "home bound field missing from contract: " .. field)
-            end
+
+            assert_screen_bindings("home", "{home_path}")
+            assert_screen_bindings("pipelines", "{pipelines_path}")
+            assert_screen_bindings("project", "{project_path}")
+            assert_screen_bindings("ticket", "{ticket_path}")
 
             return "ok"
             "#,
             plugin_dir = plugin_dir.display(),
-            home_path = home_path.display()
+            home_path = home_path.display(),
+            pipelines_path = plugin_dir
+                .join("project_pipelines/web/screens/pipelines.lua")
+                .display(),
+            project_path = plugin_dir
+                .join("project_pipelines/web/screens/project.lua")
+                .display(),
+            ticket_path = plugin_dir
+                .join("project_pipelines/web/screens/ticket.lua")
+                .display()
         ))
         .eval()
-        .expect("Project Pipelines entity contract should cover registered types and home bindings");
+        .expect("Project Pipelines entity contract should cover registered types and screen bindings");
 
     assert_eq!(result, "ok");
 }
