@@ -3,7 +3,7 @@
 -- @category plugins
 -- @dest plugins/project-pipelines/project_pipelines/entity_contract.lua
 -- @scope device
--- @version 1.2.0
+-- @version 1.3.0
 
 local M = {}
 
@@ -213,6 +213,40 @@ M.screens = {
                 "id",
                 "pr_url",
             },
+        },
+    },
+}
+
+M.repo_rendered_screens = {
+    new = {
+        reason = "form scaffolding plus recent rows and project options still render from repo reads",
+        repo_calls = {
+            "get_project",
+            "open_projects",
+            "open_ticket_run",
+        },
+        migration_sources = {
+            "/" .. M.types.project,
+            "/" .. M.types.ticket,
+            "/" .. M.types.run,
+        },
+    },
+    run = {
+        reason = "run detail still renders one composite overview until every section has filtered entity bindings",
+        repo_calls = {
+            "get_project",
+            "get_run_step_visit",
+            "run_detail_overview",
+        },
+        migration_sources = {
+            "/" .. M.types.run,
+            "/" .. M.types.run_step,
+            "/" .. M.types.review,
+            "/" .. M.types.finding,
+            "/" .. M.types.artifact,
+            "/" .. M.types.event,
+            "/" .. M.types.ticket,
+            "/" .. M.types.project,
         },
     },
 }

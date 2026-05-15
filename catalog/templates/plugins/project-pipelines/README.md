@@ -213,9 +213,10 @@ The contract module describes the published read-model shape, not the plugin.db
 table schema. Persistence models may have different names, decoded JSON fields,
 or private columns; plugin authors should treat `project-pipelines.*` contract
 entries as the client-facing API. Its screen-field coverage guards the home
-screen plus the non-home entity-backed screen sections; some sections still have
-migration notes below until their render-time `repo.*` reads move behind
-entity-backed contracts.
+screen plus the non-home entity-backed screen sections. Screens that still
+intentionally render from repo-owned overview data are listed in
+`repo_rendered_screens` with the repo calls and entity sources they should
+migrate toward.
 
 Dynamic state is published as plugin-owned entities:
 
