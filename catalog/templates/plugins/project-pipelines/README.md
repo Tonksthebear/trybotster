@@ -175,10 +175,27 @@ pipeline run flow unless they create a human question or merge/PR item.
 ### Plugin Entity Case Study
 
 Project Pipelines is the reference plugin for Botster's entity-backed UI model.
-`project_pipelines/entity_contract.lua` names every published entity family and
-the UI read-model fields that screens bind. `project_pipelines/entities.lua`
-consumes those names, builds the read models from plugin.db persistence rows,
-publishes targeted recovery baselines with `publish_snapshots()`, and exposes
+It ships models in three explicit Lua-owned layers:
+
+- `project_pipelines/db.lua` declares durable `plugin.db` tables, migrations,
+  constraints, and persisted workflow facts.
+- `project_pipelines/repo.lua` validates and mutates that private persistence
+  layer.
+- `project_pipelines/entity_contract.lua` names every published entity family
+  and the UI read-model fields that screens bind.
+- `project_pipelines/entities.lua` consumes those names, builds normalized
+  read-model records from plugin.db persistence rows, and publishes them for
+  clients under the `project-pipelines.*` namespace.
+
+The entity layer is the UI/data contract. It can expose derived labels, status
+tones, paths, counts, and flattened relationship fields that are convenient for
+shared renderers without making the raw SQLite table shape public. Browser and
+TUI clients consume those read models through the generic entity store; Project
+Pipelines must not add plugin-specific browser stores, custom data channels, or
+renderer subscription state as an alternate model path.
+
+`project_pipelines/entities.lua` publishes targeted recovery baselines with
+`publish_snapshots()`, and exposes
 targeted `upsert` / `remove` helpers so repo mutators can update clients after
 persistence changes. Plugin-owned entity families are not part of the initial
 browser/TUI hub baseline; surfaces should request the specific plugin data they
@@ -258,7 +275,8 @@ browser components:
   button.
 - Dynamic collections publish plugin-owned entity records and bind with
   `ui.bind` or `ui.bind_list` from sources such as `/project-pipelines.ticket`.
-  Publish filterable record supersets rather than per-view browser stores.
+  Publish filterable record supersets and explicit read-model fields rather
+  than per-view browser stores.
 - Detail rows use `ui.bind_list{ where = { ... } }` for filtered children when
   they need dynamic entity-backed rows. Keep `ui_tree_snapshot` for route
   scaffolding, current-path controls, and other presentation structure.
@@ -297,7 +315,9 @@ queries into existing or new plugin entity families, then remove the
 corresponding refresh-only `ui_tree_snapshot` dependency for that section. Do
 not add plugin-specific browser stores or subscription state; browser state
 remains generic entity store data plus `ui.local_state` for presentation-only
-modal/disclosure flags.
+modal/disclosure flags. When a migrated section needs data that is not already
+available as a clean field, add it to `project_pipelines/entities.lua` as an
+explicit read-model projection instead of reconstructing it in the browser.
 
 Entity families already available and expected to remain the primary UI data
 source:
