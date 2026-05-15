@@ -25,7 +25,7 @@ pub mod notification;
 pub mod pty;
 pub mod spawn;
 
-pub use crate::tui::screen::ScreenInfo;
+pub use crate::clients::tui::screen::ScreenInfo;
 pub use notification::{detect_notifications, AgentNotification, AgentStatus};
 pub use pty::PtySession;
 

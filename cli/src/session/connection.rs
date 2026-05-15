@@ -3,7 +3,7 @@
 //! Each `SessionConnection` owns a Unix socket stream to one session process.
 //! After `install_reader()`, a SessionIoWorker reads all frames from the socket:
 //!
-//! - `PtyOutput` → broadcast as `PtyEvent::Output` (no shadow screen)
+//! - `PtyOutput` → coalesced/fanned out by SessionIo to subscribed ClientWorkers
 //! - Structured events (0x10-0x15) → mapped to `PtyEvent` variants, atomics updated
 //! - `ProcessExited` → sent as `HubEvent::SessionProcessExited`
 //! - Control responses (Snapshot, Screen, ModeFlags, Pong) → routed to `response_rx`

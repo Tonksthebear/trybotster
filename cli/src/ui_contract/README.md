@@ -318,7 +318,7 @@ The TUI rule applies in both renderers:
 
 - **Hub VM** (`crate::lua::LuaRuntime`) — registered inside
   `crate::lua::primitives::register_all`.
-- **TUI VM** (`crate::tui::layout_lua::LayoutLua`) — registered inside
+- **TUI VM** (`crate::clients::tui::layout_lua::LayoutLua`) — registered inside
   `LayoutLua::new`, before executing the layout source.
 
 Both VMs use the same `ui_contract::lua::register` function so the DSL stays
@@ -446,7 +446,7 @@ ui.bind_list{
 ```
 
 The web resolver (`app/frontend/ui_contract/binding.tsx`) and the TUI
-resolver (`cli/src/tui/ui_contract_adapter/binding.rs`) must agree on
+resolver (`cli/src/clients/tui/ui_contract_adapter/binding.rs`) must agree on
 this grammar. `bind_list` expands to ordinary sibling nodes when placed inside
 `children` or slot arrays so plugin layouts can use it directly in stable
 presentation trees. `where` filters are exact top-level field matches and are

@@ -303,19 +303,19 @@ impl LuaBootstrap {
             }
             match lua.preload_module(
                 "ui.workspace_helpers",
-                include_str!("../../lua/ui/workspace_helpers.lua"),
+                include_str!("../../../lua/ui/workspace_helpers.lua"),
             ) {
                 Ok(()) => log::info!("Lua workspace helpers preloaded"),
                 Err(e) => log::warn!("Failed to preload workspace helpers: {e}"),
             }
             match lua.preload_module(
                 "ui.entity_state",
-                include_str!("../../lua/ui/entity_state.lua"),
+                include_str!("../../../lua/ui/entity_state.lua"),
             ) {
                 Ok(()) => log::info!("Lua entity state module preloaded"),
                 Err(e) => log::warn!("Failed to preload entity state module: {e}"),
             }
-            match lua.preload_module("ui.mouse", include_str!("../../lua/ui/mouse.lua")) {
+            match lua.preload_module("ui.mouse", include_str!("../../../lua/ui/mouse.lua")) {
                 Ok(()) => log::info!("Lua mouse module preloaded"),
                 Err(e) => log::warn!("Failed to preload mouse module: {e}"),
             }

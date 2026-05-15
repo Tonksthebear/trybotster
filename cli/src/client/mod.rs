@@ -4,7 +4,7 @@
 //! - `ClientId` — unique identifier for client sessions (TUI, browser, internal)
 //! - `TuiRequest` — control messages from TuiRunner to Hub
 //! - `TuiSessionInput` — raw terminal input from TuiRunner to the active transport
-//! - `TuiOutput` — messages from Hub to TuiRunner (PTY output, Lua events)
+//! - `TuiOutput` — messages delivered to TuiRunner from Lua/control paths and terminal subscriptions
 //! - `CreateAgentRequest` / `DeleteAgentRequest` — client-layer agent operation types
 //!
 //! # Architecture
@@ -15,7 +15,7 @@
 //!   ├── TuiRequest::LuaMessage ──► Hub ──► lua.call_tui_message() ──► client.lua
 //!   ├── TuiSessionInput        ──► ClientWorker ──► SessionIoWorker
 //!   ◄── TuiOutput::Message     ◄── Lua tui.send() (events, subscriptions)
-//!   ◄── TuiOutput::Output      ◄── terminal subscription path
+//!   ◄── TuiOutput::Output      ◄── ClientWorker/SessionIo terminal subscription path
 //! ```
 //!
 //! Control operations (resize, subscriptions, agent lifecycle) flow as JSON

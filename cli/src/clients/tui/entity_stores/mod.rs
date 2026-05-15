@@ -3,10 +3,10 @@
 //! The hub ships per-entity-type wire envelopes (`entity_snapshot`,
 //! `entity_upsert`, `entity_patch`, `entity_remove`) which the TUI applies
 //! to local in-memory stores. Composite renderers in
-//! [`crate::tui::ui_contract_adapter::primitive`] read from these stores
+//! [`crate::clients::tui::ui_contract_adapter::primitive`] read from these stores
 //! when rendering `ui.session_list{}`, `ui.workspace_list{}`, etc., and
 //! the `$bind` resolver in
-//! [`crate::tui::ui_contract_adapter::binding`] (added in commit 4) walks
+//! [`crate::clients::tui::ui_contract_adapter::binding`] (added in commit 4) walks
 //! the same store to resolve plugin bindings.
 //!
 //! ## Module layout
@@ -192,7 +192,7 @@ fn extract_id(entity: &JsonValue, id_field: &str) -> Option<String> {
 }
 
 /// Aggregate of all built-in entity stores plus a HashMap for plugin
-/// entity types. Owned by [`crate::tui::runner::TuiRunner`] and updated by
+/// entity types. Owned by [`crate::clients::tui::runner::TuiRunner`] and updated by
 /// the wire-frame dispatcher.
 #[derive(Debug, Default)]
 pub struct TuiEntityStores {
@@ -204,7 +204,7 @@ pub struct TuiEntityStores {
 
 impl TuiEntityStores {
     /// Construct an empty aggregate. Same as `Self::default()`; spelled out
-    /// because [`crate::tui::runner::TuiRunner::new_with_color_cache`]
+    /// because [`crate::clients::tui::runner::TuiRunner::new_with_color_cache`]
     /// reads more clearly with a named constructor.
     pub fn new() -> Self {
         Self::default()

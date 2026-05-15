@@ -1,5 +1,5 @@
 //! Integration tests for the Phase B TUI adapter
-//! (`crate::tui::ui_contract_adapter`).
+//! (`crate::clients::tui::ui_contract_adapter`).
 //!
 //! Each test goes end-to-end:
 //!
@@ -21,11 +21,11 @@
     reason = "UiViewport is Copy but helpers pass it by reference to match the adapter's signatures — consistency is more valuable here than the trivial copy optimisation"
 )]
 
-use botster::tui::entity_stores::TuiEntityStores;
-use botster::tui::render_tree::{
+use botster::clients::tui::entity_stores::TuiEntityStores;
+use botster::clients::tui::render_tree::{
     ListProps, ParagraphProps, RenderNode, StyledContent, WidgetProps, WidgetType,
 };
-use botster::tui::ui_contract_adapter::{
+use botster::clients::tui::ui_contract_adapter::{
     derive_viewport_from_terminal, render_lua_ui_node, render_lua_ui_node_with_stores,
     render_ui_node, ActionTable,
 };

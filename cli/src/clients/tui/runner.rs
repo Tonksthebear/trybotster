@@ -59,7 +59,7 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::client::{TuiOutput, TuiRequest, TuiSessionInput};
 use crate::hub::Hub;
-use crate::tui::layout::terminal_widget_inner_area;
+use crate::clients::tui::layout::terminal_widget_inner_area;
 
 use super::actions::TuiAction;
 use super::layout_lua::{KeyContext, LayoutLua, LuaKeyAction};
@@ -2662,7 +2662,7 @@ mod tests {
         runner.mode = "terminal".to_string();
         runner.pending_focus_in_session = Some("sess-0".to_string());
         runner.terminal_modes.on_focus_gained();
-        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        let mut panel = crate::clients::tui::terminal_panel::TerminalPanel::new(24, 80);
         panel.connect("sess-0");
         panel.on_scrollback(b"");
         panel.on_output(b"\x1b[?1004h");
@@ -2736,7 +2736,7 @@ mod tests {
         runner.mode = "terminal".to_string();
         runner.pending_focus_in_session = Some("sess-0".to_string());
         runner.terminal_modes.on_focus_gained();
-        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        let mut panel = crate::clients::tui::terminal_panel::TerminalPanel::new(24, 80);
         panel.connect("sess-0");
         panel.on_scrollback(b"");
         panel.on_output(b"\x1b[?1004h");
@@ -2990,9 +2990,9 @@ mod tests {
     /// Creates a `LayoutLua` with keybindings and actions loaded from actual files.
     fn make_test_layout_with_keybindings() -> LayoutLua {
         let layout_source = "function render(s) return { type = 'empty' } end\nfunction render_overlay(s) return nil end\nfunction initial_mode() return 'list' end";
-        let kb_source = include_str!("../../lua/ui/keybindings.lua");
-        let actions_source = include_str!("../../lua/ui/actions.lua");
-        let events_source = include_str!("../../lua/ui/events.lua");
+        let kb_source = include_str!("../../../lua/ui/keybindings.lua");
+        let actions_source = include_str!("../../../lua/ui/actions.lua");
+        let events_source = include_str!("../../../lua/ui/events.lua");
         let mut lua = LayoutLua::new(layout_source).expect("test layout should load");
         // Bootstrap _tui_state (actions.lua and events.lua read from it)
         lua.load_extension(
@@ -3001,12 +3001,12 @@ mod tests {
         ).expect("_tui_state bootstrap should succeed");
         lua.preload_module(
             "ui.workspace_helpers",
-            include_str!("../../lua/ui/workspace_helpers.lua"),
+            include_str!("../../../lua/ui/workspace_helpers.lua"),
         )
         .expect("workspace_helpers.lua should preload");
         lua.preload_module(
             "ui.entity_state",
-            include_str!("../../lua/ui/entity_state.lua"),
+            include_str!("../../../lua/ui/entity_state.lua"),
         )
         .expect("entity_state.lua should preload");
         lua.load_keybindings(kb_source)
@@ -3462,7 +3462,7 @@ mod tests {
         // Simulate single agent config response (auto-skips to workspace selection)
         {
             let agent_config_event = serde_json::json!({ "agents": ["codex"] });
-            let ctx = crate::tui::layout_lua::ActionContext::default();
+            let ctx = crate::clients::tui::layout_lua::ActionContext::default();
             let ops = lua
                 .call_on_hub_event("agent_config", &agent_config_event, &ctx)
                 .unwrap()
@@ -3628,7 +3628,7 @@ mod tests {
         // Simulate single agent config response (auto-skips to workspace selection)
         {
             let agent_config_event = serde_json::json!({ "agents": ["codex"] });
-            let ctx = crate::tui::layout_lua::ActionContext::default();
+            let ctx = crate::clients::tui::layout_lua::ActionContext::default();
             let ops = lua
                 .call_on_hub_event("agent_config", &agent_config_event, &ctx)
                 .unwrap()
@@ -4057,7 +4057,7 @@ mod tests {
         let (mut runner, _cmd_rx) = create_test_runner();
 
         // Setup: create a panel with initial dims
-        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        let mut panel = crate::clients::tui::terminal_panel::TerminalPanel::new(24, 80);
         panel.connect("sess-0");
         runner.panel_pool.panels.insert("sess-0".to_string(), panel);
 
@@ -4121,7 +4121,7 @@ mod tests {
         );
 
         // Verify panel created and left idle until render sync subscribes.
-        use crate::tui::terminal_panel::PanelState;
+        use crate::clients::tui::terminal_panel::PanelState;
         assert_eq!(
             runner.panel_pool.panels.get("sess-1").unwrap().state(),
             PanelState::Idle
@@ -4147,7 +4147,7 @@ mod tests {
                 .panel_pool
                 .panels
                 .entry("sess-0".to_string())
-                .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(24, 80));
+                .or_insert_with(|| crate::clients::tui::terminal_panel::TerminalPanel::new(24, 80));
             panel.connect("sess-0"); // put in Connecting state
         }
 
@@ -4193,7 +4193,7 @@ mod tests {
                 .panel_pool
                 .panels
                 .entry("sess-0".to_string())
-                .or_insert_with(|| crate::tui::terminal_panel::TerminalPanel::new(24, 80));
+                .or_insert_with(|| crate::clients::tui::terminal_panel::TerminalPanel::new(24, 80));
             panel.connect("sess-0");
         }
 
@@ -4234,7 +4234,7 @@ mod tests {
             Some("tui:sess-1")
         );
 
-        use crate::tui::terminal_panel::PanelState;
+        use crate::clients::tui::terminal_panel::PanelState;
         assert_eq!(
             runner.panel_pool.panels.get("sess-0").unwrap().state(),
             PanelState::Idle
@@ -4282,7 +4282,7 @@ mod tests {
         runner.panel_pool.selected_agent = Some("agent-0".to_string());
         runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
         runner.panel_pool.current_terminal_sub_id = Some("tui:sess-0".to_string());
-        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        let mut panel = crate::clients::tui::terminal_panel::TerminalPanel::new(24, 80);
         panel.connect("sess-0");
         panel.on_scrollback(b"");
         runner.panel_pool.panels.insert("sess-0".to_string(), panel);
@@ -4311,7 +4311,7 @@ mod tests {
         runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
         runner.panel_pool.current_terminal_sub_id = Some("tui:sess-0".to_string());
 
-        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        let mut panel = crate::clients::tui::terminal_panel::TerminalPanel::new(24, 80);
         panel.connect("sess-0");
         panel.on_scrollback(b"");
         panel.mark_transport_disconnected();
@@ -4329,7 +4329,7 @@ mod tests {
         );
         assert_eq!(
             runner.panel_pool.panels.get("sess-0").unwrap().state(),
-            crate::tui::terminal_panel::PanelState::Idle
+            crate::clients::tui::terminal_panel::PanelState::Idle
         );
     }
 
@@ -4346,7 +4346,7 @@ mod tests {
 
         // Setup: pre-populate panel for agent 1.
         // Panel must be Connected, then disconnect so it's Idle when focus_terminal runs.
-        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        let mut panel = crate::clients::tui::terminal_panel::TerminalPanel::new(24, 80);
         panel.connect("sess-1");
         panel.on_scrollback(b"");
         // Feed VT output so the parser has content
@@ -4389,13 +4389,13 @@ mod tests {
             "session_uuid": "sess-1",
         }));
 
-        let tree = crate::tui::render_tree::RenderNode::Widget {
-            widget_type: crate::tui::render_tree::WidgetType::Terminal,
+        let tree = crate::clients::tui::render_tree::RenderNode::Widget {
+            widget_type: crate::clients::tui::render_tree::WidgetType::Terminal,
             id: None,
             block: None,
             custom_lines: None,
-            props: Some(crate::tui::render_tree::WidgetProps::Terminal(
-                crate::tui::render_tree::TerminalBinding {
+            props: Some(crate::clients::tui::render_tree::WidgetProps::Terminal(
+                crate::clients::tui::render_tree::TerminalBinding {
                     session_uuid: Some("sess-1".to_string()),
                 },
             )),
@@ -4403,7 +4403,7 @@ mod tests {
         let mut areas = std::collections::HashMap::new();
         areas.insert(
             "sess-1".to_string(),
-            crate::tui::render::WidgetArea {
+            crate::clients::tui::render::WidgetArea {
                 rect: ratatui::layout::Rect::new(0, 0, 60, 20),
                 widget_type: "terminal".to_string(),
             },
@@ -4427,7 +4427,7 @@ mod tests {
 
     #[test]
     fn test_bridge_reconnected_resets_to_attach_state() {
-        use crate::tui::terminal_panel::PanelState;
+        use crate::clients::tui::terminal_panel::PanelState;
 
         let (mut runner, _request_rx) = create_test_runner();
         runner.mode = "restarting".to_string();
@@ -4587,7 +4587,7 @@ mod tests {
         let (mut runner, _request_rx) = create_test_runner();
 
         // Setup: panel in Connecting state with existing content and scroll offset
-        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        let mut panel = crate::clients::tui::terminal_panel::TerminalPanel::new(24, 80);
         panel.connect("sess-0"); // Idle → Connecting (subscribe sent)
         for i in 0..30 {
             panel.on_output(format!("old line {i}\r\n").as_bytes());
@@ -4623,7 +4623,7 @@ mod tests {
         assert!(!panel.is_scrolled(), "Scroll should be reset to bottom");
         assert_eq!(
             panel.state(),
-            crate::tui::terminal_panel::PanelState::Connected
+            crate::clients::tui::terminal_panel::PanelState::Connected
         );
     }
 
@@ -4631,7 +4631,7 @@ mod tests {
     fn test_scrollback_legacy_zero_dims_uses_panel_dims() {
         let (mut runner, _request_rx) = create_test_runner();
 
-        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        let mut panel = crate::clients::tui::terminal_panel::TerminalPanel::new(24, 80);
         panel.connect("sess-0");
         runner.panel_pool.panels.insert("sess-0".to_string(), panel);
         runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
@@ -4655,7 +4655,7 @@ mod tests {
         assert_eq!(panel.dims(), (24, 80));
         assert_eq!(
             panel.state(),
-            crate::tui::terminal_panel::PanelState::Connected
+            crate::clients::tui::terminal_panel::PanelState::Connected
         );
     }
 
@@ -4672,7 +4672,7 @@ mod tests {
         // Set up connected state with a panel
         runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
         runner.panel_pool.current_terminal_sub_id = Some("tui:sess-0".to_string());
-        let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+        let mut panel = crate::clients::tui::terminal_panel::TerminalPanel::new(24, 80);
         panel.connect("sess-0");
         runner.panel_pool.panels.insert("sess-0".to_string(), panel);
 
@@ -4753,7 +4753,7 @@ mod tests {
         // 'static requires leaked reference for the empty panels map
         let panels: &'static std::collections::HashMap<
             String,
-            crate::tui::terminal_panel::TerminalPanel,
+            crate::clients::tui::terminal_panel::TerminalPanel,
         > = Box::leak(Box::new(std::collections::HashMap::new()));
         super::super::render::RenderContext {
             error_message: None,
@@ -4783,13 +4783,13 @@ mod tests {
         runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
 
         // Tree with a single terminal widget with explicit binding
-        let tree = crate::tui::render_tree::RenderNode::Widget {
-            widget_type: crate::tui::render_tree::WidgetType::Terminal,
+        let tree = crate::clients::tui::render_tree::RenderNode::Widget {
+            widget_type: crate::clients::tui::render_tree::WidgetType::Terminal,
             id: None,
             block: None,
             custom_lines: None,
-            props: Some(crate::tui::render_tree::WidgetProps::Terminal(
-                crate::tui::render_tree::TerminalBinding {
+            props: Some(crate::clients::tui::render_tree::WidgetProps::Terminal(
+                crate::clients::tui::render_tree::TerminalBinding {
                     session_uuid: Some("sess-0".to_string()),
                 },
             )),
@@ -4798,7 +4798,7 @@ mod tests {
         let mut areas = std::collections::HashMap::new();
         areas.insert(
             "sess-0".to_string(),
-            crate::tui::render::WidgetArea {
+            crate::clients::tui::render::WidgetArea {
                 rect: ratatui::layout::Rect::new(0, 0, 80, 24),
                 widget_type: "terminal".to_string(),
             },
@@ -4826,7 +4826,7 @@ mod tests {
             Err(_) => panic!("Expected subscribe message"),
         }
 
-        use crate::tui::terminal_panel::PanelState;
+        use crate::clients::tui::terminal_panel::PanelState;
         assert_eq!(
             runner.panel_pool.panels.get("sess-0").unwrap().state(),
             PanelState::Connecting
@@ -4847,16 +4847,16 @@ mod tests {
         runner.panel_pool.selected_agent = Some("agent-0".to_string());
         runner.panel_pool.panels.insert(
             "sess-0".to_string(),
-            crate::tui::terminal_panel::TerminalPanel::new(57, 181),
+            crate::clients::tui::terminal_panel::TerminalPanel::new(57, 181),
         );
 
-        let tree = crate::tui::render_tree::RenderNode::Widget {
-            widget_type: crate::tui::render_tree::WidgetType::Terminal,
+        let tree = crate::clients::tui::render_tree::RenderNode::Widget {
+            widget_type: crate::clients::tui::render_tree::WidgetType::Terminal,
             id: None,
             block: None,
             custom_lines: None,
-            props: Some(crate::tui::render_tree::WidgetProps::Terminal(
-                crate::tui::render_tree::TerminalBinding {
+            props: Some(crate::clients::tui::render_tree::WidgetProps::Terminal(
+                crate::clients::tui::render_tree::TerminalBinding {
                     session_uuid: Some("sess-0".to_string()),
                 },
             )),
@@ -4865,7 +4865,7 @@ mod tests {
         let mut areas = std::collections::HashMap::new();
         areas.insert(
             "sess-0".to_string(),
-            crate::tui::render::WidgetArea {
+            crate::clients::tui::render::WidgetArea {
                 rect: ratatui::layout::Rect::new(0, 0, 148, 57),
                 widget_type: "terminal".to_string(),
             },
@@ -4890,7 +4890,7 @@ mod tests {
         assert_eq!(panel.dims(), (57, 148));
         assert_eq!(
             panel.state(),
-            crate::tui::terminal_panel::PanelState::Connecting
+            crate::clients::tui::terminal_panel::PanelState::Connecting
         );
     }
 
@@ -4903,10 +4903,10 @@ mod tests {
 
         // Pre-populate panels for two sessions (both connected)
         {
-            let mut p0 = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+            let mut p0 = crate::clients::tui::terminal_panel::TerminalPanel::new(24, 80);
             p0.connect("sess-0");
             runner.panel_pool.panels.insert("sess-0".to_string(), p0);
-            let mut p1 = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+            let mut p1 = crate::clients::tui::terminal_panel::TerminalPanel::new(24, 80);
             p1.connect("sess-1");
             runner.panel_pool.panels.insert("sess-1".to_string(), p1);
         }
@@ -4914,13 +4914,13 @@ mod tests {
         while request_rx.try_recv().is_ok() {}
 
         // Tree only has terminal for sess-0 — sess-1 should be unsubscribed
-        let tree = crate::tui::render_tree::RenderNode::Widget {
-            widget_type: crate::tui::render_tree::WidgetType::Terminal,
+        let tree = crate::clients::tui::render_tree::RenderNode::Widget {
+            widget_type: crate::clients::tui::render_tree::WidgetType::Terminal,
             id: None,
             block: None,
             custom_lines: None,
-            props: Some(crate::tui::render_tree::WidgetProps::Terminal(
-                crate::tui::render_tree::TerminalBinding {
+            props: Some(crate::clients::tui::render_tree::WidgetProps::Terminal(
+                crate::clients::tui::render_tree::TerminalBinding {
                     session_uuid: Some("sess-0".to_string()),
                 },
             )),
@@ -4964,20 +4964,20 @@ mod tests {
 
         // Pre-populate with a connected panel
         {
-            let mut panel = crate::tui::terminal_panel::TerminalPanel::new(24, 80);
+            let mut panel = crate::clients::tui::terminal_panel::TerminalPanel::new(24, 80);
             panel.connect("sess-0");
             runner.panel_pool.panels.insert("sess-0".to_string(), panel);
         }
         // Drain subscribe message
         while request_rx.try_recv().is_ok() {}
 
-        let tree = crate::tui::render_tree::RenderNode::Widget {
-            widget_type: crate::tui::render_tree::WidgetType::Terminal,
+        let tree = crate::clients::tui::render_tree::RenderNode::Widget {
+            widget_type: crate::clients::tui::render_tree::WidgetType::Terminal,
             id: None,
             block: None,
             custom_lines: None,
-            props: Some(crate::tui::render_tree::WidgetProps::Terminal(
-                crate::tui::render_tree::TerminalBinding {
+            props: Some(crate::clients::tui::render_tree::WidgetProps::Terminal(
+                crate::clients::tui::render_tree::TerminalBinding {
                     session_uuid: Some("sess-0".to_string()),
                 },
             )),
@@ -5007,11 +5007,11 @@ mod tests {
     /// Uses the actual layout.lua, keybindings.lua, actions.lua, events.lua.
     /// This means render_overlay() returns real overlays based on _tui_state.mode.
     fn make_real_layout_lua() -> LayoutLua {
-        let layout_source = include_str!("../../lua/ui/layout.lua");
-        let kb_source = include_str!("../../lua/ui/keybindings.lua");
-        let actions_source = include_str!("../../lua/ui/actions.lua");
-        let events_source = include_str!("../../lua/ui/events.lua");
-        let botster_source = include_str!("../../lua/ui/botster.lua");
+        let layout_source = include_str!("../../../lua/ui/layout.lua");
+        let kb_source = include_str!("../../../lua/ui/keybindings.lua");
+        let actions_source = include_str!("../../../lua/ui/actions.lua");
+        let events_source = include_str!("../../../lua/ui/events.lua");
+        let botster_source = include_str!("../../../lua/ui/botster.lua");
 
         let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
         lua.load_extension(
@@ -5020,12 +5020,12 @@ mod tests {
         ).expect("_tui_state bootstrap should succeed");
         lua.preload_module(
             "ui.workspace_helpers",
-            include_str!("../../lua/ui/workspace_helpers.lua"),
+            include_str!("../../../lua/ui/workspace_helpers.lua"),
         )
         .expect("workspace_helpers.lua should preload");
         lua.preload_module(
             "ui.entity_state",
-            include_str!("../../lua/ui/entity_state.lua"),
+            include_str!("../../../lua/ui/entity_state.lua"),
         )
         .expect("entity_state.lua should preload");
         lua.load_keybindings(kb_source)
@@ -5122,7 +5122,7 @@ mod tests {
         // Simulate single agent config response (auto-skips to workspace selection)
         {
             let agent_config_event = serde_json::json!({ "agents": ["codex"] });
-            let ctx = crate::tui::layout_lua::ActionContext::default();
+            let ctx = crate::clients::tui::layout_lua::ActionContext::default();
             let ops = lua
                 .call_on_hub_event("agent_config", &agent_config_event, &ctx)
                 .unwrap()
@@ -5300,7 +5300,7 @@ mod tests {
         // Simulate single agent config response (auto-skips to workspace selection)
         {
             let agent_config_event = serde_json::json!({ "agents": ["codex"] });
-            let ctx = crate::tui::layout_lua::ActionContext::default();
+            let ctx = crate::clients::tui::layout_lua::ActionContext::default();
             let ops = lua
                 .call_on_hub_event("agent_config", &agent_config_event, &ctx)
                 .unwrap()

@@ -5,14 +5,42 @@
 -- @scope device
 -- @version 1.1.0
 
+-- target_path is intentionally absent from every model. A target's filesystem
+-- root is derived on demand from target_id via the spawn target registry
+-- (see repo.resolve_target_path / ui.target_repo_path). Storing it denormalized
+-- let it drift and leaked a raw path into agent-facing context, where agents
+-- mistook it for their working directory. target_id is the sole stored handle.
 local db = plugin.db{
-    version = 8,
+    version = 9,
+    migrations = {
+        -- v9: drop the denormalized target_path columns. target_path is now
+        -- fully derived from target_id at point of use. Guarded so it is a
+        -- no-op on fresh databases (column never created) and only drops on
+        -- databases upgrading from v8 or earlier.
+        [9] = function(migration_db)
+            local function drop_target_path(tbl)
+                local info = migration_db:eval(string.format("PRAGMA table_info(%s)", tbl))
+                if type(info) ~= "table" then
+                    return
+                end
+                for _, col in ipairs(info) do
+                    if col.name == "target_path" then
+                        migration_db:eval(string.format(
+                            "ALTER TABLE %s DROP COLUMN target_path", tbl))
+                        return
+                    end
+                end
+            end
+            drop_target_path("tickets")
+            drop_target_path("project_targets")
+            drop_target_path("runs")
+        end,
+    },
     models = {
         tickets = {
             id = { "text", required = true, primary = true },
             project_id = { "text" },
             target_id = { "text" },
-            target_path = { "text" },
             title = { "text", required = true },
             description = { "text" },
             status = { "text", required = true },
@@ -37,7 +65,6 @@ local db = plugin.db{
             id = { "text", required = true, primary = true },
             project_id = { "text", required = true },
             target_id = { "text", required = true },
-            target_path = { "text" },
             created_at = { "integer", required = true },
         },
         pipelines = {
@@ -84,7 +111,6 @@ local db = plugin.db{
             parent_run_id = { "text" },
             target_id = { "text" },
             target_name = { "text" },
-            target_path = { "text" },
             workspace_id = { "text" },
             workspace_name = { "text" },
             base_ticket_id = { "text" },

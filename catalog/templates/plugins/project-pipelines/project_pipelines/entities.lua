@@ -76,11 +76,11 @@ local function with_view()
     return nil
 end
 
-local function target_label(view, target_id, target_path)
+local function target_label(view, target_id)
     if view and view.target_label then
-        return view.target_label(target_id, target_path)
+        return view.target_label(target_id)
     end
-    return target_id or target_path or "No target"
+    return target_id or "No target"
 end
 
 local function index_by_id(items)
@@ -190,7 +190,7 @@ local function decorate_ticket_entity(entity, opts)
     local merge_payload = merge_event and decode(merge_event.payload, {}) or {}
     local merge_session_uuid = merge_payload.session_uuid
 
-    entity.target_label = target_label(view, entity.target_id, entity.target_path)
+    entity.target_label = target_label(view, entity.target_id)
     entity.status_tone = view and view.status_tone and view.status_tone(entity.status) or "muted"
     entity.status_label = view and view.status_label and view.status_label(entity.status) or tostring(entity.status or "")
     entity.status_state = view and view.status_state and view.status_state(entity.status) or "neutral"
@@ -439,7 +439,7 @@ end
 local function project_target_entity(target)
     local entity = copy(target)
     local view = with_view()
-    entity.target_label = target_label(view, target.target_id, target.target_path)
+    entity.target_label = target_label(view, target.target_id)
     return entity
 end
 

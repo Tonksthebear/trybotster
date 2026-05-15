@@ -108,6 +108,61 @@ local function emit_pr_merged(event_repo, message, payload)
     return true, false
 end
 
+local function pr_review_payload(message, payload)
+    local pr = payload.pull_request or payload.pr or {}
+    local review = payload.review or {}
+    local repo = message.repo
+        or payload.repo
+        or payload.repository_full_name
+        or (payload.repository and payload.repository.full_name)
+    local number = payload.pr_number
+        or payload.pull_request_number
+        or payload.number
+        or pr.number
+    local action = message.action or payload.action
+    local event_type = message.event_type or payload.event_type
+
+    if event_type ~= "pull_request_review" or action ~= "submitted" or not number then
+        return nil
+    end
+
+    return {
+        provider = "github",
+        repo = repo,
+        pr_number = tonumber(number),
+        pr_url = payload.pr_url or payload.html_url or pr.html_url or pr.url,
+        head_branch = payload.head_branch or (pr.head and pr.head.ref),
+        base_branch = payload.base_branch or (pr.base and pr.base.ref),
+        review_id = payload.review_id or review.id,
+        review_url = payload.review_url or review.url,
+        review_html_url = payload.review_html_url or review.html_url,
+        reviewer = payload.reviewer or (review.user and review.user.login),
+        state = payload.state or review.state,
+        body = payload.body or review.body,
+        submitted_at = payload.submitted_at or review.submitted_at,
+        raw_event_type = event_type,
+    }
+end
+
+local function emit_pr_review_submitted(event_repo, message, payload)
+    local event = pr_review_payload(message, payload)
+    if not event then
+        return false, false
+    end
+    event.repo = event.repo or event_repo
+    if not event.repo then
+        return true, false
+    end
+    if events and events.emit then
+        local ok, err = pcall(events.emit, "pr_review_submitted", event)
+        if ok then
+            return true, true
+        end
+        log.warn("GitHub: failed to emit pr_review_submitted event: " .. tostring(err))
+    end
+    return true, false
+end
+
 local function is_pr_lifecycle_message(message, payload)
     local event_type = tostring(message.event_type or payload.event_type or "")
     return event_type == "pull_request"
@@ -120,7 +175,9 @@ end
 local function handle_message(default_repo, message, channel_id)
     local payload = message.payload or {}
     local event_repo = message.repo or default_repo
-    local pr_lifecycle_event = emit_pr_merged(event_repo, message, payload)
+    local pr_merged_event = emit_pr_merged(event_repo, message, payload)
+    local pr_review_event = emit_pr_review_submitted(event_repo, message, payload)
+    local pr_lifecycle_event = pr_merged_event or pr_review_event
 
     if pr_lifecycle_event and is_pr_lifecycle_message(message, payload) and not (payload.prompt or payload.context or payload.comment_body) then
         action_cable.perform(channel_id, "ack", { id = message.id })

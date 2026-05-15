@@ -50,7 +50,7 @@ Trigger conditions: `Create`, `Modify`, `Rename` file events on `.lua` files onl
 
 ## TUI-Side Hot-Reload
 
-1. `HotReloader` in `src/tui/hot_reload.rs` watches:
+1. `HotReloader` in `src/clients/tui/hot_reload.rs` watches:
    - Source tree `lua/ui/` (debug builds only)
    - `~/.botster/lua/ui/` and `~/.botster/lua/user/ui/`
    - Plugin `ui/` directories

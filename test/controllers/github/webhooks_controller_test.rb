@@ -809,6 +809,56 @@ module Github
       assert_response :success
     end
 
+    test "pull_request_review submitted creates review lifecycle message" do
+      payload = {
+        action: "submitted",
+        pull_request: {
+          number: 92,
+          title: "Review PR",
+          body: "PR body",
+          html_url: "https://github.com/test/repo/pull/92",
+          head: { ref: "feature-branch" },
+          base: { ref: "main" },
+          user: { login: "author" }
+        },
+        review: {
+          id: 123,
+          url: "https://api.github.com/repos/test/repo/pulls/92/reviews/123",
+          html_url: "https://github.com/test/repo/pull/92#pullrequestreview-123",
+          state: "changes_requested",
+          body: "Please fix the failing path.",
+          submitted_at: "2026-05-14T20:00:00Z",
+          user: { login: "reviewer" }
+        },
+        repository: { full_name: "test/repo" },
+        installation: { id: 12345 }
+      }
+
+      body, signature = sign_webhook_payload(payload)
+
+      assert_difference "Integrations::Github::Message.count", 1 do
+        post "/github/webhooks",
+          params: body,
+          headers: {
+            "Content-Type" => "application/json",
+            "X-GitHub-Event" => "pull_request_review",
+            "X-Hub-Signature-256" => signature
+          }
+      end
+
+      assert_response :success
+
+      message = Integrations::Github::Message.last
+      assert_equal "pull_request_review", message.event_type
+      assert_equal "test/repo", message.repo
+      assert_equal 92, message.issue_number
+      assert_equal "changes_requested", message.payload["state"]
+      assert_equal "reviewer", message.payload["reviewer"]
+      assert_equal "Please fix the failing path.", message.payload["body"]
+      assert_equal "feature-branch", message.payload["head_branch"]
+      assert_equal "main", message.payload["base_branch"]
+    end
+
     private
 
     def extract_linked_issues(pr_body)

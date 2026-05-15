@@ -48,20 +48,10 @@ local function recover_session(record, socket_info, recovered, seen_keys)
     if not ok or not handle then
         log.warn(string.format("[session_recovery] connect failed for %s: %s",
             session_uuid, tostring(handle)))
-        if socket_info and socket_info.socket_path then
-            local deleted, del_err = fs.delete(socket_info.socket_path)
-            if deleted then
-                log.info(string.format(
-                    "[session_recovery] Removed stale session socket %s",
-                    tostring(socket_info.socket_path)
-                ))
-            elseif del_err then
-                log.debug(string.format(
-                    "[session_recovery] Failed to remove stale socket %s: %s",
-                    tostring(socket_info.socket_path), tostring(del_err)
-                ))
-            end
-        end
+        log.warn(string.format(
+            "[session_recovery] leaving socket in place for inspection: %s",
+            tostring(socket_info and socket_info.socket_path or nil)
+        ))
         return
     end
 
@@ -141,6 +131,13 @@ _event_sub = events.on("sessions_discovered", function(data)
     local recovered = {}
     local seen_keys = {}
     local manifest_by_uuid = {}
+    local socket_by_uuid = {}
+
+    for _, socket_info in ipairs(sockets) do
+        if socket_info.session_uuid and socket_info.session_uuid ~= "" then
+            socket_by_uuid[socket_info.session_uuid] = true
+        end
+    end
 
     -- Build manifest index from hub manifest's active workspaces.
     -- The hub manifest tracks which workspaces were active — only scan those,
@@ -224,6 +221,27 @@ _event_sub = events.on("sessions_discovered", function(data)
                 "[session_recovery] No manifest for session socket %s",
                 tostring(session_uuid)
             ))
+        end
+    end
+
+    for session_uuid, record in pairs(manifest_by_uuid) do
+        local manifest = record and record.manifest or nil
+        local status = manifest and manifest.status or nil
+        if not socket_by_uuid[session_uuid]
+            and (status == "active" or status == "suspended" or status == "running")
+        then
+            log.warn(string.format(
+                "[session_recovery] active manifest has no live session socket; marking orphaned session=%s workspace=%s status=%s",
+                tostring(session_uuid),
+                tostring(record.workspace_id),
+                tostring(status)
+            ))
+            manifest.status = "orphaned"
+            manifest.updated_at = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time())
+            pcall(function()
+                workspace_store.write_session(record.data_dir, record.workspace_id, session_uuid, manifest)
+                workspace_store.append_event(record.data_dir, record.workspace_id, session_uuid, "orphaned")
+            end)
         end
     end
 

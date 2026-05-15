@@ -30,7 +30,7 @@
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::tui::entity_stores::TuiEntityStores;
+use crate::clients::tui::entity_stores::TuiEntityStores;
 
 /// Sentinel key marking a `$bind` lookup.
 pub const BIND_SENTINEL_KEY: &str = "$bind";

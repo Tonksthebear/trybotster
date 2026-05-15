@@ -10,6 +10,7 @@ module Github
     HANDLERS = {
       "issue_comment" => Integrations::Github::Webhooks::IssueCommentHandler,
       "pull_request_review_comment" => Integrations::Github::Webhooks::PrReviewCommentHandler,
+      "pull_request_review" => Integrations::Github::Webhooks::PrReviewHandler,
       "issues" => Integrations::Github::Webhooks::IssueHandler,
       "pull_request" => Integrations::Github::Webhooks::PullRequestHandler
     }.freeze

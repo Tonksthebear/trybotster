@@ -559,7 +559,7 @@ fn catalog_plugin_project_pipelines_entity_publish_snapshots_and_deltas_use_plug
             }
 
             package.loaded["project_pipelines.web.ui"] = {
-              target_label = function(target_id, target_path) return target_id or target_path or "No target" end,
+              target_label = function(target_id) return target_id or "No target" end,
               status_tone = function(status) return status == "done" and "success" or "muted" end,
               ticket_notification_count = function() return 0 end,
               visible_tickets = function(repo) return repo.standalone_tickets() end,
@@ -877,4 +877,80 @@ fn catalog_plugin_github_event_routing_template_notifies_matching_agent_before_c
         .expect("GitHub template should notify matching agents instead of spawning");
 
     assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_github_event_routing_emits_pr_review_submitted() {
+    let template_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates/plugins/github/event_routing.lua");
+    let template_path = template_path.to_str().unwrap();
+
+    let lua = create_lua_vm();
+
+    let result: JsonValue = lua
+        .load(format!(
+            r#"
+            local emitted = {{}}
+            local acked = false
+            local callback = nil
+
+            package.loaded["lib.agent"] = {{ find_by_workspace = function() return {{}} end }}
+            package.loaded["hub.state"] = {{ get = function() return {{}} end }}
+            package.loaded["lib.hub"] = {{ get = function() return {{}} end }}
+            events = {{
+              emit = function(name, event)
+                emitted[#emitted + 1] = {{ name = name, event = event }}
+                return 1
+              end,
+            }}
+            action_cable = {{
+              connect = function() return "conn-1" end,
+              subscribe = function(_, _, _, cb)
+                callback = cb
+                return "chan-1"
+              end,
+              perform = function(_, action, data)
+                if action == "ack" and data.id == 9 then acked = true end
+              end,
+              close = function() end,
+            }}
+
+            local routing = dofile("{template_path}")
+            routing.start("owner/repo")
+            callback({{
+              id = 9,
+              event_type = "pull_request_review",
+              repo = "owner/repo",
+              payload = {{
+                action = "submitted",
+                repo = "owner/repo",
+                pr_number = 42,
+                pr_url = "https://github.com/owner/repo/pull/42",
+                review_id = 123,
+                review_html_url = "https://github.com/owner/repo/pull/42#pullrequestreview-123",
+                reviewer = "reviewer",
+                state = "changes_requested",
+                body = "Please fix the failing path.",
+                submitted_at = "2026-05-14T20:00:00Z",
+              }},
+            }}, "chan-1")
+
+            assert(acked == true)
+            return {{ emitted = emitted }}
+            "#
+        ))
+        .eval()
+        .and_then(|value: Value| lua.from_value(value))
+        .expect("GitHub event routing should emit PR review submissions");
+
+    assert_eq!(result["emitted"][0]["name"], json!("pr_review_submitted"));
+    assert_eq!(result["emitted"][0]["event"]["repo"], json!("owner/repo"));
+    assert_eq!(result["emitted"][0]["event"]["pr_number"], json!(42));
+    assert_eq!(
+        result["emitted"][0]["event"]["state"],
+        json!("changes_requested")
+    );
+    assert_eq!(result["emitted"][0]["event"]["reviewer"], json!("reviewer"));
 }

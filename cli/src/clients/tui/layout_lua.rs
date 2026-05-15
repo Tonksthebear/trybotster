@@ -178,7 +178,7 @@ impl LayoutLua {
     pub fn call_render_with_stores(
         &self,
         ctx: &RenderContext,
-        stores: Option<&crate::tui::entity_stores::TuiEntityStores>,
+        stores: Option<&crate::clients::tui::entity_stores::TuiEntityStores>,
     ) -> Result<RenderNode> {
         let state = render_context_to_lua(&self.lua, ctx)?;
         if let Some(stores) = stores {
@@ -202,14 +202,14 @@ impl LayoutLua {
         // other shape — including the legacy `{ type = "hsplit", ... }`
         // layout tables — falls through to the pre-existing parser.
         if let Ok(type_name) = result.get::<String>("type") {
-            if crate::tui::ui_contract_adapter::is_ui_node_type(&type_name) {
-                let viewport = crate::tui::ui_contract_adapter::derive_viewport_from_terminal(
+            if crate::clients::tui::ui_contract_adapter::is_ui_node_type(&type_name) {
+                let viewport = crate::clients::tui::ui_contract_adapter::derive_viewport_from_terminal(
                     ctx.terminal_cols,
                     ctx.terminal_rows,
                     false,
                 );
                 let (render, _actions) =
-                    crate::tui::ui_contract_adapter::render_lua_ui_node_with_stores(
+                    crate::clients::tui::ui_contract_adapter::render_lua_ui_node_with_stores(
                         &self.lua, &result, &viewport, stores,
                     )?;
                 return Ok(render);
@@ -229,7 +229,7 @@ impl LayoutLua {
     pub fn call_render_overlay_with_stores(
         &self,
         ctx: &RenderContext,
-        stores: Option<&crate::tui::entity_stores::TuiEntityStores>,
+        stores: Option<&crate::clients::tui::entity_stores::TuiEntityStores>,
     ) -> Result<Option<RenderNode>> {
         let state = render_context_to_lua(&self.lua, ctx)?;
         if let Some(stores) = stores {
@@ -257,15 +257,15 @@ impl LayoutLua {
                 // legacy layout table shape is handled by the existing
                 // parser.
                 if let Ok(type_name) = table.get::<String>("type") {
-                    if crate::tui::ui_contract_adapter::is_ui_node_type(&type_name) {
+                    if crate::clients::tui::ui_contract_adapter::is_ui_node_type(&type_name) {
                         let viewport =
-                            crate::tui::ui_contract_adapter::derive_viewport_from_terminal(
+                            crate::clients::tui::ui_contract_adapter::derive_viewport_from_terminal(
                                 ctx.terminal_cols,
                                 ctx.terminal_rows,
                                 false,
                             );
                         let (node, _actions) =
-                            crate::tui::ui_contract_adapter::render_lua_ui_node_with_stores(
+                            crate::clients::tui::ui_contract_adapter::render_lua_ui_node_with_stores(
                                 &self.lua, &table, &viewport, stores,
                             )?;
                         return Ok(Some(node));
@@ -722,7 +722,7 @@ fn render_context_to_lua(lua: &Lua, ctx: &RenderContext) -> Result<LuaTable> {
     // raw column counts. Terminal mouse support is not currently detected
     // at this layer; until the TUI exposes a dedicated probe the pointer
     // is reported as `"none"`, matching the spec's TUI default.
-    let viewport = crate::tui::ui_contract_adapter::derive_viewport_from_terminal(
+    let viewport = crate::clients::tui::ui_contract_adapter::derive_viewport_from_terminal(
         ctx.terminal_cols,
         ctx.terminal_rows,
         false,
@@ -924,7 +924,7 @@ mod tests {
     fn make_test_ctx(_mode: &str) -> RenderContext<'static> {
         let panels: &'static std::collections::HashMap<
             String,
-            crate::tui::terminal_panel::TerminalPanel,
+            crate::clients::tui::terminal_panel::TerminalPanel,
         > = Box::leak(Box::new(std::collections::HashMap::new()));
         RenderContext {
             error_message: None,
@@ -1058,7 +1058,7 @@ mod tests {
     /// to Lua, and layout.lua must handle each one.
     #[test]
     fn test_mode_string_consistency_with_actual_layout() {
-        let layout_source = include_str!("../../lua/ui/layout.lua");
+        let layout_source = include_str!("../../../lua/ui/layout.lua");
         let layout = LayoutLua::new(layout_source).expect("actual layout.lua should load");
 
         // Bootstrap _tui_state (layout.lua reads from it)
@@ -1115,7 +1115,7 @@ mod tests {
     /// valid Centered → Widget trees with correct widget types.
     #[test]
     fn test_actual_layout_overlay_widget_types() {
-        let layout_source = include_str!("../../lua/ui/layout.lua");
+        let layout_source = include_str!("../../../lua/ui/layout.lua");
         let layout = LayoutLua::new(layout_source).expect("actual layout.lua should load");
 
         // Bootstrap _tui_state (layout.lua reads from it)
@@ -1335,7 +1335,7 @@ mod tests {
         .unwrap();
 
         // Load botster API
-        let botster_source = include_str!("../../lua/ui/botster.lua");
+        let botster_source = include_str!("../../../lua/ui/botster.lua");
         layout
             .load_extension(botster_source, "botster")
             .expect("botster.lua should load without errors");
@@ -1364,11 +1364,11 @@ mod tests {
     /// Create a LayoutLua with layout + keybindings + actions + botster API loaded.
     /// Mimics the full production init chain.
     fn make_full_lua() -> LayoutLua {
-        let layout_source = include_str!("../../lua/ui/layout.lua");
-        let kb_source = include_str!("../../lua/ui/keybindings.lua");
-        let actions_source = include_str!("../../lua/ui/actions.lua");
-        let events_source = include_str!("../../lua/ui/events.lua");
-        let botster_source = include_str!("../../lua/ui/botster.lua");
+        let layout_source = include_str!("../../../lua/ui/layout.lua");
+        let kb_source = include_str!("../../../lua/ui/keybindings.lua");
+        let actions_source = include_str!("../../../lua/ui/actions.lua");
+        let events_source = include_str!("../../../lua/ui/events.lua");
+        let botster_source = include_str!("../../../lua/ui/botster.lua");
 
         let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
         // Bootstrap _tui_state (layout.lua and actions.lua read from it)
@@ -1378,12 +1378,12 @@ mod tests {
         ).expect("_tui_state bootstrap should succeed");
         lua.preload_module(
             "ui.workspace_helpers",
-            include_str!("../../lua/ui/workspace_helpers.lua"),
+            include_str!("../../../lua/ui/workspace_helpers.lua"),
         )
         .expect("workspace_helpers.lua should preload");
         lua.preload_module(
             "ui.entity_state",
-            include_str!("../../lua/ui/entity_state.lua"),
+            include_str!("../../../lua/ui/entity_state.lua"),
         )
         .expect("entity_state.lua should preload");
         lua.load_keybindings(kb_source)
@@ -1622,7 +1622,7 @@ mod tests {
         .unwrap();
 
         // Reload botster.lua (simulates hot-reload)
-        let botster_source = include_str!("../../lua/ui/botster.lua");
+        let botster_source = include_str!("../../../lua/ui/botster.lua");
         lua.load_extension(botster_source, "botster_reload")
             .unwrap();
 
@@ -1686,7 +1686,7 @@ mod tests {
         )
         .unwrap();
 
-        let botster_source = include_str!("../../lua/ui/botster.lua");
+        let botster_source = include_str!("../../../lua/ui/botster.lua");
         layout.load_extension(botster_source, "botster").unwrap();
 
         layout
@@ -1720,12 +1720,12 @@ mod tests {
     /// Verifies the complete init chain produces a renderable layout.
     #[test]
     fn test_full_tui_boot_sequence() {
-        let layout_source = include_str!("../../lua/ui/layout.lua");
-        let kb_source = include_str!("../../lua/ui/keybindings.lua");
-        let actions_source = include_str!("../../lua/ui/actions.lua");
-        let events_source = include_str!("../../lua/ui/events.lua");
-        let botster_source = include_str!("../../lua/ui/botster.lua");
-        let ws_helpers_source = include_str!("../../lua/ui/workspace_helpers.lua");
+        let layout_source = include_str!("../../../lua/ui/layout.lua");
+        let kb_source = include_str!("../../../lua/ui/keybindings.lua");
+        let actions_source = include_str!("../../../lua/ui/actions.lua");
+        let events_source = include_str!("../../../lua/ui/events.lua");
+        let botster_source = include_str!("../../../lua/ui/botster.lua");
+        let ws_helpers_source = include_str!("../../../lua/ui/workspace_helpers.lua");
 
         // Mirror the exact init order from runner.rs run()
         let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
@@ -1735,7 +1735,7 @@ mod tests {
             .expect("workspace_helpers preload should succeed");
         lua.preload_module(
             "ui.entity_state",
-            include_str!("../../lua/ui/entity_state.lua"),
+            include_str!("../../../lua/ui/entity_state.lua"),
         )
         .expect("entity_state preload should succeed");
         lua.load_actions(actions_source)
@@ -1778,7 +1778,7 @@ mod tests {
     /// User override extension only replaces the function it redefines.
     #[test]
     fn test_user_override_layers_on_built_in() {
-        let layout_source = include_str!("../../lua/ui/layout.lua");
+        let layout_source = include_str!("../../../lua/ui/layout.lua");
         let lua = LayoutLua::new(layout_source).expect("layout.lua should load");
         lua.load_extension(
             "_tui_state = _tui_state or { agents = {}, pending_fields = {}, available_worktrees = {}, available_agents = {}, mode = 'normal', input_buffer = '', list_selected = 0 }",
@@ -1896,11 +1896,11 @@ mod tests {
 
     /// Helper: create full Lua env with events module loaded.
     fn make_full_lua_with_events() -> LayoutLua {
-        let layout_source = include_str!("../../lua/ui/layout.lua");
-        let kb_source = include_str!("../../lua/ui/keybindings.lua");
-        let actions_source = include_str!("../../lua/ui/actions.lua");
-        let events_source = include_str!("../../lua/ui/events.lua");
-        let botster_source = include_str!("../../lua/ui/botster.lua");
+        let layout_source = include_str!("../../../lua/ui/layout.lua");
+        let kb_source = include_str!("../../../lua/ui/keybindings.lua");
+        let actions_source = include_str!("../../../lua/ui/actions.lua");
+        let events_source = include_str!("../../../lua/ui/events.lua");
+        let botster_source = include_str!("../../../lua/ui/botster.lua");
 
         let mut lua = LayoutLua::new(layout_source).expect("layout.lua should load");
         lua.load_extension(
@@ -1909,12 +1909,12 @@ mod tests {
         ).expect("_tui_state bootstrap should succeed");
         lua.preload_module(
             "ui.workspace_helpers",
-            include_str!("../../lua/ui/workspace_helpers.lua"),
+            include_str!("../../../lua/ui/workspace_helpers.lua"),
         )
         .expect("workspace_helpers.lua should preload");
         lua.preload_module(
             "ui.entity_state",
-            include_str!("../../lua/ui/entity_state.lua"),
+            include_str!("../../../lua/ui/entity_state.lua"),
         )
         .expect("entity_state.lua should preload");
         lua.load_keybindings(kb_source)
@@ -2070,7 +2070,7 @@ mod tests {
 
     /// Extract list item plain-text strings from the sidebar (first child of HSplit).
     fn extract_sidebar_items(tree: &RenderNode) -> Vec<String> {
-        use crate::tui::render_tree::{ListProps, StyledContent, WidgetProps};
+        use crate::clients::tui::render_tree::{ListProps, StyledContent, WidgetProps};
         match tree {
             RenderNode::HSplit { children, .. } => match &children[0] {
                 RenderNode::Widget { props, .. } => {
@@ -2095,7 +2095,7 @@ mod tests {
     }
 
     fn extract_sidebar_field(tree: &RenderNode, field: &str) -> Vec<Option<String>> {
-        use crate::tui::render_tree::{ListProps, StyledContent, WidgetProps};
+        use crate::clients::tui::render_tree::{ListProps, StyledContent, WidgetProps};
         match tree {
             RenderNode::HSplit { children, .. } => match &children[0] {
                 RenderNode::Widget { props, .. } => {

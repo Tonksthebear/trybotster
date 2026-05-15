@@ -104,24 +104,24 @@ Create agents from the web client or from the TUI menu (`Ctrl+P`). Terminal outp
 ## Architecture
 
 ```
-Web client / TUI
+Browser client / TUI client
       |
   Create agent (manual or plugin-triggered)
       |
-  Rust daemon receives command
+  Hub coordinates control-plane policy
       |
-  Creates git worktree
+  Lua plugins create workspace/worktree/session intent
       |
   Spawns session PTYs (agent, server, etc.)
       |
   Agent works in isolation
       |
-  Monitor via E2E encrypted WebRTC
+  SessionIo/ClientWorker stream terminal state to clients
 ```
 
 **Rails server** ([trybotster.com](https://trybotster.com)) — User auth, hub management, browser shell, and plugin event channels. Relays E2E encrypted data it cannot decrypt.
 
-**Rust daemon** (botster) — Interactive TUI with ratatui, event-driven Lua runtime for agent lifecycle, creates isolated git worktrees, spawns sessions in PTYs, streams terminal state over encrypted WebRTC to connected clients.
+**Rust daemon** (botster) — Hub control-plane orchestrator, event-driven Lua runtime, PTY/session infrastructure, and equal client transports for the local TUI, browser over encrypted WebRTC, and socket clients.
 
 **Lua runtime** — Hot-reloadable event-driven plugin system. Core handlers manage agent lifecycle, WebRTC signaling, hub commands, and TUI keybindings. User-extensible via plugins in `.botster/`.
 

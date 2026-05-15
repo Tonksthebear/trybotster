@@ -9,28 +9,65 @@ local M = {}
 local SURFACE = "pipelines"
 
 M.rules = {
-    { id = "permission", label = "permission prompts", pattern = "permission" },
-    { id = "approval_requested", label = "approval requests", pattern = "approval requested" },
-    { id = "wants_to_edit", label = "edit approval prompts", pattern = "wants to edit" },
+    { id = "permission", label = "permission prompts", keywords = { "permission" } },
+    { id = "approval_requested", label = "approval requests", keywords = { "approval requested" } },
+    { id = "wants_to_edit", label = "edit approval prompts", keywords = { "wants to edit" } },
 }
+
+local function append_value(parts, value)
+    if value == nil then
+        return
+    end
+    if type(value) == "table" then
+        for _, item in ipairs(value) do
+            append_value(parts, item)
+        end
+        for key, item in pairs(value) do
+            if type(key) ~= "number" then
+                append_value(parts, item)
+            end
+        end
+        return
+    end
+    parts[#parts + 1] = tostring(value)
+end
 
 local function notification_text(intent)
     intent = intent or {}
-    return table.concat({
-        tostring(intent.message or ""),
-        tostring(intent.title or ""),
-        tostring(intent.body or ""),
-    }, "\n")
+    local parts = {}
+    append_value(parts, intent.message)
+    append_value(parts, intent.title)
+    append_value(parts, intent.body)
+    append_value(parts, intent.text)
+    append_value(parts, intent.summary)
+    append_value(parts, intent.keywords)
+    return table.concat(parts, "\n")
 end
 
 local function matching_rule(intent)
     local text = notification_text(intent):lower()
     for _, rule in ipairs(M.rules) do
-        if text:find(rule.pattern, 1, true) then
-            return rule
+        local keywords = rule.keywords or { rule.pattern }
+        for _, keyword in ipairs(keywords) do
+            local normalized = tostring(keyword or ""):lower()
+            if normalized ~= "" and text:find(normalized, 1, true) then
+                return rule, keyword
+            end
         end
     end
     return nil
+end
+
+local function log_suppressed(intent)
+    if type(log) ~= "table" or type(log.info) ~= "function" then
+        return
+    end
+    local text = notification_text(intent)
+    log.info(string.format(
+        "[project-pipelines] notification suppressed session=%s type=%s text=%q",
+        tostring(intent and intent.session_uuid or ""),
+        tostring(intent and intent.type or ""),
+        text))
 end
 
 function M.evaluate(intent)
@@ -43,6 +80,7 @@ function M.evaluate(intent)
         }
     end
 
+    log_suppressed(intent)
     return {
         core = "suppress",
         reason = "project_pipelines_routine_cli_notification",

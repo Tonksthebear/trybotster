@@ -74,7 +74,6 @@ local TICKET_UPDATE_FIELDS = {
     description = true,
     project_id = true,
     target_id = true,
-    target_path = true,
     status = true,
 }
 
@@ -97,6 +96,28 @@ local CHECKLIST_ITEM_UPDATE_FIELDS = {
     source_ref = true,
     evidence = true,
 }
+
+--- Resolve a spawn target's filesystem root from its target_id.
+--
+-- target_path is never stored on tickets or runs; it is derived here from the
+-- device-scoped spawn target registry whenever a real path is needed (command
+-- step cwd, repo-config scanning). Returns nil when the target is unknown or
+-- the registry primitive is unavailable.
+-- @param target_id string Spawn target identifier
+-- @return string|nil Canonical filesystem root, or nil
+function M.resolve_target_path(target_id)
+    if util.is_blank(target_id) then
+        return nil
+    end
+    if not (spawn_targets and spawn_targets.get) then
+        return nil
+    end
+    local ok, target = pcall(spawn_targets.get, target_id)
+    if ok and target and not util.is_blank(target.path) then
+        return target.path
+    end
+    return nil
+end
 
 local PR_LINK_UPDATE_FIELDS = {
     provider = true,
@@ -940,7 +961,6 @@ function M.create_ticket(attrs)
         id = attrs.id or util.id("ticket"),
         project_id = attrs.project_id,
         target_id = attrs.target_id,
-        target_path = attrs.target_path,
         title = attrs.title,
         description = attrs.description or "",
         status = attrs.status or "open",
@@ -1119,7 +1139,7 @@ function M.create_project(attrs)
     db.projects:insert(project)
     publish_entity("project", project)
     if attrs.target_id then
-        M.add_project_target(project.id, attrs.target_id, attrs.target_path)
+        M.add_project_target(project.id, attrs.target_id)
     end
     M.append_event("project.created", { payload = project })
     return project
@@ -1161,7 +1181,7 @@ function M.delete_project(project_id)
     return project
 end
 
-function M.add_project_target(project_id, target_id, target_path)
+function M.add_project_target(project_id, target_id)
     util.assert_present(project_id, "project_id")
     util.assert_present(target_id, "target_id")
     if not M.get_project(project_id) then
@@ -1171,13 +1191,12 @@ function M.add_project_target(project_id, target_id, target_path)
         id = util.id("project_target"),
         project_id = project_id,
         target_id = target_id,
-        target_path = target_path,
         created_at = util.now(),
     }
     db.project_targets:insert(row)
     publish_entity("project_target", row)
     M.append_event("project.target_added", {
-        payload = { project_id = project_id, target_id = target_id, target_path = target_path },
+        payload = { project_id = project_id, target_id = target_id },
     })
     return row
 end
@@ -1553,7 +1572,6 @@ function M.create_run(attrs)
         parent_run_id = attrs.parent_run_id,
         target_id = attrs.target_id,
         target_name = attrs.target_name,
-        target_path = attrs.target_path,
         workspace_id = attrs.workspace_id,
         workspace_name = attrs.workspace_name,
         base_ticket_id = attrs.base_ticket_id,

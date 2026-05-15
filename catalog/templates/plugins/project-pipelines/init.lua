@@ -62,6 +62,16 @@ if events and events.on then
             log.warn("[project-pipelines] pr_merged handler failed: " .. tostring(err))
         end
     end)
+
+    if _G.__project_pipelines_pr_review_submitted_sub and events.off then
+        pcall(events.off, _G.__project_pipelines_pr_review_submitted_sub)
+    end
+    _G.__project_pipelines_pr_review_submitted_sub = events.on("pr_review_submitted", function(data)
+        local ok, err = pcall(github_integration.handle_pr_review_submitted, data)
+        if not ok then
+            log.warn("[project-pipelines] pr_review_submitted handler failed: " .. tostring(err))
+        end
+    end)
 end
 
 if hooks and hooks.on then
