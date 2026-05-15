@@ -201,6 +201,7 @@ Dynamic state is published as plugin-owned entities:
 - `/project-pipelines.question`
 - `/project-pipelines.checklist`
 - `/project-pipelines.checklist_item`
+- `/project-pipelines.pr_link`
 - `/project-pipelines.event`
 
 The overview and detail pages render dynamic rows from plugin-owned entities
@@ -279,6 +280,90 @@ Ticket spawn dialogs are browser-local presentation state. The ticket detail
 screen opens them with `botster.presentation.set` and binds dialog `open` to
 `ui.local_state`; successful spawn actions return `presentation.clear` for the
 dialog keys while leaving navigation on the current ticket route.
+
+### Entity-Only UI Migration Plan
+
+The current Project Pipelines UI is only partially entity-backed. Keep the next
+slices small: migrate one screen section at a time from render-time `repo.*`
+queries into existing or new plugin entity families, then remove the
+corresponding refresh-only `ui_tree_snapshot` dependency for that section. Do
+not add plugin-specific browser stores or subscription state; browser state
+remains generic entity store data plus `ui.local_state` for presentation-only
+modal/disclosure flags.
+
+Entity families already available and expected to remain the primary UI data
+source:
+
+- `/project-pipelines.ticket`
+- `/project-pipelines.project`
+- `/project-pipelines.project_target`
+- `/project-pipelines.ticket_dependency`
+- `/project-pipelines.pipeline`
+- `/project-pipelines.pipeline_step`
+- `/project-pipelines.pipeline_gate`
+- `/project-pipelines.run`
+- `/project-pipelines.run_step`
+- `/project-pipelines.gate_result`
+- `/project-pipelines.review`
+- `/project-pipelines.finding`
+- `/project-pipelines.artifact`
+- `/project-pipelines.question`
+- `/project-pipelines.checklist`
+- `/project-pipelines.checklist_item`
+- `/project-pipelines.pr_link`
+- `/project-pipelines.event`
+
+Add only the smallest new families needed to replace embedded model snapshots:
+
+- `/project-pipelines.ticket_session` for ticket-associated agent, accessory,
+  merge, and question-advisor sessions now reconstructed from run steps and
+  event payloads.
+- `/project-pipelines.session_presence` only if generic core session entities
+  cannot supply the needed live/notification labels through shared bindings.
+  Prefer binding to core session entities before adding this family.
+
+Screen migration order:
+
+1. Overview: replace `running_pipeline_rows` and `merge_work_rows` in
+   `project_pipelines/web/screens/home.lua` with `ui.bind_list` rows from
+   `/project-pipelines.run`, `/project-pipelines.ticket`,
+   `/project-pipelines.pipeline`, `/project-pipelines.pipeline_step`,
+   `/project-pipelines.run_step`, `/project-pipelines.pr_link`,
+   `/project-pipelines.artifact`, and `/project-pipelines.event`. This removes
+   the largest overview `repo.list_runs`, `repo.visible_tickets`, event,
+   artifact, and PR-link snapshot load while leaving existing project, ticket,
+   question, and pipeline lists untouched.
+2. Run detail: migrate `project_pipelines/web/screens/run.lua` sections for
+   steps, reviews, findings, artifacts, and recent events to filtered
+   `ui.bind_list` sources. Keep the route header as scaffolding, but bind
+   title, run status, current step label, ticket link, and project link from
+   entity records instead of `repo.run_detail_overview`.
+3. Ticket timeline and terminal sections: replace `handoff_rows`,
+   `session_rows`, `run_rows`, `merge_controls`, `merge_result_rows`, and
+   dependency option lists in `project_pipelines/web/screens/ticket.lua` with
+   entity-bound lists. Publish ticket session rows explicitly rather than
+   reconstructing them from `ticket.manual_session_*`, `ticket.merge_*`, and
+   `question.agent_linked` events in the screen renderer.
+4. Pipeline index/editor: migrate `project_pipelines/web/screens/pipelines.lua`
+   from `repo.list_pipelines`, `repo.pipeline_steps`, and `repo.step_gates` to
+   `/project-pipelines.pipeline`, `/project-pipelines.pipeline_step`, and
+   `/project-pipelines.pipeline_gate`. Keep draft field feedback in the generic
+   `ui_action` feedback path; do not create a browser-side pipeline edit store.
+5. New ticket/project screens: replace recent ticket/project lists and project
+   select options in `project_pipelines/web/screens/new.lua` with bound
+   entities. Spawn target options may stay generic core UI data until spawn
+   targets have a core entity binding.
+6. Sidebar/notification cleanup: keep sidebar rows entity-bound and replace
+   `has_open_questions()` with either a generic entity-derived notification
+   query or an entity-backed nav badge when the surface registry can bind nav
+   notification state. Do not subscribe the browser to a Project Pipelines
+   custom channel for this marker.
+
+After each section migration, run static `rg` against the touched screen for
+`repo.` and verify that only route scaffolding, action feedback, or generic
+presentation helpers remain. Mutators should publish entity deltas for the
+affected families; `engine.refresh_surfaces` / `TreeSnapshot.invalidate` should
+only remain for structural route changes, not collection data changes.
 
 Routes:
 
