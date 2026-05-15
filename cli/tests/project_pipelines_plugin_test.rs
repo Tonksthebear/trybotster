@@ -1420,6 +1420,9 @@ fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_
               for field in screen:gmatch('ui%.bind%([^%)]*"%/([%w_]+)"') do
                 assert(fields[field], screen_name .. " bound field path missing from contract: " .. field)
               end
+              for field in screen:gmatch('ui%.bind%([^%)]*%.%.%s*"%/([%w_]+)"') do
+                assert(fields[field], screen_name .. " concatenated bound field path missing from contract: " .. field)
+              end
             end
 
             assert_screen_contract("home", contract.screens.home, "{home_path}")
