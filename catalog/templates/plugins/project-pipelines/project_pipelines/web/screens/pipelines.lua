@@ -25,6 +25,7 @@ local function pipeline_card_template()
             },
         },
         ui.text{ text = ui.bind("@/description"), size = "xs", tone = "muted" },
+        ui.text{ text = ui.bind("@/step_summary"), size = "xs", tone = "muted" },
     } } }
 end
 
@@ -39,6 +40,9 @@ function M.index(_view_state, ctx)
             source = "/project-pipelines.pipeline",
             item_template = pipeline_card_template(),
         },
+        -- TODO(entity-shape): ui.bind_list has no empty_template/empty_state hook yet,
+        -- so an entity-backed index cannot show the legacy empty state without
+        -- reintroducing a render-time pipeline list query.
     }
 
     return ui.stack{ direction = "vertical", gap = "4", children = children }
