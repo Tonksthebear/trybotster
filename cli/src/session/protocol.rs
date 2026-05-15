@@ -612,15 +612,15 @@ mod tests {
         };
 
         // Simulate daemon endpoint -> session -> daemon endpoint via in-memory buffers
-        let mut hub_to_session = Vec::new();
-        let mut session_to_hub = Vec::new();
+        let mut daemon_to_session = Vec::new();
+        let mut session_to_daemon = Vec::new();
 
         // Daemon endpoint writes hello
-        hub_to_session.extend_from_slice(HELLO_MAGIC);
-        hub_to_session.push(PROTOCOL_VERSION);
+        daemon_to_session.extend_from_slice(HELLO_MAGIC);
+        daemon_to_session.push(PROTOCOL_VERSION);
 
         // Session reads hello, writes welcome
-        let mut cursor = Cursor::new(&hub_to_session);
+        let mut cursor = Cursor::new(&daemon_to_session);
         let _session_out: Vec<u8> = Vec::new();
 
         // Manual session-side handshake (read from cursor, write to session_out)
@@ -630,14 +630,14 @@ mod tests {
         let mut ver = [0u8; 1];
         cursor.read_exact(&mut ver).unwrap();
 
-        session_to_hub.extend_from_slice(WELCOME_MAGIC);
-        session_to_hub.push(PROTOCOL_VERSION);
+        session_to_daemon.extend_from_slice(WELCOME_MAGIC);
+        session_to_daemon.push(PROTOCOL_VERSION);
         let json = serde_json::to_vec(&metadata).unwrap();
-        session_to_hub.extend_from_slice(&(json.len() as u32).to_le_bytes());
-        session_to_hub.extend_from_slice(&json);
+        session_to_daemon.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        session_to_daemon.extend_from_slice(&json);
 
         // Daemon endpoint reads welcome
-        let mut cursor = Cursor::new(&session_to_hub);
+        let mut cursor = Cursor::new(&session_to_daemon);
         let mut magic = [0u8; 4];
         cursor.read_exact(&mut magic).unwrap();
         assert_eq!(&magic, WELCOME_MAGIC);
