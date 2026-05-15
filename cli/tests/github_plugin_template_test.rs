@@ -356,6 +356,7 @@ fn catalog_plugin_project_pipelines_dynamic_state_uses_plugin_entities_not_force
             .expect("read project pipelines entity contract");
     let readme =
         std::fs::read_to_string(root.join("README.md")).expect("read project pipelines readme");
+    let normalized_readme = readme.split_whitespace().collect::<Vec<_>>().join(" ");
 
     assert!(
         !engine.contains("broadcast_ui_tree_snapshots")
@@ -363,9 +364,12 @@ fn catalog_plugin_project_pipelines_dynamic_state_uses_plugin_entities_not_force
         "Project Pipelines mutators must not force data-only ui_tree_snapshot refreshes"
     );
     assert!(
-        readme.contains("If a scaffold\npublishes plugin entities, include or document an `entity_contract.lua` module")
-            && readme.contains("Use `plugin.db` for durable private persistence")
-            && readme.contains("`ui.local_state` /\n`botster.presentation.*` for transient presentation state"),
+        normalized_readme.contains(
+            "If a scaffold publishes plugin entities, include or document an `entity_contract.lua` module"
+        ) && normalized_readme.contains("Use `plugin.db` for durable private persistence")
+            && normalized_readme.contains(
+                "`ui.local_state` / `botster.presentation.*` for transient presentation state"
+            ),
         "README should document the entity-publishing template convention"
     );
     for (entity_type, lua_key) in [
