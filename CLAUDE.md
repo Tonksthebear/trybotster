@@ -5,18 +5,18 @@ Local-first PTY workspace platform for agents, accessories, Lua automation, and 
 ## Architecture
 
 ```
-Client / plugin command → Rust daemon
-                              ↓
+Client / plugin command -> Rust daemon
+                              |
               Hub coordinates control-plane policy
-                              ↓
+                              |
        Lua plugins create workspace/worktree/session intent
-                              ↓
- SessionIo/ClientWorker stream terminal state to clients
+                              |
+Data plane: session PTY <-> SessionIo <-> ClientWorker <-> clients
 ```
 
 **Rails server** (trybotster.com): Hub registration, user auth, template catalog, plugin event channels, and encrypted relay/signaling it cannot decrypt.
 
-**Rust daemon** (botster): Hub control plane/orchestrator, Lua runtime, PTY/session infrastructure, and equal client transports for TUI, browser via WebRTC (E2E encrypted), and socket clients.
+**Rust daemon** (botster): Hub control plane/orchestrator, Lua runtime, PTY/session infrastructure, and equal client transports for TUI, browser via WebRTC (E2E encrypted), and socket clients. SessionIo/ClientWorker own terminal bytes, scrollback, and process-exit egress.
 
 **Lua plugin system** (Neovim-inspired): Hot-reloadable plugins, ~20 Rust primitives exposed to Lua.
 

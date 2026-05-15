@@ -434,10 +434,10 @@ Agent manifests optionally declare which plugins the agent wants (see Agent Mani
 When a session connects to MCP, tools are loaded — not filtered from a global list, but constructed for that session:
 
 ```
-session_uuid → session manifest → agent_name + target_id
-target_id    → target's available plugins (ceiling)
-agent_name   → agent manifest's requested plugins (optional)
-result       → if both declare plugins: intersection
+session_uuid -> session manifest -> agent_name + target_id
+target_id    -> target's available plugins (ceiling)
+agent_name   -> agent manifest's requested plugins (optional)
+result       -> if both declare plugins: intersection
                if only target declares: target ceiling
                if only agent declares: agent's list
                if neither declares: unrestricted (all plugins)
@@ -477,21 +477,21 @@ This means:
 - resolve configs from target root
 - persist target metadata in workspace/session manifests
 
-### Current Contract: Agent Manifests and Plugin Scoping
+### Implemented: Agent Manifests and Plugin Scoping
 
-- add `manifest.json` support to agent config directories
-- expose definition directory to initialization scripts for paired files
-- add `plugins` field to spawn target registry
-- add `plugins` field to agent manifests
-- implement MCP tool resolution: session → target ceiling ∩ agent selection
-- update config resolver to merge device + target-local manifests
+- added `manifest.json` support to agent config directories
+- exposed definition directory to initialization scripts for paired files
+- added `plugins` field to spawn target registry
+- added `plugins` field to agent manifests
+- implemented MCP tool resolution: session -> target ceiling intersect agent selection
+- updated config resolver to merge device and target-local manifests
 
-### Current Contract: TUI and Web UX
+### Implemented: TUI and Web UX
 
-- add spawn target picker
-- add target admission browser
-- group sessions by target and workspace
-- plugin selection UI in target settings and agent config
+- added spawn target picker
+- added target admission browser
+- grouped sessions by target and workspace
+- added plugin selection UI in target settings and agent config
 
 ### Remaining Integration Work: Multi-Repo GitHub Subscriptions
 

@@ -1,6 +1,7 @@
 //! Types for client communication.
 //!
-//! These types define the request/response protocol between clients and Hub.
+//! These types define shared client operation payloads used at hub policy and
+//! worker boundaries.
 //! Note: AgentInfo is re-exported from relay::types.
 
 use std::path::PathBuf;

@@ -113,15 +113,14 @@ Browser client / TUI client
   Lua plugins create workspace/worktree/session intent
       |
   Spawns session PTYs (agent, server, etc.)
-      |
-  Agent works in isolation
-      |
-  SessionIo/ClientWorker stream terminal state to clients
+
+Terminal data plane:
+  session PTY <-> SessionIo <-> ClientWorker <-> clients
 ```
 
 **Rails server** ([trybotster.com](https://trybotster.com)) — User auth, hub management, browser shell, and plugin event channels. Relays E2E encrypted data it cannot decrypt.
 
-**Rust daemon** (botster) — Hub control-plane orchestrator, event-driven Lua runtime, PTY/session infrastructure, and equal client transports for the local TUI, browser over encrypted WebRTC, and socket clients.
+**Rust daemon** (botster) — Hub control-plane orchestrator, event-driven Lua runtime, PTY/session infrastructure, and equal client transports for the local TUI, browser over encrypted WebRTC, and socket clients. Terminal bytes, scrollback, and process-exit frames flow through the SessionIo/ClientWorker data plane, not Hub byte relay.
 
 **Lua runtime** — Hot-reloadable event-driven plugin system. Core handlers manage agent lifecycle, WebRTC signaling, hub commands, and TUI keybindings. User-extensible via plugins in `.botster/`.
 
