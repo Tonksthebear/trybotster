@@ -13,6 +13,34 @@ This keeps the architecture explicit:
 - renderer-specific stores, commands, or refresh paths do not own plugin model
   data
 
+## Model Boundary
+
+Plugins ship their model through hub-owned Lua modules, not through
+client-specific stores:
+
+| Layer | Owns | Does not own |
+|---|---|---|
+| `plugin.db` schema and migrations | durable plugin persistence, constraints, migration history | client subscriptions, renderer cache shape, modal/disclosure state |
+| entity read models | normalized client-facing records derived from persistence and hub state | private SQL table shape, per-route tree snapshots, renderer components |
+| `ui.bind` / `ui.bind_list` | references from Lua-authored UI nodes into entity records | persistence, validation, or a second copy of plugin data |
+| local presentation state | per-client UI affordances such as modals, disclosure, focus, pending controls | durable workflow facts or records another client must see |
+
+That means a plugin that needs durable models should include:
+
+- a `plugin.db{}` declaration for tables, migrations, and durable writes
+- repository/model functions that validate and mutate that database
+- entity read-model publishers that expose stable, normalized record families
+  through `entity_snapshot`, `entity_upsert`, `entity_patch`, and
+  `entity_remove`
+- Lua UI trees that bind to those entity families with explicit paths
+
+Do not ship a plugin-specific browser store, custom subscription channel, or
+renderer refresh command as the model layer. Clients may cache entity frames in
+their own runtime structures, but the shared data contract remains the entity
+read model. If the UI needs fields that do not match the table shape, add them
+deliberately in the read-model publisher so the contract is visible and shared
+by browser and TUI renderers.
+
 ## Canonical Model
 
 A plugin entity type is a namespaced record family:
@@ -41,7 +69,8 @@ reserved for core.
 ## Entity Lifecycle
 
 Register entity families during plugin load with `lib.entity_broadcast`, then
-publish snapshots and deltas from mutator paths:
+publish snapshots and deltas from mutator paths. Treat these publishers as the
+explicit contract/read-model layer between private persistence and clients:
 
 ```lua
 local EB = require("lib.entity_broadcast")
@@ -125,6 +154,10 @@ bindings are valid only inside the `item_template`; outside a list template,
 bind against the absolute entity path.
 
 Missing scalar values resolve to `null`. Missing list sources resolve to `[]`.
+Bindings should name the read-model fields the UI expects. If a route needs
+derived labels, status tones, counts, or navigation paths, publish those fields
+on the entity record instead of teaching one renderer how to reconstruct them
+from private tables.
 
 ## Presentation State Boundary
 
@@ -201,6 +234,8 @@ renderer-specific pending flags.
 - Use `<plugin>.<type>` entity names and pass `owner_plugin` when registering or
   publishing outside the normal plugin load context.
 - Use a non-empty string `id` on every record.
+- Ship durable plugin models as `plugin.db` schema/migrations plus entity
+  read-model publishers; do not add plugin-specific browser stores.
 - Register every entity family before publishing snapshots or deltas.
 - Keep `all()` callbacks array-shaped and resilient; bad records are skipped.
 - Publish snapshots for baselines and targeted deltas for mutators.
@@ -232,6 +267,7 @@ For implementation changes, use the repo test script:
 cd cli
 ./test.sh --unit -- ui_contract
 ./test.sh --integration -- table_renders_rows_from_plugin_entity_bind
+./test.sh --integration -- project_pipelines_entity_contract
 ```
 
 Do not run raw `cargo test` for CLI verification; `cli/test.sh` sets the test
