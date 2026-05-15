@@ -1307,12 +1307,10 @@ fn catalog_plugin_project_pipelines_home_bind_lists_use_entity_empty_templates()
         );
     }
 
-    for stale_lookup in ["repo.list_pr_links", "repo.latest_ticket_pr_link"] {
-        assert!(
-            !home.contains(stale_lookup),
-            "home should not restore render-time {stale_lookup} lookups"
-        );
-    }
+    assert!(
+        !home.contains("repo."),
+        "home should not call repo.* at render time"
+    );
 }
 
 #[test]
