@@ -65,11 +65,11 @@ local function merge_ticket_template()
         id = ui.bind("@/id"),
         action = ui.action("botster.nav.open", { path = ui.bind("@/path") }),
         title = {
-            ui.badge{ text = ui.bind("@/latest_run_badge"), tone = ui.bind("@/latest_run_tone") },
+            ui.badge{ text = ui.bind("@/merge_status_label"), tone = ui.bind("@/merge_status_tone") },
             ui.text{ text = ui.bind("@/title"), size = "sm", weight = "semibold" },
         },
         subtitle = {
-            ui.text{ text = ui.bind("@/active_work_detail"), size = "xs", tone = "muted" },
+            ui.text{ text = ui.bind("@/merge_detail_label"), size = "xs", tone = "muted" },
         },
         end_ = {
             ui.badge{ text = ui.bind("@/target_label"), tone = "muted" },
@@ -161,10 +161,9 @@ function M.render(_view_state, ctx)
             } },
         }) },
         view.panel{ view.section("PRs And Merge", {
-            -- TODO(entity-shape): expose latest_run_path, merge_pr_url,
-            -- merge_pr_label, merge_pr_status, and merge_session_path on
-            -- /project-pipelines.ticket before restoring row-level Run, Open PR,
-            -- and Merge agent actions without render-time repo lookups.
+            -- TODO(entity-shape): expose latest_run_path and merge_session_path
+            -- on /project-pipelines.ticket before restoring row-level Run, Open
+            -- PR, and Merge agent actions without render-time repo lookups.
             ui.list{ children = {
                 ui.bind_list{
                     source = "/project-pipelines.ticket",

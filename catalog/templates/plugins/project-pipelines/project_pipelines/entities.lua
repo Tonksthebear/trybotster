@@ -167,6 +167,30 @@ local function merge_artifacts_by_run()
     return out
 end
 
+local function latest_pr_links_by(field)
+    local out = {}
+    for _, link in ipairs(rows("SELECT * FROM pr_links ORDER BY updated_at DESC, created_at DESC, id DESC")) do
+        local key = link[field]
+        if key and not out[key] then
+            out[key] = link
+        end
+    end
+    return out
+end
+
+local function pr_link_label(link)
+    if not link then
+        return nil
+    end
+    if not util.is_blank(link.pr_url) then
+        return link.pr_url
+    end
+    if not util.is_blank(link.repo) and not util.is_blank(link.pr_number) then
+        return tostring(link.repo) .. "#" .. tostring(link.pr_number)
+    end
+    return "PR linked"
+end
+
 local function decorate_ticket_entity(entity, opts)
     opts = opts or {}
     local view = opts.view
@@ -182,6 +206,11 @@ local function decorate_ticket_entity(entity, opts)
     local notifications = opts.notifications or 0
     local merge_event = opts.merge_event
     local merge_artifact = latest and opts.merge_artifacts_by_run and opts.merge_artifacts_by_run[latest.id] or nil
+    local pr_link = latest and opts.pr_links_by_run and opts.pr_links_by_run[latest.id] or nil
+    if not pr_link and opts.pr_links_by_ticket then
+        pr_link = opts.pr_links_by_ticket[entity.id]
+    end
+    local pr_label = pr_link_label(pr_link)
     local merge_active = entity.status ~= "closed"
         and latest
         and latest.status == "done"
@@ -210,6 +239,10 @@ local function decorate_ticket_entity(entity, opts)
         or "Starts this branch of work."
     entity.merge_active = merge_active and true or false
     entity.merge_session_uuid = merge_session_uuid
+    entity.merge_pr_url = pr_link and pr_link.pr_url or nil
+    entity.merge_pr_label = pr_label
+    entity.merge_pr_status = pr_link and pr_link.status or nil
+    entity.has_merge_pr_url = not util.is_blank(entity.merge_pr_url)
 
     if entity.status == "closed" then
         entity.latest_run_badge = "complete"
@@ -243,6 +276,18 @@ local function decorate_ticket_entity(entity, opts)
         entity.tail_label = "No runs yet"
         entity.active_work_label = "Ready for pipeline"
         entity.active_work_detail = "No run has started for this ticket."
+    end
+
+    if latest and latest.status == "done" and entity.status ~= "closed" then
+        entity.merge_status_label = pr_label
+            and (entity.merge_pr_status == "merged" and "PR merged" or "PR needs review")
+            or (merge_active and "merge agent running" or "ready for merge")
+        entity.merge_status_tone = pr_label and "danger" or "accent"
+        entity.merge_detail_label = pr_label or (merge_active and "Merge agent is handling final integration." or "No PR recorded yet.")
+    else
+        entity.merge_status_label = entity.latest_run_badge
+        entity.merge_status_tone = entity.latest_run_tone
+        entity.merge_detail_label = entity.active_work_detail
     end
 
     entity.notification_count = notifications
@@ -359,6 +404,8 @@ local function ticket_entities(tickets)
     local dependency_levels, dependencies_by_ticket = ticket_dependency_levels(tickets, dependencies)
     local merge_events = latest_merge_events_by_ticket()
     local merge_artifacts = merge_artifacts_by_run()
+    local pr_links_by_run = latest_pr_links_by("run_id")
+    local pr_links_by_ticket = latest_pr_links_by("ticket_id")
     local notification_counts = build_ticket_notification_counts(repo, view)
     local out = {}
     for _, ticket in ipairs(tickets or {}) do
@@ -370,6 +417,8 @@ local function ticket_entities(tickets)
             dependency_level = dependency_levels[ticket.id] or 0,
             merge_event = merge_events[ticket.id],
             merge_artifacts_by_run = merge_artifacts,
+            pr_links_by_run = pr_links_by_run,
+            pr_links_by_ticket = pr_links_by_ticket,
             notifications = notification_counts[ticket.id] or 0,
         })
     end
@@ -422,6 +471,8 @@ local function ticket_entity(ticket)
         dependency_level = dependency_levels[ticket.id] or 0,
         merge_event = merge_event,
         merge_artifacts_by_run = merge_artifacts_by_run(),
+        pr_links_by_run = latest_pr_links_by("run_id"),
+        pr_links_by_ticket = latest_pr_links_by("ticket_id"),
         notifications = notifications,
     })
 end

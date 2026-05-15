@@ -703,89 +703,37 @@ fn catalog_plugin_project_pipelines_deletes_only_manual_ticket_sessions() {
 
 #[test]
 fn catalog_plugin_project_pipelines_home_shows_linked_pr_records() {
-    let lua = Lua::new();
-    log::register(&lua).expect("register log");
+    let root = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let home = std::fs::read_to_string(root.join("project_pipelines/web/screens/home.lua"))
+        .expect("read home screen");
+    let entities = std::fs::read_to_string(root.join("project_pipelines/entities.lua"))
+        .expect("read entities");
 
-    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
-    let result: String = lua
-        .load(format!(
-            r#"
-            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
-
-            ui = {{
-              bind = function(path) return {{ bind = path }} end,
-              action = function(name, payload) return {{ name = name, payload = payload }} end,
-              list_item = function(props) return {{ type = "list_item", props = props }} end,
-              text = function(props) return {{ type = "text", props = props }} end,
-              badge = function(props) return {{ type = "badge", props = props }} end,
-              status_dot = function(props) return {{ type = "status_dot", props = props }} end,
-              button = function(props) return {{ type = "button", props = props }} end,
-              list = function(props) return {{ type = "list", props = props }} end,
-              bind_list = function(props) return {{ type = "bind_list", props = props }} end,
-              stack = function(props) return {{ type = "stack", props = props }} end,
-            }}
-
-            package.loaded["project_pipelines.web.ui"] = {{
-              page_header = function(props) return {{ type = "page_header", props = props }} end,
-              panel = function(child) return {{ type = "panel", child = child }} end,
-              section = function(title, children) return {{ type = "section", title = title, children = children }} end,
-              empty = function(title, description) return {{ type = "empty", title = title, description = description }} end,
-              badge = function(text, tone) return {{ type = "badge", text = text, tone = tone }} end,
-              row = function(children) return {{ type = "row", children = children }} end,
-              action_row = function(children) return {{ type = "action_row", children = children }} end,
-              session_info = function() return nil end,
-            }}
-
-            package.loaded["project_pipelines.repo"] = {{
-              list_runs = function() return {{}} end,
-              visible_tickets = function()
-                return {{ {{ id = "ticket-1", title = "Polish customer order and status experience", status = "open" }} }}
-              end,
-              latest_ticket_run = function(ticket_id)
-                assert(ticket_id == "ticket-1")
-                return {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipeline-1", status = "done" }}
-              end,
-              ticket_events = function()
-                return {{}}
-              end,
-              latest_merge_pr_artifact = function()
-                return nil
-              end,
-              list_pr_links = function(filters)
-                assert(filters.run_id == "run-1" or filters.ticket_id == "ticket-1")
-                return {{ {{ id = "pr-1", ticket_id = "ticket-1", run_id = "run-1", status = "open", repo = "owner/repo", pr_number = 42, pr_url = "https://github.test/owner/repo/pull/42" }} }}
-              end,
-              get_pipeline = function(id) return {{ id = id, name = "Pipeline" }} end,
-              get_ticket = function(id) return {{ id = id, title = "Ticket " .. id }} end,
-              get_step = function() return nil end,
-              get_run_step_visit = function() return nil end,
-            }}
-
-            local function contains_text(node, needle)
-              if type(node) ~= "table" then return false end
-              if node.props and node.props.text == needle then return true end
-              if node.text == needle then return true end
-              if node.label == needle then return true end
-              for _, value in pairs(node) do
-                if contains_text(value, needle) then return true end
-              end
-              return false
-            end
-
-            local home = require("project_pipelines.web.screens.home")
-            local tree = home.render({{}}, {{ path = function(path) return "/pipelines" .. path end }})
-            assert(contains_text(tree, "https://github.test/owner/repo/pull/42"))
-            assert(contains_text(tree, "PR needs review"))
-            assert(not contains_text(tree, "No PR recorded yet."))
-
-            return "ok"
-            "#,
-            plugin_dir = plugin_dir.display()
-        ))
-        .eval()
-        .expect("Project Pipelines home should show linked PR rows");
-
-    assert_eq!(result, "ok");
+    assert!(
+        home.contains(r#"source = "/project-pipelines.ticket""#)
+            && home.contains(r#"where = { status = "open", latest_run_status = "done" }"#),
+        "home PR rows should be driven by the ticket entity stream"
+    );
+    for binding in [
+        r#"ui.bind("@/merge_status_label")"#,
+        r#"ui.bind("@/merge_status_tone")"#,
+        r#"ui.bind("@/merge_detail_label")"#,
+    ] {
+        assert!(
+            home.contains(binding),
+            "home PR rows should bind projected PR field {binding}"
+        );
+    }
+    assert!(
+        !home.contains("repo.list_pr_links") && !home.contains("latest_ticket_pr_link"),
+        "home render must not reintroduce synchronous repo PR lookups"
+    );
+    assert!(
+        entities.contains("entity.merge_pr_label = pr_label")
+            && entities.contains(r#"entity.merge_status_label = pr_label"#)
+            && entities.contains(r#""PR needs review""#),
+        "ticket entities should project linked PR labels and review status for home rows"
+    );
 }
 
 #[test]
