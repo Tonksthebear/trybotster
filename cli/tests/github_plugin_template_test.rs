@@ -322,6 +322,7 @@ fn catalog_plugin_project_pipelines_template_catalog_entry_is_a_multi_file_plugi
             "plugins/project-pipelines/project_pipelines/db.lua",
             "plugins/project-pipelines/project_pipelines/engine.lua",
             "plugins/project-pipelines/project_pipelines/entities.lua",
+            "plugins/project-pipelines/project_pipelines/entity_contract.lua",
             "plugins/project-pipelines/project_pipelines/github_integration.lua",
             "plugins/project-pipelines/project_pipelines/mcp.lua",
             "plugins/project-pipelines/project_pipelines/notification_policy.lua",
@@ -350,6 +351,9 @@ fn catalog_plugin_project_pipelines_dynamic_state_uses_plugin_entities_not_force
         .expect("read project pipelines engine");
     let entities = std::fs::read_to_string(root.join("project_pipelines/entities.lua"))
         .expect("read project pipelines entities");
+    let entity_contract =
+        std::fs::read_to_string(root.join("project_pipelines/entity_contract.lua"))
+            .expect("read project pipelines entity contract");
     let readme =
         std::fs::read_to_string(root.join("README.md")).expect("read project pipelines readme");
 
@@ -372,8 +376,12 @@ fn catalog_plugin_project_pipelines_dynamic_state_uses_plugin_entities_not_force
         ("project-pipelines.pipeline_gate", "pipeline_gate"),
     ] {
         assert!(
-            entities.contains(&format!("{lua_key} = OWNER ..")),
-            "entities.lua should publish {entity_type}"
+            entity_contract.contains(&format!("{lua_key} = M.owner ..")),
+            "entity_contract.lua should publish {entity_type}"
+        );
+        assert!(
+            entities.contains("M.types = contract.types"),
+            "entities.lua should consume entity type names from the contract"
         );
         assert!(
             readme.contains(entity_type),

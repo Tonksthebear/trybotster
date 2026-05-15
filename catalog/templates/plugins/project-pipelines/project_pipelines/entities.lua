@@ -6,32 +6,14 @@
 -- @version 1.1.0
 
 local db = require("project_pipelines.db")
+local contract = require("project_pipelines.entity_contract")
 local util = require("project_pipelines.util")
 
-local OWNER = "project-pipelines"
+local OWNER = contract.owner
 
 local M = {}
 
-M.types = {
-    ticket = OWNER .. ".ticket",
-    project = OWNER .. ".project",
-    project_target = OWNER .. ".project_target",
-    ticket_dependency = OWNER .. ".ticket_dependency",
-    pipeline = OWNER .. ".pipeline",
-    pipeline_step = OWNER .. ".pipeline_step",
-    pipeline_gate = OWNER .. ".pipeline_gate",
-    run = OWNER .. ".run",
-    run_step = OWNER .. ".run_step",
-    gate_result = OWNER .. ".gate_result",
-    review = OWNER .. ".review",
-    finding = OWNER .. ".finding",
-    artifact = OWNER .. ".artifact",
-    question = OWNER .. ".question",
-    checklist = OWNER .. ".checklist",
-    checklist_item = OWNER .. ".checklist_item",
-    pr_link = OWNER .. ".pr_link",
-    event = OWNER .. ".event",
-}
+M.types = contract.types
 
 local function rows(sql, ...)
     local params = { ... }
