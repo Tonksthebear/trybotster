@@ -1480,10 +1480,9 @@ fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_
             assert_screen_contract("pipelines", contract.screens.pipelines, "{pipelines_path}")
             assert_screen_contract("project", contract.screens.project, "{project_path}")
             assert_screen_contract("ticket", contract.screens.ticket, "{ticket_path}")
+            assert_screen_contract("run", contract.screens.run, "{run_path}")
 
             local function assert_repo_rendered_screen(screen_name, path)
-              assert(contract.screens[screen_name] == nil,
-                screen_name .. " should move from repo_rendered_screens to screens only after entity binding migration")
               local metadata = assert(contract.repo_rendered_screens and contract.repo_rendered_screens[screen_name],
                 screen_name .. " repo-rendered screen missing contract metadata")
               assert(type(metadata.reason) == "string" and metadata.reason ~= "",
@@ -1493,8 +1492,10 @@ fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_
               assert(type(metadata.migration_sources) == "table" and #metadata.migration_sources > 0,
                 screen_name .. " repo-rendered metadata needs migration_sources")
               local screen = read_file(path)
-              assert(not screen:match("ui%.bind_list%s*%{{"),
-                screen_name .. " has bind_list rows; move migrated sections into contract.screens")
+              if contract.screens[screen_name] == nil then
+                assert(not screen:match("ui%.bind_list%s*%{{"),
+                  screen_name .. " has bind_list rows; move migrated sections into contract.screens")
+              end
               for _, call in ipairs(metadata.repo_calls) do
                 assert(screen:match("repo%." .. call .. "%s*%("),
                   screen_name .. " repo-rendered metadata lists missing repo call: " .. call)

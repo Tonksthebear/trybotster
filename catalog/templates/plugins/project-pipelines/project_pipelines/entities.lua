@@ -625,6 +625,14 @@ local function gate_result_entity(result)
     return entity
 end
 
+local function finding_entity(finding)
+    local entity = copy(finding)
+    entity.location_label = (not util.is_blank(entity.file))
+        and (entity.file .. (entity.line and (":" .. tostring(entity.line)) or ""))
+        or ""
+    return entity
+end
+
 local function question_entity(question)
     local entity = copy(question)
     local ticket = rows("SELECT id, title FROM tickets WHERE id = ? LIMIT 1", question.ticket_id)[1]
@@ -668,6 +676,7 @@ end
 local function artifact_entity(artifact)
     local entity = copy(artifact)
     entity.payload = decode(artifact.payload, {})
+    entity.display_summary = artifact.summary or artifact.uri or artifact.id
     return entity
 end
 
@@ -770,8 +779,14 @@ local ENTITY = {
         one = copy,
     },
     [M.types.finding] = {
-        all = function() return rows("SELECT * FROM review_findings ORDER BY created_at DESC, id DESC") end,
-        one = copy,
+        all = function()
+            local out = {}
+            for _, finding in ipairs(rows("SELECT * FROM review_findings ORDER BY created_at DESC, id DESC")) do
+                out[#out + 1] = finding_entity(finding)
+            end
+            return out
+        end,
+        one = finding_entity,
     },
     [M.types.artifact] = {
         all = function()

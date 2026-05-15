@@ -3,7 +3,7 @@
 -- @category plugins
 -- @dest plugins/project-pipelines/project_pipelines/entity_contract.lua
 -- @scope device
--- @version 1.3.0
+-- @version 1.4.0
 
 local M = {}
 
@@ -215,6 +215,48 @@ M.screens = {
             },
         },
     },
+    run = {
+        {
+            name = "reviews",
+            source = "/" .. M.types.review,
+            where_fields = { "run_id" },
+            fields = {
+                "reviewer_session_uuid",
+                "summary",
+                "verdict",
+            },
+        },
+        {
+            name = "findings",
+            source = "/" .. M.types.finding,
+            where_fields = { "run_id" },
+            fields = {
+                "details",
+                "location_label",
+                "severity",
+                "status",
+                "title",
+            },
+        },
+        {
+            name = "artifacts",
+            source = "/" .. M.types.artifact,
+            where_fields = { "run_id" },
+            fields = {
+                "display_summary",
+                "kind",
+                "uri",
+            },
+        },
+        {
+            name = "recent_events",
+            source = "/" .. M.types.event,
+            where_fields = { "run_id" },
+            fields = {
+                "kind",
+            },
+        },
+    },
 }
 
 M.repo_rendered_screens = {
@@ -232,7 +274,7 @@ M.repo_rendered_screens = {
         },
     },
     run = {
-        reason = "run detail still renders one composite overview until every section has filtered entity bindings",
+        reason = "run detail still renders one composite overview for header actions and step cards",
         repo_calls = {
             "get_project",
             "get_run_step_visit",
@@ -241,10 +283,6 @@ M.repo_rendered_screens = {
         migration_sources = {
             "/" .. M.types.run,
             "/" .. M.types.run_step,
-            "/" .. M.types.review,
-            "/" .. M.types.finding,
-            "/" .. M.types.artifact,
-            "/" .. M.types.event,
             "/" .. M.types.ticket,
             "/" .. M.types.project,
         },
