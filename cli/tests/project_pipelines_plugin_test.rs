@@ -1276,6 +1276,96 @@ fn catalog_plugin_project_pipelines_home_render_uses_bounded_notified_session_lo
 }
 
 #[test]
+fn catalog_plugin_project_pipelines_home_bind_lists_use_entity_empty_templates() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            ui = {{
+              bind = function(path) return {{ bind = path }} end,
+              action = function(name, payload) return {{ name = name, payload = payload }} end,
+              list_item = function(props) return {{ type = "list_item", props = props }} end,
+              text = function(props) return {{ type = "text", props = props }} end,
+              badge = function(props) return {{ type = "badge", props = props }} end,
+              status_dot = function(props) return {{ type = "status_dot", props = props }} end,
+              button = function(props) return {{ type = "button", props = props }} end,
+              list = function(props) return {{ type = "list", props = props }} end,
+              bind_list = function(props) return {{ type = "bind_list", props = props }} end,
+              stack = function(props) return {{ type = "stack", props = props }} end,
+            }}
+
+            package.loaded["project_pipelines.repo"] = setmetatable({{}}, {{
+              __index = function(_, key)
+                error("home render must not call repo." .. tostring(key))
+              end,
+            }})
+
+            package.loaded["project_pipelines.web.ui"] = {{
+              page_header = function(props) return {{ type = "page_header", props = props }} end,
+              panel = function(child) return child end,
+              section = function(title, children) return {{ type = "section", title = title, children = children }} end,
+              empty = function(title, description, icon)
+                return {{ type = "empty", title = title, description = description, icon = icon }}
+              end,
+            }}
+
+            local function find_section(node, title)
+              if type(node) ~= "table" then return nil end
+              if node.type == "section" and node.title == title then return node end
+              local children = node.children or node.props and node.props.children or node
+              for _, value in pairs(children) do
+                local found = find_section(value, title)
+                if found then return found end
+              end
+              return nil
+            end
+
+            local function section_bind_list(root, title)
+              local section = find_section(root, title)
+              assert(section, "missing section " .. title)
+              local list = section.children[1]
+              assert(list.type == "list", title .. " should render a list")
+              local bind_list = list.props.children[1]
+              assert(bind_list.type == "bind_list", title .. " should render a bind_list")
+              return bind_list.props
+            end
+
+            local home = require("project_pipelines.web.screens.home")
+            local root = home.render({{}}, {{ path = function(path) return "/pipelines" .. path end }})
+            local expected = {{
+              ["Questions To Answer"] = "/project-pipelines.question",
+              ["Running Pipelines"] = "/project-pipelines.run",
+              ["PRs And Merge"] = "/project-pipelines.ticket",
+              ["Projects"] = "/project-pipelines.project",
+              ["Standalone Tickets"] = "/project-pipelines.ticket",
+              ["Pipeline Definitions"] = "/project-pipelines.pipeline",
+            }}
+
+            for title, source in pairs(expected) do
+              local props = section_bind_list(root, title)
+              assert(props.source == source, title .. " should bind from its entity store")
+              assert(props.source:match("^/project%-pipelines%."), title .. " should use an entity source")
+              assert(props.item_template and props.item_template.type == "list_item", title .. " should keep an entity-backed item template")
+              assert(props.empty_template and props.empty_template.type == "empty", title .. " should provide an empty_template")
+              assert(props.empty_template.title and props.empty_template.title ~= "", title .. " empty_template should have a title")
+            end
+
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("project pipelines home bind_lists should use entity empty templates");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_mcp_mutators_return_without_bulk_snapshot_publish() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
