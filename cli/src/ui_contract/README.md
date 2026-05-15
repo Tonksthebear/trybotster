@@ -428,8 +428,9 @@ Plugin-owned entity types use the same first path segment; there is no
 `/plugin/...` prefix. For example, a Project Pipelines ticket title binds as
 `/project-pipelines.ticket/ticket_123/title`, and the ticket collection binds
 as `/project-pipelines.ticket`. Missing stores, ids, and fields resolve to
-`null`; missing list sources resolve to `[]`. `@/...` paths are only valid while
-expanding a list template, because they resolve against the current list item.
+`null`; plain list binds such as `ui.bind("/project-pipelines.ticket")` resolve
+missing list sources to `[]`. `@/...` paths are only valid while expanding a
+list template, because they resolve against the current list item.
 
 Plus the list expansion helper:
 
@@ -442,6 +443,10 @@ ui.bind_list{
     title = { ui.text{ text = ui.bind("@/title") } },
     subtitle = { ui.text{ text = ui.bind("@/status") } },
   },
+  empty_template = ui.empty_state{
+    title = "No tickets",
+    description = "Create a ticket to start a pipeline.",
+  },
 }
 ```
 
@@ -450,7 +455,10 @@ resolver (`cli/src/clients/tui/ui_contract_adapter/binding.rs`) must agree on
 this grammar. `bind_list` expands to ordinary sibling nodes when placed inside
 `children` or slot arrays so plugin layouts can use it directly in stable
 presentation trees. `where` filters are exact top-level field matches and are
-applied by both renderers before the row template expands.
+applied by both renderers before the row template expands. When no records
+match, including when the source store is absent, an optional `empty_template`
+expands as a single sibling node; it is not item-scoped, so `@/...` bindings
+inside the empty template resolve to `null`.
 
 ## Versioning
 

@@ -410,7 +410,8 @@ fn register_local(lua: &Lua, ui: &Table) -> Result<()> {
 /// { "$kind": "bind_list",
 ///   "source": "/<entity_type>",
 ///   "where": { "field": "value" },
-///   "item_template": <UiNode> }
+///   "item_template": <UiNode>,
+///   "empty_template": <UiNode> }
 /// ```
 ///
 /// The client-side resolver walks the `source` store and clones
@@ -450,6 +451,18 @@ fn register_bind_list(lua: &Lua, ui: &Table) -> Result<()> {
                 }
             }
             out.set("item_template", template)?;
+            if let Ok(empty_template) = args.get::<Value>("empty_template") {
+                match empty_template {
+                    Value::Nil => {}
+                    Value::Table(t) => out.set("empty_template", t)?,
+                    other => {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "ui.bind_list: `empty_template` must be a UiNode table when provided, got {}",
+                            other.type_name()
+                        )));
+                    }
+                }
+            }
             Ok(out)
         })
         .map_err(|e| anyhow!("Failed to create ui.bind_list: {e}"))?;
@@ -1971,10 +1984,12 @@ mod tests {
             UiChild::BindList(UiBindList::BindList {
                 source,
                 item_template,
+                empty_template,
                 ..
             }) => {
                 assert_eq!(source, "/project-pipelines.pipeline");
                 assert_eq!(item_template.node_type, "text");
+                assert!(empty_template.is_none());
             }
             other => panic!("expected bind_list child, got {other:?}"),
         }
@@ -2008,6 +2023,27 @@ mod tests {
     }
 
     #[test]
+    fn bind_list_emits_optional_empty_template() {
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.bind_list{
+                source = "/project-pipelines.pipeline",
+                item_template = ui.text{ text = ui.bind("@/name") },
+                empty_template = ui.empty_state{
+                    title = "No pipelines yet",
+                    description = "Create a pipeline first.",
+                },
+            }"#,
+        );
+        assert_eq!(v["empty_template"]["type"], json!("empty_state"));
+        assert_eq!(
+            v["empty_template"]["props"]["title"],
+            json!("No pipelines yet")
+        );
+    }
+
+    #[test]
     fn bind_list_rejects_missing_source() {
         let lua = new_lua();
         let err = lua
@@ -2025,6 +2061,22 @@ mod tests {
             .eval::<Value>()
             .unwrap_err();
         assert!(err.to_string().contains("item_template"), "got {err}");
+    }
+
+    #[test]
+    fn bind_list_rejects_non_table_empty_template() {
+        let lua = new_lua();
+        let err = lua
+            .load(
+                r#"return ui.bind_list{
+                source = "/session",
+                item_template = ui.text{ text = "x" },
+                empty_template = "not a node",
+            }"#,
+            )
+            .eval::<Value>()
+            .unwrap_err();
+        assert!(err.to_string().contains("empty_template"), "got {err}");
     }
 
     #[test]
