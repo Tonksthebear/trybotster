@@ -267,6 +267,7 @@ For implementation changes, use the repo test script:
 cd cli
 ./test.sh --unit -- ui_contract
 ./test.sh --integration -- table_renders_rows_from_plugin_entity_bind
+./test.sh --integration -- project_pipelines_entity_contract
 ```
 
 Do not run raw `cargo test` for CLI verification; `cli/test.sh` sets the test

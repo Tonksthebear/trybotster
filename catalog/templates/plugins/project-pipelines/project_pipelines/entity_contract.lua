@@ -30,36 +30,10 @@ M.types = {
     event = M.owner .. ".event",
 }
 
-M.registered_entity_types = {
-    M.types.ticket,
-    M.types.project,
-    M.types.project_target,
-    M.types.ticket_dependency,
-    M.types.pipeline,
-    M.types.pipeline_step,
-    M.types.pipeline_gate,
-    M.types.run,
-    M.types.run_step,
-    M.types.gate_result,
-    M.types.review,
-    M.types.finding,
-    M.types.artifact,
-    M.types.question,
-    M.types.checklist,
-    M.types.checklist_item,
-    M.types.pr_link,
-    M.types.event,
-}
-
-M.sources = {}
-for name, entity_type in pairs(M.types) do
-    M.sources[name] = "/" .. entity_type
-end
-
 M.home_screen = {
     {
         name = "questions_to_answer",
-        source = M.sources.question,
+        source = "/" .. M.types.question,
         where_fields = { "status" },
         fields = {
             "blocking_label",
@@ -73,7 +47,7 @@ M.home_screen = {
     },
     {
         name = "running_pipelines",
-        source = M.sources.run,
+        source = "/" .. M.types.run,
         where_fields = { "status" },
         fields = {
             "current_step_name",
@@ -85,7 +59,7 @@ M.home_screen = {
     },
     {
         name = "prs_and_merge",
-        source = M.sources.ticket,
+        source = "/" .. M.types.ticket,
         where_fields = { "latest_run_status", "status" },
         fields = {
             "id",
@@ -99,7 +73,7 @@ M.home_screen = {
     },
     {
         name = "projects",
-        source = M.sources.project,
+        source = "/" .. M.types.project,
         where_fields = { "status" },
         fields = {
             "description",
@@ -113,7 +87,7 @@ M.home_screen = {
     },
     {
         name = "standalone_tickets",
-        source = M.sources.ticket,
+        source = "/" .. M.types.ticket,
         where_fields = { "standalone", "status" },
         fields = {
             "id",
@@ -128,7 +102,7 @@ M.home_screen = {
     },
     {
         name = "pipeline_definitions",
-        source = M.sources.pipeline,
+        source = "/" .. M.types.pipeline,
         fields = {
             "edit_path",
             "id",
