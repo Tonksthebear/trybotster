@@ -1,4 +1,9 @@
-//! Client types for TUI and browser communication.
+//! Shared client identity and protocol message types.
+//!
+//! This module is not a renderer implementation. Renderer/client
+//! implementations live under [`crate::clients`]; this module holds shared IDs
+//! and typed messages that those clients, workers, and hub policy use to talk
+//! across runtime boundaries.
 //!
 //! This module provides:
 //! - `ClientId` — unique identifier for client sessions (TUI, browser, internal)
