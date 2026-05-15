@@ -1344,15 +1344,17 @@ fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_
             entities.register()
 
             local expected_types = {{}}
-            for _, entity_type in ipairs(contract.registered_entity_types) do
+            local expected_type_count = 0
+            for _, entity_type in pairs(contract.types) do
               expected_types[entity_type] = true
+              expected_type_count = expected_type_count + 1
               assert(entity_type:match("^" .. contract.owner:gsub("%-", "%%-") .. "%."), entity_type)
             end
             for _, entity_type in ipairs(registered) do
               assert(expected_types[entity_type], "registered entity type missing from contract: " .. tostring(entity_type))
               expected_types[entity_type] = nil
             end
-            assert(#registered == #contract.registered_entity_types)
+            assert(#registered == expected_type_count)
             for entity_type in pairs(expected_types) do
               error("contract entity type was not registered: " .. tostring(entity_type))
             end
@@ -1364,35 +1366,42 @@ fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_
             local contract_source_counts = {{}}
             local contract_sources = {{}}
             local contract_fields = {{}}
+            local contract_where_fields_by_source = {{}}
             for _, section in ipairs(contract.home_screen) do
               contract_source_counts[section.source] = (contract_source_counts[section.source] or 0) + 1
               contract_sources[section.source] = true
+              contract_where_fields_by_source[section.source] = contract_where_fields_by_source[section.source] or {{}}
               for _, field in ipairs(section.fields or {{}}) do
                 contract_fields[field] = true
               end
               for _, field in ipairs(section.where_fields or {{}}) do
-                contract_fields[field] = true
+                contract_where_fields_by_source[section.source][field] = true
               end
             end
 
             local actual_source_counts = {{}}
-            for source in home:gmatch('source%s*=%s*"([^"]+)"') do
-              assert(contract_sources[source], "home bind_list source missing from contract: " .. source)
-              actual_source_counts[source] = (actual_source_counts[source] or 0) + 1
+            local current_source = nil
+            for line in home:gmatch("[^\n]+") do
+              local source = line:match('source%s*=%s*"([^"]+)"')
+              if source then
+                current_source = source
+                assert(contract_sources[source], "home bind_list source missing from contract: " .. source)
+                actual_source_counts[source] = (actual_source_counts[source] or 0) + 1
+              end
+              for field in line:gmatch("([%w_]+)%s*=") do
+                if line:match("where%s*=") and field ~= "where" then
+                  assert(current_source and contract_where_fields_by_source[current_source] and contract_where_fields_by_source[current_source][field],
+                    "home where field missing from contract for " .. tostring(current_source) .. ": " .. field)
+                end
+              end
             end
             for source, expected_count in pairs(contract_source_counts) do
               assert(actual_source_counts[source] == expected_count,
                 "home source count drift for " .. source .. ": expected "
                   .. tostring(expected_count) .. " got " .. tostring(actual_source_counts[source]))
             end
-
             for field in home:gmatch('ui%.bind%("%@/([%w_]+)"%)') do
               assert(contract_fields[field], "home bound field missing from contract: " .. field)
-            end
-            for where_body in home:gmatch("where%s*=%s*%{{([^%}}]+)%}}") do
-              for field in where_body:gmatch("([%w_]+)%s*=") do
-                assert(contract_fields[field], "home where field missing from contract: " .. field)
-              end
             end
 
             return "ok"

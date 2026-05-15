@@ -175,14 +175,14 @@ pipeline run flow unless they create a human question or merge/PR item.
 ### Plugin Entity Case Study
 
 Project Pipelines is the reference plugin for Botster's entity-backed UI model.
-It ships models in three explicit Lua-owned layers:
+It ships models in four explicit Lua-owned layers:
 
 - `project_pipelines/db.lua` declares durable `plugin.db` tables, migrations,
   constraints, and persisted workflow facts.
 - `project_pipelines/repo.lua` validates and mutates that private persistence
   layer.
 - `project_pipelines/entity_contract.lua` names every published entity family
-  and the UI read-model fields that screens bind.
+  and documents the home-screen UI read-model fields that screens bind.
 - `project_pipelines/entities.lua` consumes those names, builds normalized
   read-model records from plugin.db persistence rows, and publishes them for
   clients under the `project-pipelines.*` namespace.
@@ -195,18 +195,19 @@ Pipelines must not add plugin-specific browser stores, custom data channels, or
 renderer subscription state as an alternate model path.
 
 `project_pipelines/entities.lua` publishes targeted recovery baselines with
-`publish_snapshots()`, and exposes
-targeted `upsert` / `remove` helpers so repo mutators can update clients after
-persistence changes. Plugin-owned entity families are not part of the initial
-browser/TUI hub baseline; surfaces should request the specific plugin data they
-need. The browser does this by inspecting the opened surface tree for
-`ui.bind` / `ui.bind_list` sources and requesting those entity families on
-demand.
+`publish_snapshots()`, and exposes targeted `upsert` / `remove` helpers so repo
+mutators can update clients after persistence changes. Plugin-owned entity
+families are not part of the initial browser/TUI hub baseline; surfaces should
+request the specific plugin data they need. The browser does this by inspecting
+the opened surface tree for `ui.bind` / `ui.bind_list` sources and requesting
+those entity families on demand.
 
 The contract module describes the published read-model shape, not the plugin.db
 table schema. Persistence models may have different names, decoded JSON fields,
 or private columns; plugin authors should treat `project-pipelines.*` contract
-entries as the client-facing API.
+entries as the client-facing API. Its screen-field coverage currently guards
+the overview screen; other screens still have migration notes below until their
+render-time `repo.*` reads move behind entity-backed contracts.
 
 Dynamic state is published as plugin-owned entities:
 
