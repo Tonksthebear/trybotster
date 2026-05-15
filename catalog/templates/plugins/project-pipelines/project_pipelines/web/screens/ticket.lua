@@ -423,27 +423,30 @@ local function question_rows(ticket, _ctx, _overview)
 end
 
 local function dependency_rows(ticket, ctx, overview)
-    local children = {}
-    local dependencies = overview and overview.dependencies or repo.ticket_dependencies(ticket.id)
-    for _, dependency in ipairs(dependencies) do
-        table.insert(children, view.panel{
-            view.row{
-                view.badge(dependency.depends_on_status or "missing", dependency.depends_on_status == "closed" and "success" or "danger"),
-                ui.text{
-                    text = dependency.depends_on_title or dependency.depends_on_ticket_id,
-                    size = "sm",
-                    weight = "semibold",
-                },
-                ui.button{
-                    id = "dependency-" .. dependency.id .. "-remove",
-                    label = "Remove",
-                    icon = "x-mark",
-                    variant = "ghost",
-                    action = ui.action("project_pipelines.remove_ticket_dependency", { dependency_id = dependency.id }),
+    local children = {
+        ui.bind_list{
+            source = "/project-pipelines.ticket_dependency",
+            where = { ticket_id = ticket.id },
+            item_template = view.panel{
+                view.row{
+                    view.badge(ui.bind("@/depends_on_status"), ui.bind("@/depends_on_tone")),
+                    ui.text{
+                        text = ui.bind("@/depends_on_title"),
+                        size = "sm",
+                        weight = "semibold",
+                    },
+                    ui.button{
+                        id = ui.bind("@/id"),
+                        label = "Remove",
+                        icon = "x-mark",
+                        variant = "ghost",
+                        action = ui.action("project_pipelines.remove_ticket_dependency", { dependency_id = ui.bind("@/id") }),
+                    },
                 },
             },
-        })
-    end
+        },
+    }
+    local dependencies = overview and overview.dependencies or repo.ticket_dependencies(ticket.id)
 
     if ticket.status ~= "closed" then
         local existing = {}
@@ -479,10 +482,10 @@ local function dependency_rows(ticket, ctx, overview)
                     },
                 } },
             })
-        elseif #children == 0 then
+        elseif #dependencies == 0 then
             table.insert(children, ui.text{ text = "No available tickets to depend on.", size = "sm", tone = "muted" })
         end
-    elseif #children == 0 then
+    elseif #dependencies == 0 then
         table.insert(children, ui.text{ text = "No dependencies.", size = "sm", tone = "muted" })
     end
 
@@ -499,39 +502,41 @@ local function merge_controls(ticket, ctx, overview)
     local pipeline = overview and overview.pipelines_by_id and overview.pipelines_by_id[run.pipeline_id] or repo.get_pipeline(run.pipeline_id) or {}
     local merge_policy = pipeline.merge_policy or "direct"
     local policy_label = merge_policy == "pr" and "PR via Botster MCP" or "direct merge to main"
-    local pr_links = repo.list_pr_links{ ticket_id = ticket.id }
-    local pr_link = pr_links[1]
-    local pr_label = nil
-    if pr_link then
-        if not util.is_blank(pr_link.pr_url) then
-            pr_label = pr_link.pr_url
-        elseif not util.is_blank(pr_link.repo) and not util.is_blank(pr_link.pr_number) then
-            pr_label = tostring(pr_link.repo) .. "#" .. tostring(pr_link.pr_number)
-        else
-            pr_label = "PR linked"
-        end
-    end
     local children = {
         view.panel{
             ui.stack{ direction = "vertical", gap = "2", children = {
                 view.row{
-                    view.badge(pr_link and ("PR " .. tostring(pr_link.status or "linked")) or (#failed_events > 0 and "merge blocked" or (#merge_events > 0 and "merge running" or "merge queued")), #failed_events > 0 and "danger" or "success"),
+                    view.badge(#failed_events > 0 and "merge blocked" or (#merge_events > 0 and "merge running" or "merge queued"), #failed_events > 0 and "danger" or "success"),
                     ui.text{ text = "Merge policy: " .. policy_label, size = "sm", weight = "semibold" },
                 },
-                ui.text{ text = pr_label or "Completed runs automatically spawn a merge acceptance agent. The ticket closes only after merge confirmation is recorded.", size = "sm", tone = "muted" },
+                ui.text{ text = "Completed runs automatically spawn a merge acceptance agent. The ticket closes only after merge confirmation is recorded.", size = "sm", tone = "muted" },
             } },
         },
+        ui.bind_list{
+            source = "/project-pipelines.pr_link",
+            where = { ticket_id = ticket.id },
+            item_template = view.panel{
+                ui.stack{ direction = "vertical", gap = "2", children = {
+                    view.row{
+                        view.badge(ui.bind("@/status_label"), ui.bind("@/status_tone")),
+                        ui.text{ text = ui.bind("@/label"), size = "sm", weight = "semibold" },
+                    },
+                } },
+            },
+        },
+        ui.bind_list{
+            source = "/project-pipelines.pr_link",
+            where = { ticket_id = ticket.id, has_pr_url = true },
+            item_template = ui.button{
+                id = ui.bind("@/id"),
+                label = "Open PR",
+                icon = "external-link",
+                variant = "solid",
+                tone = "accent",
+                action = ui.action("botster.url.open", { url = ui.bind("@/pr_url") }),
+            },
+        },
     }
-    if pr_link and not util.is_blank(pr_link.pr_url) then
-        table.insert(children, ui.button{
-            id = "ticket-" .. tostring(ticket.id) .. "-linked-pr",
-            label = "Open PR",
-            icon = "external-link",
-            variant = "solid",
-            tone = "accent",
-            action = ui.action("botster.url.open", { url = pr_link.pr_url }),
-        })
-    end
     if #merge_events > 0 then
         local payload = util.decode(merge_events[1].payload, {})
         table.insert(children, ui.text{ text = payload.session_uuid and ("Merge agent running: " .. payload.session_uuid) or "Merge agent has been requested.", size = "sm", tone = "muted" })
