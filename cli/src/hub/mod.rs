@@ -168,10 +168,11 @@ impl VolumeBurstState {
     }
 }
 
-/// Generate a stable hub_identifier from a repo path.
+/// Generate a legacy stable hub_identifier from a repo path.
 ///
-/// Uses SHA256 hash of the absolute path to ensure the same repo
-/// always gets the same hub_id, even across CLI restarts.
+/// Device hubs use [`hub_id_for_device`] and [`local_device_hub_id`].
+/// This repo-path helper is retained for compatibility tests and any legacy
+/// persisted relay artifacts that still need deterministic old-style IDs.
 #[must_use]
 pub fn hub_id_for_repo(repo_path: &std::path::Path) -> String {
     let canonical = repo_path

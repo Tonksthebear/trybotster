@@ -2,7 +2,7 @@
 
 ## Summary
 
-Botster should move from "one hub process per repo/directory" to "one hub process per device".
+Botster has moved from "one hub process per repo/directory" to "one hub process per device".
 
 The device hub owns:
 
@@ -12,7 +12,20 @@ The device hub owns:
 - many explicitly admitted spawn targets
 - many workspaces and sessions across those targets
 
-This preserves the current `.botster` override behavior while removing the ambient `cwd` assumption from the runtime.
+This preserves `.botster` override behavior while keeping runtime authority on explicit spawn targets rather than ambient `cwd`.
+
+## Current Status
+
+This document started as the migration spec. The current runtime already uses:
+
+- device-scoped hub identity and socket discovery
+- startup cwd normalization to the user's home directory
+- an explicit spawn target registry
+- target-aware session/workspace metadata and spawn command flows
+
+The remaining value of this document is as the contract for target admission,
+config resolution, UI behavior, plugin scoping, and any GitHub subscription
+work that still needs to follow admitted target identity.
 
 ## Goals
 
@@ -42,7 +55,8 @@ It is device-scoped, not repo-scoped:
 - owns the device-local crypto identity for web client communication
 - manages all admitted spawn targets
 
-The hub process must never derive trust or repo identity from its own `cwd`.
+The hub process must never treat its own `cwd` as a trust anchor, repo identity,
+or implicit spawn target.
 
 ### Spawn Target
 
@@ -141,11 +155,11 @@ Current behavior is correct and should be preserved:
 
 The only change is where `repo_root` comes from.
 
-Old model:
+Retired model:
 
 - config resolution uses ambient process repo root
 
-New model:
+Current model:
 
 - config resolution uses the selected target root
 
@@ -217,15 +231,15 @@ Workspaces and sessions must carry target identity explicitly so reconnect, clie
 
 ## Hub Identity and Startup
 
-The hub must become device-scoped.
+The hub is device-scoped.
 
-Changes:
+Current behavior:
 
-- remove repo-path-derived local hub identity
-- use a single device hub identity and socket location
-- `botster start` should behave the same regardless of launch directory
-- the hub process should `chdir` to `HOME` on startup
-- `botster attach` should attach to the local device hub by default
+- repo-path-derived local hub identity is retired for current runtime identity
+- one device hub identity and socket location are used
+- `botster start` behaves the same regardless of launch directory
+- the hub process changes cwd to `HOME` on startup
+- `botster attach` attaches to the local device hub by default
 
 This intentionally discards the old "hub per repo" model.
 
@@ -441,29 +455,29 @@ This means:
 - no load/unload churn as targets are selected
 - the hub has full plugin capability; sessions get scoped access
 
-## Phased Rollout
+## Rollout Status
 
-### Phase 1: Target Registry and Security Boundary
+### Implemented: Target Registry and Security Boundary
 
 - add spawn target persistence
 - canonicalize and deduplicate paths
 - add explicit target admission
 - block arbitrary-path spawns
 
-### Phase 2: Device Hub Identity
+### Implemented: Device Hub Identity
 
 - replace repo-scoped hub identity with device-scoped identity
 - start from `HOME`
 - change attach/discovery to target-independent device hub behavior
 - let device hub own fresh relay identity
 
-### Phase 3: Target-Aware Runtime
+### Implemented: Target-Aware Runtime
 
 - thread `target_id` through commands and spawn flows
 - resolve configs from target root
 - persist target metadata in workspace/session manifests
 
-### Phase 4: Agent Manifests and Plugin Scoping
+### Current Contract: Agent Manifests and Plugin Scoping
 
 - add `manifest.json` support to agent config directories
 - expose definition directory to initialization scripts for paired files
@@ -472,14 +486,14 @@ This means:
 - implement MCP tool resolution: session → target ceiling ∩ agent selection
 - update config resolver to merge device + target-local manifests
 
-### Phase 5: TUI and Web UX
+### Current Contract: TUI and Web UX
 
 - add spawn target picker
 - add target admission browser
 - group sessions by target and workspace
 - plugin selection UI in target settings and agent config
 
-### Phase 6: Multi-Repo GitHub Subscriptions
+### Remaining Integration Work: Multi-Repo GitHub Subscriptions
 
 - subscribe per admitted git-backed target repo
 - refresh subscriptions when target capabilities change

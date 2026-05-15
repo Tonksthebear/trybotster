@@ -411,7 +411,7 @@ mod tests {
     const TEST_CRYPTO_VERSION: u8 = 1;
 
     #[test]
-    fn test_hub_id_for_repo_is_stable() {
+    fn legacy_repo_hub_id_is_stable_for_compatibility_artifacts() {
         let path = std::path::Path::new("/tmp/test-repo");
         let id1 = crate::hub::hub_id_for_repo(path);
         let id2 = crate::hub::hub_id_for_repo(path);
@@ -420,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hub_id_for_repo_differs_by_path() {
+    fn legacy_repo_hub_id_keeps_path_scoped_distinction() {
         let path1 = std::path::Path::new("/tmp/repo-a");
         let path2 = std::path::Path::new("/tmp/repo-b");
         let id1 = crate::hub::hub_id_for_repo(path1);

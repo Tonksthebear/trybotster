@@ -591,8 +591,8 @@ fn set_process_title(command: &Commands) {
 
 /// Normalize the hub process cwd to the user's home directory.
 ///
-/// Device-scoped startup must not inherit repo trust or identity from the
-/// shell location that launched the process.
+/// Device-scoped startup treats the launch directory as ambient shell state,
+/// not as a trust anchor, repo identity, or implicit spawn target.
 fn normalize_process_cwd_to_home() -> Result<()> {
     let home = dirs::home_dir().context("Could not determine home directory")?;
     std::env::set_current_dir(&home)
