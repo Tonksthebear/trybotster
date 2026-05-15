@@ -7,6 +7,26 @@ that survives hot-reload and closes cleanly on hub shutdown.
 The underlying library is [vendored sqlite.lua](../../cli/lua/vendor/sqlite/)
 (bundled in PR B.1); `plugin.db` is the Botster-specific wrapper around it.
 
+## Model Boundary
+
+`plugin.db` is the durable persistence layer for plugin-owned data. It is where
+plugins declare private tables, constraints, migrations, sync cursors, queues,
+ledgers, workflow records, and audit history.
+
+`plugin.db` is not the client-facing model contract. Browser and TUI clients
+consume plugin data through entity read models published with
+`entity_snapshot`, `entity_upsert`, `entity_patch`, and `entity_remove`; Lua UI
+nodes then bind to those records with `ui.bind` and `ui.bind_list`. Keep table
+shape private when it helps persistence, and publish explicit read-model fields
+when the UI needs derived labels, counts, paths, status tones, or flattened
+relationships.
+
+A plugin that ships a durable model should therefore pair this file's
+`plugin.db{}` declaration with the entity conventions in
+[`../plugin-entities.md`](../plugin-entities.md): database schema and migrations
+own durability; entity publishers own the normalized shared data contract;
+renderer-local state owns presentation only.
+
 ## Shape
 
 ```lua

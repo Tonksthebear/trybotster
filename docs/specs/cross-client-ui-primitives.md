@@ -85,6 +85,11 @@ Both the browser and TUI are equal consumers of this entity-frame stream. They
 may store it in different local structures, but the entity envelopes are the
 only shared durable model-state path.
 
+For plugin-owned data, `plugin.db` is private durable persistence and entity
+frames are the public read-model contract. Plugins should publish explicit
+normalized records for shared renderers instead of exposing raw table shape or
+creating plugin-specific browser stores.
+
 Plugin entity types occupy the binding path's first segment directly. A Project
 Pipelines ticket collection binds as `/project-pipelines.ticket`; one title
 field binds as `/project-pipelines.ticket/ticket_123/title`.
@@ -556,7 +561,9 @@ For plugin UI, this is mandatory rather than an optimization: publish durable
 records through `entity_snapshot`, `entity_upsert`, `entity_patch`, and
 `entity_remove`, then bind UI nodes to those records. Do not introduce
 client-local model stores or presentation snapshots as alternate durable data
-paths.
+paths. If the renderer needs a field that does not exist in persistence, add it
+to the plugin entity read model so browser and TUI clients consume the same
+contract.
 
 ### 2. Share action ids across clients
 
