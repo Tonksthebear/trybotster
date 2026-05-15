@@ -151,32 +151,41 @@ fn is_bind_list(map: &JsonMap<String, JsonValue>) -> bool {
 fn expand_bind_list(
     map: &JsonMap<String, JsonValue>,
     stores: &TuiEntityStores,
-    parent_item: Option<&JsonValue>,
+    _parent_item: Option<&JsonValue>,
 ) -> JsonValue {
     let source = map.get("source").and_then(|v| v.as_str()).unwrap_or("");
     let template = map.get("item_template").cloned().unwrap_or(JsonValue::Null);
+    let empty_template = map.get("empty_template").cloned();
     let where_clause = map.get("where").and_then(JsonValue::as_object);
 
     let entity_type = strip_leading_slash(source);
-    let Some(store) = stores.store(entity_type) else {
-        return JsonValue::Array(Vec::new());
-    };
-
-    let mut out = Vec::with_capacity(store.order.len());
-    for (_id, record) in store.iter() {
-        if !matches_where(record, where_clause) {
-            continue;
+    let mut out = Vec::new();
+    if let Some(store) = stores.store(entity_type) {
+        out.reserve(store.order.len());
+        for (_id, record) in store.iter() {
+            if !matches_where(record, where_clause) {
+                continue;
+            }
+            let mut clone = template.clone();
+            // Item-relative paths use `record` as the resolution root; the
+            // outer parent_item (if any) is shadowed inside this template.
+            resolve_bindings_inner(&mut clone, stores, Some(record));
+            // Drop bare nulls so consumers receive a clean array. (A template
+            // that itself fails to resolve would produce Null after recursion.)
+            if !clone.is_null() {
+                out.push(clone);
+            }
         }
-        let mut clone = template.clone();
-        // Item-relative paths use `record` as the resolution root; the
-        // outer parent_item (if any) is shadowed inside this template.
-        resolve_bindings_inner(&mut clone, stores, Some(record));
-        // Drop bare nulls so consumers receive a clean array. (A template
-        // that itself fails to resolve would produce Null after recursion.)
-        if !clone.is_null() {
-            out.push(clone);
+    }
+    if out.is_empty() {
+        if let Some(mut empty) = empty_template {
+            // Empty templates are outside item scope; global bindings still
+            // resolve normally, while @-relative bindings become Null.
+            resolve_bindings_inner(&mut empty, stores, None);
+            if !empty.is_null() {
+                out.push(empty);
+            }
         }
-        let _unused_for_clarity = parent_item; // intentionally not threaded down: bind_list shadows
     }
     JsonValue::Array(out)
 }
@@ -602,6 +611,81 @@ mod tests {
         });
         resolve_bindings(&mut value, &stores);
         assert_eq!(value, json!([]));
+    }
+
+    #[test]
+    fn bind_list_with_empty_store_uses_empty_template_when_provided() {
+        let stores = TuiEntityStores::new();
+        let mut value = json!({
+            "$kind": "bind_list",
+            "source": "/session",
+            "item_template": { "type": "text", "props": { "text": { "$bind": "@/title" } } },
+            "empty_template": {
+                "type": "empty_state",
+                "props": {
+                    "title": "No sessions",
+                    "description": { "$bind": "/session" }
+                }
+            }
+        });
+        resolve_bindings(&mut value, &stores);
+        assert_eq!(
+            value,
+            json!([
+                {
+                    "type": "empty_state",
+                    "props": {
+                        "title": "No sessions",
+                        "description": []
+                    }
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn bind_list_with_missing_store_uses_empty_template_when_provided() {
+        let stores = TuiEntityStores::new();
+        let mut value = json!({
+            "$kind": "bind_list",
+            "source": "/project-pipelines.pipeline",
+            "item_template": { "type": "text", "props": { "text": { "$bind": "@/name" } } },
+            "empty_template": {
+                "type": "empty_state",
+                "props": {
+                    "title": "No pipelines",
+                    "description": { "$bind": "@/name" }
+                }
+            }
+        });
+        resolve_bindings(&mut value, &stores);
+        assert_eq!(
+            value,
+            json!([
+                {
+                    "type": "empty_state",
+                    "props": {
+                        "title": "No pipelines",
+                        "description": null
+                    }
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn bind_list_with_filtered_out_records_uses_empty_template() {
+        let stores = stores_with_plugin_tickets();
+        let mut value = json!({
+            "$kind": "bind_list",
+            "source": "/project-pipelines.ticket",
+            "where": { "status": "missing" },
+            "item_template": { "type": "text", "props": { "text": { "$bind": "@/title" } } },
+            "empty_template": { "type": "empty_state", "props": { "title": "No tickets" } }
+        });
+        resolve_bindings(&mut value, &stores);
+        assert_eq!(value[0]["type"], json!("empty_state"));
+        assert_eq!(value[0]["props"]["title"], json!("No tickets"));
     }
 
     #[test]

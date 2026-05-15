@@ -145,6 +145,70 @@ describe('resolveBindings', () => {
     expect((out as any[]).map((node) => node.props.text)).toEqual(['Review bindings'])
   })
 
+  it('uses bind_list empty_template when no records match', () => {
+    const out = resolveBindings({
+      $kind: 'bind_list',
+      source: '/project-pipelines.ticket',
+      where: { status: 'missing' },
+      item_template: {
+        type: 'text',
+        props: { text: { $bind: '@/title' } },
+      },
+      empty_template: {
+        type: 'empty_state',
+        props: {
+          title: 'No tickets',
+          description: { $bind: '/project-pipelines.ticket' },
+        },
+      },
+    })
+    expect((out as any[])).toHaveLength(1)
+    expect((out as any[])[0].type).toBe('empty_state')
+    expect((out as any[])[0].props.title).toBe('No tickets')
+    expect((out as any[])[0].props.description).toHaveLength(2)
+  })
+
+  it('uses bind_list empty_template when the source store is missing', () => {
+    const out = resolveBindings({
+      $kind: 'bind_list',
+      source: '/project-pipelines.pipeline',
+      item_template: {
+        type: 'text',
+        props: { text: { $bind: '@/name' } },
+      },
+      empty_template: {
+        type: 'empty_state',
+        props: {
+          title: 'No pipelines',
+          description: { $bind: '@/name' },
+        },
+      },
+    })
+    expect((out as any[])).toHaveLength(1)
+    expect((out as any[])[0].type).toBe('empty_state')
+    expect((out as any[])[0].props.title).toBe('No pipelines')
+    expect((out as any[])[0].props.description).toBeNull()
+  })
+
+  it('does not use bind_list empty_template when records match', () => {
+    const out = resolveBindings({
+      $kind: 'bind_list',
+      source: '/project-pipelines.ticket',
+      where: { status: 'open' },
+      item_template: {
+        type: 'text',
+        props: { text: { $bind: '@/title' } },
+      },
+      empty_template: {
+        type: 'empty_state',
+        props: { title: 'No tickets' },
+      },
+    })
+    expect((out as any[])).toHaveLength(1)
+    expect((out as any[])[0].type).toBe('text')
+    expect((out as any[])[0].props.text).toBe('Review bindings')
+  })
+
   it('@-relative path outside bind_list resolves null', () => {
     const out = resolveBindings({ $bind: '@/title' })
     expect(out).toBeNull()

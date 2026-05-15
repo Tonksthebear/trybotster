@@ -140,6 +140,10 @@ pub enum UiBindList {
         r#where: JsonMap<String, JsonValue>,
         /// Template cloned for each matching record.
         item_template: Box<UiNode>,
+        /// Optional template emitted when no records match, including when
+        /// the source store is absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        empty_template: Option<Box<UiNode>>,
     },
 }
 

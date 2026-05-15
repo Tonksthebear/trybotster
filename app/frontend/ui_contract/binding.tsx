@@ -124,6 +124,12 @@ function expandBindList(
     const expanded = resolveBindingsInner(envelope.item_template, record, localScope)
     if (expanded != null) out.push(expanded)
   }
+  if (out.length === 0 && envelope.empty_template != null) {
+    // Empty templates are not item-scoped. Global/local bindings still
+    // resolve; @-relative bindings resolve to null.
+    const empty = resolveBindingsInner(envelope.empty_template, undefined, localScope)
+    if (empty != null) out.push(empty)
+  }
   // `parentItem` deliberately not threaded down — bind_list always shadows.
   void parentItem
   return out
