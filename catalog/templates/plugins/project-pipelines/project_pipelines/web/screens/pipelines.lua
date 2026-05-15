@@ -120,31 +120,44 @@ local function edit_pipeline_fields(pipeline, state)
     }
 end
 
-local function edit_gate_template()
-    return view.panel{ ui.stack{ direction = "vertical", gap = "2", children = {
+local function edit_gate(gate, state)
+    local children = {
         view.row{
-            view.badge(ui.bind("@/kind"), "muted"),
-            ui.text{ text = ui.bind("@/id"), size = "xs", tone = "muted" },
+            view.badge(gate.kind, "muted"),
+            ui.text{ text = gate.id, size = "xs", tone = "muted" },
         },
         ui.textarea{
-            id = ui.bind("@/id"),
+            id = "gate-" .. gate.id .. "-prompt",
             label = "Gate prompt",
-            placeholder = ui.bind("@/prompt"),
+            placeholder = gate.prompt or "",
             on_change = view.field_action("project_pipelines.update_gate_field", {
-                gate_id = ui.bind("@/id"),
+                gate_id = gate.id,
                 field = "prompt",
             }),
         },
-        ui.text_input{
-            id = ui.bind("@/id"),
+    }
+    local prompt_error = feedback_error(state, gate.id, "prompt")
+    if prompt_error then
+        table.insert(children, ui.text{ text = prompt_error, size = "xs", tone = "danger" })
+    end
+
+    if gate.kind == "command" then
+        table.insert(children, ui.text_input{
+            id = "gate-" .. gate.id .. "-command",
             label = "Command",
-            placeholder = ui.bind("@/command"),
+            placeholder = gate.command or "",
             on_change = view.field_action("project_pipelines.update_gate_field", {
-                gate_id = ui.bind("@/id"),
+                gate_id = gate.id,
                 field = "command",
             }),
-        },
-    } } }
+        })
+        local err = feedback_error(state, gate.id, "command")
+        if err then
+            table.insert(children, ui.text{ text = err, size = "xs", tone = "danger" })
+        end
+    end
+
+    return view.panel{ ui.stack{ direction = "vertical", gap = "2", children = children } }
 end
 
 local function edit_step(step, steps, state)
@@ -214,12 +227,13 @@ local function edit_step(step, steps, state)
         end
     end
 
-    table.insert(children, ui.text{ text = "Gates", size = "xs", weight = "semibold" })
-    table.insert(children, ui.bind_list{
-        source = "/project-pipelines.pipeline_gate",
-        where = { step_id = step.id },
-        item_template = edit_gate_template(),
-    })
+    local gates = repo.step_gates(step.id)
+    if #gates > 0 then
+        table.insert(children, ui.text{ text = "Gates", size = "xs", weight = "semibold" })
+        for _, gate in ipairs(gates) do
+            table.insert(children, edit_gate(gate, state))
+        end
+    end
 
     return view.panel{ ui.stack{ direction = "vertical", gap = "3", children = children } }
 end
