@@ -1277,10 +1277,9 @@ fn catalog_plugin_project_pipelines_home_render_uses_bounded_notified_session_lo
 
 #[test]
 fn catalog_plugin_project_pipelines_home_bind_lists_use_entity_empty_templates() {
-    let home = std::fs::read_to_string(
-        project_root_dir()
-            .join("catalog/templates/plugins/project-pipelines/project_pipelines/web/screens/home.lua"),
-    )
+    let home = std::fs::read_to_string(project_root_dir().join(
+        "catalog/templates/plugins/project-pipelines/project_pipelines/web/screens/home.lua",
+    ))
     .expect("read project pipelines home screen");
 
     assert_eq!(
@@ -1311,6 +1310,100 @@ fn catalog_plugin_project_pipelines_home_bind_lists_use_entity_empty_templates()
         !home.contains("repo."),
         "home should not call repo.* at render time"
     );
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_home_bindings() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let home_path = plugin_dir.join("project_pipelines/web/screens/home.lua");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            plugin = {{
+              db = function()
+                return {{ eval = function() return {{}} end }}
+              end,
+            }}
+
+            local registered = {{}}
+            package.loaded["lib.entity_broadcast"] = {{
+              register = function(entity_type, opts)
+                registered[#registered + 1] = entity_type
+                assert(opts.id_field == "id")
+              end,
+            }}
+
+            local contract = require("project_pipelines.entity_contract")
+            local entities = require("project_pipelines.entities")
+            assert(entities.types == contract.types)
+            entities.register()
+
+            local expected_types = {{}}
+            for _, entity_type in ipairs(contract.registered_entity_types) do
+              expected_types[entity_type] = true
+              assert(entity_type:match("^" .. contract.owner:gsub("%-", "%%-") .. "%."), entity_type)
+            end
+            for _, entity_type in ipairs(registered) do
+              assert(expected_types[entity_type], "registered entity type missing from contract: " .. tostring(entity_type))
+              expected_types[entity_type] = nil
+            end
+            assert(#registered == #contract.registered_entity_types)
+            for entity_type in pairs(expected_types) do
+              error("contract entity type was not registered: " .. tostring(entity_type))
+            end
+
+            local file = assert(io.open("{home_path}", "r"))
+            local home = file:read("*a")
+            file:close()
+
+            local contract_source_counts = {{}}
+            local contract_sources = {{}}
+            local contract_fields = {{}}
+            for _, section in ipairs(contract.home_screen) do
+              contract_source_counts[section.source] = (contract_source_counts[section.source] or 0) + 1
+              contract_sources[section.source] = true
+              for _, field in ipairs(section.fields or {{}}) do
+                contract_fields[field] = true
+              end
+              for _, field in ipairs(section.where_fields or {{}}) do
+                contract_fields[field] = true
+              end
+            end
+
+            local actual_source_counts = {{}}
+            for source in home:gmatch('source%s*=%s*"([^"]+)"') do
+              assert(contract_sources[source], "home bind_list source missing from contract: " .. source)
+              actual_source_counts[source] = (actual_source_counts[source] or 0) + 1
+            end
+            for source, expected_count in pairs(contract_source_counts) do
+              assert(actual_source_counts[source] == expected_count,
+                "home source count drift for " .. source .. ": expected "
+                  .. tostring(expected_count) .. " got " .. tostring(actual_source_counts[source]))
+            end
+
+            for field in home:gmatch('ui%.bind%("%@/([%w_]+)"%)') do
+              assert(contract_fields[field], "home bound field missing from contract: " .. field)
+            end
+            for where_body in home:gmatch("where%s*=%s*%{{([^%}}]+)%}}") do
+              for field in where_body:gmatch("([%w_]+)%s*=") do
+                assert(contract_fields[field], "home where field missing from contract: " .. field)
+              end
+            end
+
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display(),
+            home_path = home_path.display()
+        ))
+        .eval()
+        .expect("Project Pipelines entity contract should cover registered types and home bindings");
+
+    assert_eq!(result, "ok");
 }
 
 #[test]
