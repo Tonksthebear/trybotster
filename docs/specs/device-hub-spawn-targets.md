@@ -459,23 +459,23 @@ This means:
 
 ### Implemented: Target Registry and Security Boundary
 
-- add spawn target persistence
-- canonicalize and deduplicate paths
-- add explicit target admission
-- block arbitrary-path spawns
+- added spawn target persistence
+- canonicalized and deduplicated paths
+- added explicit target admission
+- blocked arbitrary-path spawns
 
 ### Implemented: Device Hub Identity
 
-- replace repo-scoped hub identity with device-scoped identity
-- start from `HOME`
-- change attach/discovery to target-independent device hub behavior
+- replaced repo-scoped hub identity with device-scoped identity
+- started from `HOME`
+- changed attach/discovery to target-independent device hub behavior
 - let device hub own fresh relay identity
 
 ### Implemented: Target-Aware Runtime
 
-- thread `target_id` through commands and spawn flows
-- resolve configs from target root
-- persist target metadata in workspace/session manifests
+- threaded `target_id` through commands and spawn flows
+- resolved configs from target root
+- persisted target metadata in workspace/session manifests
 
 ### Implemented: Agent Manifests and Plugin Scoping
 
