@@ -362,6 +362,12 @@ fn catalog_plugin_project_pipelines_dynamic_state_uses_plugin_entities_not_force
             && !engine.contains("send_ui_tree_snapshots"),
         "Project Pipelines mutators must not force data-only ui_tree_snapshot refreshes"
     );
+    assert!(
+        readme.contains("If a scaffold\npublishes plugin entities, include or document an `entity_contract.lua` module")
+            && readme.contains("Use `plugin.db` for durable private persistence")
+            && readme.contains("`ui.local_state` /\n`botster.presentation.*` for transient presentation state"),
+        "README should document the entity-publishing template convention"
+    );
     for (entity_type, lua_key) in [
         ("project-pipelines.ticket", "ticket"),
         ("project-pipelines.run", "run"),
