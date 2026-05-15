@@ -57,9 +57,6 @@ local function running_run_template()
             ui.text{ text = ui.bind("@/pipeline_name"), size = "xs", tone = "muted" },
             ui.text{ text = ui.bind("@/current_step_name"), size = "xs", tone = "muted" },
         },
-        end_ = {
-            ui.badge{ text = ui.bind("@/status"), tone = ui.bind("@/status_tone") },
-        },
     }
 end
 
@@ -151,6 +148,10 @@ function M.render(_view_state, ctx)
             } },
         }) },
         view.panel{ view.section("Running Pipelines", {
+            -- TODO(entity-shape): expose ticket_path, project_path, run_path,
+            -- current_agent_session_path, and current_agent_session_label on
+            -- /project-pipelines.run before restoring row-level Ticket,
+            -- Project, Run, and Agent actions without render-time repo lookups.
             ui.list{ children = {
                 ui.bind_list{
                     source = "/project-pipelines.run",
