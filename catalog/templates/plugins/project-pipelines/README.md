@@ -16,6 +16,7 @@ The plugin is intentionally split across modules:
 - `init.lua` clears hot-reload module cache, registers tools, surfaces, and events.
 - `project_pipelines/db.lua` owns the plugin SQLite schema.
 - `project_pipelines/repo.lua` owns persistence and audit events.
+- `project_pipelines/entity_contract.lua` owns published entity type names and read-model field contracts.
 - `project_pipelines/entities.lua` owns plugin entity read models and publishes dynamic state to clients.
 - `project_pipelines/engine.lua` owns run advancement, gates, agent creation, and command gates.
 - `project_pipelines/mcp.lua` exposes the agent-facing API.
@@ -174,14 +175,21 @@ pipeline run flow unless they create a human question or merge/PR item.
 ### Plugin Entity Case Study
 
 Project Pipelines is the reference plugin for Botster's entity-backed UI model.
-`project_pipelines/entities.lua` registers every dynamic workflow record family
-under the `project-pipelines.*` namespace, publishes targeted recovery baselines
-with `publish_snapshots()`, and exposes targeted `upsert` / `remove` helpers so
-repo mutators can update clients after persistence changes. Plugin-owned entity
-families are not part of the initial browser/TUI hub baseline; surfaces should
-request the specific plugin data they need. The browser does this by inspecting
-the opened surface tree for `ui.bind` / `ui.bind_list` sources and requesting
-those entity families on demand.
+`project_pipelines/entity_contract.lua` names every published entity family and
+the UI read-model fields that screens bind. `project_pipelines/entities.lua`
+consumes those names, builds the read models from plugin.db persistence rows,
+publishes targeted recovery baselines with `publish_snapshots()`, and exposes
+targeted `upsert` / `remove` helpers so repo mutators can update clients after
+persistence changes. Plugin-owned entity families are not part of the initial
+browser/TUI hub baseline; surfaces should request the specific plugin data they
+need. The browser does this by inspecting the opened surface tree for
+`ui.bind` / `ui.bind_list` sources and requesting those entity families on
+demand.
+
+The contract module describes the published read-model shape, not the plugin.db
+table schema. Persistence models may have different names, decoded JSON fields,
+or private columns; plugin authors should treat `project-pipelines.*` contract
+entries as the client-facing API.
 
 Dynamic state is published as plugin-owned entities:
 
