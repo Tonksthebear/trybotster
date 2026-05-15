@@ -1288,6 +1288,7 @@ function M.update_step(step_id, attrs)
     set.updated_at = util.now()
     db.pipeline_steps:update{ where = { id = step_id }, set = set }
     publish_entity("pipeline_step", M.get_step(step_id))
+    publish_entity("pipeline", M.get_pipeline(step.pipeline_id))
     M.append_event("pipeline.step_updated", {
         payload = { step_id = step_id, fields = set },
     })
@@ -1428,6 +1429,7 @@ function M.create_step(attrs)
         })
     end)
     publish_entity("pipeline_step", M.get_step(step.id))
+    publish_entity("pipeline", M.get_pipeline(step.pipeline_id))
     for _, gate_id in ipairs(gate_ids) do
         publish_entity("pipeline_gate", decode_gate_row(M.get_gate(gate_id)))
     end
@@ -1470,6 +1472,7 @@ function M.delete_step(step_id)
         remove_entity("pipeline_gate", gate_id)
     end
     remove_entity("pipeline_step", step_id)
+    publish_entity("pipeline", M.get_pipeline(step.pipeline_id))
     return step
 end
 
