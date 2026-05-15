@@ -90,13 +90,11 @@ frames are the public read-model contract. Plugins should publish explicit
 normalized records for shared renderers instead of exposing raw table shape or
 creating plugin-specific browser stores.
 
-Entity-backed plugin templates should make that split visible in files:
-`db.lua` for `plugin.db` schema/migrations, model/repository modules for
-validated mutations, `entity_contract.lua` for published entity names and bound
-read-model fields, and `entities.lua` for projections plus snapshot/delta
-publishers. Per-client modal, disclosure, focus, and draft affordances stay in
-`ui.local_state` and presentation actions instead of the database or entity
-stream.
+Entity-backed plugin templates should follow the canonical file split in
+[`../plugin-entities.md#shipping-a-model`](../plugin-entities.md#shipping-a-model):
+private persistence in `plugin.db`, validated mutations in plugin-owned
+model/repository modules, shared read-model contracts in `entity_contract.lua`,
+publishers in `entities.lua`, and per-client affordances in presentation state.
 
 Plugin entity types occupy the binding path's first segment directly. A Project
 Pipelines ticket collection binds as `/project-pipelines.ticket`; one title

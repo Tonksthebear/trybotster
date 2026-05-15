@@ -366,11 +366,8 @@ fn catalog_plugin_project_pipelines_dynamic_state_uses_plugin_entities_not_force
     assert!(
         normalized_readme.contains(
             "If a scaffold publishes plugin entities, include or document an `entity_contract.lua` module"
-        ) && normalized_readme.contains("Use `plugin.db` for durable private persistence")
-            && normalized_readme.contains(
-                "`ui.local_state` / `botster.presentation.*` for transient presentation state"
-            ),
-        "README should document the entity-publishing template convention"
+        ) && normalized_readme.contains("docs/plugin-entities.md#shipping-a-model"),
+        "README should point entity-backed templates at the canonical shipping convention"
     );
     for (entity_type, lua_key) in [
         ("project-pipelines.ticket", "ticket"),

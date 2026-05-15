@@ -112,6 +112,8 @@ M.home_screen = {
     },
 }
 
+-- `M.screens` is the canonical screen registry; `M.home_screen` remains as a
+-- named alias for older tests and docs that predate non-home screen contracts.
 M.screens = {
     home = M.home_screen,
     pipelines = {

@@ -21,17 +21,11 @@ shape private when it helps persistence, and publish explicit read-model fields
 when the UI needs derived labels, counts, paths, status tones, or flattened
 relationships.
 
-A plugin that ships a durable model should therefore pair this file's
-`plugin.db{}` declaration with the entity conventions in
-[`../plugin-entities.md`](../plugin-entities.md): database schema and migrations
-own durability; entity publishers own the normalized shared data contract;
-renderer-local state owns presentation only.
-
-For entity-backed plugin templates, include an `entity_contract.lua` module next
-to the publishers. The contract module names each published `<plugin>.<type>`
-family and records the read-model fields shared screens bind. Keep migrations in
-the `plugin.db{}` module, read-model projection in `entities.lua`, and modal or
-disclosure state in `ui.local_state` rather than the database.
+A plugin that ships a durable model should pair this file's `plugin.db{}`
+declaration with the canonical sequence in
+[`../plugin-entities.md#shipping-a-model`](../plugin-entities.md#shipping-a-model):
+database schema and migrations own durability; entity publishers own the
+normalized shared data contract; renderer-local state owns presentation only.
 
 ## Shape
 
