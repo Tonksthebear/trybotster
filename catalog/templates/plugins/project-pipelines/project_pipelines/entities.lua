@@ -581,6 +581,8 @@ local function ticket_dependency_entity(dependency)
     end
     entity.depends_on_title = entity.depends_on_title or (ticket and ticket.title) or dependency.depends_on_ticket_id
     entity.depends_on_status = entity.depends_on_status or (ticket and ticket.status) or "missing"
+    local view = with_view()
+    entity.depends_on_label = view and view.status_label(entity.depends_on_status) or tostring(entity.depends_on_status or "")
     entity.depends_on_tone = entity.depends_on_status == "closed" and "success" or "danger"
     return entity
 end

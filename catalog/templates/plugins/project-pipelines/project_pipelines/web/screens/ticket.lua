@@ -429,7 +429,7 @@ local function dependency_rows(ticket, ctx, overview)
             where = { ticket_id = ticket.id },
             item_template = view.panel{
                 view.row{
-                    view.badge(ui.bind("@/depends_on_status"), ui.bind("@/depends_on_tone")),
+                    view.badge(ui.bind("@/depends_on_label"), ui.bind("@/depends_on_tone")),
                     ui.text{
                         text = ui.bind("@/depends_on_title"),
                         size = "sm",
