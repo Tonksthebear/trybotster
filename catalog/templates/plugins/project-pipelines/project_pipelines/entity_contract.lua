@@ -112,4 +112,107 @@ M.home_screen = {
     },
 }
 
+M.screens = {
+    home = M.home_screen,
+    pipelines = {
+        {
+            name = "pipeline_definitions",
+            source = "/" .. M.types.pipeline,
+            fields = {
+                "description",
+                "edit_path",
+                "id",
+                "name",
+                "step_count_label",
+                "step_summary",
+            },
+        },
+    },
+    project = {
+        {
+            name = "project_targets",
+            source = "/" .. M.types.project_target,
+            where_fields = { "project_id" },
+            fields = {
+                "target_label",
+            },
+        },
+        {
+            name = "tickets",
+            source = "/" .. M.types.ticket,
+            where_fields = { "project_id" },
+            fields = {
+                "dependency_summary",
+                "id",
+                "latest_run_badge",
+                "latest_run_tone",
+                "path",
+                "project_stage_label",
+                "tail_label",
+                "target_label",
+                "title",
+            },
+        },
+    },
+    ticket = {
+        {
+            name = "ticket_header",
+            mode = "record",
+            source = "/" .. M.types.ticket,
+            where_fields = { "id" },
+            fields = {
+                "active_work_detail",
+                "active_work_label",
+                "description",
+                "latest_run_badge",
+                "latest_run_tone",
+                "target_label",
+                "title",
+            },
+        },
+        {
+            name = "questions",
+            source = "/" .. M.types.question,
+            where_fields = { "status", "ticket_id" },
+            fields = {
+                "blocking_label",
+                "blocking_tone",
+                "id",
+                "kind_label",
+                "question",
+            },
+        },
+        {
+            name = "dependencies",
+            source = "/" .. M.types.ticket_dependency,
+            where_fields = { "ticket_id" },
+            fields = {
+                "depends_on_label",
+                "depends_on_title",
+                "depends_on_tone",
+                "id",
+            },
+        },
+        {
+            name = "pr_links",
+            source = "/" .. M.types.pr_link,
+            where_fields = { "ticket_id" },
+            fields = {
+                "label",
+                "status_label",
+                "status_tone",
+            },
+        },
+        {
+            name = "open_pr_links",
+            source = "/" .. M.types.pr_link,
+            where_fields = { "has_pr_url", "ticket_id" },
+            fields = {
+                "id",
+                "pr_url",
+            },
+        },
+    },
+}
+
 return M

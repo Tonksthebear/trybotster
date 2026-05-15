@@ -182,7 +182,8 @@ It ships models in four explicit Lua-owned layers:
 - `project_pipelines/repo.lua` validates and mutates that private persistence
   layer.
 - `project_pipelines/entity_contract.lua` names every published entity family
-  and documents the home-screen UI read-model fields that screens bind.
+  and documents the screen UI read-model sources, filter fields, and projected
+  fields that entity-backed screens bind.
 - `project_pipelines/entities.lua` consumes those names, builds normalized
   read-model records from plugin.db persistence rows, and publishes them for
   clients under the `project-pipelines.*` namespace.
@@ -205,9 +206,10 @@ those entity families on demand.
 The contract module describes the published read-model shape, not the plugin.db
 table schema. Persistence models may have different names, decoded JSON fields,
 or private columns; plugin authors should treat `project-pipelines.*` contract
-entries as the client-facing API. Its screen-field coverage currently guards
-the home screen; other screens still have migration notes below until their
-render-time `repo.*` reads move behind entity-backed contracts.
+entries as the client-facing API. Its screen-field coverage guards the home
+screen plus the non-home entity-backed screen sections; some sections still have
+migration notes below until their render-time `repo.*` reads move behind
+entity-backed contracts.
 
 Dynamic state is published as plugin-owned entities:
 
