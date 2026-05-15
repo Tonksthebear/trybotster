@@ -42,77 +42,78 @@ local function render_step(step, ctx, ticket_id)
     return view.panel{ ui.stack{ direction = "vertical", gap = "1", children = children } }
 end
 
-local function review_nodes(run_id, overview)
-    local nodes = {}
-    local rows = overview and overview.reviews or repo.run_reviews(run_id)
-    if #rows == 0 then
-        return { ui.text{ text = "No reviews submitted.", size = "sm", tone = "muted" } }
-    end
-
-    for _, review in ipairs(rows) do
-        table.insert(nodes, view.panel{
-            ui.stack{ direction = "vertical", gap = "1", children = {
-                view.row{
-                    view.badge(review.verdict),
-                    ui.text{ text = review.summary or "", size = "sm", weight = "medium" },
-                },
-                ui.text{ text = review.reviewer_session_uuid or "", size = "xs", tone = "muted" },
-            } },
-        })
-    end
-    return nodes
-end
-
-local function finding_nodes(run_id, overview)
-    local nodes = {}
-    local rows = overview and overview.findings or repo.run_findings(run_id)
-    if #rows == 0 then
-        return { ui.text{ text = "No findings recorded.", size = "sm", tone = "muted" } }
-    end
-
-    for _, finding in ipairs(rows) do
-        table.insert(nodes, view.panel{
-            ui.stack{ direction = "vertical", gap = "1", children = {
-                view.row{
-                    view.badge(finding.severity),
-                    ui.text{ text = finding.title, size = "sm", weight = "semibold" },
-                    view.badge(finding.status),
-                },
-                ui.text{
-                    text = (finding.file or "") .. (finding.line and (":" .. tostring(finding.line)) or ""),
-                    size = "xs",
-                    tone = "muted",
-                },
-                ui.text{ text = finding.details or "", size = "xs", tone = "muted" },
-            } },
-        })
-    end
-    return nodes
-end
-
-local function artifact_nodes(run_id, overview)
-    local nodes = {}
-    local rows = overview and overview.artifacts or repo.run_artifacts(run_id)
-    if #rows == 0 then
-        return { ui.text{ text = "No artifacts attached.", size = "sm", tone = "muted" } }
-    end
-
-    for _, artifact in ipairs(rows) do
-        table.insert(nodes, view.panel{
-            ui.stack{ direction = "vertical", gap = "1", children = {
-                view.row{
-                    view.badge(artifact.kind, "muted"),
-                    ui.text{
-                        text = artifact.summary or artifact.uri or artifact.id,
-                        size = "sm",
-                        weight = "medium",
+local function review_nodes(run_id)
+    return {
+        ui.bind_list{
+            source = "/project-pipelines.review",
+            where = { run_id = run_id },
+            item_template = view.panel{
+                ui.stack{ direction = "vertical", gap = "1", children = {
+                    view.row{
+                        view.badge(ui.bind("@/verdict")),
+                        ui.text{ text = ui.bind("@/summary"), size = "sm", weight = "medium" },
                     },
-                },
-                ui.text{ text = artifact.uri or "", size = "xs", tone = "muted" },
-            } },
-        })
-    end
-    return nodes
+                    ui.text{ text = ui.bind("@/reviewer_session_uuid"), size = "xs", tone = "muted" },
+                } },
+            },
+            empty_template = ui.text{ text = "No reviews submitted.", size = "sm", tone = "muted" },
+        },
+    }
+end
+
+local function finding_nodes(run_id)
+    return {
+        ui.bind_list{
+            source = "/project-pipelines.finding",
+            where = { run_id = run_id },
+            item_template = view.panel{
+                ui.stack{ direction = "vertical", gap = "1", children = {
+                    view.row{
+                        view.badge(ui.bind("@/severity")),
+                        ui.text{ text = ui.bind("@/title"), size = "sm", weight = "semibold" },
+                        view.badge(ui.bind("@/status")),
+                    },
+                    ui.text{ text = ui.bind("@/location_label"), size = "xs", tone = "muted" },
+                    ui.text{ text = ui.bind("@/details"), size = "xs", tone = "muted" },
+                } },
+            },
+            empty_template = ui.text{ text = "No findings recorded.", size = "sm", tone = "muted" },
+        },
+    }
+end
+
+local function artifact_nodes(run_id)
+    return {
+        ui.bind_list{
+            source = "/project-pipelines.artifact",
+            where = { run_id = run_id },
+            item_template = view.panel{
+                ui.stack{ direction = "vertical", gap = "1", children = {
+                    view.row{
+                        view.badge(ui.bind("@/kind"), "muted"),
+                        ui.text{
+                            text = ui.bind("@/display_summary"),
+                            size = "sm",
+                            weight = "medium",
+                        },
+                    },
+                    ui.text{ text = ui.bind("@/uri"), size = "xs", tone = "muted" },
+                } },
+            },
+            empty_template = ui.text{ text = "No artifacts attached.", size = "sm", tone = "muted" },
+        },
+    }
+end
+
+local function event_nodes(run_id)
+    return {
+        ui.bind_list{
+            source = "/project-pipelines.event",
+            where = { run_id = run_id },
+            item_template = ui.text{ text = ui.bind("@/kind"), size = "xs", tone = "muted" },
+            empty_template = ui.text{ text = "No events yet.", size = "sm", tone = "muted" },
+        },
+    }
 end
 
 function M.render(view_state, ctx)
@@ -129,14 +130,6 @@ function M.render(view_state, ctx)
     local step_nodes = {}
     for _, step in ipairs(overview.steps) do
         table.insert(step_nodes, render_step(step, ctx, run.ticket_id))
-    end
-
-    local event_nodes = {}
-    for _, event in ipairs(overview.events) do
-        table.insert(event_nodes, ui.text{ text = event.kind, size = "xs", tone = "muted" })
-    end
-    if #event_nodes == 0 then
-        table.insert(event_nodes, ui.text{ text = "No events yet.", size = "sm", tone = "muted" })
     end
 
     local header_actions = {}
@@ -182,10 +175,10 @@ function M.render(view_state, ctx)
             description = (pipeline and pipeline.name or run.pipeline_id) .. " - current step: " .. (run.current_step_id or "none"),
         },
         view.section("Steps", step_nodes),
-        view.section("Reviews", review_nodes(run.id, overview)),
-        view.section("Findings", finding_nodes(run.id, overview)),
-        view.section("Artifacts", artifact_nodes(run.id, overview)),
-        view.section("Recent Events", event_nodes),
+        view.section("Reviews", review_nodes(run.id)),
+        view.section("Findings", finding_nodes(run.id)),
+        view.section("Artifacts", artifact_nodes(run.id)),
+        view.section("Recent Events", event_nodes(run.id)),
     } }
 end
 
