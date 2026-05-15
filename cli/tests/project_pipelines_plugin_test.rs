@@ -1481,6 +1481,33 @@ fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_
             assert_screen_contract("project", contract.screens.project, "{project_path}")
             assert_screen_contract("ticket", contract.screens.ticket, "{ticket_path}")
 
+            local function assert_repo_rendered_screen(screen_name, path)
+              assert(contract.screens[screen_name] == nil,
+                screen_name .. " should move from repo_rendered_screens to screens only after entity binding migration")
+              local metadata = assert(contract.repo_rendered_screens and contract.repo_rendered_screens[screen_name],
+                screen_name .. " repo-rendered screen missing contract metadata")
+              assert(type(metadata.reason) == "string" and metadata.reason ~= "",
+                screen_name .. " repo-rendered metadata needs a reason")
+              assert(type(metadata.repo_calls) == "table" and #metadata.repo_calls > 0,
+                screen_name .. " repo-rendered metadata needs repo_calls")
+              assert(type(metadata.migration_sources) == "table" and #metadata.migration_sources > 0,
+                screen_name .. " repo-rendered metadata needs migration_sources")
+              local screen = read_file(path)
+              assert(not screen:match("ui%.bind_list%s*%{{"),
+                screen_name .. " has bind_list rows; move migrated sections into contract.screens")
+              for _, call in ipairs(metadata.repo_calls) do
+                assert(screen:match("repo%." .. call .. "%s*%("),
+                  screen_name .. " repo-rendered metadata lists missing repo call: " .. call)
+              end
+              for _, source in ipairs(metadata.migration_sources) do
+                assert(source:match("^/" .. contract.owner:gsub("%-", "%%-") .. "%."),
+                  screen_name .. " migration source should be a project-pipelines entity path: " .. tostring(source))
+              end
+            end
+
+            assert_repo_rendered_screen("new", "{new_path}")
+            assert_repo_rendered_screen("run", "{run_path}")
+
             return "ok"
             "#,
             plugin_dir = plugin_dir.display(),
@@ -1493,6 +1520,12 @@ fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_
                 .display(),
             ticket_path = plugin_dir
                 .join("project_pipelines/web/screens/ticket.lua")
+                .display(),
+            new_path = plugin_dir
+                .join("project_pipelines/web/screens/new.lua")
+                .display(),
+            run_path = plugin_dir
+                .join("project_pipelines/web/screens/run.lua")
                 .display()
         ))
         .eval()
