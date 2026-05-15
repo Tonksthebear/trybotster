@@ -41,6 +41,30 @@ read model. If the UI needs fields that do not match the table shape, add them
 deliberately in the read-model publisher so the contract is visible and shared
 by browser and TUI renderers.
 
+## Shipping A Model
+
+Use this sequence when a plugin owns data that must survive reloads and appear
+in a shared UI:
+
+1. Declare the private durable schema in `plugin.db{}` at plugin load time.
+   Put tables, constraints, additive migrations, and indexes there; keep this
+   shape optimized for persistence and plugin invariants.
+2. Mutate the database through plugin-owned model/repository functions. Validate
+   inputs there, write audit/history rows there, and publish entity deltas after
+   successful commits.
+3. Put the client-facing contract in an `entity_contract.lua` module. It should
+   name each `<plugin>.<type>` family and document the read-model fields screens
+   bind, without exposing the raw table schema.
+4. Build publishers in `entities.lua` that project database rows and hub state
+   into normalized read models, register those families with
+   `lib.entity_broadcast`, and publish snapshots or targeted deltas.
+5. Keep transient presentation in `ui.local_state` plus
+   `botster.presentation.*`. Modal open flags, disclosure, focus, and pending
+   controls are per-client state, not `plugin.db` rows or plugin entities.
+
+`project_pipelines/db.lua`, `repo.lua`, `entity_contract.lua`, and
+`entities.lua` are the reference layout for entity-backed plugin templates.
+
 ## Canonical Model
 
 A plugin entity type is a namespaced record family:
