@@ -1686,7 +1686,7 @@ impl LuaRuntime {
         }
 
         // Generate ASCII QR (generous max size - clients will re-render if needed)
-        let qr_lines = crate::tui::generate_qr_code_lines(url, 200, 100);
+        let qr_lines = crate::clients::tui::generate_qr_code_lines(url, 200, 100);
 
         let url = url.to_string();
 

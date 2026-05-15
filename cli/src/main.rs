@@ -4,7 +4,7 @@
 //! for the core functionality.
 
 use anyhow::{Context, Result};
-use botster::{commands, tui, Config, Hub};
+use botster::{clients::tui, commands, Config, Hub};
 use mimalloc::MiMalloc;
 
 /// Global allocator configured per M-MIMALLOC-APPS guideline.

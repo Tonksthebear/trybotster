@@ -117,11 +117,6 @@ function M.register()
             title = "Untitled ticket"
         end
         local target_id = draft.target_id
-        local target_path = nil
-        if spawn_targets and spawn_targets.get and target_id and target_id ~= "" then
-            local target = spawn_targets.get(target_id)
-            target_path = target and target.path or nil
-        end
         if not target_id or target_id == "" then
             refresh(ctx)
             return action.result{ ok = false, error = "Select a spawn target before creating the ticket." }
@@ -134,7 +129,6 @@ function M.register()
             description = draft.description or "",
             project_id = project_id,
             target_id = target_id,
-            target_path = target_path,
         }
         drafts[key] = {}
         refresh(ctx)
@@ -160,16 +154,10 @@ function M.register()
             name = "Untitled project"
         end
         local target_id = draft.project_target_id
-        local target_path = nil
-        if spawn_targets and spawn_targets.get and target_id and target_id ~= "" then
-            local target = spawn_targets.get(target_id)
-            target_path = target and target.path or nil
-        end
         local project = repo.create_project{
             name = name,
             description = draft.project_description or "",
             target_id = target_id ~= "" and target_id or nil,
-            target_path = target_path,
         }
         draft.project_name = nil
         draft.project_description = nil

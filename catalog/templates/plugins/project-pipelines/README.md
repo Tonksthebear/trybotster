@@ -366,9 +366,15 @@ Start a run:
   "ticket_id": "ticket_...",
   "pipeline_id": "ticket_delivery",
   "target_id": "...",
-  "target_path": "/path/to/repo",
   "workspace_name": "Pipelines"
 }
 ```
 
-Agent steps require `target_id` or `target_path`; command steps require `target_path`.
+A ticket's `target_id` is the sole stored target handle. The target's filesystem
+root is never stored on tickets or runs — it is derived on demand from the
+spawn target registry whenever a real path is needed (command step `cwd`,
+scanning a repo's `.botster` config for agents and accessories). This keeps the
+path from drifting and keeps it out of agent-facing context, where a raw
+`target_path` was mistaken for the agent's working directory. Runs need a
+resolvable `target_id`; command steps additionally require that the target
+still resolves to a filesystem path.

@@ -71,4 +71,29 @@ function M.handle_pr_merged(event)
     return { ok = true, pr_link = link, ticket = ticket }
 end
 
+function M.handle_pr_review_submitted(event)
+    event = event or {}
+    if util.is_blank(event.repo) or util.is_blank(event.pr_number) then
+        return { ok = false, reason = "missing_repo_or_pr_number" }
+    end
+
+    local state = string.lower(tostring(event.state or ""))
+    if state ~= "changes_requested" and state ~= "commented" and state ~= "approved" then
+        return { ok = false, reason = "ignored_review_state", state = state }
+    end
+
+    local link = repo.find_pr_link{
+        provider = normalize_provider(event.provider),
+        repo = event.repo,
+        pr_number = event.pr_number,
+    }
+    if not link then
+        return { ok = false, reason = "pr_not_linked" }
+    end
+
+    local result = engine.handle_pr_review_submitted(link, event)
+    result.pr_link = link
+    return result
+end
+
 return M

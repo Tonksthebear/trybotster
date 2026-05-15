@@ -246,7 +246,14 @@ pub fn run(session_uuid: &str, socket_path: &str, timeout_secs: u64) -> Result<(
 
     // Clean up stale socket if present
     if socket_path.exists() {
-        std::fs::remove_file(socket_path).ok();
+        if session_process_is_live(session_uuid) {
+            bail!(
+                "refusing to replace live session socket for {} at {}",
+                session_uuid,
+                socket_path.display()
+            );
+        }
+        remove_socket_path_logged(session_uuid, socket_path, "session_start_stale_socket");
     }
 
     // Bind socket
@@ -283,10 +290,10 @@ pub fn run(session_uuid: &str, socket_path: &str, timeout_secs: u64) -> Result<(
     })();
 
     if let Ok(pid_path) = session_pid_path(session_uuid) {
-        let _ = std::fs::remove_file(pid_path);
+        remove_file_logged(session_uuid, &pid_path, "session_exit_pid_cleanup");
     }
     if run_result.is_err() && socket_path.exists() {
-        let _ = std::fs::remove_file(socket_path);
+        remove_socket_path_logged(session_uuid, socket_path, "session_start_or_run_error");
     }
 
     run_result
@@ -729,7 +736,7 @@ fn run_session(
 
     let socket_existed = socket_path.exists();
     if socket_existed {
-        std::fs::remove_file(socket_path).ok();
+        remove_socket_path_logged(session_uuid, socket_path, exit_reason);
     }
     log::info!(
         "[session {}] exiting (reason={}, socket_existed={})",
@@ -1319,10 +1326,46 @@ fn session_identity_is_live(identity: &SessionIdentity) -> bool {
 
 fn cleanup_stale_session_files(session_uuid: &str) {
     if let Ok(path) = session_socket_path(session_uuid) {
-        let _ = std::fs::remove_file(path);
+        remove_socket_path_logged(session_uuid, &path, "orphan_cleanup_dead_identity");
     }
     if let Ok(path) = session_pid_path(session_uuid) {
-        let _ = std::fs::remove_file(path);
+        remove_file_logged(session_uuid, &path, "orphan_cleanup_dead_identity");
+    }
+}
+
+fn remove_socket_path_logged(session_uuid: &str, path: &Path, reason: &str) -> bool {
+    remove_file_logged(session_uuid, path, reason)
+}
+
+fn remove_file_logged(session_uuid: &str, path: &Path, reason: &str) -> bool {
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            log::info!(
+                "[session {}] removed runtime file reason={} path={}",
+                &session_uuid[..session_uuid.len().min(16)],
+                reason,
+                path.display()
+            );
+            true
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            log::debug!(
+                "[session {}] runtime file already absent reason={} path={}",
+                &session_uuid[..session_uuid.len().min(16)],
+                reason,
+                path.display()
+            );
+            false
+        }
+        Err(e) => {
+            log::warn!(
+                "[session {}] failed to remove runtime file reason={} path={}: {e}",
+                &session_uuid[..session_uuid.len().min(16)],
+                reason,
+                path.display()
+            );
+            false
+        }
     }
 }
 
@@ -1373,7 +1416,7 @@ pub fn cleanup_orphaned_session_files() {
                 removed += 1;
             } else if !socket_exists && identity.is_some() && !identity_live {
                 if let Ok(pid_path) = session_pid_path(session_uuid) {
-                    let _ = std::fs::remove_file(pid_path);
+                    remove_file_logged(session_uuid, &pid_path, "orphan_cleanup_dead_pid_only");
                     removed += 1;
                 }
             }
@@ -1405,6 +1448,11 @@ pub fn discover_sessions() -> Result<Vec<PathBuf>> {
             };
             if session_process_is_live(session_uuid) {
                 sockets.push(path);
+            } else {
+                log::debug!(
+                    "[session {}] skipping non-live session socket during discovery",
+                    &session_uuid[..session_uuid.len().min(16)]
+                );
             }
         }
     }

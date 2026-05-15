@@ -76,6 +76,15 @@ module Integrations
             payload: payload
           )
         end
+
+        def create_pull_request_review_lifecycle_message(repo:, pr_number:, payload:)
+          Integrations::Github::Message.create!(
+            event_type: "pull_request_review",
+            repo: repo,
+            issue_number: pr_number,
+            payload: payload
+          )
+        end
       end
     end
   end

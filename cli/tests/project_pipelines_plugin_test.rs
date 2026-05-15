@@ -32,6 +32,13 @@ fn catalog_plugin_project_pipelines_notification_policy_scopes_to_owned_sessions
 
             local claim = nil
             local pushes = {{}}
+            local logs = {{}}
+            log = {{
+              info = function(message)
+                logs[#logs + 1] = message
+              end,
+              warn = function() end,
+            }}
             push = {{
               send = function(payload)
                 pushes[#pushes + 1] = payload
@@ -57,15 +64,19 @@ fn catalog_plugin_project_pipelines_notification_policy_scopes_to_owned_sessions
             assert(claim.scope.owner_plugin == "project-pipelines")
             assert(claim.scope.all_sessions == nil)
 
-            local suppressed = claim.handler({{ message = "Task complete" }})
+            local suppressed = claim.handler({{ session_uuid = "sess-1", type = "osc9", message = "Task complete" }})
             assert(suppressed.core == "suppress")
             assert(suppressed.reason == "project_pipelines_routine_cli_notification")
+            assert(#logs == 1)
+            assert(logs[1]:match("notification suppressed"))
+            assert(logs[1]:match("sess%-1"))
+            assert(logs[1]:match("Task complete"))
 
-            local permission = claim.handler({{ message = "Permission needed" }})
+            local permission = claim.handler({{ message = "PERMISSION needed" }})
             assert(permission.core == "replace")
             assert(permission.reason == "project_pipelines_allowed_permission")
 
-            local approval = claim.handler({{ body = "Approval requested before command" }})
+            local approval = claim.handler({{ body = "Approval Requested before command" }})
             assert(approval.core == "replace")
             assert(approval.reason == "project_pipelines_allowed_approval_requested")
 
@@ -73,8 +84,14 @@ fn catalog_plugin_project_pipelines_notification_policy_scopes_to_owned_sessions
             assert(edit.core == "replace")
             assert(edit.reason == "project_pipelines_allowed_wants_to_edit")
 
+            local keyword = policy.evaluate({{ keywords = {{ "APPROVAL REQUESTED" }}, message = "tool is waiting" }})
+            assert(keyword.core == "replace")
+            assert(keyword.reason == "project_pipelines_allowed_approval_requested")
+
             local phase_text = policy.evaluate({{ message = "Phase changed to review" }})
             assert(phase_text.core == "suppress")
+            assert(#logs == 2)
+            assert(logs[2]:match("Phase changed to review"))
 
             policy.notify_phase_transition({{
               run_id = "run-1",
@@ -100,6 +117,202 @@ fn catalog_plugin_project_pipelines_notification_policy_scopes_to_owned_sessions
         ))
         .eval()
         .expect("Project Pipelines notification policy behavior");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_accessory_options_use_live_ticket_worktree() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local captured_repo_root = nil
+            package.loaded["lib.config_resolver"] = {{
+              list_accessories = function(device_root, repo_root)
+                assert(device_root == "/device-root")
+                captured_repo_root = repo_root
+                return {{ "rails-server" }}
+              end,
+            }}
+            package.loaded["lib.agent"] = {{
+              get = function(session_uuid)
+                if session_uuid ~= "sess-live" then return nil end
+                return {{
+                  info = function()
+                    return {{
+                      worktree_path = "/tmp/hyperflex-ticket-worktree",
+                    }}
+                  end,
+                }}
+              end,
+            }}
+            config = {{
+              data_dir = function() return "/device-root" end,
+            }}
+            -- target_path is never stored on the ticket; the UI derives the
+            -- repo-config scan root from target_id via the spawn target registry.
+            spawn_targets = {{
+              list = function()
+                return {{
+                  {{ id = "tgt-hyperflex", name = "Hyperflex", path = "/repo/hyperflex", enabled = true }},
+                }}
+              end,
+              get = function(id)
+                if id == "tgt-hyperflex" then
+                  return {{ id = id, name = "Hyperflex", path = "/repo/hyperflex" }}
+                end
+                return nil
+              end,
+            }}
+
+            local view = require("project_pipelines.web.ui")
+
+            -- target_repo_path resolves the repo root from target_id alone.
+            assert(view.target_repo_path("tgt-hyperflex") == "/repo/hyperflex")
+            assert(view.target_repo_path("tgt-unknown") == nil)
+            assert(view.target_repo_path(nil) == nil)
+
+            -- A live ticket session's worktree wins over the derived repo root.
+            local config_path = view.worktree_path_for_sessions(
+              {{ "sess-live" }}, view.target_repo_path("tgt-hyperflex"))
+            assert(config_path == "/tmp/hyperflex-ticket-worktree")
+
+            local options = view.accessory_options("terminal", config_path)
+            assert(captured_repo_root == "/tmp/hyperflex-ticket-worktree")
+            assert(options[1].value == "terminal")
+            assert(options[2].value == "rails-server")
+
+            -- With no live session, it falls back to the derived repo root.
+            local fallback = view.worktree_path_for_sessions(
+              {{ "missing" }}, view.target_repo_path("tgt-hyperflex"))
+            assert(fallback == "/repo/hyperflex")
+
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines accessory options should resolve scan path from target_id");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_spawn_controls_resolve_options_from_target_id() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            -- Below-the-view dependencies the real ui.lua resolves through.
+            package.loaded["lib.config_resolver"] = {{
+              list_accessories = function(device_root, repo_root)
+                assert(device_root == "/device-root", "accessory scan must use the device data dir")
+                if repo_root == "/repo/hyperflex" then
+                  return {{ "rails-server" }}
+                end
+                return {{}}
+              end,
+              list_agents = function(_device_root, repo_root)
+                if repo_root == "/repo/hyperflex" then
+                  return {{ "hyperflex-impl" }}
+                end
+                return {{}}
+              end,
+            }}
+            -- No live ticket session, so the scan path falls back to the
+            -- target's repo root derived purely from target_id.
+            package.loaded["lib.agent"] = {{ get = function() return nil end }}
+            package.loaded["project_pipelines.repo"] = {{}}
+            package.loaded["project_pipelines.web.actions"] = {{
+              draft = function() return {{}} end,
+            }}
+            config = {{ data_dir = function() return "/device-root" end }}
+            spawn_targets = {{
+              list = function()
+                return {{
+                  {{ id = "tgt-hyperflex", name = "Hyperflex", path = "/repo/hyperflex", enabled = true }},
+                }}
+              end,
+              get = function(id)
+                if id == "tgt-hyperflex" then
+                  return {{ id = id, name = "Hyperflex", path = "/repo/hyperflex" }}
+                end
+                return nil
+              end,
+            }}
+
+            -- Capture ui.select props so we can inspect the rendered option lists.
+            local selects = {{}}
+            local function node(kind)
+              return function(props) return {{ kind = kind, props = props }} end
+            end
+            ui = {{
+              button = node("button"),
+              dialog = node("dialog"),
+              stack = node("stack"),
+              text = node("text"),
+              textarea = node("textarea"),
+              badge = node("badge"),
+              inline = node("inline"),
+              panel = node("panel"),
+              empty_state = node("empty_state"),
+              status_dot = node("status_dot"),
+              select = function(props)
+                selects[#selects + 1] = props
+                return {{ kind = "select", props = props }}
+              end,
+              action = function(name, payload) return {{ kind = "action", name = name, payload = payload }} end,
+              local_state = function(key, default) return {{ kind = "local_state", key = key, default = default }} end,
+              responsive = function(map) return {{ kind = "responsive", map = map }} end,
+              bind = function(path) return {{ bind = path }} end,
+            }}
+
+            local screen = require("project_pipelines.web.screens.ticket")
+            local controls = screen.spawn_session_controls(
+              {{ id = "ticket-1", status = "open", target_id = "tgt-hyperflex" }},
+              {{}},
+              {{ session_uuids = {{}} }})
+            assert(type(controls) == "table" and #controls > 0, "spawn controls must render nodes")
+
+            local accessory_options, agent_options
+            for _, props in ipairs(selects) do
+              if props.id == "ticket-ticket-1-spawn-accessory" then accessory_options = props.options end
+              if props.id == "ticket-ticket-1-spawn-agent" then agent_options = props.options end
+            end
+            assert(accessory_options ~= nil, "accessory select did not render")
+            assert(agent_options ~= nil, "agent select did not render")
+
+            local function has(options, value)
+              for _, option in ipairs(options or {{}}) do
+                if option.value == value then return true end
+              end
+              return false
+            end
+
+            -- The accessory configured under the target's repo is presented,
+            -- resolved purely from ticket.target_id with no stored target_path.
+            assert(has(accessory_options, "rails-server"), "custom repo accessory must be presented")
+            assert(has(accessory_options, "terminal"), "built-in terminal must remain present")
+            -- Agent options reach repo-level definitions through the same derived path.
+            assert(has(agent_options, "hyperflex-impl"), "repo-level agent must be presented")
+
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("spawn controls should resolve agent/accessory options from target_id");
 
     assert_eq!(result, "ok");
 }
@@ -219,7 +432,7 @@ fn catalog_plugin_project_pipelines_can_spawn_ticket_session_from_engine() {
             package.loaded["project_pipelines.repo"] = {{
               get_ticket = function(ticket_id)
                 assert(ticket_id == "ticket-1")
-                return {{ id = "ticket-1", title = "Ship", target_id = "target-1", target_path = "/repo" }}
+                return {{ id = "ticket-1", title = "Ship", target_id = "target-1" }}
               end,
               latest_ticket_run = function(ticket_id)
                 assert(ticket_id == "ticket-1")
@@ -257,6 +470,93 @@ fn catalog_plugin_project_pipelines_can_spawn_ticket_session_from_engine() {
         ))
         .eval()
         .expect("Project Pipelines should expose a clean engine spawn path");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_merge_prompt_describes_pr_steward_role() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local created_agent = nil
+
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() end,
+              notify_question_asked = function() end,
+            }}
+            package.loaded["lib.agent"] = {{
+              get = function() return nil end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  create_agent = function(_, opts)
+                    created_agent = opts
+                    return {{ session_uuid = "sess-merge", status = "queued" }}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              get_ticket = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{ id = "ticket-1", title = "Ship PR Loop", target_id = "target-1" }}
+              end,
+              latest_ticket_run = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipeline-1", status = "done", target_id = "target-1" }}
+              end,
+              get_pipeline = function(pipeline_id)
+                assert(pipeline_id == "pipeline-1")
+                return {{ id = "pipeline-1", merge_policy = "pr" }}
+              end,
+              ticket_events = function(ticket_id, kind)
+                assert(ticket_id == "ticket-1")
+                assert(kind == "ticket.merge_requested")
+                return {{}}
+              end,
+              append_event = function(kind, event)
+                assert(kind == "ticket.merge_requested")
+                assert(event.payload.merge_policy == "pr")
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            local response = engine.request_merge({{ ticket_id = "ticket-1" }}, {{}})
+
+            assert(response.merge_policy == "pr")
+            assert(created_agent ~= nil)
+            assert(created_agent.metadata.role == "merge")
+            assert(created_agent.prompt:match("merge agent and PR steward"))
+            assert(created_agent.prompt:match("orchestrator between the human"))
+            assert(created_agent.prompt:match("Do not implement code changes yourself"))
+            assert(created_agent.prompt:match("After opening or updating the PR, you remain the PR steward"))
+            assert(created_agent.prompt:match("keep the conversation on the PR"))
+            assert(created_agent.prompt:match("Delegate implementation work to the existing implementer"))
+            assert(created_agent.prompt:match("architectural/product reasoning to the planner"))
+            assert(created_agent.prompt:match("project_pipelines_get_ticket"))
+            assert(created_agent.prompt:match("list_hubs"))
+            assert(created_agent.prompt:match("post_message"))
+            assert(created_agent.prompt:match("notify_session"))
+            assert(created_agent.prompt:match("project_pipelines_ask_agent only when no existing ticket agent owns the needed context"))
+            assert(created_agent.prompt:match("Do not create a new run or a new PR"))
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("merge prompt should describe the PR steward role");
 
     assert_eq!(result, "ok");
 }
@@ -648,6 +948,284 @@ fn catalog_plugin_project_pipelines_ignores_unlinked_pr_merged_event() {
 }
 
 #[test]
+fn catalog_plugin_project_pipelines_routes_pr_review_to_live_merge_steward() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+    botster::lua::primitives::json::register(&lua).expect("register json");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local events = {{}}
+            local posted = nil
+            local notified = nil
+
+            package.loaded["lib.agent"] = {{
+              get = function(session_uuid)
+                if session_uuid == "sess-merge" then
+                  return {{ info = function() return {{ session_uuid = session_uuid }} end }}
+                end
+                return nil
+              end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  post = function(_, session_uuid, message)
+                    posted = {{ session_uuid = session_uuid, message = message }}
+                  end,
+                  notify = function(_, session_uuid, notification)
+                    notified = {{ session_uuid = session_uuid, notification = notification }}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() end,
+            }}
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              find_pr_link = function(attrs)
+                assert(attrs.provider == "github")
+                assert(attrs.repo == "owner/repo")
+                assert(attrs.pr_number == 42)
+                return {{
+                  id = "pr-1",
+                  provider = "github",
+                  repo = "owner/repo",
+                  pr_number = 42,
+                  pr_url = "https://github.com/owner/repo/pull/42",
+                  ticket_id = "ticket-1",
+                  run_id = "run-1",
+                  status = "open",
+                }}
+              end,
+              get_ticket = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{ id = "ticket-1", title = "Ship review loop", status = "open", target_id = "target-1" }}
+              end,
+              get_run = function(run_id)
+                assert(run_id == "run-1")
+                return {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipeline-1", status = "done", target_id = "target-1", current_step_id = false, current_run_step_id = false }}
+              end,
+              latest_ticket_run = function() error("linked run should be used") end,
+              ticket_events = function(ticket_id, kind)
+                assert(ticket_id == "ticket-1")
+                if kind == "ticket.merge_agent_linked" then
+                  return {{ {{ payload = "{{\"session_uuid\":\"sess-merge\"}}" }} }}
+                end
+                return {{
+                }}
+              end,
+              pipeline_steps = function()
+                error("merge steward should triage before implementation fallback")
+              end,
+              create_run_step_visit = function()
+                error("merge steward path must not create an implementation visit")
+              end,
+              update_run = function()
+                error("merge steward path must not reactivate the run directly")
+              end,
+              append_event = function(kind, event)
+                events[#events + 1] = {{ kind = kind, event = event }}
+              end,
+            }}
+
+            local integration = require("project_pipelines.github_integration")
+            local response = integration.handle_pr_review_submitted({{
+              provider = "github",
+              repo = "owner/repo",
+              pr_number = 42,
+              pr_url = "https://github.com/owner/repo/pull/42",
+              review_id = 123,
+              review_html_url = "https://github.com/owner/repo/pull/42#pullrequestreview-123",
+              reviewer = "reviewer",
+              state = "changes_requested",
+              body = "Please fix the failing path.",
+            }})
+
+            assert(response.ok == true)
+            assert(response.status == "steward_prompted")
+            assert(response.pr_steward.session_uuid == "sess-merge")
+            assert(posted.session_uuid == "sess-merge")
+            assert(posted.message.type == "task")
+            assert(posted.message.payload.source_event == "pr_review_submitted")
+            assert(posted.message.payload.review_state == "changes_requested")
+            assert(posted.message.payload.instructions:match("Please fix the failing path%."))
+            assert(posted.message.payload.instructions:match("You are an orchestrator, not the implementer"))
+            assert(posted.message.payload.instructions:match("Do not implement PR feedback yourself"))
+            assert(posted.message.payload.instructions:match("ask clarifying follow%-up questions and provide answers on that PR thread"))
+            assert(posted.message.payload.instructions:match("delegate to the existing implementer"))
+            assert(posted.message.payload.instructions:match("architectural/product reasoning"))
+            assert(posted.message.payload.instructions:match("post_message"))
+            assert(posted.message.payload.instructions:match("notify_session"))
+            assert(notified.session_uuid == "sess-merge")
+            assert(notified.notification.title == "PR changes requested")
+            assert(notified.notification.action.name == "project_pipelines_current_context")
+            assert(events[1].kind == "ticket.pr_review_submitted")
+            assert(events[2].kind == "ticket.pr_review_steward_prompted")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("PR review changes should route to the live merge steward");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_falls_back_to_existing_implementer_when_no_merge_steward() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local events = {{}}
+            local visits = {{}}
+            local posted = nil
+            local notified = nil
+
+            package.loaded["lib.agent"] = {{
+              get = function(session_uuid)
+                if session_uuid == "sess-impl" then
+                  return {{ info = function() return {{ session_uuid = session_uuid }} end }}
+                end
+                return nil
+              end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  post = function(_, session_uuid, message)
+                    posted = {{ session_uuid = session_uuid, message = message }}
+                  end,
+                  notify = function(_, session_uuid, notification)
+                    notified = {{ session_uuid = session_uuid, notification = notification }}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() end,
+            }}
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              find_pr_link = function(attrs)
+                assert(attrs.provider == "github")
+                assert(attrs.repo == "owner/repo")
+                assert(attrs.pr_number == 42)
+                return {{
+                  id = "pr-1",
+                  provider = "github",
+                  repo = "owner/repo",
+                  pr_number = 42,
+                  pr_url = "https://github.com/owner/repo/pull/42",
+                  ticket_id = "ticket-1",
+                  run_id = "run-1",
+                  status = "open",
+                }}
+              end,
+              get_ticket = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{ id = "ticket-1", title = "Ship review loop", status = "open", target_id = "target-1" }}
+              end,
+              get_run = function(run_id)
+                assert(run_id == "run-1")
+                return {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipeline-1", status = "done", target_id = "target-1", current_step_id = false, current_run_step_id = false }}
+              end,
+              latest_ticket_run = function() error("linked run should be used") end,
+              ticket_events = function(ticket_id, kind)
+                assert(ticket_id == "ticket-1")
+                assert(kind == "ticket.merge_agent_linked" or kind == "ticket.merge_requested")
+                return {{}}
+              end,
+              pipeline_steps = function(pipeline_id)
+                assert(pipeline_id == "pipeline-1")
+                return {{
+                  {{ id = "impl", kind = "agent", name = "Implement", agent_name = "codex", prompt = "Build the change" }},
+                  {{ id = "review", kind = "agent", name = "Review", agent_name = "codex" }},
+                }}
+              end,
+              create_run_step_visit = function(run_id, step_id, attrs)
+                assert(run_id == "run-1")
+                assert(step_id == "impl")
+                local visit = {{ id = "visit-2", run_id = run_id, step_id = step_id, status = attrs.status, sequence = 2 }}
+                visits[#visits + 1] = visit
+                return visit
+              end,
+              update_run = function(run_id, attrs)
+                assert(run_id == "run-1")
+                assert(attrs.status == "active")
+                assert(attrs.current_step_id == "impl")
+                assert(attrs.current_run_step_id == "visit-2")
+                return {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipeline-1", status = "active", target_id = "target-1", current_step_id = "impl", current_run_step_id = "visit-2" }}
+              end,
+              append_event = function(kind, event)
+                events[#events + 1] = {{ kind = kind, event = event }}
+              end,
+              get_run_step_visit = function(run_step_id)
+                return {{ id = run_step_id, run_id = "run-1", step_id = "impl", status = "active" }}
+              end,
+              latest_step_session = function(run_id, step_id)
+                assert(run_id == "run-1")
+                assert(step_id == "impl")
+                return {{ id = "visit-1", agent_session_uuid = "sess-impl" }}
+              end,
+              update_run_step_visit = function(run_step_id, attrs)
+                assert(run_step_id == "visit-2")
+                assert(attrs.agent_session_uuid == "sess-impl")
+                return {{ id = run_step_id, run_id = "run-1", step_id = "impl", agent_session_uuid = attrs.agent_session_uuid }}
+              end,
+            }}
+
+            local integration = require("project_pipelines.github_integration")
+            local response = integration.handle_pr_review_submitted({{
+              provider = "github",
+              repo = "owner/repo",
+              pr_number = 42,
+              pr_url = "https://github.com/owner/repo/pull/42",
+              review_id = 123,
+              review_html_url = "https://github.com/owner/repo/pull/42#pullrequestreview-123",
+              reviewer = "reviewer",
+              state = "changes_requested",
+              body = "Please fix the failing path.",
+            }})
+
+            assert(response.ok == true)
+            assert(response.status == "reactivated")
+            assert(response.agent.reused == true)
+            assert(posted.session_uuid == "sess-impl")
+            assert(posted.message.payload.instructions:match("Please fix the failing path%."))
+            assert(notified.notification.title == "PR changes requested")
+            assert(#visits == 1)
+            assert(events[1].kind == "ticket.pr_review_submitted")
+            assert(events[2].kind == "step.activated")
+            assert(events[3].kind == "step.agent_prompted")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("PR review changes should return the linked run to implementer");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_home_render_uses_bounded_notified_session_lookup() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
@@ -966,7 +1544,6 @@ fn catalog_plugin_project_pipelines_start_run_queues_agent_and_links_later_by_re
               id = "ticket-1",
               title = "Async spawn",
               target_id = "target-1",
-              target_path = "/repo",
             }}
             local pipeline = {{ id = "pipe-1", name = "Default" }}
             local step = {{
@@ -1005,7 +1582,6 @@ fn catalog_plugin_project_pipelines_start_run_queues_agent_and_links_later_by_re
                   ticket_id = attrs.ticket_id,
                   pipeline_id = attrs.pipeline_id,
                   target_id = attrs.target_id,
-                  target_path = attrs.target_path,
                   workspace_id = attrs.workspace_id,
                   workspace_name = attrs.workspace_name,
                   base_ticket_id = attrs.base_ticket_id,
@@ -1125,7 +1701,6 @@ fn catalog_plugin_project_pipelines_start_run_threads_stacked_base_metadata() {
               id = "ticket-2",
               title = "Stacked change",
               target_id = "target-1",
-              target_path = "/repo",
             }}
             local step = {{
               id = "step-1",
@@ -1157,7 +1732,6 @@ fn catalog_plugin_project_pipelines_start_run_threads_stacked_base_metadata() {
                   ticket_id = attrs.ticket_id,
                   pipeline_id = attrs.pipeline_id,
                   target_id = attrs.target_id,
-                  target_path = attrs.target_path,
                   base_ticket_id = attrs.base_ticket_id,
                   base_run_id = attrs.base_run_id,
                   base_ref = attrs.base_ref,
@@ -1230,8 +1804,8 @@ fn catalog_plugin_project_pipelines_start_run_infers_base_ref_from_closed_pr_dep
 
             local run = nil
             local tickets = {{
-              ["ticket-child"] = {{ id = "ticket-child", title = "Child", target_id = "target-1", target_path = "/repo" }},
-              ["ticket-parent"] = {{ id = "ticket-parent", title = "Parent", target_id = "target-1", target_path = "/repo" }},
+              ["ticket-child"] = {{ id = "ticket-child", title = "Child", target_id = "target-1" }},
+              ["ticket-parent"] = {{ id = "ticket-parent", title = "Parent", target_id = "target-1" }},
             }}
             local parent_run = {{
               id = "run-parent",
@@ -1324,7 +1898,7 @@ fn catalog_plugin_project_pipelines_step_advance_can_override_to_specific_step()
               id = "run-verify",
               ticket_id = "ticket-verify",
               pipeline_id = "pipe-1",
-              target_path = "/repo",
+              target_id = "target-1",
               current_step_id = "verify",
               current_run_step_id = "visit-verify",
             }}
@@ -1458,7 +2032,6 @@ fn catalog_plugin_project_pipelines_retry_step_agent_requeues_current_visit() {
               current_step_id = "verify",
               current_run_step_id = "visit-verify",
               target_id = "target-1",
-              target_path = "/repo",
               workspace_name = "Pipeline - Verify",
             }}
             local visit = {{
@@ -1475,7 +2048,7 @@ fn catalog_plugin_project_pipelines_retry_step_agent_requeues_current_visit() {
               agent_name = "codex",
               prompt = "Verify the work",
             }}
-            local ticket = {{ id = "ticket-verify", title = "Retry verify", target_id = "target-1", target_path = "/repo" }}
+            local ticket = {{ id = "ticket-verify", title = "Retry verify", target_id = "target-1" }}
             local events = {{}}
             local create_agent_calls = 0
 

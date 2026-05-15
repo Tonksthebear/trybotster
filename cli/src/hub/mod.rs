@@ -1,24 +1,25 @@
-//! Hub - Central orchestrator for agent management.
+//! Hub - Botster control-plane orchestrator.
 //!
-//! The Hub is the core of botster, owning all state and running the main
-//! event loop. It follows the centralized state store pattern where TUI and
-//! Relay adapters query the Hub for state rather than owning it themselves.
+//! The Hub coordinates Botster lifecycle and policy: session creation,
+//! attach/detach decisions, plugin routing, server registration, pairing, and
+//! recovery. Hot terminal bytes, initial scrollback, and per-client stream
+//! state belong to Session I/O and ClientWorker actors rather than the hub
+//! event loop.
 //!
 //! # Architecture
 //!
 //! ```text
 //!            ┌──────────────────────┐
 //!            │        Hub           │
-//!            │  - Owns all state    │
-//!            │  - Runs event loop   │
-//!            │  - Source of truth   │
+//!            │  - Control plane     │
+//!            │  - Policy/lifecycle  │
 //!            └──────────┬───────────┘
 //!                       │
 //!        ┌──────────────┼──────────────┐
 //!        │              │              │
 //!        ▼              ▼              ▼
-//!      TUI           Server         Relay
-//!   (renders)     (Rails API)    (Browser WS)
+//!   Workers        Lua/plugins     Server
+//! (data plane)     (behavior)    (Rails API)
 //! ```
 //!
 //! # Module Structure
@@ -209,11 +210,11 @@ pub fn local_device_hub_id() -> anyhow::Result<String> {
     Ok(hub_id_for_device(&device))
 }
 
-/// Central orchestrator for the botster application.
+/// Central control-plane orchestrator for the botster runtime.
 ///
-/// The Hub owns all application state and coordinates between the TUI,
-/// server integration, and browser relay components. It can run in either
-/// TUI mode (with terminal rendering) or headless mode (for CI/daemon use).
+/// The Hub owns lifecycle policy and coordinates workers, Lua plugins, server
+/// integration, and connected clients. It can run with a local TUI client or in
+/// headless mode for daemon and test use.
 
 /// State for a session awaiting background reconnect.
 pub(crate) struct ReconnectState {
@@ -1027,7 +1028,7 @@ impl Hub {
 
     /// Run the Hub event loop without TUI.
     ///
-    /// For TUI mode, use `crate::tui::run_with_hub()` instead - the TUI
+    /// For TUI mode, use `crate::clients::tui::run_with_hub()` instead - the TUI
     /// module now owns TuiRunner instantiation.
     ///
     /// For headless mode, use `hub::run::run_headless_loop()`.

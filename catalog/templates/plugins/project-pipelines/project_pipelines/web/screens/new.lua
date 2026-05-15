@@ -30,7 +30,7 @@ function M.ticket(_view_state, ctx)
                 view.metadata{
                     ui.text{ text = ticket.title, size = "sm", weight = "semibold" },
                     run and view.badge(run.status == "blocked" and "blocked" or "in progress", run.status == "blocked" and "danger" or "accent") or view.badge("ready", "muted"),
-                    view.badge(view.target_label(ticket.target_id, ticket.target_path), "accent"),
+                    view.badge(view.target_label(ticket.target_id), "accent"),
                 },
                 ui.text{ text = ticket.description or "", size = "xs", tone = "muted" },
                 ui.button{

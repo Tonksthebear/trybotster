@@ -346,7 +346,7 @@ mod socket_path_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::session::{
-        cleanup_orphaned_session_files, read_session_pid_file, session_pid_path,
+        cleanup_orphaned_session_files, read_session_pid_file, run, session_pid_path,
         session_process_is_live, session_socket_path, sessions_socket_dir, write_session_pid_file,
     };
 
@@ -430,6 +430,66 @@ mod socket_path_tests {
 
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_file(&pid_path);
+    }
+
+    #[test]
+    fn session_start_refuses_to_replace_live_socket() {
+        let session_uuid = unique_session_uuid("duplicate-live");
+        let socket_path = session_socket_path(&session_uuid).unwrap();
+        let pid_path = session_pid_path(&session_uuid).unwrap();
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&pid_path);
+
+        std::fs::write(&socket_path, b"placeholder").unwrap();
+        write_session_pid_file(&session_uuid, std::process::id()).unwrap();
+
+        let err = run(&session_uuid, socket_path.to_str().unwrap(), 0)
+            .expect_err("startup must refuse to replace a live session socket");
+        assert!(
+            err.to_string()
+                .contains("refusing to replace live session socket"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            socket_path.exists(),
+            "duplicate startup must not unlink the live session socket"
+        );
+        assert!(
+            pid_path.exists(),
+            "duplicate startup must not unlink the live session pid metadata"
+        );
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&pid_path);
+    }
+
+    #[test]
+    fn cleanup_orphaned_session_files_removes_socket_with_dead_identity() {
+        let session_uuid = unique_session_uuid("dead-identity");
+        let socket_path = session_socket_path(&session_uuid).unwrap();
+        let pid_path = session_pid_path(&session_uuid).unwrap();
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&pid_path);
+
+        std::fs::write(&socket_path, b"placeholder").unwrap();
+        std::fs::write(
+            &pid_path,
+            format!(r#"{{"pid":{},"pgid":0,"sid":0}}"#, std::process::id()),
+        )
+        .unwrap();
+
+        cleanup_orphaned_session_files();
+
+        assert!(
+            !socket_path.exists(),
+            "dead identity cleanup should remove stale socket"
+        );
+        assert!(
+            !pid_path.exists(),
+            "dead identity cleanup should remove stale pid metadata"
+        );
     }
 
     #[test]

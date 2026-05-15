@@ -35,10 +35,10 @@
 //! see the README in `cli/src/ui_contract/` for the Phase A surface this
 //! module consumes.
 //!
-//! [`RenderNode`]: crate::tui::render_tree::RenderNode
+//! [`RenderNode`]: crate::clients::tui::render_tree::RenderNode
 //! [`UiNode`]: crate::ui_contract::node::UiNode
 //! [`UiViewport`]: crate::ui_contract::viewport::UiViewport
-//! [`WidgetType`]: crate::tui::render_tree::WidgetType
+//! [`WidgetType`]: crate::clients::tui::render_tree::WidgetType
 
 // Rust guideline compliant 2026-04-18
 
@@ -46,8 +46,8 @@ use anyhow::{anyhow, Result};
 use mlua::{Lua, LuaSerdeExt, Table as LuaTable, Value as LuaValue};
 use serde_json::Value as JsonValue;
 
-use crate::tui::entity_stores::TuiEntityStores;
-use crate::tui::render_tree::RenderNode;
+use crate::clients::tui::entity_stores::TuiEntityStores;
+use crate::clients::tui::render_tree::RenderNode;
 use crate::ui_contract::node::UiNode;
 use crate::ui_contract::viewport::UiViewport;
 

@@ -296,12 +296,13 @@ function M.context_for(run_id, session_uuid)
     }
 end
 
-local function spawn_step_agent(run, step)
+local function spawn_step_agent(run, step, opts)
+    opts = opts or {}
     if util.is_blank(step.agent_name) then
         return nil, "step has no agent_name"
     end
-    if util.is_blank(run.target_id) and util.is_blank(run.target_path) then
-        return nil, "target_id or target_path is required before spawning agent steps"
+    if util.is_blank(run.target_id) then
+        return nil, "target_id is required before spawning agent steps"
     end
 
     local ticket = repo.get_ticket(run.ticket_id)
@@ -323,6 +324,9 @@ local function spawn_step_agent(run, step)
         "When work is ready for advancement, submit the required gate evidence with project_pipelines_submit_gate, then call project_pipelines_request_step_advance.",
         "If you are reviewing, check correctness, regressions, architecture fit, missing tests, documentation gaps, overcomplication, hidden assumptions, dead code, deprecated code paths, and unwired implementation. Do not accept pre-existing failures as a blanket excuse; require exact evidence that a failure is unrelated or send the work back. Call project_pipelines_submit_review with findings or approval.",
     }, "\n\n")
+    if not util.is_blank(opts.extra_prompt) then
+        role_prompt = role_prompt .. "\n\n" .. tostring(opts.extra_prompt)
+    end
 
     if existing and existing.agent_session_uuid and Agent.get(existing.agent_session_uuid) then
         local ok, err = pcall(function()
@@ -339,8 +343,8 @@ local function spawn_step_agent(run, step)
             })
             Hub.get():notify(existing.agent_session_uuid, {
                 source = OWNER,
-                title = "Pipeline step returned",
-                body = "Ticket " .. tostring(ticket and ticket.title or run.ticket_id) .. " is back at " .. tostring(step.name) .. ".",
+                title = opts.notification_title or "Pipeline step returned",
+                body = opts.notification_body or ("Ticket " .. tostring(ticket and ticket.title or run.ticket_id) .. " is back at " .. tostring(step.name) .. "."),
                 action = {
                     kind = "mcp_tool",
                     name = "project_pipelines_current_context",
@@ -356,6 +360,7 @@ local function spawn_step_agent(run, step)
                 session_uuid = existing.agent_session_uuid,
                 delivered = ok,
                 error = ok and nil or tostring(err),
+                source_event = opts.source_event,
             },
         })
         if current_visit then
@@ -373,7 +378,6 @@ local function spawn_step_agent(run, step)
             base_ref = run.base_ref,
             base_target_path = run.base_target_path,
             target_id = run.target_id,
-            target_path = run.target_path,
             workspace_id = run.workspace_id,
             workspace_name = run.workspace_name or ticket_workspace_name(ticket, run.id),
             label = step.name .. " - " .. (ticket and ticket.title or run.id),
@@ -474,7 +478,6 @@ function M.ask_agent(params, context)
             base_ref = resolved.run and resolved.run.base_ref or nil,
             base_target_path = resolved.run and resolved.run.base_target_path or nil,
             target_id = resolved.ticket.target_id,
-            target_path = resolved.ticket.target_path,
             workspace_id = resolved.run and resolved.run.workspace_id or params.workspace_id,
             workspace_name = params.workspace_name or (resolved.run and resolved.run.workspace_name) or ticket_workspace_name(resolved.ticket, question.id),
             label = "Question - " .. resolved.ticket.title,
@@ -575,11 +578,11 @@ function M.request_merge(params, context)
     end
 
     local prompt = table.concat({
-        "You are the Project Pipelines merge agent.",
+        "You are the Project Pipelines merge agent and PR steward.",
         "Ticket: " .. ticket.title,
         "Run: " .. run.id,
         "Merge policy: " .. merge_policy,
-        "You are the final acceptance gate, not just a Git operator. Re-read the ticket title, ticket description, latest run context, final signoff, review findings, artifacts, branch diff, tests, docs, and merge target before merging.",
+        "You are the final acceptance gate and the ongoing steward for the provider PR, not just a Git operator. Re-read the ticket title, ticket description, latest run context, final signoff, review findings, artifacts, branch diff, tests, docs, and merge target before creating, updating, or merging a PR.",
         "Judge the work against the intent and meaning of the ticket, not only the literal checklist. If the ticket asked for a new architecture, replacement, or cleanup, verify the old architecture, dead paths, deprecated code, stale docs, stale tests, compatibility shims, and contradictory examples are removed or explicitly human-waived.",
         "Reject hidden assumptions, speculative scope, broad unrelated refactors, or overcomplicated implementation unless the ticket or a human-approved waiver justifies them.",
         "Reject weak evidence. Success criteria must be explicit and verified; evidence must prove the actual production/user/runtime path uses the change, not merely that new helpers, modules, or tests exist.",
@@ -588,10 +591,20 @@ function M.request_merge(params, context)
         "For hot attach/connect/snapshot/input paths, require explicit latency or race evidence when relevant. New or retained fixed sleeps on hot paths require measurement-backed justification.",
         "All actionable review findings must be resolved or explicitly human-waived before merge. Do not accept 'acceptable workaround', 'future follow-up', 'not necessary', or similar reasoning from an agent unless you agree it is outside the ticket intent or a human has waived it through Project Pipelines questions.",
         "Be proactive about the affected surface area. Confirm the implementation is wired into the actual runtime paths, not merely added beside the old behavior.",
+        "As merge agent and PR steward, you are an orchestrator between the human, the provider PR, source control, and the ticket's existing agent team. Do not implement code changes yourself. Do not answer architectural questions from your own judgment alone when an existing ticket agent has relevant context; route them to the appropriate existing planner, implementer, reviewer, or verifier and synthesize the answer back to the PR/human.",
         "Use the repo's conventions for merge strategy and verification.",
         merge_policy == "pr"
             and "This pipeline requires a PR. Create or update the PR only through the Botster MCP PR tools. Do not merge directly. Do not use gh, hub, direct GitHub API calls, browser automation, or manual web UI actions for PR creation or PR updates."
             or "This pipeline requires a direct merge to main. If the acceptance check passes, merge according to the repo's direct-merge convention and do not open a PR.",
+        merge_policy == "pr"
+            and "After opening or updating the PR, you remain the PR steward. Submitted PR reviews and PR comments may be delivered back to you. Triage them before delegating: answer informational comments on the PR, send actionable code feedback back to the implementer or another ticket agent, and keep the conversation on the PR when the human asked or said something there. Use Project Pipelines human questions only for decisions that did not originate on the PR, or when you need a durable pipeline-level waiver/decision record in addition to the PR reply."
+            or "",
+        merge_policy == "pr"
+            and "Coordinate with agents that worked on this ticket using Botster MCP. Use project_pipelines_get_ticket or project_pipelines_current_context to find ticket sessions and run steps, list_hubs to inspect live agents, post_message to send structured tasks, and notify_session to wake the target agent. Delegate implementation work to the existing implementer, architectural/product reasoning to the planner or other context-owning agent, verification questions to the verifier, and review interpretation to the reviewer when available. Use project_pipelines_ask_agent only when no existing ticket agent owns the needed context."
+            or "",
+        merge_policy == "pr"
+            and "When delegating PR review feedback, include the linked PR, review URL/body, required changes, expected evidence, and instruction to update the existing PR branch. Do not create a new run or a new PR for ordinary PR review revisions."
+            or "",
         merge_policy == "pr" and not util.is_blank(run.base_ref)
             and ("This is stacked pipeline work. Open or update the PR against base_ref `" .. tostring(run.base_ref) .. "`, not main.")
             or "",
@@ -615,7 +628,6 @@ function M.request_merge(params, context)
             base_ref = run.base_ref,
             base_target_path = run.base_target_path,
             target_id = run.target_id or ticket.target_id,
-            target_path = run.target_path or ticket.target_path,
             workspace_id = run.workspace_id or params.workspace_id,
             workspace_name = params.workspace_name or run.workspace_name or ticket_workspace_name(ticket, run.id),
             label = "Merge - " .. ticket.title,
@@ -704,7 +716,6 @@ function M.spawn_ticket_session(params, context)
             request_id = request_id,
             accessory_name = accessory_name,
             target_id = ticket.target_id,
-            target_path = ticket.target_path,
             workspace_id = params.workspace_id or workspace_id,
             workspace_name = params.workspace_name or workspace_name or ticket_workspace_name(ticket, latest_run and latest_run.id),
             from_worktree = from_worktree,
@@ -745,7 +756,6 @@ function M.spawn_ticket_session(params, context)
             issue_or_branch = branch,
             from_worktree = from_worktree,
             target_id = ticket.target_id,
-            target_path = ticket.target_path,
             workspace_id = params.workspace_id or workspace_id,
             workspace_name = params.workspace_name or workspace_name or ticket_workspace_name(ticket, latest_run and latest_run.id),
             label = "Assist - " .. ticket.title,
@@ -900,8 +910,9 @@ local function run_command_step(run, step)
     if util.is_blank(command) then
         return nil, "command step has no command"
     end
-    if util.is_blank(run.target_path) then
-        return nil, "target_path is required for command steps"
+    local target_path = repo.resolve_target_path(run.target_id)
+    if util.is_blank(target_path) then
+        return nil, "could not resolve a filesystem path for command step (target_id=" .. tostring(run.target_id) .. ")"
     end
 
     local request_id = string.format("%s:%s:%s:command:%s", OWNER, run.id, step.id, command_gate and command_gate.id or "step")
@@ -909,7 +920,7 @@ local function run_command_step(run, step)
         return hub.run_command_gate{
             request_id = request_id,
             command = command,
-            cwd = run.target_path,
+            cwd = target_path,
             timeout_secs = 600,
             context = {
                 owner_plugin = OWNER,
@@ -941,6 +952,14 @@ function M.activate_step(run, step)
             ticket_id = run.ticket_id,
             ticket = repo.get_ticket(run.ticket_id),
         })
+        if run_merge_policy(run) == "pr" and #repo.list_pr_links{ ticket_id = run.ticket_id, status = "open" } > 0 then
+            repo.append_event("ticket.pr_revision_ready", {
+                run_id = run.id,
+                ticket_id = run.ticket_id,
+                payload = { reason = "open_pr_link_exists" },
+            })
+            return { ok = true, status = "done", pr_revision_ready = true }
+        end
         local merge_ok, merge_result = pcall(function()
             return M.request_merge({ ticket_id = run.ticket_id }, {})
         end)
@@ -1004,6 +1023,235 @@ function M.activate_step(run, step)
     return { ok = true, status = "active" }
 end
 
+local function likely_implementation_step(run)
+    local fallback = nil
+    for _, step in ipairs(repo.pipeline_steps(run.pipeline_id)) do
+        if step.kind == "agent" then
+            fallback = fallback or step
+            local text = string.lower(table.concat({
+                tostring(step.id or ""),
+                tostring(step.name or ""),
+                tostring(step.agent_name or ""),
+                tostring(step.prompt or ""),
+            }, " "))
+            if text:find("implement", 1, true) or text:find("build", 1, true) or text:find("code", 1, true) then
+                return step
+            end
+        end
+    end
+    return fallback
+end
+
+local function pr_review_extra_prompt(ticket, link, event)
+    local state = tostring(event.state or "commented")
+    local lines = {
+        "A GitHub PR review was submitted for this ticket's linked PR.",
+        "Review state: " .. state,
+        "PR: " .. tostring(event.pr_url or link.pr_url or (tostring(link.repo) .. "#" .. tostring(link.pr_number))),
+    }
+    if not util.is_blank(event.review_html_url or event.review_url) then
+        lines[#lines + 1] = "Review: " .. tostring(event.review_html_url or event.review_url)
+    end
+    if not util.is_blank(event.reviewer) then
+        lines[#lines + 1] = "Reviewer: " .. tostring(event.reviewer)
+    end
+    if not util.is_blank(event.body) then
+        lines[#lines + 1] = "Review body:\n" .. tostring(event.body)
+    end
+    lines[#lines + 1] = "Update the existing PR branch in this ticket worktree. Answer through the PR when appropriate. Do not create a new run or a new PR."
+    lines[#lines + 1] = "When the revision is ready, submit current gate evidence and advance the pipeline. Because the linked PR is already open, completion should update the existing PR instead of spawning a new merge agent."
+    if ticket then
+        table.insert(lines, 2, "Ticket: " .. tostring(ticket.title or ticket.id))
+    end
+    return table.concat(lines, "\n\n")
+end
+
+local function pr_steward_review_prompt(ticket, link, event)
+    local state = tostring(event.state or "commented")
+    local lines = {
+        "A GitHub PR review was submitted for a PR you steward for this Project Pipelines ticket.",
+        "Ticket: " .. tostring(ticket and (ticket.title or ticket.id) or link.ticket_id),
+        "Review state: " .. state,
+        "PR: " .. tostring(event.pr_url or link.pr_url or (tostring(link.repo) .. "#" .. tostring(link.pr_number))),
+    }
+    if not util.is_blank(event.review_html_url or event.review_url) then
+        lines[#lines + 1] = "Review: " .. tostring(event.review_html_url or event.review_url)
+    end
+    if not util.is_blank(event.reviewer) then
+        lines[#lines + 1] = "Reviewer: " .. tostring(event.reviewer)
+    end
+    if not util.is_blank(event.body) then
+        lines[#lines + 1] = "Review body:\n" .. tostring(event.body)
+    end
+    lines[#lines + 1] = "You are the PR steward. Triage this through project_pipelines_current_context and project_pipelines_get_ticket before acting."
+    lines[#lines + 1] = "You are an orchestrator, not the implementer. Do not implement PR feedback yourself, and do not answer architecture/product questions from your own judgment alone when an existing ticket agent has relevant context."
+    lines[#lines + 1] = "If the feedback is informational, answer on the PR using the GitHub MCP tools after checking the appropriate ticket context. If the human asked or said something through the PR, ask clarifying follow-up questions and provide answers on that PR thread instead of switching to project_pipelines_ask_human. If it needs code changes, delegate to the existing implementer with Botster MCP messaging tools such as list_hubs, post_message, and notify_session, and route the pipeline back to implementation when needed. If it is architectural/product reasoning, delegate to the existing planner or other context-owning ticket agent and synthesize their answer back to the PR. Use Project Pipelines human questions only for non-PR-originated decisions or when a durable pipeline-level waiver/decision record is required in addition to the PR reply."
+    lines[#lines + 1] = "Do not create a new PR or new ticket run for ordinary PR review revisions. Keep the existing linked PR as the delivery envelope."
+    return table.concat(lines, "\n\n")
+end
+
+local function live_merge_agent(ticket_id)
+    for _, event in ipairs(repo.ticket_events(ticket_id, "ticket.merge_agent_linked", 25)) do
+        local payload = util.decode(event.payload, {})
+        if not util.is_blank(payload.session_uuid) and Agent.get(payload.session_uuid) then
+            return payload.session_uuid
+        end
+    end
+    for _, event in ipairs(repo.ticket_events(ticket_id, "ticket.merge_requested", 25)) do
+        local payload = util.decode(event.payload, {})
+        if not util.is_blank(payload.session_uuid) and Agent.get(payload.session_uuid) then
+            return payload.session_uuid
+        end
+    end
+    return nil
+end
+
+local function notify_merge_agent_of_pr_review(ticket, run, link, event)
+    local session_uuid = live_merge_agent(ticket.id)
+    if util.is_blank(session_uuid) then
+        return nil
+    end
+    local state = string.lower(tostring(event.state or ""))
+    local instructions = pr_steward_review_prompt(ticket, link, event)
+    local ok, err = pcall(function()
+        Hub.get():post(session_uuid, {
+            type = "task",
+            from_agent_id = OWNER,
+            from_label = "Project Pipelines",
+            payload = {
+                run_id = run.id,
+                ticket_id = ticket.id,
+                pr_link_id = link.id,
+                source_event = "pr_review_submitted",
+                review_state = state,
+                instructions = instructions,
+            },
+        })
+        Hub.get():notify(session_uuid, {
+            source = OWNER,
+            title = state == "changes_requested" and "PR changes requested" or (state == "approved" and "PR approved" or "PR review submitted"),
+            body = "GitHub PR review feedback is ready for PR steward triage on ticket " .. tostring(ticket.title or ticket.id) .. ".",
+            action = {
+                kind = "mcp_tool",
+                name = "project_pipelines_current_context",
+                params = { run_id = run.id },
+            },
+        })
+    end)
+    repo.append_event("ticket.pr_review_steward_prompted", {
+        run_id = run.id,
+        ticket_id = ticket.id,
+        payload = {
+            pr_link_id = link.id,
+            session_uuid = session_uuid,
+            review_state = state,
+            delivered = ok,
+            error = ok and nil or tostring(err),
+        },
+    })
+    if ok then
+        return { session_uuid = session_uuid, prompted = true }
+    end
+    return nil
+end
+
+function M.handle_pr_review_submitted(link, event)
+    link = link or {}
+    event = event or {}
+    local ticket = repo.get_ticket(link.ticket_id)
+    local run = link.run_id and repo.get_run(link.run_id) or nil
+    if not run and ticket then
+        run = repo.latest_ticket_run(ticket.id)
+    end
+    if not ticket or not run then
+        return { ok = false, reason = "missing_ticket_or_run" }
+    end
+
+    local state = string.lower(tostring(event.state or ""))
+    repo.append_event("ticket.pr_review_submitted", {
+        run_id = run.id,
+        ticket_id = ticket.id,
+        payload = {
+            pr_link_id = link.id,
+            provider = link.provider,
+            repo = link.repo,
+            pr_number = link.pr_number,
+            pr_url = event.pr_url or link.pr_url,
+            review_id = event.review_id,
+            review_url = event.review_html_url or event.review_url,
+            reviewer = event.reviewer,
+            state = state,
+            body = event.body,
+            submitted_at = event.submitted_at,
+        },
+    })
+
+    local steward = notify_merge_agent_of_pr_review(ticket, run, link, event)
+    if steward then
+        refresh_surfaces()
+        return { ok = true, status = "steward_prompted", ticket = ticket, run = run, pr_steward = steward }
+    end
+
+    if state ~= "changes_requested" and state ~= "commented" then
+        refresh_surfaces()
+        return { ok = true, status = "recorded", ticket = ticket, run = run }
+    end
+
+    local step = likely_implementation_step(run)
+    if not step then
+        refresh_surfaces()
+        return { ok = false, reason = "no_implementation_step", ticket = ticket, run = run }
+    end
+
+    local visit = repo.create_run_step_visit(run.id, step.id, {
+        status = "active",
+        started_at = util.now(),
+    })
+    repo.update_run(run.id, { status = "active", current_step_id = step.id, current_run_step_id = visit.id })
+    repo.append_event("step.activated", {
+        run_id = run.id,
+        ticket_id = ticket.id,
+        payload = {
+            step_id = step.id,
+            run_step_id = visit.id,
+            sequence = visit.sequence,
+            kind = step.kind,
+            name = step.name,
+            source_event = "pr_review_submitted",
+            pr_review_state = state,
+            pr_link_id = link.id,
+        },
+    })
+    notification_policy.notify_phase_transition({
+        run_id = run.id,
+        ticket_id = ticket.id,
+        ticket = ticket,
+        step = step,
+        run_step = visit,
+    })
+
+    local agent, err = spawn_step_agent(repo.get_run(run.id), step, {
+        source_event = "pr_review_submitted",
+        extra_prompt = pr_review_extra_prompt(ticket, link, event),
+        notification_title = state == "changes_requested" and "PR changes requested" or "PR review commented",
+        notification_body = "GitHub review feedback was sent back to " .. tostring(step.name) .. " for ticket " .. tostring(ticket.title or ticket.id) .. ".",
+    })
+    if err then
+        repo.update_run(run.id, { status = "blocked" })
+        repo.update_run_step_visit(visit.id, { status = "blocked" })
+        repo.append_event("step.spawn_failed", {
+            run_id = run.id,
+            ticket_id = ticket.id,
+            payload = { step_id = step.id, run_step_id = visit.id, source_event = "pr_review_submitted", error = err },
+        })
+        refresh_surfaces()
+        return { ok = false, status = "blocked", error = err, ticket = ticket, run = repo.get_run(run.id), step = step, run_step = repo.get_run_step_visit(visit.id) }
+    end
+
+    refresh_surfaces()
+    return { ok = true, status = "reactivated", ticket = ticket, run = repo.get_run(run.id), step = step, run_step = repo.get_run_step_visit(visit.id), agent = agent }
+end
+
 function M.start_run(params)
     repo.prune_legacy_seed_data()
     local pipeline_id = params.pipeline_id
@@ -1045,7 +1293,6 @@ function M.start_run(params)
         pipeline_id = pipeline_id,
         parent_run_id = params.parent_run_id,
         target_id = params.target_id or ticket.target_id,
-        target_path = params.target_path or ticket.target_path,
         workspace_id = params.workspace_id,
         workspace_name = params.workspace_name or ticket_workspace_name(ticket, params.ticket_id),
         base_ticket_id = base_attrs.base_ticket_id,

@@ -1,13 +1,14 @@
-//! TUI - Terminal User Interface.
+//! TUI client renderer.
 //!
 //! This module provides the terminal rendering, input handling, and event loop
-//! for the botster TUI. The TUI runs independently from the Hub, communicating
-//! via channels.
+//! for the local Botster TUI client. The `botster` binary embeds this client
+//! for convenience, but it is a renderer/client of the runtime rather than CLI
+//! command plumbing.
 //!
 //! # Architecture
 //!
 //! ```text
-//! TuiRunner (TUI thread)
+//! TuiRunner (client thread)
 //! ├── owns: mode, widget_states (WidgetStateStore), panels (TerminalPanel)
 //! ├── sends: JSON messages via request_tx (to Hub → Lua client.lua)
 //! └── receives: TuiOutput via output_rx (PTY output and Lua events from Hub)
@@ -15,7 +16,8 @@
 //!
 //! The TuiRunner owns all TUI state and runs its own event loop. It converts
 //! keyboard/mouse input into either local TUI actions or JSON messages, and
-//! communicates with Hub exclusively through the Lua client protocol.
+//! communicates with Hub through the same client protocol family as browser and
+//! socket clients.
 //!
 //! # Modules
 //!

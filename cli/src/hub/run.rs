@@ -1,7 +1,7 @@
 //! Hub event loop implementation.
 //!
 //! Contains the headless run loop for Hub operations. TUI mode is now
-//! handled by [`crate::tui::run_with_hub`] to maintain proper layer separation.
+//! handled by [`crate::clients::tui::run_with_hub`] to maintain proper layer separation.
 //!
 //! # Architecture
 //!
@@ -18,7 +18,7 @@
 //!
 //! ## TUI Mode
 //!
-//! See [`crate::tui::run_with_hub`] - the TUI module coordinates with Hub
+//! See [`crate::clients::tui::run_with_hub`] - the TUI module coordinates with Hub
 //! via channels, with the Hub event loop also using `select!`.
 
 // Rust guideline compliant 2026-02

@@ -43,10 +43,10 @@
 //!   stack. This keeps the adapter purely additive over the existing
 //!   render tree — no new [`RenderNode`] variants.
 //!
-//! [`BlockConfig`]: crate::tui::render_tree::BlockConfig
-//! [`ListProps`]: crate::tui::render_tree::ListProps
-//! [`ListItemProps`]: crate::tui::render_tree::ListItemProps
-//! [`WidgetType`]: crate::tui::render_tree::WidgetType
+//! [`BlockConfig`]: crate::clients::tui::render_tree::BlockConfig
+//! [`ListProps`]: crate::clients::tui::render_tree::ListProps
+//! [`ListItemProps`]: crate::clients::tui::render_tree::ListItemProps
+//! [`WidgetType`]: crate::clients::tui::render_tree::WidgetType
 
 // Rust guideline compliant 2026-04-18
 
@@ -59,8 +59,8 @@ use anyhow::{anyhow, Result};
 use ratatui::layout::Constraint;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::tui::entity_stores::TuiEntityStores;
-use crate::tui::render_tree::{
+use crate::clients::tui::entity_stores::TuiEntityStores;
+use crate::clients::tui::render_tree::{
     BlockConfig, BorderStyle, InputProps, ListItemProps, ListProps, ParagraphAlignment,
     ParagraphProps, RenderNode, SpanStyle, StyledContent, StyledSpan,
     TableProps as RenderTableProps, WidgetProps, WidgetType,
@@ -501,7 +501,7 @@ fn render_empty_state(
         rows.push(paragraph_widget_line(
             &icon_glyph_for(icon_name),
             SpanStyle {
-                fg: Some(crate::tui::render_tree::SpanColor::Cyan),
+                fg: Some(crate::clients::tui::render_tree::SpanColor::Cyan),
                 ..SpanStyle::default()
             },
             ParagraphAlignment::Center,
@@ -523,7 +523,7 @@ fn render_empty_state(
         rows.push(paragraph_widget_line(
             desc,
             SpanStyle {
-                fg: Some(crate::tui::render_tree::SpanColor::Gray),
+                fg: Some(crate::clients::tui::render_tree::SpanColor::Gray),
                 ..SpanStyle::default()
             },
             ParagraphAlignment::Center,
@@ -1063,7 +1063,7 @@ fn flatten_tree_item(
     spans.push(StyledSpan {
         text: expansion_glyph.to_owned(),
         style: SpanStyle {
-            fg: Some(crate::tui::render_tree::SpanColor::Gray),
+            fg: Some(crate::clients::tui::render_tree::SpanColor::Gray),
             ..SpanStyle::default()
         },
     });
@@ -1071,7 +1071,7 @@ fn flatten_tree_item(
         spans.push(StyledSpan {
             text: notification_glyph.to_owned(),
             style: SpanStyle {
-                fg: Some(crate::tui::render_tree::SpanColor::Yellow),
+                fg: Some(crate::clients::tui::render_tree::SpanColor::Yellow),
                 bold: true,
                 ..SpanStyle::default()
             },
@@ -1538,7 +1538,7 @@ fn button_widget(
     label: &str,
     action: &UiAction,
     icon_prefix: Option<&str>,
-    tone: Option<crate::tui::render_tree::SpanColor>,
+    tone: Option<crate::clients::tui::render_tree::SpanColor>,
 ) -> RenderNode {
     let disabled = action.disabled.unwrap_or(false);
     let mut spans: Vec<StyledSpan> = Vec::with_capacity(3);

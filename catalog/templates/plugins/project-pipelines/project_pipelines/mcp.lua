@@ -112,7 +112,7 @@ local function tool(name, spec, handler)
     end)
 end
 
-local function list_agent_choices(target_path)
+local function list_agent_choices(target_id)
     local choices = {}
     local root = nil
     if config and config.data_dir then
@@ -121,6 +121,7 @@ local function list_agent_choices(target_path)
             root = data_dir
         end
     end
+    local target_path = repo.resolve_target_path(target_id)
     for _, name in ipairs(ConfigResolver.list_agents(root, target_path)) do
         table.insert(choices, { name = name, label = name })
     end
@@ -157,7 +158,7 @@ function M.register()
     end
 
     tool("project_pipelines_create_ticket", {
-        description = "Create a project pipeline ticket.",
+        description = "Create a project pipeline ticket. target_id identifies the spawn target; its filesystem path is resolved automatically and is never set by callers.",
         input_schema = {
             type = "object",
             properties = {
@@ -165,7 +166,6 @@ function M.register()
                 description = { type = "string" },
                 project_id = { type = "string" },
                 target_id = { type = "string" },
-                target_path = { type = "string" },
             },
             required = { "title", "target_id" },
         },
@@ -220,14 +220,13 @@ function M.register()
                 description = { type = "string" },
                 project_id = { type = "string" },
                 target_id = { type = "string" },
-                target_path = { type = "string" },
                 status = { type = "string", enum = { "open", "active", "blocked", "closed" } },
             },
             required = { "ticket_id" },
         },
     }, function(params)
         local fields = {}
-        for _, field in ipairs({ "title", "description", "project_id", "target_id", "target_path", "status" }) do
+        for _, field in ipairs({ "title", "description", "project_id", "target_id", "status" }) do
             if params[field] ~= nil then fields[field] = params[field] end
         end
         return sync_ok(repo.update_ticket(params.ticket_id, fields))
@@ -304,7 +303,6 @@ function M.register()
                 name = { type = "string" },
                 description = { type = "string" },
                 target_id = { type = "string" },
-                target_path = { type = "string" },
             },
             required = { "name" },
         },
@@ -372,12 +370,11 @@ function M.register()
             properties = {
                 project_id = { type = "string" },
                 target_id = { type = "string" },
-                target_path = { type = "string" },
             },
             required = { "project_id", "target_id" },
         },
     }, function(params)
-        return sync_ok(repo.add_project_target(params.project_id, params.target_id, params.target_path))
+        return sync_ok(repo.add_project_target(params.project_id, params.target_id))
     end)
 
     tool("project_pipelines_remove_project_target", {
@@ -586,15 +583,15 @@ function M.register()
     end)
 
     tool("project_pipelines_list_agent_choices", {
-        description = "List available Botster agent definitions for assigning pipeline steps.",
+        description = "List available Botster agent definitions for assigning pipeline steps. Pass target_id to include agents configured under that target's repo.",
         input_schema = {
             type = "object",
             properties = {
-                target_path = { type = "string" },
+                target_id = { type = "string" },
             },
         },
     }, function(params)
-        return ok(list_agent_choices(params.target_path))
+        return ok(list_agent_choices(params.target_id))
     end)
 
     tool("project_pipelines_update_step_agent", {
@@ -612,7 +609,7 @@ function M.register()
     end)
 
     tool("project_pipelines_start_run", {
-        description = "Start a pipeline run for a ticket. Agent steps require target_id or target_path; command steps require target_path.",
+        description = "Start a pipeline run for a ticket. The ticket's target_id supplies the spawn target; its filesystem path is resolved automatically for agent and command steps.",
         input_schema = {
             type = "object",
             properties = {
@@ -620,7 +617,6 @@ function M.register()
                 pipeline_id = { type = "string" },
                 parent_run_id = { type = "string" },
                 target_id = { type = "string" },
-                target_path = { type = "string" },
                 workspace_id = { type = "string" },
                 workspace_name = { type = "string" },
                 base_ticket_id = { type = "string" },
@@ -1108,7 +1104,6 @@ function M.register()
                 description = { type = "string" },
                 pipeline_id = { type = "string" },
                 target_id = { type = "string" },
-                target_path = { type = "string" },
                 workspace_id = { type = "string" },
                 workspace_name = { type = "string" },
                 base_ticket_id = { type = "string" },
@@ -1124,16 +1119,13 @@ function M.register()
             error("parent_run_id not found")
         end
         local target_id = params.target_id or parent.target_id
-        local target_path = params.target_path or parent.target_path
         local ticket = repo.create_ticket{
             title = params.title,
             description = params.description or "",
             target_id = target_id,
-            target_path = target_path,
         }
         params.ticket_id = ticket.id
         params.target_id = target_id
-        params.target_path = target_path
         params.workspace_id = params.workspace_id or parent.workspace_id
         params.workspace_name = params.workspace_name or parent.workspace_name
         params.base_ticket_id = params.base_ticket_id or parent.base_ticket_id

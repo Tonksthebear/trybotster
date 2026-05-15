@@ -183,7 +183,7 @@ fn render_grid(
 mod tests {
     use super::*;
     use crate::terminal::TerminalParser;
-    use crate::tui::terminal_panel::TerminalPanel;
+    use crate::clients::tui::terminal_panel::TerminalPanel;
     use ratatui::backend::TestBackend;
     use ratatui::style::Color;
     use ratatui::Terminal;

@@ -167,7 +167,7 @@ function M.field_action(id, payload)
     return ui.action(id, payload or {})
 end
 
-function M.agent_options(current)
+function M.agent_options(current, target_path)
     local device_root = nil
     if config and config.data_dir then
         local ok, data_dir = pcall(config.data_dir)
@@ -186,7 +186,7 @@ function M.agent_options(current)
     end
 
     add(current)
-    for _, name in ipairs(ConfigResolver.list_agents(device_root, nil)) do
+    for _, name in ipairs(ConfigResolver.list_agents(device_root, target_path)) do
         add(name)
     end
     add("codex")
@@ -226,6 +226,19 @@ function M.accessory_options(current, target_path)
         return a.value < b.value
     end)
     return options
+end
+
+function M.worktree_path_for_sessions(session_uuids, fallback_path)
+    for _, session_uuid in ipairs(session_uuids or {}) do
+        local session = Agent.get(session_uuid)
+        if session and session.info then
+            local ok, info = pcall(session.info, session)
+            if ok and info and info.worktree_path and info.worktree_path ~= "" then
+                return info.worktree_path
+            end
+        end
+    end
+    return fallback_path
 end
 
 function M.targets()
@@ -278,12 +291,26 @@ function M.target_by_id(target_id)
     return targets_cache.by_id and targets_cache.by_id[target_id] or nil
 end
 
-function M.target_label(target_id, target_path)
+--- Resolve a spawn target's filesystem root from its target_id.
+-- target_path is never stored on tickets/runs; it is derived here from the
+-- spawn target registry whenever the UI needs a real path (e.g. scanning a
+-- repo's .botster config for agents/accessories).
+-- @param target_id string Spawn target identifier
+-- @return string|nil Canonical filesystem root, or nil when unknown
+function M.target_repo_path(target_id)
+    local target = M.target_by_id(target_id)
+    if target and target.path and target.path ~= "" then
+        return target.path
+    end
+    return nil
+end
+
+function M.target_label(target_id)
     local target = M.target_by_id(target_id)
     if target then
         return target.name or target.id
     end
-    return target_id or target_path or "No target"
+    return target_id or "No target"
 end
 
 function M.session_info(session_uuid)

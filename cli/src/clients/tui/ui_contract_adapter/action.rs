@@ -3,7 +3,7 @@
 //! # Why actions live in two shapes
 //!
 //! The existing TUI action-dispatch path reads a `Vec<String>` of action
-//! ids via [`crate::tui::render_tree::extract_list_actions`] — selection
+//! ids via [`crate::clients::tui::render_tree::extract_list_actions`] — selection
 //! index maps to a string. The Phase A contract uses a richer
 //! [`UiAction`] envelope with id + payload + disabled.
 //!
@@ -42,7 +42,7 @@
 //! [`UiAction`]: crate::ui_contract::node::UiAction
 //! [`UiNode`]: crate::ui_contract::node::UiNode
 //! [`UiNode::id`]: crate::ui_contract::node::UiNode::id
-//! [`ListItemProps`]: crate::tui::render_tree::ListItemProps
+//! [`ListItemProps`]: crate::clients::tui::render_tree::ListItemProps
 
 // Rust guideline compliant 2026-04-18
 

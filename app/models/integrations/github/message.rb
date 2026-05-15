@@ -6,7 +6,7 @@ module Integrations
       self.table_name = "github_messages"
 
       validates :event_type, presence: true, inclusion: {
-        in: %w[github_mention agent_cleanup pull_request],
+        in: %w[github_mention agent_cleanup pull_request pull_request_review],
         message: "%{value} is not a valid event type"
       }
       validates :repo, presence: true

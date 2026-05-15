@@ -99,7 +99,7 @@ local function pipeline_start_controls(ticket, ctx, overview)
                         ui.text{ text = pipeline.description or "", size = "xs", tone = "muted" },
                     } },
                     view.row{
-                        view.badge(view.target_label(ticket.target_id, ticket.target_path), "accent"),
+                        view.badge(view.target_label(ticket.target_id), "accent"),
                         ui.button{
                             id = "ticket-" .. ticket.id .. "-start-pipeline-" .. pipeline.id,
                             label = "Start pipeline",
@@ -596,7 +596,10 @@ local function run_rows(ticket_id, ctx, overview)
     return children
 end
 
-local function spawn_session_controls(ticket, _ctx, _overview)
+-- Exported so the spawn-control wiring (target_id -> derived config scan path
+-- -> agent/accessory option lists) can be exercised directly in tests without
+-- standing up the full ticket render.
+function M.spawn_session_controls(ticket, _ctx, overview)
     if ticket.status == "closed" then
         return { ui.text{ text = "Closed tickets cannot spawn new sessions.", size = "sm", tone = "muted" } }
     end
@@ -608,9 +611,16 @@ local function spawn_session_controls(ticket, _ctx, _overview)
     local prefix = "ticket_session_" .. ticket.id .. "_"
     local agent_dialog_key = "ticket-" .. ticket.id .. "-spawn-agent-open"
     local accessory_dialog_key = "ticket-" .. ticket.id .. "-spawn-accessory-open"
+    -- Resolve the repo-config scan root from the ticket's target_id. Prefer a
+    -- live ticket session's worktree (it may carry branch-local .botster
+    -- config); fall back to the target's repo root. target_path is never
+    -- stored on the ticket — it is derived here.
+    local config_scan_path = view.worktree_path_for_sessions(
+        overview and overview.session_uuids or {},
+        view.target_repo_path(ticket.target_id))
     local function spawn_context_row()
         return view.row{
-            view.badge(view.target_label(ticket.target_id, ticket.target_path), "accent"),
+            view.badge(view.target_label(ticket.target_id), "accent"),
             ui.text{ text = "Spawn in this ticket's worktree context.", size = "sm", weight = "semibold" },
         }
     end
@@ -620,7 +630,7 @@ local function spawn_session_controls(ticket, _ctx, _overview)
             id = "ticket-" .. ticket.id .. "-spawn-agent",
             label = "Agent",
             value = draft[prefix .. "agent_name"] or "codex",
-            options = view.agent_options(draft[prefix .. "agent_name"] or "codex"),
+            options = view.agent_options(draft[prefix .. "agent_name"] or "codex", config_scan_path),
             on_change = view.field_action("project_pipelines.update_ticket_session_draft", {
                 ticket_id = ticket.id,
                 field = "agent_name",
@@ -643,7 +653,7 @@ local function spawn_session_controls(ticket, _ctx, _overview)
             id = "ticket-" .. ticket.id .. "-spawn-accessory",
             label = "Accessory",
             value = draft[prefix .. "accessory_name"] or "terminal",
-            options = view.accessory_options(draft[prefix .. "accessory_name"] or "terminal", ticket.target_path),
+            options = view.accessory_options(draft[prefix .. "accessory_name"] or "terminal", config_scan_path),
             on_change = view.field_action("project_pipelines.update_ticket_session_draft", {
                 ticket_id = ticket.id,
                 field = "accessory_name",
@@ -783,7 +793,7 @@ function M.render(view_state, ctx)
         table.insert(children, view.section("Merge", merge_children))
     end
     table.insert(children, view.section(open_run and "Pipeline" or "Move Into Pipeline", pipeline_start_controls(ticket, ctx, overview)))
-    table.insert(children, view.section("Spawn Session", spawn_session_controls(ticket, ctx, overview)))
+    table.insert(children, view.section("Spawn Session", M.spawn_session_controls(ticket, ctx, overview)))
     table.insert(children, view.section("Timeline", handoff_rows(latest_run, ctx, overview)))
     table.insert(children, view.section("Runs", run_rows(ticket.id, ctx, overview)))
     table.insert(children, view.section("Agent Terminals", session_rows(ticket.id, ctx, overview)))

@@ -1,9 +1,9 @@
 //! TUI communication types.
 //!
-//! Defines the message types for TuiRunner <-> Hub communication:
+//! Defines the message types for TuiRunner control and terminal communication:
 //! - TuiRunner → Hub: [`TuiRequest`] (JSON/control protocol)
 //! - TuiRunner → terminal transport: [`TuiSessionInput`] (raw PTY bytes)
-//! - Hub → TuiRunner: [`TuiOutput`] (PTY output, Lua events)
+//! - terminal/control adapters → TuiRunner: [`TuiOutput`] (PTY output, Lua events)
 //!
 //! # Message Format
 //!
@@ -53,7 +53,7 @@ pub struct TuiSessionInput {
     pub data: Vec<u8>,
 }
 
-/// Output messages sent from Hub to TuiRunner.
+/// Output messages delivered to TuiRunner by the TUI adapter.
 ///
 /// TuiRunner receives these through the output channel and processes them
 /// (feeding to AlacrittyParser, handling process exit, etc.).
@@ -87,7 +87,7 @@ pub enum TuiOutput {
 
     /// Ongoing PTY output.
     ///
-    /// Sent whenever the PTY produces new output.
+    /// Sent whenever the SessionIo/ClientWorker data plane delivers new output.
     Output {
         /// Session UUID for parser routing.
         session_uuid: String,

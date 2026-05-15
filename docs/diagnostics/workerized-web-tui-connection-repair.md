@@ -20,7 +20,7 @@ Date: 2026-05-04
   - Removed fixed `25ms`/`125ms` attach-path sleeps and the `should_force_snapshot_redraw` resize bounce from WebRTC initial attach, browser refresh snapshot, and shared TUI/socket snapshot paths.
   - Added metrics for client-worker backpressure and missing session-I/O sender events.
   - Added regression coverage for fixed-sleep removal, observable missing-sender metrics, and coalesced socket-frame reading in reconnecting attach tests.
-- `cli/src/tui/runner.rs`
+- `cli/src/clients/tui/runner.rs`
   - Handles `terminal_attach` state `not_ready` by rendering the existing error modal with a session-specific message and syncing Lua mode to `error`.
   - Added regression coverage that the TUI renders `not_ready` as user-visible error state.
 - `app/frontend/lib/connections/terminal_connection.js`

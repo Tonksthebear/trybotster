@@ -1,22 +1,23 @@
-//! Botster Hub - Agent orchestration daemon.
+//! Botster runtime library.
 //!
-//! This crate provides the core functionality for the botster CLI,
-//! managing agent lifecycles, TUI rendering, and remote client communication.
+//! This crate provides the local Botster runtime used by the `botster`
+//! command: hub orchestration, PTY/session workers, client transports,
+//! Lua plugins, and renderer adapters.
 //!
 //! # Architecture
 //!
-//! The crate follows a centralized state store pattern:
+//! Botster splits control-plane orchestration from data-plane streaming:
 //!
-//! - **Hub** - Central orchestrator, owns state, runs event loop
-//! - **Agent** - Domain entity representing a working session (user-defined processes)
-//! - **TUI** - Terminal view adapter (optional - headless mode works without it)
-//! - **Server** - Rails API adapter
-//! - **Relay** - Browser WebSocket adapter
+//! - **Hub** - Central control-plane orchestrator and lifecycle policy owner
+//! - **Session I/O workers** - Per-session PTY data-plane readers and mailboxes
+//! - **Client workers** - Transport-neutral stream state for TUI, browser, and socket clients
+//! - **Lua runtime** - Hot-reloadable product behavior, plugins, hooks, and UI composition
+//! - **Rails server** - Auth, registry, pairing/signaling, and browser shell
 //!
 //! # Modules
 //!
 //! - [`agent`] - Agent and PTY session management
-//! - [`app`] - TUI state types and input handling
+//! - [`app`] - Legacy TUI state types and input handling
 //! - [`server`] - Rails API client
 //! - [`config`] - Configuration loading/saving
 
@@ -26,6 +27,7 @@ pub mod app;
 pub mod auth;
 pub mod channel;
 pub mod client;
+pub mod clients;
 pub mod commands;
 pub mod hub;
 pub mod lua;
@@ -33,7 +35,6 @@ pub mod mcp_gateway;
 pub mod relay;
 pub mod session;
 pub mod socket;
-pub mod tui;
 pub mod ws;
 
 pub mod compat;

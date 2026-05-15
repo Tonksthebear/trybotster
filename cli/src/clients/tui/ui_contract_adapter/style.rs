@@ -1,5 +1,5 @@
 //! Conversions from shared UI tokens to the TUI's local
-//! [`crate::tui::render_tree::SpanStyle`] / [`StyledContent`] types.
+//! [`crate::clients::tui::render_tree::SpanStyle`] / [`StyledContent`] types.
 //!
 //! The shared vocabulary (`UiTone`, `UiSize`, `UiTextWeight`, …) has
 //! coarser semantics than ratatui styling — e.g. there is no `xs` font in
@@ -9,7 +9,7 @@
 
 // Rust guideline compliant 2026-04-18
 
-use crate::tui::render_tree::{SpanColor, SpanStyle, StyledContent, StyledSpan};
+use crate::clients::tui::render_tree::{SpanColor, SpanStyle, StyledContent, StyledSpan};
 use crate::ui_contract::tokens::{
     UiBadgeTone, UiButtonTone, UiStatusDotState, UiTextWeight, UiTone,
 };

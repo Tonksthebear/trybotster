@@ -59,7 +59,7 @@ where
     }
 
     /// Get a mutable reference to the currently focused terminal panel.
-    fn focused_panel_mut(&mut self) -> Option<&mut crate::tui::terminal_panel::TerminalPanel> {
+    fn focused_panel_mut(&mut self) -> Option<&mut crate::clients::tui::terminal_panel::TerminalPanel> {
         self.panel_pool.focused_panel_mut()
     }
 }
