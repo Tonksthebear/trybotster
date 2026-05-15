@@ -11,41 +11,22 @@ local actions = require("project_pipelines.web.actions")
 
 local M = {}
 
-local function pipeline_step_summary(step)
-    local bits = {
-        view.badge(step.position, "muted"),
-        ui.text{ text = step.name, size = "xs", weight = "medium" },
-        view.badge(step.kind, "muted"),
-    }
-    if step.agent_name then
-        table.insert(bits, view.badge(step.agent_name, "accent"))
-    end
-    if step.command and step.command ~= "" then
-        table.insert(bits, ui.text{ text = step.command, size = "xs", tone = "muted" })
-    end
-    return view.row(bits)
-end
-
-local function pipeline_card(pipeline, ctx)
-    local children = {
+local function pipeline_card_template()
+    return view.panel{ ui.stack{ direction = "vertical", gap = "2", children = {
         view.row{
-            ui.text{ text = pipeline.name, size = "sm", weight = "semibold" },
+            ui.text{ text = ui.bind("@/name"), size = "sm", weight = "semibold" },
+            view.badge(ui.bind("@/step_count_label"), "muted"),
             ui.button{
-                id = "pipeline-" .. pipeline.id .. "-edit",
+                id = ui.bind("@/id"),
                 label = "Edit",
                 icon = "pencil-square",
                 variant = "ghost",
-                action = ui.action("botster.nav.open", {
-                    path = ctx.path("/pipelines/" .. pipeline.id .. "/edit"),
-                }),
+                action = ui.action("botster.nav.open", { path = ui.bind("@/edit_path") }),
             },
         },
-        ui.text{ text = pipeline.description or "", size = "xs", tone = "muted" },
-    }
-    for _, step in ipairs(repo.pipeline_steps(pipeline.id)) do
-        table.insert(children, pipeline_step_summary(step))
-    end
-    return view.panel{ ui.stack{ direction = "vertical", gap = "2", children = children } }
+        ui.text{ text = ui.bind("@/description"), size = "xs", tone = "muted" },
+        ui.text{ text = ui.bind("@/step_summary"), size = "xs", tone = "muted" },
+    } } }
 end
 
 function M.index(_view_state, ctx)
@@ -55,15 +36,14 @@ function M.index(_view_state, ctx)
             back_id = "pipeline-index-back",
             back_path = ctx.path("/"),
         },
+        ui.bind_list{
+            source = "/project-pipelines.pipeline",
+            item_template = pipeline_card_template(),
+        },
+        -- TODO(entity-shape): ui.bind_list has no empty_template/empty_state hook yet,
+        -- so an entity-backed index cannot show the legacy empty state without
+        -- reintroducing a render-time pipeline list query.
     }
-
-    local pipelines = repo.list_pipelines()
-    if #pipelines == 0 then
-        table.insert(children, view.empty("No pipelines yet", "Ask an agent to create one with the Project Pipelines MCP tools.", "queue-list"))
-    end
-    for _, pipeline in ipairs(pipelines) do
-        table.insert(children, pipeline_card(pipeline, ctx))
-    end
 
     return ui.stack{ direction = "vertical", gap = "4", children = children }
 end

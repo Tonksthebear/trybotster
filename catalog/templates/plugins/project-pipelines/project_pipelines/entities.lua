@@ -443,19 +443,48 @@ local function project_target_entity(target)
     return entity
 end
 
+local function pipeline_step_summary(steps)
+    local labels = {}
+    for _, step in ipairs(steps or {}) do
+        local bits = {
+            "#" .. tostring(step.position or ""),
+            tostring(step.name or step.id or ""),
+            "(" .. tostring(step.kind or "") .. ")",
+        }
+        if step.agent_name and step.agent_name ~= "" then
+            bits[#bits + 1] = step.agent_name
+        end
+        if step.command and step.command ~= "" then
+            bits[#bits + 1] = step.command
+        end
+        labels[#labels + 1] = table.concat(bits, " ")
+    end
+    if #labels == 0 then
+        return "No steps configured."
+    end
+    return table.concat(labels, "\n")
+end
+
 local function pipeline_entity(pipeline)
     local entity = copy(pipeline)
-    local step_count = #rows("SELECT id FROM pipeline_steps WHERE pipeline_id = ?", pipeline.id)
+    local steps = rows("SELECT * FROM pipeline_steps WHERE pipeline_id = ? ORDER BY position ASC, created_at ASC, id ASC", pipeline.id)
+    local step_count = #steps
     entity.step_count = step_count
     entity.step_count_label = string.format("%d step%s", step_count, step_count == 1 and "" or "s")
+    entity.step_summary = pipeline_step_summary(steps)
     entity.edit_path = "/pipelines/pipelines/" .. pipeline.id .. "/edit"
     return entity
 end
 
 local function pipeline_entities(pipelines)
     local counts = {}
+    local steps_by_pipeline = {}
     for _, row in ipairs(rows("SELECT pipeline_id, COUNT(*) AS count FROM pipeline_steps GROUP BY pipeline_id")) do
         counts[row.pipeline_id] = tonumber(row.count or 0) or 0
+    end
+    for _, step in ipairs(rows("SELECT * FROM pipeline_steps ORDER BY pipeline_id ASC, position ASC, created_at ASC, id ASC")) do
+        steps_by_pipeline[step.pipeline_id] = steps_by_pipeline[step.pipeline_id] or {}
+        table.insert(steps_by_pipeline[step.pipeline_id], step)
     end
     local out = {}
     for _, pipeline in ipairs(pipelines or {}) do
@@ -463,6 +492,7 @@ local function pipeline_entities(pipelines)
         local step_count = counts[pipeline.id] or 0
         entity.step_count = step_count
         entity.step_count_label = string.format("%d step%s", step_count, step_count == 1 and "" or "s")
+        entity.step_summary = pipeline_step_summary(steps_by_pipeline[pipeline.id])
         entity.edit_path = "/pipelines/pipelines/" .. pipeline.id .. "/edit"
         out[#out + 1] = entity
     end
