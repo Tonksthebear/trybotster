@@ -144,6 +144,11 @@ function M.render(_view_state, ctx)
                     source = "/project-pipelines.question",
                     where = { status = "open" },
                     item_template = question_template(),
+                    empty_template = view.empty(
+                        "No open questions",
+                        "Questions that need answers will appear here.",
+                        "question-mark-circle"
+                    ),
                 },
             } },
         }) },
@@ -157,6 +162,11 @@ function M.render(_view_state, ctx)
                     source = "/project-pipelines.run",
                     where = { status = "active" },
                     item_template = running_run_template(),
+                    empty_template = view.empty(
+                        "No running pipelines",
+                        "Active ticket pipeline runs will appear here.",
+                        "play-circle"
+                    ),
                 },
             } },
         }) },
@@ -169,6 +179,11 @@ function M.render(_view_state, ctx)
                     source = "/project-pipelines.ticket",
                     where = { status = "open", latest_run_status = "done" },
                     item_template = merge_ticket_template(),
+                    empty_template = view.empty(
+                        "No tickets ready to merge",
+                        "Completed runs waiting on PR or merge work will appear here.",
+                        "code-bracket"
+                    ),
                 },
             } },
         }) },
@@ -178,6 +193,11 @@ function M.render(_view_state, ctx)
                     source = "/project-pipelines.project",
                     where = { status = "open" },
                     item_template = project_template(),
+                    empty_template = view.empty(
+                        "No open projects",
+                        "Projects with active pipeline work will appear here.",
+                        "folder"
+                    ),
                 },
             } },
         }) },
@@ -187,12 +207,25 @@ function M.render(_view_state, ctx)
                     source = "/project-pipelines.ticket",
                     where = { status = "open", standalone = true },
                     item_template = ticket_template(),
+                    empty_template = view.empty(
+                        "No standalone tickets",
+                        "Open tickets that are not part of a project will appear here.",
+                        "ticket"
+                    ),
                 },
             } },
         }) },
         view.panel{ view.section("Pipeline Definitions", {
             ui.list{ children = {
-                ui.bind_list{ source = "/project-pipelines.pipeline", item_template = pipeline_template() },
+                ui.bind_list{
+                    source = "/project-pipelines.pipeline",
+                    item_template = pipeline_template(),
+                    empty_template = view.empty(
+                        "No pipelines yet",
+                        "Visit Pipeline index to create one, or ask an agent via the Project Pipelines MCP tools.",
+                        "queue-list"
+                    ),
+                },
             } },
         }) },
     } }

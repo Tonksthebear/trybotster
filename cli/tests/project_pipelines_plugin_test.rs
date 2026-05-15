@@ -1276,6 +1276,44 @@ fn catalog_plugin_project_pipelines_home_render_uses_bounded_notified_session_lo
 }
 
 #[test]
+fn catalog_plugin_project_pipelines_home_bind_lists_use_entity_empty_templates() {
+    let home = std::fs::read_to_string(
+        project_root_dir()
+            .join("catalog/templates/plugins/project-pipelines/project_pipelines/web/screens/home.lua"),
+    )
+    .expect("read project pipelines home screen");
+
+    assert_eq!(
+        home.matches("ui.bind_list").count(),
+        6,
+        "home should keep the six entity-backed bind_list sections"
+    );
+    assert_eq!(
+        home.matches("empty_template = view.empty").count(),
+        6,
+        "each home bind_list should provide an empty_template"
+    );
+
+    for source in [
+        "/project-pipelines.question",
+        "/project-pipelines.run",
+        "/project-pipelines.ticket",
+        "/project-pipelines.project",
+        "/project-pipelines.pipeline",
+    ] {
+        assert!(
+            home.contains(source),
+            "home should keep entity source {source}"
+        );
+    }
+
+    assert!(
+        !home.contains("repo."),
+        "home should not call repo.* at render time"
+    );
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_mcp_mutators_return_without_bulk_snapshot_publish() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
