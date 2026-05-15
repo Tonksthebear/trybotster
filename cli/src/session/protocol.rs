@@ -1,6 +1,8 @@
 //! Per-session process wire protocol.
 //!
-//! Each session process communicates with the Hub over a dedicated Unix socket.
+//! Each session process communicates with the daemon's per-session I/O side over
+//! a dedicated Unix socket. The Hub authorizes and coordinates session
+//! lifecycle, while `SessionIoWorker` owns the durable socket read/write path.
 //! No multiplexing — one socket, one session, one protocol instance.
 //!
 //! # Frame format
@@ -15,9 +17,9 @@
 //!
 //! # Handshake
 //!
-//! After TCP-level connect, the Hub sends a `Hello` and the session responds
-//! with `Welcome` containing session metadata. No capabilities negotiation —
-//! protocol version is sufficient.
+//! After socket connect, the hub-authorized daemon endpoint sends a `Hello`
+//! and the session responds with `Welcome` containing session metadata. No
+//! capabilities negotiation — protocol version is sufficient.
 
 use std::io::{Read, Write};
 
@@ -31,80 +33,80 @@ use anyhow::{bail, Context, Result};
 /// Current protocol version. Bump on breaking wire changes.
 pub const PROTOCOL_VERSION: u8 = 2;
 
-/// Magic bytes for hub → session hello.
+/// Legacy magic bytes for daemon endpoint -> session hello.
 pub const HELLO_MAGIC: &[u8; 4] = b"SPH1";
 
-/// Magic bytes for session → hub welcome.
+/// Legacy magic bytes for session -> daemon endpoint welcome.
 pub const WELCOME_MAGIC: &[u8; 4] = b"SPA1";
 
 // ─── Frame types ─────────────────────────────────────────────────────────────
 
-/// Hub → Session: raw PTY input bytes.
+/// Daemon data plane -> Session: raw PTY input bytes.
 pub const FRAME_PTY_INPUT: u8 = 0x01;
 
-/// Session → Hub: raw PTY output bytes.
+/// Session -> daemon data plane: raw PTY output bytes.
 pub const FRAME_PTY_OUTPUT: u8 = 0x02;
 
-/// Hub → Session: resize command (JSON payload: `{"rows": u16, "cols": u16}`).
+/// Hub policy via data plane -> Session: resize command (JSON payload: `{"rows": u16, "cols": u16}`).
 pub const FRAME_RESIZE: u8 = 0x03;
 
-/// Hub → Session: arm tee log (JSON payload: `{"log_path": str, "cap_bytes": u64}`).
+/// Hub policy via data plane -> Session: arm tee log (JSON payload: `{"log_path": str, "cap_bytes": u64}`).
 pub const FRAME_ARM_TEE: u8 = 0x04;
 
-/// Hub → Session: request an opaque terminal snapshot of current state.
+/// Hub policy via data plane -> Session: request an opaque terminal snapshot of current state.
 pub const FRAME_GET_SNAPSHOT: u8 = 0x05;
 
-/// Session → Hub: opaque terminal snapshot response.
+/// Session -> daemon data plane: opaque terminal snapshot response.
 pub const FRAME_SNAPSHOT: u8 = 0x06;
 
-/// Session → Hub: child process exited (JSON payload: `{"exit_code": i32|null}`).
+/// Session -> daemon data plane: child process exited (JSON payload: `{"exit_code": i32|null}`).
 pub const FRAME_PROCESS_EXITED: u8 = 0x07;
 
-/// Hub → Session: keepalive ping.
+/// Daemon data plane -> Session: keepalive ping.
 pub const FRAME_PING: u8 = 0x08;
 
-/// Session → Hub: keepalive pong.
+/// Session -> daemon data plane: keepalive pong.
 pub const FRAME_PONG: u8 = 0x09;
 
-/// Hub → Session: request clean shutdown (kill child, exit).
+/// Hub policy via data plane -> Session: request clean shutdown (kill child, exit).
 pub const FRAME_SHUTDOWN: u8 = 0x0A;
 
-/// Hub → Session: set reconnect timeout (JSON payload: `{"seconds": u64}`).
+/// Hub policy via data plane -> Session: set reconnect timeout (JSON payload: `{"seconds": u64}`).
 pub const FRAME_SET_TIMEOUT: u8 = 0x0B;
 
-/// Hub → Session: request terminal mode flags.
+/// Hub policy via data plane -> Session: request terminal mode flags.
 pub const FRAME_GET_MODE_FLAGS: u8 = 0x0C;
 
-/// Session → Hub: terminal mode flags response (JSON payload).
+/// Session -> daemon data plane: terminal mode flags response (JSON payload).
 pub const FRAME_MODE_FLAGS: u8 = 0x0D;
 
-/// Hub → Session: request plain text screen contents.
+/// Hub policy via data plane -> Session: request plain text screen contents.
 pub const FRAME_GET_SCREEN: u8 = 0x0E;
 
-/// Session → Hub: plain text screen response.
+/// Session -> daemon data plane: plain text screen response.
 pub const FRAME_SCREEN: u8 = 0x0F;
 
-// ─── Proactive state change frames (session → hub) ─────────────────────
+// --- Proactive state change frames (session -> daemon data plane) ------------
 
-/// Session → Hub: window title changed (string payload: new title).
+/// Session -> daemon data plane: window title changed (string payload: new title).
 pub const FRAME_TITLE_CHANGED: u8 = 0x10;
 
-/// Session → Hub: bell character received (empty payload).
+/// Session -> daemon data plane: bell character received (empty payload).
 pub const FRAME_BELL: u8 = 0x11;
 
-/// Session → Hub: terminal mode changed (JSON payload: only changed fields).
+/// Session -> daemon data plane: terminal mode changed (JSON payload: only changed fields).
 pub const FRAME_MODE_CHANGED: u8 = 0x12;
 
-/// Session → Hub: working directory changed (string payload: new CWD path).
+/// Session -> daemon data plane: working directory changed (string payload: new CWD path).
 pub const FRAME_CWD_CHANGED: u8 = 0x13;
 
-/// Session → Hub: semantic prompt action detected (JSON payload: `{"mark": str}`).
+/// Session -> daemon data plane: semantic prompt action detected (JSON payload: `{"mark": str}`).
 pub const FRAME_PROMPT_MARK: u8 = 0x14;
 
-/// Session → Hub: OSC notification detected (JSON payload: `{"title": str, "body": str}`).
+/// Session -> daemon data plane: OSC notification detected (JSON payload: `{"title": str, "body": str}`).
 pub const FRAME_NOTIFICATION: u8 = 0x15;
 
-/// Hub → Session: replace the parser's terminal color profile (JSON payload).
+/// Hub policy via data plane -> Session: replace the parser's terminal color profile (JSON payload).
 pub const FRAME_SET_COLOR_PROFILE: u8 = 0x16;
 
 // ─── Handshake metadata ──────────────────────────────────────────────────────
@@ -133,8 +135,8 @@ pub struct SessionMetadata {
     pub port: Option<u16>,
     /// Terminal mode flags at handshake time.
     ///
-    /// Reconnect handshakes carry this so the hub can seed state without
-    /// issuing an RPC before the reader thread owns the socket.
+    /// Reconnect handshakes carry this so daemon state can be seeded without
+    /// issuing an RPC before the SessionIo reader owns the socket.
     #[serde(default)]
     pub mode_flags: ModeFlags,
 }
@@ -162,8 +164,9 @@ pub struct ModeFlags {
 
 /// Incremental mode change pushed proactively by the session.
 ///
-/// Only changed fields are present (None = unchanged). This avoids the hub
-/// needing to re-parse PTY output to detect mode transitions.
+/// Only changed fields are present (None = unchanged). This avoids daemon-side
+/// clients of the session state needing to re-parse PTY output to detect mode
+/// transitions.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ModeChanged {
     /// Kitty keyboard protocol toggled.
@@ -344,7 +347,7 @@ impl FrameDecoder {
 
 // ─── Handshake ───────────────────────────────────────────────────────────────
 
-/// Perform the hub side of the handshake: send hello, receive welcome + metadata.
+/// Perform the hub-authorized daemon endpoint handshake.
 pub fn handshake_hub(stream: &mut (impl Read + Write)) -> Result<(u8, SessionMetadata)> {
     // Send hello
     stream.write_all(HELLO_MAGIC)?;
@@ -422,7 +425,8 @@ pub fn handshake_session(
 //
 // The snapshot is an opaque blob produced by `ghostty_snapshot_terminal_export`
 // and consumed by `ghostty_snapshot_terminal_import`. The session process
-// exports it, the hub routes it opaquely, and clients import it.
+// exports it, the SessionIo/ClientWorker data plane routes it opaquely, and
+// clients import it.
 //
 // Internal format (owned by ghostty snapshot.zig):
 //   [u8 version] [u8 screen_count] [u8 active_key]
@@ -607,11 +611,11 @@ mod tests {
             },
         };
 
-        // Simulate hub → session → hub via in-memory buffers
+        // Simulate daemon endpoint -> session -> daemon endpoint via in-memory buffers
         let mut hub_to_session = Vec::new();
         let mut session_to_hub = Vec::new();
 
-        // Hub writes hello
+        // Daemon endpoint writes hello
         hub_to_session.extend_from_slice(HELLO_MAGIC);
         hub_to_session.push(PROTOCOL_VERSION);
 
@@ -632,7 +636,7 @@ mod tests {
         session_to_hub.extend_from_slice(&(json.len() as u32).to_le_bytes());
         session_to_hub.extend_from_slice(&json);
 
-        // Hub reads welcome
+        // Daemon endpoint reads welcome
         let mut cursor = Cursor::new(&session_to_hub);
         let mut magic = [0u8; 4];
         cursor.read_exact(&mut magic).unwrap();

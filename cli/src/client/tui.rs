@@ -5,8 +5,8 @@
 //! terminal data plane.
 //!
 //! Defines the message types for TuiRunner control and terminal communication:
-//! - TuiRunner → Hub: [`TuiRequest`] (JSON/control protocol)
-//! - TuiRunner → terminal transport: [`TuiSessionInput`] (raw PTY bytes)
+//! - TuiRunner → hub policy/Lua boundary: [`TuiRequest`] (JSON/control protocol)
+//! - TuiRunner → ClientWorker data plane: [`TuiSessionInput`] (raw PTY bytes)
 //! - terminal/control adapters → TuiRunner: [`TuiOutput`] (PTY output, Lua events)
 //!
 //! # Message Format
@@ -25,9 +25,9 @@
 
 // Rust guideline compliant 2026-02
 
-/// Request messages sent from TuiRunner to Hub.
+/// Control messages sent from TuiRunner toward hub policy.
 ///
-/// Control messages from the TUI to the hub.
+/// Control messages from the TUI to hub policy or Lua routing.
 #[derive(Debug, Clone)]
 pub enum TuiRequest {
     /// JSON message routed through Lua `client.lua` protocol.

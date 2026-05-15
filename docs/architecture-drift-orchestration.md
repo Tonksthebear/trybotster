@@ -82,6 +82,9 @@ model.
 - Prefer docs/comments for framing cleanup before behavioral refactors.
 - Avoid broad compatibility layers; when ambiguity itself is the problem, make
   the current architecture the only current-facing story.
-- Use explicit `target_id` when spawning Botster agents in multi-target hubs;
-  target-name routing can be ambiguous when orchestration spans many active
-  workspaces.
+- Use explicit `agent_name`, `workspace_id`, and `target_id` when spawning
+  Botster agents in multi-target hubs; target-name routing can be ambiguous
+  when orchestration spans many active workspaces.
+- Prompts for spawned agents must name the assigned worktree path, not the
+  orchestrator's main checkout path, so each slice lands on its intended
+  branch.

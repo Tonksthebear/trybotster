@@ -32,9 +32,11 @@ Session I/O workers mirror the current per-session process protocol. The
 current production mailbox work is PTY input, resize, snapshot requests,
 mode-flag requests, plain-screen requests, color profile updates, authorized
 file paste/drop payloads, prepared snapshot payloads, and clean shutdown
-requests. The worker emits structured terminal events and process-exit messages
-back to the hub. The Unix socket wire protocol in `cli/src/session/protocol.rs`
-remains the durable process boundary.
+requests. The worker emits terminal bytes, metadata, and process-exit messages
+through SessionIo subscriptions to subscribed client workers; hub-visible
+session I/O events are for policy, lifecycle, and slow-path correlation. The
+Unix socket wire protocol in `cli/src/session/protocol.rs` remains the durable
+process boundary.
 
 Plugin workers own plugin execution. The hub may keep descriptor registries for
 discovery, routing, and UI state, but executable plugin code should be invoked
@@ -55,7 +57,9 @@ Unix socket and exits with that connection; reconnect creates a fresh
 The worker keeps the session process protocol unchanged. `SessionConnection`
 still owns synchronous RPC methods, while the worker decodes every socket frame
 and routes snapshot, screen, mode-flags, and other control responses back to the
-existing `response_rx` channel. A companion request processor owns bounded
+existing `response_rx` channel. Terminal-output frames fan out through
+SessionIo subscriptions to client workers rather than entering the Hub as a
+byte-bearing event. A companion request processor owns bounded
 `SessionIoRequest` mailbox work such as PTY input, paste path injection, and
 prepared snapshot payloads. This avoids socket read contention without moving
 hub orchestration policy into the worker.
@@ -66,8 +70,8 @@ session and transport capabilities, then enqueues the already-authorized
 filename and bytes as `SessionIoRequest::PasteFile`. The Session I/O worker
 writes the file, injects the resulting path into the PTY, and reports
 `SessionIoEvent::PasteFileWritten` or `SessionIoEvent::PasteFileFailed` back
-through `HubEvent::SessionIo`. Paste temp paths are session-scoped and resolve
-in this order: session manifest
+for hub policy/lifecycle handling. Paste temp paths are session-scoped and
+resolve in this order: session manifest
 `worktree_path` under `.botster/pastes/<session_uuid>`, Botster data dir under
 `pastes/<session_uuid>`, then the OS temp dir under
 `botster/pastes/<session_uuid>`. Cleanup is keyed by session UUID, never label,
