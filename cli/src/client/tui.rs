@@ -1,4 +1,8 @@
-//! TUI communication types.
+//! TUI protocol message types.
+//!
+//! The TUI renderer lives in [`crate::clients::tui`]. This module only defines
+//! the typed messages exchanged between that renderer, hub policy, and the
+//! terminal data plane.
 //!
 //! Defines the message types for TuiRunner control and terminal communication:
 //! - TuiRunner → Hub: [`TuiRequest`] (JSON/control protocol)
