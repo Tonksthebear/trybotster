@@ -3,7 +3,7 @@
 -- @category plugins
 -- @dest plugins/project-pipelines/project_pipelines/entity_contract.lua
 -- @scope device
--- @version 1.1.0
+-- @version 1.2.0
 
 local M = {}
 
