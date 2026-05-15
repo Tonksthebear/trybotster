@@ -1373,55 +1373,106 @@ fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_
               local screen = read_file(path)
 
               local source_counts = {{}}
-              local sources = {{}}
-              local fields = {{}}
-              local where_fields_by_source = {{}}
+              local sections_by_source = {{}}
+              local record_fields_by_source = {{}}
               for _, section in ipairs(sections) do
                 assert(section.name and section.name ~= "", "screen contract section missing name: " .. screen_name)
                 assert(section.source and section.source ~= "", "screen contract section missing source: " .. section.name)
-                sources[section.source] = true
-                where_fields_by_source[section.source] = where_fields_by_source[section.source] or {{}}
-                if section.mode ~= "record" then
+                if section.mode == "record" then
+                  record_fields_by_source[section.source] = record_fields_by_source[section.source] or {{}}
+                  for _, field in ipairs(section.fields or {{}}) do
+                    record_fields_by_source[section.source][field] = true
+                  end
+                else
+                  sections_by_source[section.source] = sections_by_source[section.source] or {{}}
+                  table.insert(sections_by_source[section.source], section)
                   source_counts[section.source] = (source_counts[section.source] or 0) + 1
-                end
-                for _, field in ipairs(section.fields or {{}}) do
-                  fields[field] = true
-                end
-                for _, field in ipairs(section.where_fields or {{}}) do
-                  where_fields_by_source[section.source][field] = true
                 end
               end
 
-              local actual_source_counts = {{}}
-              local current_source = nil
-              for line in screen:gmatch("[^\n]+") do
-                local source = line:match('source%s*=%s*"([^"]+)"')
-                if source then
-                  current_source = source
-                  assert(sources[source],
-                    screen_name .. " bind_list source missing from contract: " .. source)
-                  actual_source_counts[source] = (actual_source_counts[source] or 0) + 1
+              local function table_set(values)
+                local set = {{}}
+                for _, value in ipairs(values or {{}}) do
+                  set[value] = true
                 end
-                for field in line:gmatch("([%w_]+)%s*=") do
-                  if line:match("where%s*=") and field ~= "where" then
-                    assert(current_source and where_fields_by_source[current_source] and where_fields_by_source[current_source][field],
-                      screen_name .. " where field missing from contract for " .. tostring(current_source) .. ": " .. field)
+                return set
+              end
+
+              local function extract_call_blocks(source_text, call_name)
+                local blocks = {{}}
+                local start_at = 1
+                while true do
+                  local call_start, call_end = source_text:find(call_name .. "%s*%{{", start_at)
+                  if not call_start then
+                    break
+                  end
+                  local depth = 0
+                  local block_end = nil
+                  for index = call_end, #source_text do
+                    local char = source_text:sub(index, index)
+                    if char == "{{" then
+                      depth = depth + 1
+                    elseif char == "}}" then
+                      depth = depth - 1
+                      if depth == 0 then
+                        block_end = index
+                        break
+                      end
+                    end
+                  end
+                  assert(block_end, screen_name .. " unterminated " .. call_name .. " block")
+                  table.insert(blocks, source_text:sub(call_start, block_end))
+                  start_at = block_end + 1
+                end
+                return blocks
+              end
+
+              local actual_source_counts = {{}}
+              for _, block in ipairs(extract_call_blocks(screen, "ui%.bind_list")) do
+                local source = block:match('source%s*=%s*"([^"]+)"')
+                assert(source, screen_name .. " bind_list missing source")
+                actual_source_counts[source] = (actual_source_counts[source] or 0) + 1
+                local section = sections_by_source[source] and sections_by_source[source][actual_source_counts[source]]
+                assert(section, screen_name .. " bind_list source missing from contract: " .. source)
+                local section_fields = table_set(section.fields)
+                local section_where_fields = table_set(section.where_fields)
+
+                local where_block = block:match("where%s*=%s*%{{(.-)%}}")
+                if where_block then
+                  for field in where_block:gmatch("([%w_]+)%s*=") do
+                    assert(section_where_fields[field],
+                      screen_name .. " where field missing from contract for " .. section.name .. ": " .. field)
                   end
                 end
+                for field in block:gmatch('ui%.bind%("%@/([%w_]+)"%)') do
+                  assert(section_fields[field],
+                    screen_name .. " bound field missing from contract for " .. section.name .. ": " .. field)
+                end
               end
+
               for source, expected_count in pairs(source_counts) do
                 assert(actual_source_counts[source] == expected_count,
                   screen_name .. " source count drift for " .. source .. ": expected "
                     .. tostring(expected_count) .. " got " .. tostring(actual_source_counts[source]))
               end
-              for field in screen:gmatch('ui%.bind%("%@/([%w_]+)"%)') do
-                assert(fields[field], screen_name .. " bound field missing from contract: " .. field)
+
+              local path_vars = {{}}
+              for var, source in screen:gmatch('local%s+([%w_]+_path)%s*=%s*"(/[^"]+)/"%s*%.%.') do
+                path_vars[var] = source
               end
-              for field in screen:gmatch('ui%.bind%([^%)]*"%/([%w_]+)"') do
-                assert(fields[field], screen_name .. " bound field path missing from contract: " .. field)
+              for var, field in screen:gmatch('ui%.bind%(%s*([%w_]+_path)%s*%.%.%s*"%/([%w_]+)"%s*%)') do
+                local source = path_vars[var]
+                assert(source, screen_name .. " bound field path variable missing source: " .. var)
+                assert(record_fields_by_source[source] and record_fields_by_source[source][field],
+                  screen_name .. " bound record field missing from contract for " .. source .. ": " .. field)
               end
-              for field in screen:gmatch('ui%.bind%([^%)]*%.%.%s*"%/([%w_]+)"') do
-                assert(fields[field], screen_name .. " concatenated bound field path missing from contract: " .. field)
+              for path in screen:gmatch('ui%.bind%(%s*"(/[^"]+)"%s*%)') do
+                local source = path:match("^(/[^/]+)")
+                local field = path:match("/([%w_]+)$")
+                if source and field then
+                  assert(record_fields_by_source[source] and record_fields_by_source[source][field],
+                    screen_name .. " literal bound record field missing from contract for " .. source .. ": " .. field)
+                end
               end
             end
 

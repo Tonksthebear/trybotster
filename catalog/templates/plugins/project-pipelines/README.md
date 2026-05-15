@@ -188,12 +188,11 @@ It ships models in four explicit Lua-owned layers:
   read-model records from plugin.db persistence rows, and publishes them for
   clients under the `project-pipelines.*` namespace.
 
-New entity-backed plugin templates should keep the same split. If a scaffold
-publishes plugin entities, include or document an `entity_contract.lua` module
-instead of burying entity names and bound field expectations inside screens or
-publishers. Use `plugin.db` for durable private persistence, entity contracts
-and publishers for client-facing read models, and `ui.local_state` /
-`botster.presentation.*` for transient presentation state.
+New entity-backed plugin templates should keep the same split and follow
+Botster's canonical `docs/plugin-entities.md#shipping-a-model` sequence. If a
+scaffold publishes plugin entities, include or document an `entity_contract.lua`
+module instead of burying entity names and bound field expectations inside
+screens or publishers.
 
 The entity layer is the UI/data contract. It can expose derived labels, status
 tones, paths, counts, and flattened relationship fields that are convenient for
