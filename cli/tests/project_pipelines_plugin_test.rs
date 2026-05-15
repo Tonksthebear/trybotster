@@ -1359,50 +1359,60 @@ fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_
               error("contract entity type was not registered: " .. tostring(entity_type))
             end
 
-            local file = assert(io.open("{home_path}", "r"))
-            local home = file:read("*a")
-            file:close()
-
-            local contract_source_counts = {{}}
-            local contract_sources = {{}}
-            local contract_fields = {{}}
-            local contract_where_fields_by_source = {{}}
-            for _, section in ipairs(contract.home_screen) do
-              contract_source_counts[section.source] = (contract_source_counts[section.source] or 0) + 1
-              contract_sources[section.source] = true
-              contract_where_fields_by_source[section.source] = contract_where_fields_by_source[section.source] or {{}}
-              for _, field in ipairs(section.fields or {{}}) do
-                contract_fields[field] = true
-              end
-              for _, field in ipairs(section.where_fields or {{}}) do
-                contract_where_fields_by_source[section.source][field] = true
-              end
+            local function read_file(path)
+              local file = assert(io.open(path, "r"))
+              local contents = file:read("*a")
+              file:close()
+              return contents
             end
 
-            local actual_source_counts = {{}}
-            local current_source = nil
-            for line in home:gmatch("[^\n]+") do
-              local source = line:match('source%s*=%s*"([^"]+)"')
-              if source then
-                current_source = source
-                assert(contract_sources[source], "home bind_list source missing from contract: " .. source)
-                actual_source_counts[source] = (actual_source_counts[source] or 0) + 1
-              end
-              for field in line:gmatch("([%w_]+)%s*=") do
-                if line:match("where%s*=") and field ~= "where" then
-                  assert(current_source and contract_where_fields_by_source[current_source] and contract_where_fields_by_source[current_source][field],
-                    "home where field missing from contract for " .. tostring(current_source) .. ": " .. field)
+            local function assert_screen_contract(screen_name, sections, path)
+              assert(type(sections) == "table", screen_name .. " contract must be a table")
+              local screen = read_file(path)
+
+              local contract_source_counts = {{}}
+              local contract_sources = {{}}
+              local contract_fields = {{}}
+              local contract_where_fields_by_source = {{}}
+              for _, section in ipairs(sections) do
+                contract_source_counts[section.source] = (contract_source_counts[section.source] or 0) + 1
+                contract_sources[section.source] = true
+                contract_where_fields_by_source[section.source] = contract_where_fields_by_source[section.source] or {{}}
+                for _, field in ipairs(section.fields or {{}}) do
+                  contract_fields[field] = true
+                end
+                for _, field in ipairs(section.where_fields or {{}}) do
+                  contract_where_fields_by_source[section.source][field] = true
                 end
               end
+
+              local actual_source_counts = {{}}
+              local current_source = nil
+              for line in screen:gmatch("[^\n]+") do
+                local source = line:match('source%s*=%s*"([^"]+)"')
+                if source then
+                  current_source = source
+                  assert(contract_sources[source], screen_name .. " bind_list source missing from contract: " .. source)
+                  actual_source_counts[source] = (actual_source_counts[source] or 0) + 1
+                end
+                for field in line:gmatch("([%w_]+)%s*=") do
+                  if line:match("where%s*=") and field ~= "where" then
+                    assert(current_source and contract_where_fields_by_source[current_source] and contract_where_fields_by_source[current_source][field],
+                      screen_name .. " where field missing from contract for " .. tostring(current_source) .. ": " .. field)
+                  end
+                end
+              end
+              for source, expected_count in pairs(contract_source_counts) do
+                assert(actual_source_counts[source] == expected_count,
+                  screen_name .. " source count drift for " .. source .. ": expected "
+                    .. tostring(expected_count) .. " got " .. tostring(actual_source_counts[source]))
+              end
+              for field in screen:gmatch('ui%.bind%("%@/([%w_]+)"%)') do
+                assert(contract_fields[field], screen_name .. " bound field missing from contract: " .. field)
+              end
             end
-            for source, expected_count in pairs(contract_source_counts) do
-              assert(actual_source_counts[source] == expected_count,
-                "home source count drift for " .. source .. ": expected "
-                  .. tostring(expected_count) .. " got " .. tostring(actual_source_counts[source]))
-            end
-            for field in home:gmatch('ui%.bind%("%@/([%w_]+)"%)') do
-              assert(contract_fields[field], "home bound field missing from contract: " .. field)
-            end
+
+            assert_screen_contract("home", contract.home_screen, "{home_path}")
 
             return "ok"
             "#,
