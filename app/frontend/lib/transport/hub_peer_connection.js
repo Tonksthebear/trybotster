@@ -89,7 +89,9 @@ class HubPeerConnection {
         createSession: (hubId, bundle, browserIdentity) =>
           bridge.createSession(String(hubId), bundle, browserIdentity),
         decryptBinary: (hubId, raw) => bridge.decryptBinary(String(hubId), raw),
-        markServerReady: (hubId) => this.#markServerReady(hubId),
+        isCurrentPeerGeneration: (hubId, generation) =>
+          this.#isCurrentPeerGeneration(hubId, generation),
+        markServerReady: (hubId, generation) => this.#markServerReady(hubId, generation),
       },
       constants: {
         CONTENT_MSG,
@@ -106,7 +108,8 @@ class HubPeerConnection {
         getSignalingSubscription: (hubId) => this.#signalingClient.getSubscription(hubId),
         getIceConfig: (hubId, conn) => this.#getIceConfig(hubId, conn),
         encryptSignal: (hubId, payload) => this.#encryptSignal(hubId, payload),
-        setupDataChannel: (hubId, dataChannel) => this.#setupDataChannel(hubId, dataChannel),
+        setupDataChannel: (hubId, dataChannel, generation) =>
+          this.#setupDataChannel(hubId, dataChannel, generation),
         peerLost: (hubId, reason) => this.#handlePeerLost(hubId, reason),
       },
       constants: {
@@ -210,6 +213,7 @@ class HubPeerConnection {
       peerSetupTimer: null,
       peerSetupStartedAt: 0,
       offerSentAt: null,
+      peerGeneration: 0,
       serverReady: false,
       recentDirectDisconnects: [],
       forceRelayUntil: 0,
@@ -399,8 +403,15 @@ class HubPeerConnection {
       throw new Error("Cannot subscribe without encrypted payload")
     }
 
-    conn.dataChannel.send(encryptedBinary.buffer)
-    await this.#channelProtocol.waitForSubscriptionConfirmed(subscriptionId)
+    const confirmed = this.#channelProtocol.waitForSubscriptionConfirmed(subscriptionId)
+    try {
+      conn.dataChannel.send(encryptedBinary.buffer)
+    } catch (error) {
+      this.#channelProtocol.clearPendingSubscription(subscriptionId)
+      conn.subscriptions.delete(subscriptionId)
+      throw error
+    }
+    await confirmed
     const subscribeReadyMs = Math.round(performance.now() - subscribeStartedAt)
     this.#emit("subscription:confirmed", { subscriptionId })
     this.#emit("subscription:ready", { hubId, subscriptionId, subscribeReadyMs })
@@ -640,10 +651,11 @@ class HubPeerConnection {
     this.#emit("connection:state", { hubId, state: "disconnected", reason })
   }
 
-  #setupDataChannel(hubId, dataChannel) {
+  #setupDataChannel(hubId, dataChannel, generation) {
     dataChannel.binaryType = "arraybuffer"
 
     dataChannel.onopen = () => {
+      if (!this.#isCurrentPeerGeneration(hubId, generation)) return
       console.debug(`[WebRTCTransport] DataChannel open for hub ${hubId}`)
       const conn = this.#connections.get(hubId)
       let peerReadyMs = null
@@ -665,21 +677,30 @@ class HubPeerConnection {
     }
 
     dataChannel.onclose = () => {
+      if (!this.#isCurrentPeerGeneration(hubId, generation)) return
       console.debug(`[WebRTCTransport] DataChannel closed for hub ${hubId}`)
       this.#handlePeerLost(hubId, PEER_LOST_REASONS.DATACHANNEL_CLOSE)
     }
 
     dataChannel.onerror = (error) => {
+      if (!this.#isCurrentPeerGeneration(hubId, generation)) return
       console.error("[WebRTCTransport] DataChannel error:", error)
       this.#handlePeerLost(hubId, PEER_LOST_REASONS.DATACHANNEL_ERROR)
     }
 
     dataChannel.onmessage = (event) => {
-      this.#enqueueDataChannelMessage(hubId, event.data)
+      this.#enqueueDataChannelMessage(hubId, event.data, generation)
     }
   }
 
-  #markServerReady(hubId) {
+  #isCurrentPeerGeneration(hubId, generation) {
+    const conn = this.#connections.get(hubId)
+    return !!conn && conn.peerGeneration === generation
+  }
+
+  #markServerReady(hubId, generation) {
+    if (!this.#isCurrentPeerGeneration(hubId, generation)) return
+
     const conn = this.#connections.get(hubId)
     if (conn) {
       conn.serverReady = true
@@ -717,11 +738,13 @@ class HubPeerConnection {
     })
   }
 
-  #enqueueDataChannelMessage(hubId, data) {
+  #enqueueDataChannelMessage(hubId, data, generation) {
+    if (!this.#isCurrentPeerGeneration(hubId, generation)) return
+
     const previous = this.#dataMessageChains.get(hubId) || Promise.resolve()
     const current = previous
       .catch(() => {})
-      .then(() => this.#channelProtocol.handleDataChannelMessage(hubId, data))
+      .then(() => this.#channelProtocol.handleDataChannelMessage(hubId, data, generation))
       .catch((error) => {
         console.error("[WebRTCTransport] Message handler error:", error)
       })

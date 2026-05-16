@@ -47,6 +47,11 @@ The most useful span names are:
 | `webrtc_message.dc_pong` | DataChannel pong handler |
 | `webrtc_message.terminal_color_profile` | WebRTC color profile handler |
 | `webrtc_message.lua` | Lua fallback for WebRTC messages |
+| `webrtc_offer.replacement` | same-device stale peer cleanup and advisory close wait before a new offer; emitted only when replacement work actually occurred |
+| `webrtc_offer.start_channel` | hub-side WebRTC channel setup before async SDP negotiation |
+| `webrtc_offer.dispatch` | total synchronous offer dispatch work before negotiation is spawned |
+| `webrtc_open.ready_path` | DataChannel-open work to install receive forwarding, send queue, client worker route, ping, connected state, and `dc_ready`; excludes Lua `peer_connected` callback time |
+| `webrtc_open.total` | full hub-side DataChannel-open handler, including Lua `peer_connected` callback time on successful opens |
 | `webrtc_send.queue` | queued WebRTC send item byte accounting |
 | `client_worker.backpressure` | client worker queue rejected delivery/control work |
 | `cleanup.webrtc_scan` | periodic WebRTC channel cleanup scan |
@@ -87,6 +92,11 @@ largest observed value instead of summing every sample.
 | `webrtc_send.unknown_peer` | send targeted a peer with no active send task |
 | `webrtc_send.unknown_peer_burst` | unknown-peer burst guardrail fired |
 | `webrtc_channel.closed_after_connect` | channel closed shortly after connected/open |
+| `webrtc_offer.start_failed` | channel setup failed before async SDP negotiation could start |
+| `webrtc_open.unknown_peer` | DataChannel-open event arrived for a peer no longer owned by the registry |
+| `webrtc_open.stale_generation` | DataChannel-open event belonged to an older offer generation and was ignored |
+| `webrtc_open.recv_forwarder_failed` | DataChannel opened but the registry could not start the receive forwarder; connected state is not emitted |
+| `webrtc_open.peer_sender_missing` | DataChannel opened but no peer command sender was available after sender setup; connected state is not emitted |
 | `client_worker.backpressure` | terminal/client worker queue rejected work |
 | `client_worker.session_io_missing` | terminal input or resize arrived without a registered session I/O sender |
 | `pty_osc.title`, `pty_osc.cwd`, `pty_osc.prompt`, `pty_osc.cursor`, `pty_osc.other` | OSC subtype volume |

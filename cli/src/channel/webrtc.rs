@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use mdns_sd::{HostnameResolutionEvent, ScopedIp, ServiceDaemon};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -338,6 +338,7 @@ impl WebRtcChannelBuilder {
             recv_tx: Arc::new(Mutex::new(None)),
             peer_olm_key: Arc::new(Mutex::new(None)),
             decrypt_failures: Arc::new(AtomicU32::new(0)),
+            offer_generation: Arc::new(AtomicU64::new(0)),
             dc_opened: Arc::new(AtomicBool::new(false)),
             hub_event_tx: self.hub_event_tx,
             close_complete_tx: close_tx,
@@ -385,6 +386,8 @@ pub struct WebRtcChannel {
     peer_olm_key: Arc<Mutex<Option<String>>>,
     /// Consecutive decryption failure count for session health monitoring.
     decrypt_failures: Arc<AtomicU32>,
+    /// Hub-side offer generation that owns this channel instance.
+    offer_generation: Arc<AtomicU64>,
     /// Set to `true` when the DataChannel opens; consumed by `take_dc_opened()`.
     /// Kept as test-only fallback when `hub_event_tx` is None.
     dc_opened: Arc<AtomicBool>,
@@ -788,6 +791,7 @@ impl WebRtcChannel {
         let pty_input_tx = self.pty_input_tx.clone();
         let file_input_tx = self.file_input_tx.clone();
         let dc_opened = Arc::clone(&self.dc_opened);
+        let offer_generation = Arc::clone(&self.offer_generation);
         let hub_event_tx = self.hub_event_tx.clone();
 
         // Subscribe to ICE candidates for forwarding
@@ -907,6 +911,7 @@ impl WebRtcChannel {
                                 if let Some(ref tx) = hub_event_tx {
                                     let _ = tx.send(crate::hub::events::HubEvent::DcOpened {
                                         browser_identity: browser_id.clone(),
+                                        generation: offer_generation.load(Ordering::Relaxed),
                                     });
                                 } else {
                                     dc_opened.store(true, Ordering::Relaxed);
@@ -1454,6 +1459,14 @@ impl WebRtcChannel {
     /// Reset decryption failure counter.
     pub fn reset_decrypt_failures(&self) {
         self.decrypt_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Stamp this channel with the hub offer generation that owns it.
+    ///
+    /// DataChannel-open events carry this value back to the hub so stale opens
+    /// from replaced channels cannot be attributed to the current offer.
+    pub(crate) fn set_offer_generation(&self, generation: u64) {
+        self.offer_generation.store(generation, Ordering::Relaxed);
     }
 
     /// Returns `true` exactly once after the DataChannel opens.

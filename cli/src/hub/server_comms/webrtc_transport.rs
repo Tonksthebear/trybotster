@@ -675,6 +675,7 @@ impl Hub {
     }
 
     pub(super) fn start_webrtc_offer(&mut self, sdp: &str, browser_identity: &str) {
+        let offer_started = Instant::now();
         if crate::env::is_offline() {
             log::warn!("[WebRTC] Rejecting offer — hub is in offline mode");
             return;
@@ -691,8 +692,13 @@ impl Hub {
 
         if !self.webrtc.has_channel(browser_identity) {
             // Clean up stale channels from the same device (same Olm key, different tab UUID).
+            let replacement_started = Instant::now();
+            let mut did_replacement_work = false;
             let olm_key = crate::relay::extract_olm_key(browser_identity);
             let stale = self.webrtc.same_device_channels(browser_identity);
+            if !stale.is_empty() {
+                did_replacement_work = true;
+            }
             for stale_id in stale {
                 log::info!(
                     "[WebRTC] Replacing stale channel for same device: {}",
@@ -709,17 +715,30 @@ impl Hub {
             ) {
                 crate::worker::webrtc::ReplacedPeerCloseWait::NoPendingClose => {}
                 crate::worker::webrtc::ReplacedPeerCloseWait::AlreadyClosed => {
+                    did_replacement_work = true;
                     log::debug!("[WebRTC] Previous connection already closed");
                 }
                 crate::worker::webrtc::ReplacedPeerCloseWait::Closed => {
+                    did_replacement_work = true;
                     log::debug!("[WebRTC] Previous connection sockets released");
                 }
                 crate::worker::webrtc::ReplacedPeerCloseWait::ClosedChannelDropped => {
+                    did_replacement_work = true;
                     log::debug!("[WebRTC] Close channel dropped, proceeding");
                 }
                 crate::worker::webrtc::ReplacedPeerCloseWait::TimedOut => {
+                    did_replacement_work = true;
                     log::debug!("[WebRTC] Previous connection still closing, proceeding anyway");
                 }
+            }
+            if did_replacement_work {
+                self.hub_event_metrics.record_span_with_threshold(
+                    "webrtc_offer.replacement",
+                    replacement_started.elapsed(),
+                    0,
+                    Self::HOT_SUBHANDLER_SLOW,
+                    browser_identity,
+                );
             }
         }
 
@@ -740,13 +759,23 @@ impl Hub {
             pty_input_tx: self.webrtc.pty_input_tx(),
             file_input_tx: self.webrtc.file_input_tx(),
         };
+        let channel_started = Instant::now();
         let start = match self.webrtc.start_offer(request, &self.tokio_runtime) {
             Ok(start) => start,
             Err(error) => {
                 log::error!("[WebRTC] Failed to configure channel: {error}");
+                self.hub_event_metrics
+                    .record_counter("webrtc_offer.start_failed", 1);
                 return;
             }
         };
+        self.hub_event_metrics.record_span_with_threshold(
+            "webrtc_offer.start_channel",
+            channel_started.elapsed(),
+            sdp.len(),
+            Self::HOT_SUBHANDLER_SLOW,
+            browser_identity,
+        );
         let event_tx = self.hub_event_tx.clone();
 
         // Spawn async task for SDP negotiation + answer encryption.
@@ -757,6 +786,13 @@ impl Hub {
                 completion,
             ));
         });
+        self.hub_event_metrics.record_span_with_threshold(
+            "webrtc_offer.dispatch",
+            offer_started.elapsed(),
+            sdp.len(),
+            Self::HOT_SUBHANDLER_SLOW,
+            browser_identity,
+        );
     }
 
     #[cfg(test)]

@@ -92,31 +92,37 @@ impl Hub {
             .terminal_subscription_peers
             .contains_key(&subscription_key)
         {
-            let _ = pty_handle.enqueue_session_io_request(
-                crate::worker::session_io::SessionIoRequest::Resize {
-                    rows: req.rows,
-                    cols: req.cols,
-                },
-            );
-            let _ = worker.try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
-                crate::worker::client::ClientControlFrame::BoundaryJson(serde_json::json!({
-                    "type": "subscribed",
-                    "subscriptionId": req.subscription_id.clone(),
-                })),
-            ));
-            Self::send_worker_terminal_attach_state(
-                &worker,
-                &req.subscription_id,
-                &req.session_uuid,
-                "attached",
-            );
-            log::debug!(
-                "[WebRTC] Reused active terminal subscription for {} resize={}x{}",
-                subscription_key,
-                req.cols,
-                req.rows
-            );
-            return true;
+            if self.terminal_subscription_id(&subscription_key)
+                != Some(req.subscription_id.as_str())
+            {
+                self.replace_terminal_subscription(&subscription_key);
+            } else {
+                let _ = pty_handle.enqueue_session_io_request(
+                    crate::worker::session_io::SessionIoRequest::Resize {
+                        rows: req.rows,
+                        cols: req.cols,
+                    },
+                );
+                let _ = worker.try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                    crate::worker::client::ClientControlFrame::BoundaryJson(serde_json::json!({
+                        "type": "subscribed",
+                        "subscriptionId": req.subscription_id.clone(),
+                    })),
+                ));
+                Self::send_worker_terminal_attach_state(
+                    &worker,
+                    &req.subscription_id,
+                    &req.session_uuid,
+                    "attached",
+                );
+                log::debug!(
+                    "[WebRTC] Reused active terminal subscription for {} resize={}x{}",
+                    subscription_key,
+                    req.cols,
+                    req.rows
+                );
+                return true;
+            }
         }
 
         // Stop any existing subscription for this key.
@@ -124,7 +130,7 @@ impl Hub {
             .terminal_subscription_peers
             .contains_key(&subscription_key)
         {
-            self.stop_terminal_subscription(&subscription_key);
+            self.replace_terminal_subscription(&subscription_key);
             log::debug!(
                 "[WebRTC] Replaced terminal subscription for {}",
                 subscription_key
@@ -166,6 +172,7 @@ impl Hub {
                 &req.session_uuid,
                 &req.peer_id,
             );
+            self.register_terminal_subscription_id(&subscription_key, &req.subscription_id);
         }
         attached
     }

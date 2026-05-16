@@ -105,6 +105,8 @@ pub(crate) enum HubEvent {
     DcOpened {
         /// Browser identity key for the peer whose DC just opened.
         browser_identity: String,
+        /// Offer generation owned by the channel that emitted this event.
+        generation: u64,
     },
 
     /// A bounded WebRTC ingress queue filled up for a browser peer.

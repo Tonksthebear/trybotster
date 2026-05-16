@@ -146,6 +146,18 @@ describe("HubPeerConnection peer lost transitions", () => {
     return plaintext
   }
 
+  function encodePtyMessage(subscriptionId, payload) {
+    const subBytes = new TextEncoder().encode(subscriptionId)
+    const payloadBytes = new TextEncoder().encode(payload)
+    const plaintext = new Uint8Array(3 + subBytes.length + payloadBytes.length)
+    plaintext[0] = 1
+    plaintext[1] = 0
+    plaintext[2] = subBytes.length
+    plaintext.set(subBytes, 3)
+    plaintext.set(payloadBytes, 3 + subBytes.length)
+    return plaintext
+  }
+
   it("emits peer-ready timing when the data channel opens", async () => {
     const pc = await connectPeer()
 
@@ -188,6 +200,113 @@ describe("HubPeerConnection peer lost transitions", () => {
       subscribeReadyMs: expect.any(Number),
     })
     expect(readyEvents[0].subscribeReadyMs).toBeGreaterThanOrEqual(0)
+  })
+
+  it("registers subscription confirmation before sending subscribe frame", async () => {
+    const pc = await connectPeer()
+    pc.dataChannel.readyState = "open"
+
+    mocks.bridge.decryptBinary.mockResolvedValueOnce({
+      data: encodeControlMessage({ type: "dc_ready" }),
+    })
+    pc.dataChannel.onmessage({ data: new Uint8Array([0]) })
+    await flushPromises()
+
+    mocks.bridge.decryptBinary.mockResolvedValueOnce({
+      data: encodeControlMessage({ type: "subscribed", subscriptionId: "sub-fast" }),
+    })
+    pc.dataChannel.send.mockImplementationOnce(() => {
+      pc.dataChannel.onmessage({ data: new Uint8Array([0]) })
+    })
+
+    await expect(
+      transport.subscribe("hub-1", "terminal", {}, "sub-fast", new Uint8Array([1, 2, 3])),
+    ).resolves.toEqual({ subscriptionId: "sub-fast" })
+  })
+
+  it("clears pending subscription confirmation when subscribe send throws", async () => {
+    const pc = await connectPeer()
+    pc.dataChannel.readyState = "open"
+
+    mocks.bridge.decryptBinary.mockResolvedValueOnce({
+      data: encodeControlMessage({ type: "dc_ready" }),
+    })
+    pc.dataChannel.onmessage({ data: new Uint8Array([0]) })
+    await flushPromises()
+
+    pc.dataChannel.send.mockImplementationOnce(() => {
+      throw new Error("send failed")
+    })
+
+    await expect(
+      transport.subscribe("hub-1", "terminal", {}, "sub-send-failed", new Uint8Array([1, 2, 3])),
+    ).rejects.toThrow("send failed")
+
+    await vi.advanceTimersByTimeAsync(10_000)
+  })
+
+  it("ignores dc_ready from an old peer generation after reconnect", async () => {
+    const serverReadyEvents = []
+    transport.on("connection:server-ready", (event) => serverReadyEvents.push(event))
+    const firstPc = await connectPeer()
+    let resolveOldDecrypt
+    const oldDecrypt = new Promise((resolve) => {
+      resolveOldDecrypt = resolve
+    })
+
+    mocks.bridge.decryptBinary.mockReturnValueOnce(oldDecrypt)
+    firstPc.dataChannel.onmessage({ data: new Uint8Array([0]) })
+    await flushPromises()
+
+    firstPc.dataChannel.onclose()
+    const secondPc = await connectPeer()
+    resolveOldDecrypt({
+      data: encodeControlMessage({ type: "dc_ready" }),
+    })
+    await flushPromises()
+
+    expect(serverReadyEvents).toEqual([])
+
+    mocks.bridge.decryptBinary.mockResolvedValueOnce({
+      data: encodeControlMessage({ type: "dc_ready" }),
+    })
+    secondPc.dataChannel.onmessage({ data: new Uint8Array([0]) })
+    await flushPromises()
+
+    expect(serverReadyEvents).toEqual([{ hubId: "hub-1" }])
+  })
+
+  it("ignores decrypted binary payloads from an old peer generation after reconnect", async () => {
+    const subscriptionMessages = []
+    transport.on("subscription:message", (event) => subscriptionMessages.push(event))
+    const firstPc = await connectPeer()
+    let resolveOldDecrypt
+    const oldDecrypt = new Promise((resolve) => {
+      resolveOldDecrypt = resolve
+    })
+
+    mocks.bridge.decryptBinary.mockReturnValueOnce(oldDecrypt)
+    firstPc.dataChannel.onmessage({ data: new Uint8Array([0]) })
+    await flushPromises()
+
+    firstPc.dataChannel.onclose()
+    const secondPc = await connectPeer()
+    resolveOldDecrypt({
+      data: encodePtyMessage("sub-old", "old-output"),
+    })
+    await flushPromises()
+
+    expect(subscriptionMessages).toEqual([])
+
+    mocks.bridge.decryptBinary.mockResolvedValueOnce({
+      data: encodePtyMessage("sub-new", "new-output"),
+    })
+    secondPc.dataChannel.onmessage({ data: new Uint8Array([0]) })
+    await flushPromises()
+
+    expect(subscriptionMessages).toHaveLength(1)
+    expect(subscriptionMessages[0].subscriptionId).toBe("sub-new")
+    expect(new TextDecoder().decode(subscriptionMessages[0].message)).toBe("new-output")
   })
 
   it("emits one datachannel_close event and tears down peer timers", async () => {
