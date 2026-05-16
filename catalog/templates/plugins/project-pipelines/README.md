@@ -218,6 +218,15 @@ intentionally render from repo-owned overview data are listed in
 `repo_rendered_screens` with the repo calls and entity sources they should
 migrate toward.
 
+Use singular, plugin-owned entity names for every published family and keep the
+shape renderer-ready: flattened relationship ids, labels, status tones, paths,
+button ids, counts, and booleans are projection fields, not browser
+reconstruction work. `project_pipelines/entity_contract.lua` is the source of
+truth for those names and fields; `project_pipelines/entities.lua` projects
+private `plugin.db` rows and hub state into that shape. Do not publish raw table
+rows, large nested graphs, route-specific view objects, or client-only state as
+entity records.
+
 Dynamic state is published as plugin-owned entities:
 
 - `/project-pipelines.ticket`
@@ -255,6 +264,19 @@ pipeline entity, because the editor mutates individual step and gate fields and
 detail screens need row-level handoff updates. Snapshot publishing is reserved
 for registration/recovery paths; mutators publish targeted entity deltas instead
 of forcing fresh `ui_tree_snapshot` frames for data-only changes.
+
+UI screens must not perform render-time `repo.*` reads for dynamic rows that
+belong to the plugin entity model. If a screen still needs repo-owned
+scaffolding before migration, list the exception in
+`project_pipelines/entity_contract.lua` under `repo_rendered_screens` with the
+repo calls and entity sources it should move toward. When a section becomes
+entity-backed, remove the old repo-rendered path, refresh-only snapshot
+dependency, docs allowance, and test exception in the same slice.
+
+Project Pipelines migrations are cold-turkey at the section boundary. Do not
+leave v1/v2 screen paths, compatibility shims, custom browser stores,
+plugin-specific subscriptions, or dual repo/entity reads after an entity-backed
+replacement lands.
 
 Stable submitter `id` values are required in repeated rows so the generic
 `ui_action` lifecycle can scope pending, success, and error feedback to the
@@ -295,6 +317,11 @@ browser components:
   `botster.presentation.toggle`. Use this for modal open flags and local
   disclosure state; do not encode those states in routes, plugin entities, or
   plugin DB tables.
+- Modal field values that are not submitted yet are browser-local presentation
+  state too. Keep draft text, selected options, temporary filters, and similar
+  local inputs in `ui.local_state` or native form state until submit; persist
+  only the accepted workflow fact through `project_pipelines/repo.lua` and the
+  resulting entity delta.
 
 Before restyling visible Catalyst primitives, inspect `tmp/tailwind_plus_preview`
 if it exists in the worktree. If the directory is absent, use the vendored
@@ -322,12 +349,15 @@ dialog keys while leaving navigation on the current ticket route.
 The current Project Pipelines UI is only partially entity-backed. Keep the next
 slices small: migrate one screen section at a time from render-time `repo.*`
 queries into existing or new plugin entity families, then remove the
-corresponding refresh-only `ui_tree_snapshot` dependency for that section. Do
-not add plugin-specific browser stores or subscription state; browser state
-remains generic entity store data plus `ui.local_state` for presentation-only
-modal/disclosure flags. When a migrated section needs data that is not already
-available as a clean field, add it to `project_pipelines/entities.lua` as an
-explicit read-model projection instead of reconstructing it in the browser.
+corresponding repo-rendered code, refresh-only `ui_tree_snapshot` dependency,
+docs allowance, and test exception for that section. Do not add
+plugin-specific browser stores or subscription state; browser state remains
+generic entity store data plus `ui.local_state` or native form state for
+presentation-only modal/disclosure flags and unsubmitted modal field values.
+When a migrated section needs data that is not already available as a clean
+field, add it to `project_pipelines/entities.lua` as an explicit read-model
+projection and document it in `entity_contract.lua` instead of reconstructing it
+in the browser.
 
 Entity families already available and expected to remain the primary UI data
 source:
