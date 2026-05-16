@@ -351,6 +351,7 @@ impl WebRtcChannelBuilder {
 /// WebRTC DataChannel-based channel implementation.
 ///
 /// Provides E2E encrypted communication via WebRTC with SCTP reliable delivery.
+#[derive(Clone)]
 pub struct WebRtcChannel {
     /// Server URL for signaling.
     server_url: String,

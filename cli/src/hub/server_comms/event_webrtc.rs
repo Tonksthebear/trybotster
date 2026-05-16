@@ -190,7 +190,7 @@ impl Hub {
                     generation,
                     queued_ice,
                     &self.tokio_runtime,
-                    |gen, candidate_str, sdp_mid, sdp_mline_index, e| {
+                    move |gen, candidate_str, sdp_mid, sdp_mline_index, e| {
                         log::warn!(
                             "[WebRTC] Failed to apply queued ICE candidate for {}: {} (gen={}, mid={:?}, mline={:?}, candidate='{}')",
                             browser_id_short,
@@ -219,6 +219,8 @@ impl Hub {
                 browser_identity,
                 generation,
             } => {
+                self.hub_event_metrics
+                    .record_counter("webrtc_offer.start_failed", 1);
                 log::warn!(
                     "[WebRTC] Offer handling failed for {} at generation {} — registry discarded channel so the next retry can start cleanly",
                     &browser_identity[..browser_identity.len().min(8)],

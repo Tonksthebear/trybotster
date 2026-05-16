@@ -130,23 +130,28 @@ impl Hub {
     ) {
         const MAX_QUEUED_ICE_PER_BROWSER: usize = 128;
 
-        let candidate_preview = candidate
-            .get("candidate")
-            .and_then(|c| c.as_str())
-            .map(Self::ice_candidate_preview);
+        let browser_id_short = browser_identity[..browser_identity.len().min(8)].to_string();
         match self.webrtc.queue_or_apply_ice(
             browser_identity,
             candidate,
             MAX_QUEUED_ICE_PER_BROWSER,
             &self.tokio_runtime,
-        ) {
-            crate::worker::webrtc::QueueOrApplyIceOutcome::Applied(Ok(())) => {}
-            crate::worker::webrtc::QueueOrApplyIceOutcome::Applied(Err(error)) => {
+            move |candidate_str, sdp_mid, sdp_mline_index, error| {
                 log::warn!(
-                    "[Lua] Failed to add ICE candidate for {}: {} (candidate='{}')",
-                    &browser_identity[..browser_identity.len().min(8)],
+                    "[Lua] Failed to add ICE candidate for {}: {} (mid={:?}, mline={:?}, candidate='{}')",
+                    browser_id_short,
                     error,
-                    candidate_preview.as_deref().unwrap_or(""),
+                    sdp_mid,
+                    sdp_mline_index,
+                    Self::ice_candidate_preview(candidate_str),
+                );
+            },
+        ) {
+            crate::worker::webrtc::QueueOrApplyIceOutcome::ApplySpawned => {}
+            crate::worker::webrtc::QueueOrApplyIceOutcome::ApplyBackpressure => {
+                log::warn!(
+                    "[Lua] Dropping ICE candidate for {} because peer ICE apply tasks are saturated",
+                    &browser_identity[..browser_identity.len().min(8)]
                 );
             }
             crate::worker::webrtc::QueueOrApplyIceOutcome::Queued(queued) => {
@@ -760,15 +765,7 @@ impl Hub {
             file_input_tx: self.webrtc.file_input_tx(),
         };
         let channel_started = Instant::now();
-        let start = match self.webrtc.start_offer(request, &self.tokio_runtime) {
-            Ok(start) => start,
-            Err(error) => {
-                log::error!("[WebRTC] Failed to configure channel: {error}");
-                self.hub_event_metrics
-                    .record_counter("webrtc_offer.start_failed", 1);
-                return;
-            }
-        };
+        let start = self.webrtc.start_offer(request);
         self.hub_event_metrics.record_span_with_threshold(
             "webrtc_offer.start_channel",
             channel_started.elapsed(),

@@ -32,6 +32,10 @@ slow samples, then logs the slowest 8 from that bounded set. Slow-sample labels
 are capped to 24 characters so peer/session identifiers do not make log lines
 unbounded.
 
+The WebRTC offer dispatch spans should be sub-millisecond during normal local
+hub use. They are kept for regression detection; sustained values above a few
+milliseconds usually mean synchronous work has leaked back into the hub path.
+
 ## Hot-Path Spans
 
 The most useful span names are:
@@ -48,7 +52,7 @@ The most useful span names are:
 | `webrtc_message.terminal_color_profile` | WebRTC color profile handler |
 | `webrtc_message.lua` | Lua fallback for WebRTC messages |
 | `webrtc_offer.replacement` | same-device stale peer cleanup and advisory close wait before a new offer; emitted only when replacement work actually occurred |
-| `webrtc_offer.start_channel` | hub-side WebRTC channel setup before async SDP negotiation |
+| `webrtc_offer.start_channel` | hub-side WebRTC channel object preparation before async channel connect and SDP negotiation |
 | `webrtc_offer.dispatch` | total synchronous offer dispatch work before negotiation is spawned |
 | `webrtc_open.ready_path` | DataChannel-open work to install receive forwarding, send queue, client worker route, ping, connected state, and `dc_ready`; excludes Lua `peer_connected` callback time |
 | `webrtc_open.total` | full hub-side DataChannel-open handler, including Lua `peer_connected` callback time on successful opens |
@@ -92,7 +96,7 @@ largest observed value instead of summing every sample.
 | `webrtc_send.unknown_peer` | send targeted a peer with no active send task |
 | `webrtc_send.unknown_peer_burst` | unknown-peer burst guardrail fired |
 | `webrtc_channel.closed_after_connect` | channel closed shortly after connected/open |
-| `webrtc_offer.start_failed` | channel setup failed before async SDP negotiation could start |
+| `webrtc_offer.start_failed` | async channel connect, SDP handling, or answer encryption failed before answer dispatch |
 | `webrtc_open.unknown_peer` | DataChannel-open event arrived for a peer no longer owned by the registry |
 | `webrtc_open.stale_generation` | DataChannel-open event belonged to an older offer generation and was ignored |
 | `webrtc_open.recv_forwarder_failed` | DataChannel opened but the registry could not start the receive forwarder; connected state is not emitted |

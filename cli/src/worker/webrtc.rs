@@ -31,6 +31,8 @@ pub(crate) const PEER_SEND_CHANNEL_CAPACITY: usize = 256;
 pub(crate) const PEER_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 /// Cooldown before sending a backpressure-recovery snapshot.
 pub(crate) const BACKPRESSURE_SNAPSHOT_COOLDOWN: Duration = Duration::from_millis(500);
+/// Maximum in-flight ICE candidate apply tasks per browser peer.
+pub(crate) const WEBRTC_ICE_APPLY_IN_FLIGHT_PER_BROWSER: usize = 8;
 
 /// Item queued for a per-peer async WebRTC send task.
 #[derive(Debug)]
@@ -170,6 +172,7 @@ pub(crate) struct WebRtcOfferStart {
     pub(crate) sdp: String,
     pub(crate) generation: u64,
     pub(crate) channel: crate::channel::WebRtcChannel,
+    pub(crate) config: crate::channel::ChannelConfig,
     pub(crate) crypto_service: crate::relay::CryptoService,
 }
 
@@ -241,6 +244,7 @@ pub(crate) struct WebRtcPeerRegistry {
     pending_closes: HashMap<String, tokio::sync::watch::Receiver<bool>>,
     offer_generation: HashMap<String, u64>,
     pending_ice_candidates: HashMap<String, Vec<(u64, serde_json::Value)>>,
+    ice_apply_limits: HashMap<String, Arc<tokio::sync::Semaphore>>,
     ratchet_restarted_peers: HashSet<String>,
     backpressure_recovery: HashMap<String, BackpressureRecoveryEntry>,
     outgoing_signal_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::OutgoingSignal>,
@@ -466,17 +470,51 @@ impl WebRtcTransportRunner {
         }
     }
 
+    /// Connect the WebRTC channel, process the browser offer, and encrypt the answer.
     pub(crate) async fn negotiate_offer(start: WebRtcOfferStart) -> WebRtcOfferCompletion {
         let WebRtcOfferStart {
             browser_identity,
             sdp,
             generation,
-            channel,
+            mut channel,
+            config,
             crypto_service,
         } = start;
         let started_at = Instant::now();
+        let encrypted_answer = if let Err(error) = channel.connect(config).await {
+            log::error!(
+                "[WebRTC] Failed to configure channel before offer handling after {}ms: {error}",
+                started_at.elapsed().as_millis()
+            );
+            None
+        } else {
+            Self::handle_offer_and_encrypt_answer(
+                &channel,
+                &browser_identity,
+                &sdp,
+                &crypto_service,
+                started_at,
+            )
+            .await
+        };
+
+        WebRtcOfferCompletion {
+            browser_identity,
+            generation,
+            channel,
+            encrypted_answer,
+        }
+    }
+
+    async fn handle_offer_and_encrypt_answer(
+        channel: &crate::channel::WebRtcChannel,
+        browser_identity: &str,
+        sdp: &str,
+        crypto_service: &crate::relay::CryptoService,
+        started_at: Instant,
+    ) -> Option<serde_json::Value> {
         let olm_key = crate::relay::extract_olm_key(&browser_identity).to_string();
-        let encrypted_answer = match channel.handle_sdp_offer(&sdp, &browser_identity).await {
+        match channel.handle_sdp_offer(sdp, browser_identity).await {
             Ok(answer_sdp) => {
                 log::info!(
                     "[WebRTC] Created answer for {} in {}ms",
@@ -523,13 +561,6 @@ impl WebRtcTransportRunner {
                 );
                 None
             }
-        };
-
-        WebRtcOfferCompletion {
-            browser_identity,
-            generation,
-            channel,
-            encrypted_answer,
         }
     }
 }
@@ -557,6 +588,7 @@ impl WebRtcPeerRegistry {
             pending_closes: HashMap::new(),
             offer_generation: HashMap::new(),
             pending_ice_candidates: HashMap::new(),
+            ice_apply_limits: HashMap::new(),
             ratchet_restarted_peers: HashSet::new(),
             backpressure_recovery: HashMap::new(),
             outgoing_signal_tx,
@@ -903,11 +935,7 @@ impl WebRtcPeerRegistry {
             .unwrap_or(0)
     }
 
-    pub(crate) fn start_offer(
-        &mut self,
-        request: WebRtcOfferRequest,
-        runtime: &tokio::runtime::Runtime,
-    ) -> Result<WebRtcOfferStart, crate::channel::ChannelError> {
+    pub(crate) fn start_offer(&mut self, request: WebRtcOfferRequest) -> WebRtcOfferStart {
         use crate::channel::{ChannelConfig, WebRtcChannel};
 
         let generation = self.next_offer_generation(&request.browser_identity);
@@ -921,7 +949,7 @@ impl WebRtcPeerRegistry {
             .pty_input_tx(request.pty_input_tx)
             .file_input_tx(request.file_input_tx);
 
-        let mut channel = builder.build();
+        let channel = builder.build();
         channel.set_offer_generation(generation);
         let config = ChannelConfig {
             channel_name: "WebRtcChannel".to_string(),
@@ -932,17 +960,17 @@ impl WebRtcPeerRegistry {
             cli_subscription: false,
         };
 
-        tokio::task::block_in_place(|| runtime.block_on(channel.connect(config)))?;
         self.connection_started
             .insert(request.browser_identity.clone(), Instant::now());
 
-        Ok(WebRtcOfferStart {
+        WebRtcOfferStart {
             browser_identity: request.browser_identity,
             sdp: request.sdp,
             generation,
             channel,
+            config,
             crypto_service: request.crypto_service,
-        })
+        }
     }
 
     pub(crate) fn complete_offer(
@@ -1002,6 +1030,7 @@ impl WebRtcPeerRegistry {
         self.connection_started.remove(browser_identity);
         self.offer_generation.remove(browser_identity);
         self.pending_ice_candidates.remove(browser_identity);
+        self.ice_apply_limits.remove(browser_identity);
     }
 
     pub(crate) fn queue_ice_for_current_generation(
@@ -1026,13 +1055,17 @@ impl WebRtcPeerRegistry {
         Some(queue.len())
     }
 
-    pub(crate) fn queue_or_apply_ice(
+    pub(crate) fn queue_or_apply_ice<F>(
         &mut self,
         browser_identity: &str,
         candidate: serde_json::Value,
         max_queued: usize,
         runtime: &tokio::runtime::Runtime,
-    ) -> QueueOrApplyIceOutcome {
+        on_error: F,
+    ) -> QueueOrApplyIceOutcome
+    where
+        F: FnOnce(&str, Option<&str>, Option<u16>, crate::channel::ChannelError) + Send + 'static,
+    {
         let candidate_str = candidate
             .get("candidate")
             .and_then(|c| c.as_str())
@@ -1047,14 +1080,17 @@ impl WebRtcPeerRegistry {
             .and_then(|i| i.as_u64())
             .map(|i| i as u16);
 
-        if let Some(result) = self.apply_browser_ice_candidate(
+        if self.spawn_browser_ice_candidate_apply(
             browser_identity,
             candidate_str,
             sdp_mid,
             sdp_mline_index,
             runtime,
+            on_error,
         ) {
-            return QueueOrApplyIceOutcome::Applied(result);
+            return QueueOrApplyIceOutcome::ApplySpawned;
+        } else if self.channels.contains_key(browser_identity) {
+            return QueueOrApplyIceOutcome::ApplyBackpressure;
         }
 
         self.queue_ice_for_current_generation(browser_identity, candidate, max_queued)
@@ -1108,18 +1144,49 @@ impl WebRtcPeerRegistry {
         true
     }
 
-    pub(crate) fn apply_browser_ice_candidate(
-        &self,
+    /// Spawn bounded ICE application work for an active peer.
+    ///
+    /// Candidate application is intentionally unordered; callers must not rely
+    /// on FIFO behavior for candidate side effects.
+    pub(crate) fn spawn_browser_ice_candidate_apply<F>(
+        &mut self,
         browser_identity: &str,
         candidate_str: &str,
         sdp_mid: Option<&str>,
         sdp_mline_index: Option<u16>,
         runtime: &tokio::runtime::Runtime,
-    ) -> Option<Result<(), crate::channel::ChannelError>> {
-        let channel = self.channels.get(browser_identity)?;
-        Some(tokio::task::block_in_place(|| {
-            runtime.block_on(channel.handle_ice_candidate(candidate_str, sdp_mid, sdp_mline_index))
-        }))
+        on_error: F,
+    ) -> bool
+    where
+        F: FnOnce(&str, Option<&str>, Option<u16>, crate::channel::ChannelError) + Send + 'static,
+    {
+        let Some(channel) = self.channels.get(browser_identity).cloned() else {
+            return false;
+        };
+        let limit = Arc::clone(
+            self.ice_apply_limits
+                .entry(browser_identity.to_string())
+                .or_insert_with(|| {
+                    Arc::new(tokio::sync::Semaphore::new(
+                        WEBRTC_ICE_APPLY_IN_FLIGHT_PER_BROWSER,
+                    ))
+                }),
+        );
+        let Ok(permit) = limit.try_acquire_owned() else {
+            return false;
+        };
+        let candidate_str = candidate_str.to_string();
+        let sdp_mid = sdp_mid.map(String::from);
+        runtime.spawn(async move {
+            let _permit = permit;
+            if let Err(error) = channel
+                .handle_ice_candidate(&candidate_str, sdp_mid.as_deref(), sdp_mline_index)
+                .await
+            {
+                on_error(&candidate_str, sdp_mid.as_deref(), sdp_mline_index, error);
+            }
+        });
+        true
     }
 
     pub(crate) fn apply_queued_ice_for_offer<F>(
@@ -1130,9 +1197,13 @@ impl WebRtcPeerRegistry {
         runtime: &tokio::runtime::Runtime,
         mut on_error: F,
     ) where
-        F: FnMut(u64, &str, Option<&str>, Option<u16>, crate::channel::ChannelError),
+        F: FnMut(u64, &str, Option<&str>, Option<u16>, crate::channel::ChannelError)
+            + Send
+            + 'static,
     {
-        let Some(channel) = self.channels.get(browser_identity) else {
+        // Queued ICE drains through one serial task after AnswerReady, so it is
+        // already bounded separately from the per-candidate fresh ICE gate.
+        let Some(channel) = self.channels.get(browser_identity).cloned() else {
             return;
         };
 
@@ -1177,23 +1248,21 @@ impl WebRtcPeerRegistry {
             return;
         }
 
-        tokio::task::block_in_place(|| {
-            runtime.block_on(async {
-                for (generation, candidate_str, sdp_mid, sdp_mline_index) in &valid {
-                    if let Err(error) = channel
-                        .handle_ice_candidate(candidate_str, sdp_mid.as_deref(), *sdp_mline_index)
-                        .await
-                    {
-                        on_error(
-                            *generation,
-                            candidate_str,
-                            sdp_mid.as_deref(),
-                            *sdp_mline_index,
-                            error,
-                        );
-                    }
+        runtime.spawn(async move {
+            for (generation, candidate_str, sdp_mid, sdp_mline_index) in valid {
+                if let Err(error) = channel
+                    .handle_ice_candidate(&candidate_str, sdp_mid.as_deref(), sdp_mline_index)
+                    .await
+                {
+                    on_error(
+                        generation,
+                        &candidate_str,
+                        sdp_mid.as_deref(),
+                        sdp_mline_index,
+                        error,
+                    );
                 }
-            });
+            }
         });
     }
 
@@ -1748,6 +1817,7 @@ impl WebRtcPeerRegistry {
         self.connected_at.remove(browser_identity);
         self.offer_generation.remove(browser_identity);
         self.pending_ice_candidates.remove(browser_identity);
+        self.ice_apply_limits.remove(browser_identity);
         if let Some(state) = self.send_tasks.remove(browser_identity) {
             drop(state.tx);
             state.task.abort();
@@ -1788,6 +1858,7 @@ impl WebRtcPeerRegistry {
         self.connection_started.clear();
         self.connected_at.clear();
         self.pending_ice_candidates.clear();
+        self.ice_apply_limits.clear();
         self.ratchet_restarted_peers.clear();
         self.pending_closes.clear();
         self.offer_generation.clear();
@@ -1812,7 +1883,10 @@ pub(crate) enum ReplacedPeerCloseWait {
 
 #[derive(Debug)]
 pub(crate) enum QueueOrApplyIceOutcome {
-    Applied(Result<(), crate::channel::ChannelError>),
+    /// ICE application was spawned; failures are reported through the callback.
+    ApplySpawned,
+    /// The peer already has too many in-flight ICE application tasks.
+    ApplyBackpressure,
     Queued(usize),
     IgnoredEmpty,
     UnknownBrowser,
@@ -1966,6 +2040,28 @@ mod tests {
             .server_url("https://example.test")
             .api_key("test-key")
             .build()
+    }
+
+    fn test_offer_request(browser_identity: &str) -> WebRtcOfferRequest {
+        let (outgoing_signal_tx, _outgoing_signal_rx) = tokio::sync::mpsc::channel(1);
+        let (stream_frame_tx, _stream_frame_rx) = tokio::sync::mpsc::channel(1);
+        let (hub_event_tx, _hub_event_rx) = tokio::sync::mpsc::channel(1);
+        let (pty_input_tx, _pty_input_rx) = tokio::sync::mpsc::channel(1);
+        let (file_input_tx, _file_input_rx) = tokio::sync::mpsc::channel(1);
+
+        WebRtcOfferRequest {
+            browser_identity: browser_identity.to_string(),
+            sdp: "v=0\r\n".to_string(),
+            hub_id: "hub-test".to_string(),
+            server_url: "https://example.test".to_string(),
+            api_key: "test-key".to_string(),
+            crypto_service: crate::relay::create_crypto_service("hub-test"),
+            outgoing_signal_tx,
+            stream_frame_tx,
+            hub_event_tx: hub_event_tx.into(),
+            pty_input_tx,
+            file_input_tx,
+        }
     }
 
     #[test]
@@ -2140,6 +2236,203 @@ mod tests {
         assert_eq!(queued[0].0, first);
         assert_eq!(queued[1].0, second);
         assert_eq!(registry.current_offer_generation(browser_identity), second);
+    }
+
+    #[test]
+    fn start_offer_prepares_async_negotiation_without_runtime_connect() {
+        let mut registry = WebRtcPeerRegistry::new();
+        let browser_identity = "olm-key:tab-1";
+
+        let start = registry.start_offer(test_offer_request(browser_identity));
+
+        assert_eq!(start.browser_identity, browser_identity);
+        assert_eq!(start.generation, 1);
+        assert_eq!(start.config.channel_name, "WebRtcChannel");
+        assert_eq!(start.config.hub_id, "hub-test");
+        assert_eq!(
+            start.config.browser_identity.as_deref(),
+            Some(browser_identity)
+        );
+        assert!(start.config.encrypt);
+        assert_eq!(start.config.compression_threshold, Some(4096));
+        assert!(!start.config.cli_subscription);
+        assert_eq!(registry.current_offer_generation(browser_identity), 1);
+        assert!(registry.connection_started.contains_key(browser_identity));
+        assert!(!registry.channels.contains_key(browser_identity));
+    }
+
+    #[test]
+    fn failed_offer_completion_clears_inflight_state_for_retry() {
+        let mut registry = WebRtcPeerRegistry::new();
+        let browser_identity = "olm-key:tab-1";
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let generation = registry.next_offer_generation(browser_identity);
+        registry
+            .connection_started
+            .insert(browser_identity.to_string(), Instant::now());
+        assert_eq!(
+            registry.queue_ice_for_current_generation(
+                browser_identity,
+                serde_json::json!({"candidate": "candidate:1 1 UDP 1 127.0.0.1 9 typ host"}),
+                128,
+            ),
+            Some(1)
+        );
+
+        let outcome = registry.complete_offer(
+            WebRtcOfferCompletion {
+                browser_identity: browser_identity.to_string(),
+                generation,
+                channel: test_channel(),
+                encrypted_answer: None,
+            },
+            &runtime,
+        );
+
+        assert!(matches!(
+            outcome,
+            WebRtcOfferCompletionOutcome::FailedCleaned { generation: 1, .. }
+        ));
+        assert_eq!(registry.current_offer_generation(browser_identity), 0);
+        assert!(!registry.connection_started.contains_key(browser_identity));
+        assert!(registry.drain_pending_ice(browser_identity).is_none());
+        assert!(!registry.channels.contains_key(browser_identity));
+    }
+
+    #[test]
+    fn active_ice_candidate_application_is_spawned_off_hot_path() {
+        let mut registry = WebRtcPeerRegistry::new();
+        let browser_identity = "olm-key:tab-1";
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        registry
+            .channels
+            .insert(browser_identity.to_string(), test_channel());
+        let (error_tx, error_rx) = std::sync::mpsc::channel();
+
+        let outcome = registry.queue_or_apply_ice(
+            browser_identity,
+            serde_json::json!({"candidate": "candidate:1 1 UDP 1 127.0.0.1 9 typ host"}),
+            128,
+            &runtime,
+            move |candidate, sdp_mid, sdp_mline_index, error| {
+                error_tx
+                    .send((
+                        candidate.to_string(),
+                        sdp_mid.map(String::from),
+                        sdp_mline_index,
+                        error.to_string(),
+                    ))
+                    .expect("send error");
+            },
+        );
+
+        assert!(matches!(outcome, QueueOrApplyIceOutcome::ApplySpawned));
+        let (candidate, sdp_mid, sdp_mline_index, error) = error_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("spawned ICE application reports async failure");
+        assert_eq!(candidate, "candidate:1 1 UDP 1 127.0.0.1 9 typ host");
+        assert_eq!(sdp_mid, None);
+        assert_eq!(sdp_mline_index, None);
+        assert!(error.contains("No peer connection"));
+    }
+
+    #[test]
+    fn active_ice_candidate_application_is_bounded_per_peer() {
+        let mut registry = WebRtcPeerRegistry::new();
+        let browser_identity = "olm-key:tab-1";
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        registry
+            .channels
+            .insert(browser_identity.to_string(), test_channel());
+        let limit = Arc::new(tokio::sync::Semaphore::new(
+            WEBRTC_ICE_APPLY_IN_FLIGHT_PER_BROWSER,
+        ));
+        let _permits: Vec<_> = (0..WEBRTC_ICE_APPLY_IN_FLIGHT_PER_BROWSER)
+            .map(|_| Arc::clone(&limit).try_acquire_owned().expect("permit"))
+            .collect();
+        registry
+            .ice_apply_limits
+            .insert(browser_identity.to_string(), limit);
+
+        let outcome = registry.queue_or_apply_ice(
+            browser_identity,
+            serde_json::json!({"candidate": "candidate:1 1 UDP 1 127.0.0.1 9 typ host"}),
+            128,
+            &runtime,
+            |_, _, _, _| panic!("saturated apply should not spawn"),
+        );
+
+        assert!(matches!(outcome, QueueOrApplyIceOutcome::ApplyBackpressure));
+    }
+
+    #[test]
+    fn queue_or_apply_ice_queues_or_rejects_when_no_active_peer_exists() {
+        let mut registry = WebRtcPeerRegistry::new();
+        let browser_identity = "olm-key:tab-1";
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+
+        assert!(matches!(
+            registry.queue_or_apply_ice(
+                browser_identity,
+                serde_json::json!({"candidate": "candidate:1"}),
+                128,
+                &runtime,
+                |_, _, _, _| panic!("no active peer should not spawn"),
+            ),
+            QueueOrApplyIceOutcome::UnknownBrowser
+        ));
+
+        registry.next_offer_generation(browser_identity);
+        assert!(matches!(
+            registry.queue_or_apply_ice(
+                browser_identity,
+                serde_json::json!({"candidate": "candidate:1"}),
+                128,
+                &runtime,
+                |_, _, _, _| panic!("queued candidate should not spawn"),
+            ),
+            QueueOrApplyIceOutcome::Queued(1)
+        ));
+    }
+
+    #[test]
+    fn queued_ice_apply_drops_stale_generations_and_reports_failures() {
+        let mut registry = WebRtcPeerRegistry::new();
+        let browser_identity = "olm-key:tab-1";
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        registry
+            .channels
+            .insert(browser_identity.to_string(), test_channel());
+        let (error_tx, error_rx) = std::sync::mpsc::channel();
+
+        registry.apply_queued_ice_for_offer(
+            browser_identity,
+            2,
+            vec![
+                (
+                    1,
+                    serde_json::json!({"candidate": "candidate:stale 1 UDP 1 127.0.0.1 9 typ host"}),
+                ),
+                (
+                    2,
+                    serde_json::json!({"candidate": "candidate:current 1 UDP 1 127.0.0.1 9 typ host"}),
+                ),
+            ],
+            &runtime,
+            move |generation, candidate, _, _, error| {
+                error_tx
+                    .send((generation, candidate.to_string(), error.to_string()))
+                    .expect("send queued error");
+            },
+        );
+
+        let (generation, candidate, error) = error_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("current generation candidate reports async failure");
+        assert_eq!(generation, 2);
+        assert!(candidate.starts_with("candidate:current"));
+        assert!(error.contains("No peer connection"));
+        assert!(error_rx.try_recv().is_err());
     }
 
     #[test]

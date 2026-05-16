@@ -1164,6 +1164,37 @@ pub(super) fn test_webrtc_dead_sender_cleanup_removes_peer_owned_state() {
 }
 
 #[test]
+pub(super) fn test_failed_webrtc_offer_completion_records_start_failed_metric() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let browser_identity = "browser-offer-failed";
+    let channel = crate::channel::WebRtcChannel::builder()
+        .server_url(hub.config.server_url.clone())
+        .api_key(hub.config.get_api_key().to_string())
+        .signal_tx(hub.webrtc.outgoing_signal_tx())
+        .stream_frame_tx(hub.webrtc.stream_frame_tx())
+        .pty_input_tx(hub.webrtc.pty_input_tx())
+        .file_input_tx(hub.webrtc.file_input_tx())
+        .crypto_service(
+            hub.browser
+                .crypto_service
+                .clone()
+                .expect("crypto service required"),
+        )
+        .build();
+    let generation = hub.webrtc.next_offer_generation(browser_identity);
+
+    hub.handle_webrtc_offer_negotiated_event(crate::worker::webrtc::WebRtcOfferCompletion {
+        browser_identity: browser_identity.to_string(),
+        generation,
+        channel,
+        encrypted_answer: None,
+    });
+
+    let snapshot = hub.hub_event_metrics.snapshot();
+    assert_eq!(snapshot.counters["webrtc_offer.start_failed"], 1);
+}
+
+#[test]
 pub(super) fn test_debug_memory_diagnostics_reports_counts_without_heap_claims() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let browser_identity = "browser-diagnostics";
