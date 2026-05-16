@@ -5,9 +5,7 @@
 -- @scope device
 -- @version 1.1.0
 
-local repo = require("project_pipelines.repo")
 local view = require("project_pipelines.web.ui")
-local util = require("project_pipelines.util")
 
 local M = {}
 
@@ -117,62 +115,50 @@ end
 
 function M.render(view_state, ctx)
     local params = view_state and view_state.params or {}
-    local run = repo.get_run(params.run_id)
-    if not run then
+    local run_id = params.run_id
+    if not run_id then
         return view.panel{ ui.text{ text = "Run not found", tone = "danger" } }
     end
-
-    local run_path = "/project-pipelines.run/" .. run.id
-    local ticket = repo.get_ticket(run.ticket_id)
-    local project = ticket and not util.is_blank(ticket.project_id) and repo.get_project(ticket.project_id) or nil
-
-    local header_actions = {}
-    if ticket then
-        header_actions[#header_actions + 1] = ui.button{
-            id = "run-" .. run.id .. "-ticket",
+    local run_path = "/project-pipelines.run/" .. run_id
+    local header_actions = {
+        ui.bind_if(run_path .. "/has_ticket", ui.button{
+            id = ui.bind(run_path .. "/ticket_button_id"),
             label = "Ticket",
             icon = "ticket",
             variant = "ghost",
-            action = ui.action("botster.nav.open", { path = ctx.path("/tickets/" .. ticket.id) }),
-        }
-    end
-    if project then
-        header_actions[#header_actions + 1] = ui.button{
-            id = "run-" .. run.id .. "-project",
+            action = ui.action("botster.nav.open", { path = ui.bind(run_path .. "/ticket_path") }),
+        }),
+        ui.bind_if(run_path .. "/has_project", ui.button{
+            id = ui.bind(run_path .. "/project_button_id"),
             label = "Project",
             icon = "folder",
             variant = "ghost",
-            action = ui.action("botster.nav.open", { path = ctx.path("/projects/" .. project.id) }),
-        }
-    end
-    local current = run.current_run_step_id and repo.get_run_step_visit(run.current_run_step_id) or nil
-    if current and not util.is_blank(current.agent_session_uuid) and view.session_info(current.agent_session_uuid) then
-        header_actions[#header_actions + 1] = ui.button{
-            id = "run-" .. run.id .. "-current-agent",
+            action = ui.action("botster.nav.open", { path = ui.bind(run_path .. "/project_path") }),
+        }),
+        ui.bind_if(run_path .. "/has_current_agent", ui.button{
+            id = ui.bind(run_path .. "/current_agent_button_id"),
             label = "Current agent",
             icon = "command-line",
             variant = "solid",
             tone = "accent",
-            action = ui.action("botster.nav.open", {
-                path = ctx.path("/tickets/" .. run.ticket_id .. "/sessions/" .. current.agent_session_uuid),
-            }),
-        }
-    end
+            action = ui.action("botster.nav.open", { path = ui.bind(run_path .. "/current_agent_path") }),
+        }),
+    }
 
     return ui.stack{ direction = "vertical", gap = "4", children = {
         view.page_header{
             title = ui.bind(run_path .. "/ticket_title"),
-            back_id = "run-" .. run.id .. "-back",
+            back_id = "run-" .. run_id .. "-back",
             back_path = ctx.path("/"),
             meta = { view.badge(ui.bind(run_path .. "/status")) },
             actions = header_actions,
             description = ui.bind(run_path .. "/detail_label"),
         },
-        view.section("Steps", step_nodes(run.id)),
-        view.section("Reviews", review_nodes(run.id)),
-        view.section("Findings", finding_nodes(run.id)),
-        view.section("Artifacts", artifact_nodes(run.id)),
-        view.section("Recent Events", event_nodes(run.id)),
+        view.section("Steps", step_nodes(run_id)),
+        view.section("Reviews", review_nodes(run_id)),
+        view.section("Findings", finding_nodes(run_id)),
+        view.section("Artifacts", artifact_nodes(run_id)),
+        view.section("Recent Events", event_nodes(run_id)),
     } }
 end
 

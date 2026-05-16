@@ -1921,6 +1921,7 @@ function M.update_run_step_visit(run_step_id, attrs)
     if run_step then
         local run = M.get_run(run_step.run_id)
         if run then
+            publish_entity("run", run)
             publish_entity("ticket", M.get_ticket(run.ticket_id))
         end
     end
