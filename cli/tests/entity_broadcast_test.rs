@@ -518,6 +518,59 @@ fn send_snapshots_to_core_scope_skips_plugin_types() {
 }
 
 #[test]
+fn send_snapshots_to_owner_plugin_scope_skips_other_plugin_types() {
+    let (lua, eb) = new_eb_lua();
+
+    let register: Function = eb.get("register").unwrap();
+    for (entity_type, owner_plugin, label) in [
+        ("kanban.board", "kanban", "Roadmap"),
+        ("pipelines.ticket", "pipelines", "Reload polish"),
+    ] {
+        let opts: Table = lua.create_table().unwrap();
+        opts.set("id_field", "id").unwrap();
+        opts.set("owner_plugin", owner_plugin).unwrap();
+        let label = label.to_string();
+        let all_fn: Function = lua
+            .create_function(move |lua, ()| {
+                let arr = lua.create_table()?;
+                let item = lua.create_table()?;
+                item.set("id", label.to_lowercase().replace(' ', "-"))?;
+                item.set("label", label.as_str())?;
+                arr.set(1, item)?;
+                Ok(arr)
+            })
+            .unwrap();
+        opts.set("all", all_fn).unwrap();
+        register.call::<()>((entity_type, opts)).unwrap();
+    }
+
+    let captured: Table = lua.create_table().unwrap();
+    let client: Table = lua.create_table().unwrap();
+    let captured_for_send = captured.clone();
+    let send: Function = lua
+        .create_function(move |_, (_self, frame): (Table, Table)| {
+            let next_idx = captured_for_send.raw_len() + 1;
+            captured_for_send.raw_set(next_idx, frame)?;
+            Ok(())
+        })
+        .unwrap();
+    client.set("send", send).unwrap();
+
+    let opts: Table = lua.create_table().unwrap();
+    opts.set("owner_plugin", "pipelines").unwrap();
+    let send_snapshots_to: Function = eb.get("send_snapshots_to").unwrap();
+    send_snapshots_to
+        .call::<()>((client, "sub-plugin", opts))
+        .unwrap();
+
+    let frames = frames_as_json(&lua, &captured);
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0]["entity_type"], json!("pipelines.ticket"));
+    assert_eq!(frames[0]["subscriptionId"], json!("sub-plugin"));
+    assert_eq!(frames[0]["items"][0]["label"], json!("Reload polish"));
+}
+
+#[test]
 fn plugin_snapshot_drops_items_without_string_id() {
     let (lua, eb) = new_eb_lua();
     let register: Function = eb.get("register").unwrap();

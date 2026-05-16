@@ -165,3 +165,158 @@ fn connections_before_reload_leaves_broadcaster_intact() {
     assert_eq!(json["type"], json!("entity_patch"));
     assert_eq!(json["patch"]["title"], json!("during-reload"));
 }
+
+#[test]
+fn plugin_reloaded_invalidates_tree_cache_before_rebroadcast() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+    let dir = lua_src_dir();
+    let setup = format!(
+        r#"
+        package.path = "{dir}/?.lua;{dir}/?/init.lua;" .. package.path
+
+        callbacks = {{}}
+        invalidate_count = 0
+        route_count = 0
+        tree_count = 0
+        snapshot_attempts = 0
+        snapshot_count = 0
+
+        hooks = {{
+          on = function(event, _name, fn) callbacks[event] = fn end,
+          off = function(...) end,
+          notify = function(...) end,
+        }}
+        timer = {{
+          after_idle = function(_key, _delay, fn) fn() end,
+          every = function(_delay, _fn) return "timer:output_activity" end,
+          cancel = function(...) end,
+        }}
+        events = {{
+          on = function(name, _fn) return name .. ":sub" end,
+          off = function(...) end,
+        }}
+        hub = {{
+          server_id = function() return "hub-test" end,
+          get_worktrees = function() return {{}} end,
+          write_pty = function(...) end,
+        }}
+
+        package.loaded["hub.state"] = {{
+          get = function(_key, default) return default end,
+          set = function(...) end,
+        }}
+        package.loaded["lib.agent"] = {{
+          get = function(...) return nil end,
+          list = function() return {{}} end,
+        }}
+        package.loaded["lib.entity_model"] = {{
+          publish_session = function(...) end,
+          remove_session = function(...) end,
+          patch_session = function(...) end,
+          upsert_session_workspace = function(...) end,
+          upsert_workspace = function(...) end,
+          patch_workspace = function(...) end,
+          upsert_connection_code = function(...) end,
+          upsert_hub = function(...) end,
+          remove_session_action = function(...) end,
+        }}
+        package.loaded["lib.session"] = {{
+          get = function(...) return nil end,
+          list = function() return {{}} end,
+          all_info = function() return {{}} end,
+          is_system_session = function(...) return false end,
+        }}
+        package.loaded["lib.terminal_clients"] = {{
+          set_focused = function(...) end,
+          get_focused_sessions = function(...) return {{}} end,
+          is_any_focused = function(...) return false end,
+        }}
+        package.loaded["lib.entity_broadcast"] = {{
+          set_broadcaster = function(...) end,
+          send_snapshots_to = function(_client, sub_id, opts)
+            snapshot_attempts = snapshot_attempts + 1
+            if sub_id == "hub_bad" then error("snapshot source failed") end
+            assert(sub_id == "hub_good")
+            assert(tree_count == 2, "entity snapshots should follow tree rebroadcast")
+            assert(opts.owner_plugin == "demo")
+            snapshot_count = snapshot_count + 1
+          end,
+        }}
+        package.loaded["lib.surfaces"] = {{
+          build_route_registry_payload = function()
+            return {{ type = "ui_route_registry", routes = {{}} }}
+          end,
+          path = function(...) return nil end,
+        }}
+        package.loaded["lib.notifications"] = {{
+          evaluate = function(...) return {{ core = "suppress" }} end,
+          notify_observers = function(...) end,
+        }}
+        package.loaded["lib.tree_snapshot"] = {{
+          invalidate = function()
+            invalidate_count = invalidate_count + 1
+          end,
+        }}
+
+        local connections = require("handlers.connections")
+        connections.register_client("peer-bad", {{
+          peer_id = "peer-bad",
+          transport = {{ type = "test" }},
+          subscriptions = {{ hub_bad = {{ channel = "hub" }} }},
+          send_ui_route_registry = function(_self, sub_id)
+            assert(sub_id == "hub_bad")
+            route_count = route_count + 1
+          end,
+          send_ui_tree_snapshots = function(_self, sub_id)
+            assert(sub_id == "hub_bad")
+            assert(invalidate_count == 1, "tree cache must be invalidated before rebroadcast")
+            tree_count = tree_count + 1
+            return 1
+          end,
+          send = function(...) end,
+          disconnect = function(...) end,
+        }})
+        connections.register_client("peer-good", {{
+          peer_id = "peer-good",
+          transport = {{ type = "test" }},
+          subscriptions = {{ hub_good = {{ channel = "hub" }} }},
+          send_ui_route_registry = function(_self, sub_id)
+            assert(sub_id == "hub_good")
+            route_count = route_count + 1
+          end,
+          send_ui_tree_snapshots = function(_self, sub_id)
+            assert(sub_id == "hub_good")
+            assert(invalidate_count == 1, "tree cache must be invalidated before rebroadcast")
+            tree_count = tree_count + 1
+            return 1
+          end,
+          send = function(...) end,
+          disconnect = function(...) end,
+        }})
+
+        assert(type(callbacks.plugin_reloaded) == "function", "connections should observe plugin_reloaded")
+        callbacks.plugin_reloaded({{ key = "demo" }})
+
+        return invalidate_count, route_count, tree_count, snapshot_attempts, snapshot_count
+        "#,
+        dir = dir.display()
+    );
+
+    let (invalidate_count, route_count, tree_count, snapshot_attempts, snapshot_count): (
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+    ) = lua
+        .load(&setup)
+        .eval()
+        .expect("plugin_reloaded rebroadcast harness");
+
+    assert_eq!(invalidate_count, 1);
+    assert_eq!(route_count, 2);
+    assert_eq!(tree_count, 2);
+    assert_eq!(snapshot_attempts, 2);
+    assert_eq!(snapshot_count, 1);
+}
