@@ -1330,6 +1330,31 @@ fn catalog_plugin_project_pipelines_home_bind_lists_use_entity_empty_templates()
 }
 
 #[test]
+fn catalog_plugin_project_pipelines_run_screen_handles_stale_run_id_from_entities() {
+    let run =
+        std::fs::read_to_string(project_root_dir().join(
+            "catalog/templates/plugins/project-pipelines/project_pipelines/web/screens/run.lua",
+        ))
+        .expect("read project pipelines run screen");
+
+    assert!(
+        run.contains(r#"source = "/project-pipelines.run""#)
+            && run.contains("where = { id = run_id }")
+            && run.contains("empty_template = view.panel")
+            && run.contains("No run entity exists for run_id"),
+        "run detail should render a stale/wrong run_id notice from an entity-backed filtered list"
+    );
+    assert!(
+        run.contains(r#"ui.bind_if(run_path .. "/id""#),
+        "run detail content should only render when the selected run entity exists"
+    );
+    assert!(
+        !run.contains(r#"require("project_pipelines.repo")"#) && !run.contains("repo."),
+        "run detail screen must not reintroduce project_pipelines.repo reads"
+    );
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_screen_bindings() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
@@ -1677,6 +1702,122 @@ fn catalog_plugin_project_pipelines_run_snapshot_bounds_relationship_lookups() {
         ))
         .eval()
         .expect("Project Pipelines run entity relationship lookup bounds");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_run_entities_decorate_relationship_and_agent_fields() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local upserts = {{}}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  entity_upsert = function(_self, entity_type, entity, opts)
+                    upserts[#upserts + 1] = {{ entity_type = entity_type, entity = entity, opts = opts }}
+                  end,
+                }}
+              end,
+            }}
+
+            package.loaded["project_pipelines.web.ui"] = {{
+              status_tone = function(status)
+                return status == "blocked" and "danger" or "muted"
+              end,
+            }}
+            package.loaded["project_pipelines.db"] = {{
+              eval = function(_self, sql, param)
+                if sql:match("FROM tickets") then
+                  if param == "ticket-1" then
+                    return {{ {{ id = "ticket-1", title = "Implement pipelines", project_id = "project-1" }} }}
+                  end
+                  return {{}}
+                end
+                if sql:match("FROM projects") then
+                  if param == "project-1" then
+                    return {{ {{ id = "project-1" }} }}
+                  end
+                  return {{}}
+                end
+                if sql:match("FROM pipelines") then
+                  if param == "pipeline-1" then
+                    return {{ {{ id = "pipeline-1", name = "Default pipeline" }} }}
+                  end
+                  return {{}}
+                end
+                if sql:match("FROM pipeline_steps") then
+                  if param == "step-1" then
+                    return {{ {{ id = "step-1", name = "Implement" }} }}
+                  end
+                  return {{}}
+                end
+                if sql:match("FROM run_steps") then
+                  if param == "run-step-1" then
+                    return {{ {{ id = "run-step-1", agent_session_uuid = "sess-agent" }} }}
+                  end
+                  return {{}}
+                end
+                return {{}}
+              end,
+            }}
+
+            local entities = require("project_pipelines.entities")
+            entities.upsert(entities.types.run, {{
+              id = "run-1",
+              ticket_id = "ticket-1",
+              pipeline_id = "pipeline-1",
+              current_step_id = "step-1",
+              current_run_step_id = "run-step-1",
+              status = "active",
+            }})
+
+            local decorated = upserts[1].entity
+            assert(upserts[1].entity_type == "project-pipelines.run")
+            assert(upserts[1].opts.owner_plugin == "project-pipelines")
+            assert(decorated.ticket_title == "Implement pipelines")
+            assert(decorated.pipeline_name == "Default pipeline")
+            assert(decorated.current_step_name == "Implement")
+            assert(decorated.detail_label == "Default pipeline - current step: Implement")
+            assert(decorated.label == "Implement pipelines - Default pipeline (active)")
+            assert(decorated.path == "/pipelines/runs/run-1")
+            assert(decorated.has_ticket == true)
+            assert(decorated.ticket_path == "/pipelines/tickets/ticket-1")
+            assert(decorated.has_project == true)
+            assert(decorated.project_path == "/pipelines/projects/project-1")
+            assert(decorated.current_agent_session_uuid == "sess-agent")
+            assert(decorated.has_current_agent == true)
+            assert(decorated.current_agent_path == "/pipelines/tickets/ticket-1/sessions/sess-agent")
+
+            entities.upsert(entities.types.run, {{
+              id = "run-stale-refs",
+              ticket_id = "ticket-missing",
+              pipeline_id = "pipeline-missing",
+              status = "blocked",
+            }})
+
+            local fallback = upserts[2].entity
+            assert(fallback.ticket_title == "ticket-missing")
+            assert(fallback.pipeline_name == "pipeline-missing")
+            assert(fallback.current_step_name == "No current step")
+            assert(fallback.has_ticket == false)
+            assert(fallback.has_project == false)
+            assert(fallback.has_current_agent == false)
+            assert(fallback.current_agent_path == nil)
+            assert(fallback.status_tone == "danger")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display(),
+        ))
+        .eval()
+        .expect("Project Pipelines run entities should decorate relationship and agent fields");
 
     assert_eq!(result, "ok");
 }

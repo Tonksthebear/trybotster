@@ -9,6 +9,30 @@ local view = require("project_pipelines.web.ui")
 
 local M = {}
 
+local function stale_run_notice(run_id, ctx)
+    return ui.bind_list{
+        source = "/project-pipelines.run",
+        where = { id = run_id },
+        item_template = ui.stack{ direction = "vertical", gap = "1", children = {} },
+        empty_template = view.panel{
+            ui.stack{ direction = "vertical", gap = "2", children = {
+                view.empty(
+                    "Run not found",
+                    "No run entity exists for run_id " .. tostring(run_id) .. ". The link may be stale or from another hub.",
+                    "alert-triangle"
+                ),
+                ui.button{
+                    id = "run-" .. tostring(run_id) .. "-not-found-back",
+                    label = "Back",
+                    icon = "arrow-left",
+                    variant = "ghost",
+                    action = ui.action("botster.nav.open", { path = ctx.path("/") }),
+                },
+            } },
+        },
+    }
+end
+
 local function step_nodes(run_id)
     return {
         ui.bind_list{
@@ -146,19 +170,22 @@ function M.render(view_state, ctx)
     }
 
     return ui.stack{ direction = "vertical", gap = "4", children = {
-        view.page_header{
-            title = ui.bind(run_path .. "/ticket_title"),
-            back_id = "run-" .. run_id .. "-back",
-            back_path = ctx.path("/"),
-            meta = { view.badge(ui.bind(run_path .. "/status")) },
-            actions = header_actions,
-            description = ui.bind(run_path .. "/detail_label"),
-        },
-        view.section("Steps", step_nodes(run_id)),
-        view.section("Reviews", review_nodes(run_id)),
-        view.section("Findings", finding_nodes(run_id)),
-        view.section("Artifacts", artifact_nodes(run_id)),
-        view.section("Recent Events", event_nodes(run_id)),
+        stale_run_notice(run_id, ctx),
+        ui.bind_if(run_path .. "/id", ui.stack{ direction = "vertical", gap = "4", children = {
+            view.page_header{
+                title = ui.bind(run_path .. "/ticket_title"),
+                back_id = "run-" .. run_id .. "-back",
+                back_path = ctx.path("/"),
+                meta = { view.badge(ui.bind(run_path .. "/status")) },
+                actions = header_actions,
+                description = ui.bind(run_path .. "/detail_label"),
+            },
+            view.section("Steps", step_nodes(run_id)),
+            view.section("Reviews", review_nodes(run_id)),
+            view.section("Findings", finding_nodes(run_id)),
+            view.section("Artifacts", artifact_nodes(run_id)),
+            view.section("Recent Events", event_nodes(run_id)),
+        } }),
     } }
 end
 
