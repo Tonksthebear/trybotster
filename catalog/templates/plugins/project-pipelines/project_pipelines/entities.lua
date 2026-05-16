@@ -241,6 +241,9 @@ local function decorate_ticket_entity(entity, opts)
     entity.run_count_label = string.format("%d run%s", #runs, #runs == 1 and "" or "s")
     entity.latest_run_id = latest and latest.id or nil
     entity.latest_run_status = latest and latest.status or nil
+    entity.has_latest_run = latest ~= nil
+    entity.latest_run_button_id = latest and ("ticket-" .. tostring(entity.id or "") .. "-latest-run") or nil
+    entity.latest_run_path = latest and ("/pipelines/runs/" .. tostring(latest.id)) or nil
     entity.project_dependency_level = opts.dependency_level or 0
     entity.project_stage_label = "stage " .. tostring((opts.dependency_level or 0) + 1)
     entity.project_sort_key = string.format("%04d:%012d:%s",
@@ -252,7 +255,17 @@ local function decorate_ticket_entity(entity, opts)
         or "Starts this branch of work."
     entity.merge_active = merge_active and true or false
     entity.merge_session_uuid = merge_session_uuid
+    entity.has_merge_session = not util.is_blank(merge_session_uuid)
+    entity.merge_session_button_id = entity.has_merge_session
+        and ("ticket-" .. tostring(entity.id or "") .. "-merge-session")
+        or nil
+    entity.merge_session_path = entity.has_merge_session
+        and ("/pipelines/tickets/" .. tostring(entity.id) .. "/sessions/" .. tostring(merge_session_uuid))
+        or nil
     entity.merge_pr_url = pr_link and pr_link.pr_url or nil
+    entity.merge_pr_button_id = not util.is_blank(entity.merge_pr_url)
+        and ("ticket-" .. tostring(entity.id or "") .. "-merge-pr")
+        or nil
     entity.merge_pr_label = pr_label
     entity.merge_pr_status = pr_link and pr_link.status or nil
     entity.has_merge_pr_url = not util.is_blank(entity.merge_pr_url)

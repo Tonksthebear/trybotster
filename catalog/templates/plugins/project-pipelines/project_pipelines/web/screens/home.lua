@@ -100,6 +100,28 @@ local function merge_ticket_template()
         },
         end_ = {
             ui.badge{ text = ui.bind("@/target_label"), tone = "muted" },
+            ui.bind_if("@/has_latest_run", ui.button{
+                id = ui.bind("@/latest_run_button_id"),
+                label = "Run",
+                icon = "play-circle",
+                variant = "ghost",
+                action = ui.action("botster.nav.open", { path = ui.bind("@/latest_run_path") }),
+            }),
+            ui.bind_if("@/has_merge_pr_url", ui.button{
+                id = ui.bind("@/merge_pr_button_id"),
+                label = "Open PR",
+                icon = "external-link",
+                variant = "ghost",
+                action = ui.action("botster.url.open", { url = ui.bind("@/merge_pr_url") }),
+            }),
+            ui.bind_if("@/has_merge_session", ui.button{
+                id = ui.bind("@/merge_session_button_id"),
+                label = "Merge agent",
+                icon = "command-line",
+                variant = "solid",
+                tone = "accent",
+                action = ui.action("botster.nav.open", { path = ui.bind("@/merge_session_path") }),
+            }),
         },
     }
 end
@@ -194,9 +216,6 @@ function M.render(_view_state, ctx)
             } },
         }) },
         view.panel{ view.section("PRs And Merge", {
-            -- TODO(entity-shape): expose latest_run_path and merge_session_path
-            -- on /project-pipelines.ticket before restoring row-level Run, Open
-            -- PR, and Merge agent actions without render-time repo lookups.
             ui.list{ children = {
                 ui.bind_list{
                     source = "/project-pipelines.ticket",
