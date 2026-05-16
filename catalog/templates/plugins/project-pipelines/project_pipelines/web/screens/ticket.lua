@@ -8,7 +8,6 @@
 local repo = require("project_pipelines.repo")
 local util = require("project_pipelines.util")
 local view = require("project_pipelines.web.ui")
-local actions = require("project_pipelines.web.actions")
 
 local M = {}
 
@@ -612,10 +611,15 @@ function M.spawn_session_controls(ticket, _ctx, overview)
         return { ui.text{ text = "This ticket has no spawn target.", size = "sm", tone = "danger" } }
     end
 
-    local draft = actions.draft(_ctx)
     local prefix = "ticket_session_" .. ticket.id .. "_"
     local agent_dialog_key = "ticket-" .. ticket.id .. "-spawn-agent-open"
     local accessory_dialog_key = "ticket-" .. ticket.id .. "-spawn-accessory-open"
+    local agent_name_key = prefix .. "agent_name"
+    local prompt_key = prefix .. "prompt"
+    local accessory_name_key = prefix .. "accessory_name"
+    local default_agent_name = "codex"
+    local default_prompt = ""
+    local default_accessory_name = "terminal"
     -- Resolve the repo-config scan root from the ticket's target_id. Prefer a
     -- live ticket session's worktree (it may carry branch-local .botster
     -- config); fall back to the target's repo root. target_path is never
@@ -634,22 +638,16 @@ function M.spawn_session_controls(ticket, _ctx, overview)
         ui.select{
             id = "ticket-" .. ticket.id .. "-spawn-agent",
             label = "Agent",
-            value = draft[prefix .. "agent_name"] or "codex",
-            options = view.agent_options(draft[prefix .. "agent_name"] or "codex", config_scan_path),
-            on_change = view.field_action("project_pipelines.update_ticket_session_draft", {
-                ticket_id = ticket.id,
-                field = "agent_name",
-            }),
+            value = ui.local_state(agent_name_key, default_agent_name),
+            options = view.agent_options(nil, config_scan_path),
+            on_change = ui.action("botster.presentation.set", { key = agent_name_key }),
         },
         ui.textarea{
             id = "ticket-" .. ticket.id .. "-spawn-prompt",
             label = "Agent prompt",
             placeholder = "Optional prompt for this agent session",
-            value = draft[prefix .. "prompt"] or "",
-            on_change = view.field_action("project_pipelines.update_ticket_session_draft", {
-                ticket_id = ticket.id,
-                field = "prompt",
-            }),
+            value = ui.local_state(prompt_key, default_prompt),
+            on_change = ui.action("botster.presentation.set", { key = prompt_key }),
         },
     }
     local accessory_body = {
@@ -657,12 +655,9 @@ function M.spawn_session_controls(ticket, _ctx, overview)
         ui.select{
             id = "ticket-" .. ticket.id .. "-spawn-accessory",
             label = "Accessory",
-            value = draft[prefix .. "accessory_name"] or "terminal",
-            options = view.accessory_options(draft[prefix .. "accessory_name"] or "terminal", config_scan_path),
-            on_change = view.field_action("project_pipelines.update_ticket_session_draft", {
-                ticket_id = ticket.id,
-                field = "accessory_name",
-            }),
+            value = ui.local_state(accessory_name_key, default_accessory_name),
+            options = view.accessory_options(nil, config_scan_path),
+            on_change = ui.action("botster.presentation.set", { key = accessory_name_key }),
         },
     }
 
@@ -707,6 +702,8 @@ function M.spawn_session_controls(ticket, _ctx, overview)
                     action = ui.action("project_pipelines.spawn_ticket_session", {
                         ticket_id = ticket.id,
                         session_type = "agent",
+                        agent_name = ui.local_state(agent_name_key, default_agent_name),
+                        prompt = ui.local_state(prompt_key, default_prompt),
                     }),
                 },
             },
@@ -734,6 +731,7 @@ function M.spawn_session_controls(ticket, _ctx, overview)
                     action = ui.action("project_pipelines.spawn_ticket_session", {
                         ticket_id = ticket.id,
                         session_type = "accessory",
+                        accessory_name = ui.local_state(accessory_name_key, default_accessory_name),
                     }),
                 },
             },
