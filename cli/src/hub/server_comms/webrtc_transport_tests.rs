@@ -1195,6 +1195,25 @@ pub(super) fn test_failed_webrtc_offer_completion_records_start_failed_metric() 
 }
 
 #[test]
+pub(super) fn test_webrtc_ice_apply_backpressure_metric_recorded() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let browser_identity = "browser-ice-saturated";
+    hub.webrtc
+        .install_test_dead_connected_peer(browser_identity, &hub.tokio_runtime);
+    let _permits = hub.webrtc.saturate_test_ice_apply_limit(browser_identity);
+
+    hub.handle_browser_ice_candidate(
+        browser_identity,
+        serde_json::json!({
+            "candidate": "candidate:1 1 UDP 1 127.0.0.1 9 typ host",
+        }),
+    );
+
+    let snapshot = hub.hub_event_metrics.snapshot();
+    assert_eq!(snapshot.counters["webrtc_ice.apply_backpressure"], 1);
+}
+
+#[test]
 pub(super) fn test_debug_memory_diagnostics_reports_counts_without_heap_claims() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let browser_identity = "browser-diagnostics";
