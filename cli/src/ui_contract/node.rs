@@ -59,8 +59,8 @@ impl UiNode {
 }
 
 /// What can appear in a `children` array or a slot array — either a regular
-/// node, a `$kind`-tagged conditional wrapper, or a `$kind = "bind_list"`
-/// reactive list envelope.
+/// node, a `$kind`-tagged conditional wrapper, a `$kind = "bind_list"`
+/// reactive list envelope, or a `$kind = "bind_if"` data-conditional wrapper.
 ///
 /// Serializes as an untagged union: serde tries the `$kind`-tagged variants
 /// first and falls through to the regular node shape.
@@ -72,6 +72,9 @@ pub enum UiChild {
     /// A `$kind = "bind_list"` envelope, expanded by renderers before
     /// primitive dispatch.
     BindList(UiBindList),
+    /// A `$kind = "bind_if"` wrapper, elided by renderers when the bound
+    /// value resolves to false or null before primitive dispatch.
+    BindIf(UiBindIf),
     /// A regular primitive node.
     Node(UiNode),
 }
@@ -91,6 +94,12 @@ impl From<UiConditional> for UiChild {
 impl From<UiBindList> for UiChild {
     fn from(value: UiBindList) -> Self {
         Self::BindList(value)
+    }
+}
+
+impl From<UiBindIf> for UiChild {
+    fn from(value: UiBindIf) -> Self {
+        Self::BindIf(value)
     }
 }
 
@@ -144,6 +153,23 @@ pub enum UiBindList {
         /// the source store is absent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         empty_template: Option<Box<UiNode>>,
+    },
+}
+
+/// Data-conditional wrapper.
+///
+/// Renderers resolve `path` using the same grammar as `ui.bind`; if the
+/// resolved value is truthy, `node` is rendered. If it is false or null, the
+/// wrapper is removed.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "$kind", rename_all = "snake_case")]
+pub enum UiBindIf {
+    /// Render `node` only when `path` resolves to a truthy value.
+    BindIf {
+        /// Binding path, e.g. `@/has_terminal`.
+        path: String,
+        /// Wrapped node.
+        node: Box<UiNode>,
     },
 }
 
@@ -503,6 +529,15 @@ mod tests {
         let from_bind_list: UiChild =
             serde_json::from_value(raw_bind_list).expect("deserialize bind_list");
         assert!(matches!(from_bind_list, UiChild::BindList(_)));
+
+        let raw_bind_if = json!({
+            "$kind": "bind_if",
+            "path": "@/has_terminal",
+            "node": { "type": "button", "props": { "label": "Open terminal", "action": { "id": "botster.nav.open" } } }
+        });
+        let from_bind_if: UiChild =
+            serde_json::from_value(raw_bind_if).expect("deserialize bind_if");
+        assert!(matches!(from_bind_if, UiChild::BindIf(_)));
     }
 
     #[test]

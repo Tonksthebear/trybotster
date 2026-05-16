@@ -637,6 +637,9 @@ the entity store in insertion order and must flatten into ordinary children or
 slot siblings in both browser and TUI renderers. `ui.bind_list` may include a
 `where` object; browser and TUI renderers must apply it as exact matches against
 top-level entity fields before expanding the row template.
+`ui.bind_if(path, node)` uses the same path grammar and lets templates include
+child nodes only when a bound field is truthy; renderers remove the wrapper
+when the value is `false` or `null`.
 
 The shared primitives can map onto the current Rust render tree like this:
 

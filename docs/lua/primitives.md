@@ -351,6 +351,8 @@ Use `where = { field = value }` to scope a list to records whose top-level
 fields match exactly, such as one run's steps or one pipeline step's gates.
 The filter is part of the shared browser/TUI UI contract; do not pre-render
 filtered child collections into the tree snapshot just to get per-record rows.
+Use `ui.bind_if("@/field", node)` inside a bound template when a row should
+include an action or detail only when a model field is present/truthy.
 `ui_tree_snapshot` remains the presentation tree; plugin state changes flow
 through `entity_snapshot`, `entity_upsert`, `entity_patch`, and
 `entity_remove`.

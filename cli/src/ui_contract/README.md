@@ -460,6 +460,19 @@ match, including when the source store is absent, an optional `empty_template`
 expands as a single sibling node; it is not item-scoped, so `@/...` bindings
 inside the empty template resolve to `null`.
 
+Use `ui.bind_if(path, node)` for data-dependent child nodes inside a bound
+template. It uses the same path grammar as `ui.bind`; the wrapped node is kept
+when the resolved value is truthy and removed when it is `false` or `null`.
+
+```lua
+ui.bind_if("@/has_terminal", ui.button{
+  label = "Open terminal",
+  action = ui.action("botster.nav.open", {
+    path = ui.bind("@/terminal_path"),
+  }),
+})
+```
+
 ## Versioning
 
 This is `ui-contract` with the wire-protocol composite extensions

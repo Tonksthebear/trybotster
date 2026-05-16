@@ -581,10 +581,10 @@ local function run_entity(run)
     })
 end
 
-local function run_step_entity(run_step)
-    local entity = copy(run_step)
-    local step = rows("SELECT * FROM pipeline_steps WHERE id = ? LIMIT 1", run_step.step_id)[1]
-    local run = rows("SELECT * FROM runs WHERE id = ? LIMIT 1", run_step.run_id)[1]
+local function decorate_run_step_entity(entity, opts)
+    opts = opts or {}
+    local step = opts.step
+    local run = opts.run
     if step then
         entity.name = step.name
         entity.kind = step.kind
@@ -597,7 +597,30 @@ local function run_step_entity(run_step)
         entity.ticket_id = run.ticket_id
         entity.pipeline_id = run.pipeline_id
     end
+
+    local detail = entity.kind or ""
+    if entity.kind == "agent" and not util.is_blank(entity.agent_name) then
+        detail = detail .. " - selected agent: " .. entity.agent_name
+    elseif entity.kind == "command" and not util.is_blank(entity.command) then
+        detail = detail .. " - " .. entity.command
+    end
+    entity.sequence_label = "#" .. tostring(entity.sequence or "?")
+    entity.status_label = entity.status or entity.kind
+    entity.detail = detail
+    entity.prompt_text = entity.prompt or ""
+    entity.has_terminal = not util.is_blank(entity.agent_session_uuid) and not util.is_blank(entity.ticket_id)
+    entity.terminal_button_id = "run-" .. tostring(entity.run_id or "") .. "-terminal-" .. tostring(entity.id or "")
+    if entity.has_terminal then
+        entity.terminal_path = "/pipelines/tickets/" .. tostring(entity.ticket_id) .. "/sessions/" .. tostring(entity.agent_session_uuid)
+    end
     return entity
+end
+
+local function run_step_entity(run_step)
+    local entity = copy(run_step)
+    local step = rows("SELECT * FROM pipeline_steps WHERE id = ? LIMIT 1", run_step.step_id)[1]
+    local run = rows("SELECT * FROM runs WHERE id = ? LIMIT 1", run_step.run_id)[1]
+    return decorate_run_step_entity(entity, { step = step, run = run })
 end
 
 local function run_step_entities(run_steps)
@@ -606,20 +629,10 @@ local function run_step_entities(run_steps)
     local out = {}
     for _, run_step in ipairs(run_steps or {}) do
         local entity = copy(run_step)
-        local step = steps_by_id[run_step.step_id]
-        local run = runs_by_id[run_step.run_id]
-        if step then
-            entity.name = step.name
-            entity.kind = step.kind
-            entity.position = step.position
-            entity.agent_name = step.agent_name
-            entity.prompt = step.prompt
-            entity.command = step.command
-        end
-        if run then
-            entity.ticket_id = run.ticket_id
-            entity.pipeline_id = run.pipeline_id
-        end
+        decorate_run_step_entity(entity, {
+            step = steps_by_id[run_step.step_id],
+            run = runs_by_id[run_step.run_id],
+        })
         out[#out + 1] = entity
     end
     return out

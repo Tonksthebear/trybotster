@@ -179,6 +179,70 @@ describe('ui_contract registry — content primitives', () => {
     expect(await screen.findByText('Patched title')).toBeInTheDocument()
   })
 
+  it('bind_if renders optional bound-list children only when the field is truthy', () => {
+    applyEntityFrame({
+      v: 2,
+      type: 'entity_snapshot',
+      entity_type: 'project-pipelines.run_step',
+      items: [
+        {
+          id: 'step-1',
+          run_id: 'run-1',
+          name: 'Implement',
+          has_terminal: true,
+          terminal_path: '/pipelines/tickets/ticket-1/sessions/sess-1',
+        },
+        {
+          id: 'step-2',
+          run_id: 'run-1',
+          name: 'Review',
+          has_terminal: false,
+        },
+      ],
+      snapshot_seq: 1,
+    })
+
+    const actions: UiAction[] = []
+    const tree: UiNode = {
+      type: 'stack',
+      children: [
+        {
+          $kind: 'bind_list',
+          source: '/project-pipelines.run_step',
+          where: { run_id: 'run-1' },
+          item_template: {
+            type: 'panel',
+            children: [
+              { type: 'text', props: { text: { $bind: '@/name' } } },
+              {
+                $kind: 'bind_if',
+                path: '@/has_terminal',
+                node: {
+                  type: 'button',
+                  props: {
+                    label: 'Open terminal',
+                    action: {
+                      id: 'botster.nav.open',
+                      payload: { path: { $bind: '@/terminal_path' } },
+                    },
+                  },
+                },
+              },
+            ],
+          },
+        } as any,
+      ],
+    }
+
+    renderTree(tree, { onAction: (action) => actions.push(action) })
+
+    expect(screen.getByText('Implement')).toBeInTheDocument()
+    expect(screen.getByText('Review')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Open terminal' }))
+    expect(actions).toHaveLength(1)
+    expect(actions[0]?.payload.path).toBe('/pipelines/tickets/ticket-1/sessions/sess-1')
+  })
+
   it('icon exposes name via data-icon', () => {
     const { container } = renderTree({
       type: 'icon',

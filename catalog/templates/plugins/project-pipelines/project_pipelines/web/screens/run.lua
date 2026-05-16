@@ -11,35 +11,34 @@ local util = require("project_pipelines.util")
 
 local M = {}
 
-local function render_step(step, ctx, ticket_id)
-    local detail = step.kind
-    if step.kind == "agent" and step.agent_name then
-        detail = detail .. " - selected agent: " .. step.agent_name
-    elseif step.kind == "command" and step.command then
-        detail = detail .. " - " .. step.command
-    end
-
-    local children = {
-            view.row{
-                view.badge("#" .. tostring(step.sequence or "?"), "muted"),
-                ui.text{ text = step.name, size = "sm", weight = "semibold" },
-                view.badge(step.status or step.kind),
+local function step_nodes(run_id)
+    return {
+        ui.bind_list{
+            source = "/project-pipelines.run_step",
+            where = { run_id = run_id },
+            item_template = view.panel{
+                ui.stack{ direction = "vertical", gap = "1", children = {
+                    view.row{
+                        view.badge(ui.bind("@/sequence_label"), "muted"),
+                        ui.text{ text = ui.bind("@/name"), size = "sm", weight = "semibold" },
+                        view.badge(ui.bind("@/status_label")),
+                    },
+                    ui.text{ text = ui.bind("@/detail"), size = "xs", tone = "muted" },
+                    ui.text{ text = ui.bind("@/prompt_text"), size = "xs", tone = "muted" },
+                    ui.bind_if("@/has_terminal", ui.button{
+                        id = ui.bind("@/terminal_button_id"),
+                        label = "Open terminal",
+                        icon = "command-line",
+                        variant = "ghost",
+                        action = ui.action("botster.nav.open", {
+                            path = ui.bind("@/terminal_path"),
+                        }),
+                    }),
+                } },
             },
-            ui.text{ text = detail, size = "xs", tone = "muted" },
-            ui.text{ text = step.prompt or "", size = "xs", tone = "muted" },
+            empty_template = ui.text{ text = "No steps recorded.", size = "sm", tone = "muted" },
+        },
     }
-    if step.agent_session_uuid and step.agent_session_uuid ~= "" then
-        table.insert(children, ui.button{
-            id = "run-" .. step.run_id .. "-terminal-" .. step.id,
-            label = "Open terminal",
-            icon = "command-line",
-            variant = "ghost",
-            action = ui.action("botster.nav.open", {
-                path = ctx.path("/tickets/" .. ticket_id .. "/sessions/" .. step.agent_session_uuid),
-            }),
-        })
-    end
-    return view.panel{ ui.stack{ direction = "vertical", gap = "1", children = children } }
 end
 
 local function review_nodes(run_id)
@@ -118,19 +117,14 @@ end
 
 function M.render(view_state, ctx)
     local params = view_state and view_state.params or {}
-    local overview = repo.run_detail_overview(params.run_id)
-    local run = overview and overview.run or nil
+    local run = repo.get_run(params.run_id)
     if not run then
         return view.panel{ ui.text{ text = "Run not found", tone = "danger" } }
     end
 
     local run_path = "/project-pipelines.run/" .. run.id
-    local ticket = overview.ticket
+    local ticket = repo.get_ticket(run.ticket_id)
     local project = ticket and not util.is_blank(ticket.project_id) and repo.get_project(ticket.project_id) or nil
-    local step_nodes = {}
-    for _, step in ipairs(overview.steps) do
-        table.insert(step_nodes, render_step(step, ctx, run.ticket_id))
-    end
 
     local header_actions = {}
     if ticket then
@@ -174,7 +168,7 @@ function M.render(view_state, ctx)
             actions = header_actions,
             description = ui.bind(run_path .. "/detail_label"),
         },
-        view.section("Steps", step_nodes),
+        view.section("Steps", step_nodes(run.id)),
         view.section("Reviews", review_nodes(run.id)),
         view.section("Findings", finding_nodes(run.id)),
         view.section("Artifacts", artifact_nodes(run.id)),

@@ -93,6 +93,7 @@ pub fn register(lua: &Lua) -> Result<()> {
     // Wire protocol — reactive data sentinels for plugin layouts.
     register_bind(lua, &ui)?;
     register_local(lua, &ui)?;
+    register_bind_if(lua, &ui)?;
     register_bind_list(lua, &ui)?;
 
     lua.globals()
@@ -468,6 +469,36 @@ fn register_bind_list(lua: &Lua, ui: &Table) -> Result<()> {
         .map_err(|e| anyhow!("Failed to create ui.bind_list: {e}"))?;
     ui.set("bind_list", constructor)
         .map_err(|e| anyhow!("Failed to attach ui.bind_list: {e}"))?;
+    Ok(())
+}
+
+/// `ui.bind_if(path, node)` — data-conditional child wrapper.
+///
+/// Clients resolve `path` with the same grammar as `ui.bind`; the wrapped node
+/// is rendered only when the resolved value is truthy.
+fn register_bind_if(lua: &Lua, ui: &Table) -> Result<()> {
+    let constructor = lua
+        .create_function(|lua, (path, node): (String, Value)| {
+            if path.is_empty() {
+                return Err(mlua::Error::RuntimeError(
+                    "ui.bind_if: path must be a non-empty string".to_string(),
+                ));
+            }
+            let Value::Table(node) = node else {
+                return Err(mlua::Error::RuntimeError(format!(
+                    "ui.bind_if: node must be a UiNode table, got {}",
+                    node.type_name()
+                )));
+            };
+            let out = lua.create_table()?;
+            out.set("$kind", "bind_if")?;
+            out.set("path", path)?;
+            out.set("node", node)?;
+            Ok(out)
+        })
+        .map_err(|e| anyhow!("Failed to create ui.bind_if: {e}"))?;
+    ui.set("bind_if", constructor)
+        .map_err(|e| anyhow!("Failed to attach ui.bind_if: {e}"))?;
     Ok(())
 }
 
@@ -1941,6 +1972,35 @@ mod tests {
                 "props": { "text": { "$bind": "/session/sess-1/title" } }
             })
         );
+    }
+
+    #[test]
+    fn bind_if_emits_kind_sentinel_with_path_and_node() {
+        let lua = new_lua();
+        let v = eval_to_json(
+            &lua,
+            r#"return ui.bind_if("@/has_terminal", ui.button{
+                label = "Open terminal",
+                action = ui.action("botster.nav.open", { path = ui.bind("@/terminal_path") }),
+            })"#,
+        );
+        assert_eq!(v["$kind"], json!("bind_if"));
+        assert_eq!(v["path"], json!("@/has_terminal"));
+        assert_eq!(v["node"]["type"], json!("button"));
+        assert_eq!(
+            v["node"]["props"]["action"]["payload"]["path"],
+            json!({ "$bind": "@/terminal_path" })
+        );
+    }
+
+    #[test]
+    fn bind_if_rejects_empty_path() {
+        let lua = new_lua();
+        let err = lua
+            .load(r#"return ui.bind_if("", ui.text{ text = "x" })"#)
+            .eval::<Value>()
+            .unwrap_err();
+        assert!(err.to_string().contains("ui.bind_if"), "got {err}");
     }
 
     #[test]
