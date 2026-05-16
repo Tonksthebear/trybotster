@@ -715,21 +715,40 @@ fn catalog_plugin_project_pipelines_home_shows_linked_pr_records() {
         "home PR rows should be driven by the ticket entity stream"
     );
     for binding in [
+        r#"ui.bind("@/latest_run_path")"#,
         r#"ui.bind("@/merge_status_label")"#,
         r#"ui.bind("@/merge_status_tone")"#,
         r#"ui.bind("@/merge_detail_label")"#,
+        r#"ui.bind("@/merge_pr_url")"#,
+        r#"ui.bind("@/merge_session_path")"#,
     ] {
         assert!(
             home.contains(binding),
             "home PR rows should bind projected PR field {binding}"
         );
     }
+    for binding in [
+        r#"ui.bind_if("@/has_latest_run""#,
+        r#"ui.bind_if("@/has_merge_pr_url""#,
+        r#"ui.bind_if("@/has_merge_session""#,
+    ] {
+        assert!(
+            home.contains(binding),
+            "home PR rows should condition row actions on projected field {binding}"
+        );
+    }
+    assert!(
+        !home.contains("TODO(entity-shape)"),
+        "home PR rows should not carry the entity-shape TODO after action fields are projected"
+    );
     assert!(
         !home.contains("repo.list_pr_links") && !home.contains("latest_ticket_pr_link"),
         "home render must not reintroduce synchronous repo PR lookups"
     );
     assert!(
         entities.contains("entity.merge_pr_label = pr_label")
+            && entities.contains("entity.latest_run_path = latest and")
+            && entities.contains("entity.merge_session_path = entity.has_merge_session")
             && entities.contains(r#"entity.merge_status_label = pr_label"#)
             && entities.contains(r#""PR needs review""#),
         "ticket entities should project linked PR labels and review status for home rows"
@@ -753,10 +772,14 @@ fn catalog_plugin_project_pipelines_spawn_modal_uses_local_presentation_state() 
     assert!(ticket_screen.contains(r#"local default_accessory_name = "terminal""#));
     assert!(ticket_screen.contains("value = ui.local_state(agent_name_key, default_agent_name)"));
     assert!(ticket_screen.contains("value = ui.local_state(prompt_key, default_prompt)"));
-    assert!(ticket_screen.contains("value = ui.local_state(accessory_name_key, default_accessory_name)"));
-    assert!(ticket_screen.contains("agent_name = ui.local_state(agent_name_key, default_agent_name)"));
+    assert!(ticket_screen
+        .contains("value = ui.local_state(accessory_name_key, default_accessory_name)"));
+    assert!(
+        ticket_screen.contains("agent_name = ui.local_state(agent_name_key, default_agent_name)")
+    );
     assert!(ticket_screen.contains("prompt = ui.local_state(prompt_key, default_prompt)"));
-    assert!(ticket_screen.contains("accessory_name = ui.local_state(accessory_name_key, default_accessory_name)"));
+    assert!(ticket_screen
+        .contains("accessory_name = ui.local_state(accessory_name_key, default_accessory_name)"));
     assert!(ticket_screen.contains("botster.presentation.set"));
     assert!(ticket_screen.contains("botster.presentation.clear"));
     assert!(ticket_screen.contains("project_pipelines.spawn_ticket_session"));
