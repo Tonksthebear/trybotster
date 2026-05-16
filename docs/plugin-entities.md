@@ -90,6 +90,28 @@ Built-in entity families such as `session`, `workspace`, `spawn_target`,
 `worktree`, `hub`, `connection_code`, `template`, and `session_action` are
 reserved for core.
 
+Keep plugin model names and entity names aligned, but do not expose private
+table shape by accident. Use singular entity type names for one record family
+(`project-pipelines.ticket`, not `project-pipelines.tickets`), and keep record
+fields flat, scalar-friendly, and renderer-ready. Relationship ids, labels,
+status tones, button ids, navigation paths, and small booleans such as
+`has_terminal` belong on the read model when screens need them. Large nested
+graphs, decoded private JSON blobs, SQL column names that only make sense
+inside `plugin.db`, and renderer-specific view objects do not.
+
+Plugin modules should make the split obvious:
+
+- `db.lua` owns tables, migrations, constraints, and persistence names.
+- `repo.lua` owns validation, mutations, and private lookup helpers.
+- `entity_contract.lua` owns published `<plugin>.<type>` names and the field
+  shape screens may bind.
+- `entities.lua` owns projection from private rows and hub state into client
+  read models.
+
+When a screen needs a field that does not exist yet, add a projection field to
+`entities.lua` and document it in `entity_contract.lua`. Do not reconstruct it
+from raw repo rows in the browser or hide it in a route-specific tree snapshot.
+
 ## Entity Lifecycle
 
 Register entity families during plugin load with `lib.entity_broadcast`, then
@@ -186,6 +208,14 @@ derived labels, status tones, counts, or navigation paths, publish those fields
 on the entity record instead of teaching one renderer how to reconstruct them
 from private tables.
 
+UI screens must not read plugin repositories during render to fetch dynamic
+rows that are already model state. Render-time repo reads are allowed only for
+structural scaffolding that is not yet represented as entities, and those
+exceptions must be named in the plugin contract with a migration source. Once a
+section is entity-backed, keep it entity-backed: mutators publish
+`entity_upsert`, `entity_patch`, `entity_remove`, or targeted snapshots instead
+of forcing `ui_tree_snapshot` refreshes for data-only changes.
+
 ## Presentation State Boundary
 
 Plugin entities are for durable, shared model state. Browser-local presentation
@@ -215,6 +245,27 @@ client-specific refresh commands just to open or close local UI. Mutators that
 finish hub-side work may return
 `action.result{ presentation = { clear = { "ticket-123-dialog-open" } } }` to
 reset local presentation keys after success.
+
+Modal field values that are only browser presentation state follow the same
+boundary. Keep draft text, selected radio values, temporary filters, and other
+not-yet-submitted modal controls in browser-local state or native form state
+until the user submits an action. Persist only the submitted workflow fact
+through the plugin repo and publish the resulting entity delta. Do not mirror
+draft modal fields into plugin entities or `plugin.db` so another client can
+see half-authored local input.
+
+## Removing Old Paths
+
+Entity-backed migrations are cold-turkey at the section boundary. When a screen
+section moves to plugin entities, remove the old repo-rendered data path,
+browser-only store, custom refresh command, legacy snapshot dependency, stale
+doc example, and test allowance in the same slice. Do not leave v1/v2 names,
+compatibility shims, or "temporary" dual read paths unless the ticket has an
+explicit human-approved compatibility requirement.
+
+For Project Pipelines, the desired direction is one canonical entity-backed
+path per migrated section. `repo_rendered_screens` exists to name remaining
+exceptions, not to normalize permanent mixed rendering.
 
 ## Action Feedback Lifecycle
 
@@ -263,17 +314,22 @@ renderer-specific pending flags.
 - Use a non-empty string `id` on every record.
 - Ship durable plugin models as `plugin.db` schema/migrations plus entity
   read-model publishers; do not add plugin-specific browser stores.
+- Keep entity type names singular, namespaced, and owned by the registering
+  plugin; keep published records flat and renderer-ready.
 - Register every entity family before publishing snapshots or deltas.
 - Keep `all()` callbacks array-shaped and resilient; bad records are skipped.
 - Publish snapshots for baselines and targeted deltas for mutators.
 - Use `entity_patch` only for top-level sparse changes.
 - Keep `ui_tree_snapshot` focused on route structure, stable node ids, and
   controls; bind durable values from entity stores.
+- Do not read plugin repos at UI render time for dynamic model rows once an
+  entity family owns that section.
 - Use `ui.local_state` and `botster.presentation.*` for per-browser modal,
-  disclosure, or focus state.
+  disclosure, focus state, and not-yet-submitted modal field values.
 - Use `ui.bind_list{ where = { ... } }` for filtered child collections.
 - Give repeated submitters stable node `id` values so `ui_action_result`
   feedback scopes to the clicked control.
+- Remove dead dual paths cold-turkey when a section migrates to entities.
 - Prefer Project Pipelines as the reference plugin:
   `catalog/templates/plugins/project-pipelines/project_pipelines/entities.lua`,
   `web/screens/home.lua`, `web/screens/project.lua`, and `web/actions.lua`.

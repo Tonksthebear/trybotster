@@ -366,7 +366,14 @@ fn catalog_plugin_project_pipelines_dynamic_state_uses_plugin_entities_not_force
     assert!(
         normalized_readme.contains(
             "If a scaffold publishes plugin entities, include or document an `entity_contract.lua` module"
-        ) && normalized_readme.contains("docs/plugin-entities.md#shipping-a-model"),
+        ) && normalized_readme.contains("docs/plugin-entities.md#shipping-a-model")
+            && normalized_readme.contains("Use singular, plugin-owned entity names")
+            && normalized_readme.contains("UI screens must not perform render-time `repo.*` reads")
+            && normalized_readme.contains(
+                "Modal field values that are not submitted yet are browser-local presentation state",
+            )
+            && normalized_readme
+                .contains("Project Pipelines migrations are cold-turkey at the section boundary"),
         "README should point entity-backed templates at the canonical shipping convention"
     );
     for (entity_type, lua_key) in [
