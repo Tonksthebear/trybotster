@@ -726,6 +726,14 @@ function M.reload_plugin(name)
     end
 
     update_registry_status(name, "loaded", nil)
+    hooks.notify("plugin_reloaded", {
+        name = name,
+        plugin_name = plugin_name,
+        key = entry.key or name,
+        path = entry.path,
+        source = entry.source,
+        repo_root = entry.repo_root,
+    })
     return true
 end
 

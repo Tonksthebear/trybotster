@@ -488,6 +488,7 @@ end
 local function registered_type_names(opts)
     opts = opts or {}
     local scope = opts.scope or "all"
+    local owner_plugin = opts.owner_plugin
     local requested = nil
     if type(opts.types) == "table" then
         requested = {}
@@ -498,9 +499,10 @@ local function registered_type_names(opts)
         end
     end
     local names = {}
-    for name in pairs(registry) do
+    for name, entry in pairs(registry) do
         if (requested == nil or requested[name])
             and (scope ~= "core" or BUILTIN_ENTITY_TYPES[name])
+            and (owner_plugin == nil or entry.owner_plugin == owner_plugin)
         then
             names[#names + 1] = name
         end

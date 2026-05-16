@@ -231,6 +231,38 @@ hooks.on("surfaces_changed", "broadcast_ui_route_registry", function(_info)
     end)
 end)
 
+hooks.on("plugin_reloaded", "broadcast_plugin_reload_refresh", function(info)
+    timer.after_idle("plugin_reload_refresh", ROUTE_REGISTRY_DEBOUNCE_SECS, function()
+        local plugin_key = info and (info.key or info.name)
+        local plugin_name = info and info.plugin_name
+
+        -- A reload can replace render closures without changing the route
+        -- registry. Force the currently-open plugin surface trees through
+        -- the existing hub broadcast path so browsers/TUIs visibly pick up
+        -- the fresh code without a hub restart.
+        local TreeSnapshot = require("lib.tree_snapshot")
+        pcall(TreeSnapshot.invalidate)
+        broadcast_ui_route_registry()
+        broadcast_ui_tree_snapshots()
+
+        -- Plugin-owned entity registrations are rebuilt during reload. Ship
+        -- fresh baselines for the reloaded owner so surfaces already open on
+        -- those entities do not wait for another user action to re-request.
+        for _, client in pairs(clients) do
+            for sub_id, sub in pairs(client.subscriptions or {}) do
+                if sub.channel == "hub" then
+                    if plugin_key then
+                        EB.send_snapshots_to(client, sub_id, { owner_plugin = plugin_key })
+                    end
+                    if plugin_name and plugin_name ~= plugin_key then
+                        EB.send_snapshots_to(client, sub_id, { owner_plugin = plugin_name })
+                    end
+                end
+            end
+        end
+    end)
+end)
+
 hooks.on("agent_created", "broadcast_agent_created", function(info)
     if Session.is_system_session(info) then
         return
@@ -741,8 +773,10 @@ function M._before_reload()
     hooks.off("pty_cursor_visibility", "update_agent_cursor")
     hooks.off("client_disconnected", "unfocus_on_disconnect")
     hooks.off("surfaces_changed", "broadcast_ui_route_registry")
+    hooks.off("plugin_reloaded", "broadcast_plugin_reload_refresh")
     hooks.off("workspace_closed", "broadcast_workspace_closed")
     timer.cancel("ui_route_registry_broadcast")
+    timer.cancel("plugin_reload_refresh")
     if output_activity_timer_id then
         timer.cancel(output_activity_timer_id)
         output_activity_timer_id = nil

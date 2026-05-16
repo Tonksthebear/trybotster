@@ -284,6 +284,10 @@ fn reload_plugin_removes_capabilities_that_new_version_no_longer_registers() {
         assert(require("lib.commands").has("reload_cleanup_command"), "v1 command should be registered")
         assert(require("lib.surfaces").get("reload_cleanup_surface") ~= nil, "v1 surface should be registered")
         assert(#require("lib.action").registered_ids() == 1, "v1 action should be registered")
+
+        hooks.on("plugin_reloaded", "test.plugin_reloaded", function(info)
+            _G.reload_cleanup_reloaded = info
+        end)
         "#,
         init_path = lua_string(&init_path),
     ))
@@ -298,6 +302,11 @@ fn reload_plugin_removes_capabilities_that_new_version_no_longer_registers() {
         local loader = require("hub.loader")
         local ok, err = loader.reload_plugin("reload-cleanup")
         assert(ok, tostring(err))
+
+        assert(_G.reload_cleanup_reloaded ~= nil, "successful reload should notify plugin_reloaded")
+        assert(_G.reload_cleanup_reloaded.name == "reload-cleanup")
+        assert(_G.reload_cleanup_reloaded.plugin_name == "reload-cleanup")
+        assert(_G.reload_cleanup_reloaded.key == "reload-cleanup")
 
         assert(hooks.notify("worktree_created", {}) == 0, "stale hook should be removed")
         assert(_G.reload_cleanup_hook_called == false, "stale hook must not run")
