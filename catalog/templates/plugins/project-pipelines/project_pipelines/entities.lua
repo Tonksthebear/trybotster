@@ -596,14 +596,24 @@ local function pipeline_entities(pipelines)
 end
 
 local function run_entities(runs)
-    local tickets_by_id = index_by_id(rows("SELECT id, title, project_id FROM tickets"))
-    local projects_by_id = index_by_id(rows("SELECT id FROM projects"))
-    local pipelines_by_id = index_by_id(rows("SELECT id, name FROM pipelines"))
-    local steps_by_id = index_by_id(rows("SELECT id, name FROM pipeline_steps"))
+    local ticket_ids = {}
+    local pipeline_ids = {}
+    local step_ids = {}
     local current_run_step_ids = {}
     for _, run in ipairs(runs or {}) do
+        ticket_ids[#ticket_ids + 1] = run.ticket_id
+        pipeline_ids[#pipeline_ids + 1] = run.pipeline_id
+        step_ids[#step_ids + 1] = run.current_step_id
         current_run_step_ids[#current_run_step_ids + 1] = run.current_run_step_id
     end
+    local tickets_by_id = rows_by_id("tickets", "id, title, project_id", ticket_ids)
+    local project_ids = {}
+    for _, ticket in pairs(tickets_by_id) do
+        project_ids[#project_ids + 1] = ticket.project_id
+    end
+    local projects_by_id = rows_by_id("projects", "id", project_ids)
+    local pipelines_by_id = rows_by_id("pipelines", "id, name", pipeline_ids)
+    local steps_by_id = rows_by_id("pipeline_steps", "id, name", step_ids)
     local run_steps_by_id = rows_by_id("run_steps", "id, agent_session_uuid", current_run_step_ids)
     local view = with_view()
     local out = {}
