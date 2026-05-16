@@ -498,6 +498,22 @@ local function pipeline_step_summary(steps)
     return table.concat(labels, "\n")
 end
 
+local function decorate_run_entity(entity, opts)
+    opts = opts or {}
+    local ticket = opts.ticket
+    local pipeline = opts.pipeline
+    local step = opts.step
+    local view = opts.view
+    entity.ticket_title = ticket and ticket.title or entity.ticket_id
+    entity.pipeline_name = pipeline and pipeline.name or entity.pipeline_id
+    entity.current_step_name = step and step.name or "No current step"
+    entity.status_tone = view and view.status_tone(entity.status) or "muted"
+    entity.detail_label = entity.pipeline_name .. " - current step: " .. entity.current_step_name
+    entity.label = entity.ticket_title .. " - " .. entity.pipeline_name .. " (" .. tostring(entity.status) .. ")"
+    entity.path = "/pipelines/runs/" .. entity.id
+    return entity
+end
+
 local function pipeline_entity(pipeline)
     local entity = copy(pipeline)
     local steps = rows("SELECT * FROM pipeline_steps WHERE pipeline_id = ? ORDER BY position ASC, created_at ASC, id ASC", pipeline.id)
@@ -540,15 +556,12 @@ local function run_entities(runs)
     local out = {}
     for _, run in ipairs(runs or {}) do
         local entity = copy(run)
-        local ticket = tickets_by_id[run.ticket_id]
-        local pipeline = pipelines_by_id[run.pipeline_id]
-        local step = run.current_step_id and steps_by_id[run.current_step_id] or nil
-        entity.ticket_title = ticket and ticket.title or run.ticket_id
-        entity.pipeline_name = pipeline and pipeline.name or run.pipeline_id
-        entity.current_step_name = step and step.name or "No current step"
-        entity.status_tone = view and view.status_tone(run.status) or "muted"
-        entity.label = entity.ticket_title .. " - " .. entity.pipeline_name .. " (" .. tostring(run.status) .. ")"
-        entity.path = "/pipelines/runs/" .. run.id
+        decorate_run_entity(entity, {
+            ticket = tickets_by_id[run.ticket_id],
+            pipeline = pipelines_by_id[run.pipeline_id],
+            step = run.current_step_id and steps_by_id[run.current_step_id] or nil,
+            view = view,
+        })
         out[#out + 1] = entity
     end
     return out
@@ -560,13 +573,12 @@ local function run_entity(run)
     local pipeline = rows("SELECT * FROM pipelines WHERE id = ? LIMIT 1", run.pipeline_id)[1]
     local step = run.current_step_id and rows("SELECT * FROM pipeline_steps WHERE id = ? LIMIT 1", run.current_step_id)[1] or nil
     local view = with_view()
-    entity.ticket_title = ticket and ticket.title or run.ticket_id
-    entity.pipeline_name = pipeline and pipeline.name or run.pipeline_id
-    entity.current_step_name = step and step.name or "No current step"
-    entity.status_tone = view and view.status_tone(run.status) or "muted"
-    entity.label = entity.ticket_title .. " - " .. entity.pipeline_name .. " (" .. tostring(run.status) .. ")"
-    entity.path = "/pipelines/runs/" .. run.id
-    return entity
+    return decorate_run_entity(entity, {
+        ticket = ticket,
+        pipeline = pipeline,
+        step = step,
+        view = view,
+    })
 end
 
 local function run_step_entity(run_step)

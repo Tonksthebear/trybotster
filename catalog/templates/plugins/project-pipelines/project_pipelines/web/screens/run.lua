@@ -124,8 +124,8 @@ function M.render(view_state, ctx)
         return view.panel{ ui.text{ text = "Run not found", tone = "danger" } }
     end
 
+    local run_path = "/project-pipelines.run/" .. run.id
     local ticket = overview.ticket
-    local pipeline = overview.pipeline
     local project = ticket and not util.is_blank(ticket.project_id) and repo.get_project(ticket.project_id) or nil
     local step_nodes = {}
     for _, step in ipairs(overview.steps) do
@@ -167,12 +167,12 @@ function M.render(view_state, ctx)
 
     return ui.stack{ direction = "vertical", gap = "4", children = {
         view.page_header{
-            title = ticket and ticket.title or run.id,
+            title = ui.bind(run_path .. "/ticket_title"),
             back_id = "run-" .. run.id .. "-back",
             back_path = ctx.path("/"),
-            meta = { view.badge(run.status) },
+            meta = { view.badge(ui.bind(run_path .. "/status")) },
             actions = header_actions,
-            description = (pipeline and pipeline.name or run.pipeline_id) .. " - current step: " .. (run.current_step_id or "none"),
+            description = ui.bind(run_path .. "/detail_label"),
         },
         view.section("Steps", step_nodes),
         view.section("Reviews", review_nodes(run.id)),
