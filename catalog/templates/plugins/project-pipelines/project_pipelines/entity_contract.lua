@@ -3,7 +3,7 @@
 -- @category plugins
 -- @dest plugins/project-pipelines/project_pipelines/entity_contract.lua
 -- @scope device
--- @version 1.4.0
+-- @version 1.5.0
 
 local M = {}
 
@@ -216,6 +216,17 @@ M.screens = {
         },
     },
     run = {
+        {
+            name = "run_header",
+            mode = "record",
+            source = "/" .. M.types.run,
+            where_fields = { "id" },
+            fields = {
+                "detail_label",
+                "status",
+                "ticket_title",
+            },
+        },
         {
             name = "reviews",
             source = "/" .. M.types.review,

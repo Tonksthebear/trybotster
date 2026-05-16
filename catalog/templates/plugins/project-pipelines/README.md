@@ -371,9 +371,10 @@ Screen migration order:
    the largest overview `repo.list_runs`, `repo.visible_tickets`, event,
    artifact, and PR-link snapshot load while leaving existing project, ticket,
    question, and pipeline lists untouched.
-2. Run detail: reviews, findings, artifacts, and recent events now use
-   filtered `ui.bind_list` sources. Finish this screen by moving step cards and
-   header fields to `/project-pipelines.run`, `/project-pipelines.run_step`,
+2. Run detail: the header display, reviews, findings, artifacts, and recent
+   events now use `/project-pipelines.run` record bindings plus filtered
+   `ui.bind_list` sources. Finish this screen by moving step cards and
+   conditional header actions to `/project-pipelines.run_step`,
    `/project-pipelines.ticket`, and `/project-pipelines.project` records so the
    route no longer needs `repo.run_detail_overview`.
 3. Ticket timeline and terminal sections: replace `handoff_rows`,
