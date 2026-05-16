@@ -1562,6 +1562,126 @@ fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_
 }
 
 #[test]
+fn catalog_plugin_project_pipelines_run_snapshot_bounds_relationship_lookups() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local frames = {{}}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  entity_snapshot = function(_self, entity_type, items, opts)
+                    frames[#frames + 1] = {{ entity_type = entity_type, items = items, owner_plugin = opts.owner_plugin }}
+                  end,
+                }}
+              end,
+            }}
+
+            package.loaded["project_pipelines.web.ui"] = {{
+              status_tone = function() return "muted" end,
+            }}
+
+            local expected_ids = {{
+              tickets = {{ ["ticket-1"] = true, ["ticket-2"] = true }},
+              projects = {{ ["project-1"] = true }},
+              pipelines = {{ ["pipe-1"] = true, ["pipe-2"] = true }},
+              pipeline_steps = {{ ["step-1"] = true, ["step-2"] = true }},
+              run_steps = {{ ["run-step-1"] = true }},
+            }}
+            local bounded = {{ tickets = false, projects = false, pipelines = false, pipeline_steps = false }}
+
+            local function normalize(sql)
+              return (sql:gsub("%s+", " "))
+            end
+
+            local function assert_bound(name, sql, params)
+              sql = normalize(sql)
+              assert(sql:find(" WHERE id IN %("), name .. " lookup must be scoped by referenced ids: " .. sql)
+              assert(type(params) == "table", name .. " lookup must bind ids")
+              for _, id in ipairs(params) do
+                assert(expected_ids[name][id], name .. " lookup loaded unreferenced id: " .. tostring(id))
+              end
+              bounded[name] = true
+            end
+
+            local db = {{}}
+            function db:eval(sql, params)
+              local compact = normalize(sql)
+              if compact:find("FROM runs ORDER BY") then
+                return {{
+                  {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipe-1", status = "active", current_step_id = "step-1", current_run_step_id = "run-step-1", created_at = 1, updated_at = 2 }},
+                  {{ id = "run-2", ticket_id = "ticket-2", pipeline_id = "pipe-2", status = "done", current_step_id = "step-2", created_at = 3, updated_at = 4 }},
+                }}
+              end
+              if compact:find("FROM tickets") then
+                assert_bound("tickets", sql, params)
+                return {{
+                  {{ id = "ticket-1", title = "Ticket One", project_id = "project-1" }},
+                  {{ id = "ticket-2", title = "Ticket Two" }},
+                }}
+              end
+              if compact:find("FROM projects") then
+                assert_bound("projects", sql, params)
+                return {{ {{ id = "project-1" }} }}
+              end
+              if compact:find("FROM pipelines") then
+                assert_bound("pipelines", sql, params)
+                return {{
+                  {{ id = "pipe-1", name = "Primary" }},
+                  {{ id = "pipe-2", name = "Secondary" }},
+                }}
+              end
+              if compact:find("FROM pipeline_steps") then
+                assert_bound("pipeline_steps", sql, params)
+                return {{
+                  {{ id = "step-1", name = "Implement" }},
+                  {{ id = "step-2", name = "Review" }},
+                }}
+              end
+              if compact:find("FROM run_steps") then
+                assert_bound("run_steps", sql, params)
+                return {{ {{ id = "run-step-1", agent_session_uuid = "sess-1" }} }}
+              end
+              return {{}}
+            end
+            package.loaded["project_pipelines.db"] = db
+
+            local entities = require("project_pipelines.entities")
+            entities.snapshot(entities.types.run)
+
+            assert(#frames == 1)
+            assert(frames[1].entity_type == entities.types.run)
+            assert(frames[1].owner_plugin == "project-pipelines")
+            assert(#frames[1].items == 2)
+            assert(frames[1].items[1].ticket_title == "Ticket One")
+            assert(frames[1].items[1].pipeline_name == "Primary")
+            assert(frames[1].items[1].current_step_name == "Implement")
+            assert(frames[1].items[1].current_agent_session_uuid == "sess-1")
+            assert(frames[1].items[2].ticket_title == "Ticket Two")
+            assert(frames[1].items[2].pipeline_name == "Secondary")
+            assert(frames[1].items[2].current_step_name == "Review")
+
+            for name, was_bounded in pairs(bounded) do
+              assert(was_bounded, name .. " relationship lookup was not exercised")
+            end
+
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines run entity relationship lookup bounds");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_mcp_mutators_return_without_bulk_snapshot_publish() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
