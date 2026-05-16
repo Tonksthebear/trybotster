@@ -229,6 +229,7 @@ M.screens = {
                 "has_current_agent",
                 "has_project",
                 "has_ticket",
+                "id",
                 "project_button_id",
                 "project_path",
                 "status",
@@ -236,6 +237,12 @@ M.screens = {
                 "ticket_path",
                 "ticket_title",
             },
+        },
+        {
+            name = "stale_run_notice",
+            source = "/" .. M.types.run,
+            where_fields = { "id" },
+            fields = {},
         },
         {
             name = "steps",
