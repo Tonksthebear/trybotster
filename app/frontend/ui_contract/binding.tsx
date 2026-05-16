@@ -71,6 +71,8 @@ function resolveBindingsInner(
       const resolved = resolveBindingsInner(v, item, localScope)
       if (Array.isArray(resolved)) {
         out.push(...resolved)
+      } else if (resolved == null) {
+        continue
       } else {
         out.push(resolved)
       }
@@ -86,6 +88,9 @@ function resolveBindingsInner(
   if (isLocalSentinel(value)) {
     return resolveLocal(value, localScope)
   }
+  if (isBindIf(value)) {
+    return expandBindIf(value, item, localScope)
+  }
   if (isBindList(value)) {
     return expandBindList(value, item, localScope)
   }
@@ -100,6 +105,28 @@ function resolveBindingsInner(
     out[k] = resolveBindingsInner(v, item, localScope)
   }
   return out
+}
+
+type UiBindIf = {
+  $kind: 'bind_if'
+  path: string
+  node: UiNode
+}
+
+function isBindIf(value: unknown): value is UiBindIf {
+  if (value === null || typeof value !== 'object') return false
+  const v = value as Record<string, unknown>
+  return v.$kind === 'bind_if' && typeof v.path === 'string'
+}
+
+function expandBindIf(
+  envelope: UiBindIf,
+  item: ItemContext,
+  localScope?: LocalScope,
+): unknown {
+  const value = resolvePath(envelope.path, item)
+  if (value === null || value === false) return null
+  return resolveBindingsInner(envelope.node, item, localScope)
 }
 
 function isPlainObject(value: unknown): boolean {
@@ -319,7 +346,7 @@ export function findLocalSentinels(value: unknown): UiLocal[] {
 export function countBindings(value: unknown): number {
   let count = 0
   walk(value, (v) => {
-    if (isBindSentinel(v) || isBindList(v) || isLocalSentinel(v)) count += 1
+    if (isBindSentinel(v) || isBindList(v) || isBindIf(v) || isLocalSentinel(v)) count += 1
   })
   return count
 }
@@ -332,6 +359,9 @@ export function bindingEntityTypes(value: unknown): string[] {
       if (entityType) types.add(entityType)
     } else if (isBindList(v)) {
       const entityType = entityTypeFromPath(v.source)
+      if (entityType) types.add(entityType)
+    } else if (isBindIf(v)) {
+      const entityType = entityTypeFromPath(v.path)
       if (entityType) types.add(entityType)
     }
   })

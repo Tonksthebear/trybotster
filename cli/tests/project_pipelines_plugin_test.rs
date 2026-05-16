@@ -1448,6 +1448,10 @@ fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_
                   assert(section_fields[field],
                     screen_name .. " bound field missing from contract for " .. section.name .. ": " .. field)
                 end
+                for field in block:gmatch('ui%.bind_if%("%@/([%w_]+)"') do
+                  assert(section_fields[field],
+                    screen_name .. " bind_if field missing from contract for " .. section.name .. ": " .. field)
+                end
               end
 
               for source, expected_count in pairs(source_counts) do

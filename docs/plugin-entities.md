@@ -176,6 +176,9 @@ ui.list{ children = {
 `where` filters are exact matches against top-level record fields. `@/...`
 bindings are valid only inside the `item_template`; outside a list template,
 bind against the absolute entity path.
+Use `ui.bind_if(path, node)` inside a bound template for optional row children
+such as session buttons; the condition should be a plain model field like
+`has_terminal`, while paths and labels stay as separate entity fields.
 
 Missing scalar values resolve to `null`. Missing list sources resolve to `[]`.
 Bindings should name the read-model fields the UI expects. If a route needs

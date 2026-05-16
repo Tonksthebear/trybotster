@@ -35,7 +35,7 @@ pub mod tokens;
 pub mod viewport;
 
 pub use node::{
-    UiAction, UiCapabilitySet, UiChild, UiCondition, UiConditional, UiNode, UiResponsive,
+    UiAction, UiBindIf, UiCapabilitySet, UiChild, UiCondition, UiConditional, UiNode, UiResponsive,
     UiResponsiveHeight, UiResponsiveWidth, UiValue,
 };
 pub use props::{

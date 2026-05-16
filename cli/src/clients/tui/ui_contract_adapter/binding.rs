@@ -38,6 +38,8 @@ pub const BIND_SENTINEL_KEY: &str = "$bind";
 pub const LOCAL_SENTINEL_KEY: &str = "$local";
 /// Sentinel value for `bind_list` (under the shared `$kind` discriminator).
 pub const BIND_LIST_KIND: &str = "bind_list";
+/// Sentinel value for `bind_if` (under the shared `$kind` discriminator).
+pub const BIND_IF_KIND: &str = "bind_if";
 /// Item-relative path prefix for `@/<field>` inside a `bind_list` template.
 const ITEM_RELATIVE_PREFIX: &str = "@";
 
@@ -90,6 +92,11 @@ fn resolve_bindings_inner(
                 resolve_bindings_inner(value, stores, item_context);
                 return;
             }
+            // Detect bind_if sentinel — object with $kind == "bind_if".
+            if is_bind_if(map) {
+                *value = expand_bind_if(map, stores, item_context);
+                return;
+            }
             // Detect bind_list sentinel — object with $kind == "bind_list".
             if is_bind_list(map) {
                 *value = expand_bind_list(map, stores, item_context);
@@ -109,6 +116,7 @@ fn resolve_bindings_inner(
                 resolve_bindings_inner(&mut item, stores, item_context);
                 match item {
                     JsonValue::Array(items) => flattened.extend(items),
+                    JsonValue::Null => {}
                     other => flattened.push(other),
                 }
             }
@@ -139,6 +147,28 @@ fn try_resolve_bind(
 
 fn is_bind_list(map: &JsonMap<String, JsonValue>) -> bool {
     map.get("$kind").and_then(|v| v.as_str()) == Some(BIND_LIST_KIND)
+}
+
+fn is_bind_if(map: &JsonMap<String, JsonValue>) -> bool {
+    map.get("$kind").and_then(|v| v.as_str()) == Some(BIND_IF_KIND)
+}
+
+fn expand_bind_if(
+    map: &JsonMap<String, JsonValue>,
+    stores: &TuiEntityStores,
+    item_context: Option<&JsonValue>,
+) -> JsonValue {
+    let path = map.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    if !is_truthy(&resolve_path(path, stores, item_context)) {
+        return JsonValue::Null;
+    }
+    let mut node = map.get("node").cloned().unwrap_or(JsonValue::Null);
+    resolve_bindings_inner(&mut node, stores, item_context);
+    node
+}
+
+fn is_truthy(value: &JsonValue) -> bool {
+    !matches!(value, JsonValue::Null | JsonValue::Bool(false))
 }
 
 /// Expand a `bind_list` sentinel into an array of cloned, fully resolved
@@ -302,6 +332,8 @@ pub fn count_bindings(value: &JsonValue) -> usize {
                 count += 1;
             } else if is_bind_list(map) {
                 count += 1;
+            } else if is_bind_if(map) {
+                count += 1;
             }
         }
     });
@@ -345,12 +377,15 @@ mod tests {
                 json!({
                     "session_uuid": "sess-a",
                     "title": "alpha",
+                    "connected": true,
+                    "path": "/sessions/a",
                     "output_activity": "active",
                     "plugin_state": { "example_provider": { "status": "running", "url": "https://x" } }
                 }),
                 json!({
                     "session_uuid": "sess-b",
                     "title": "beta",
+                    "connected": false,
                     "output_activity": "idle"
                 }),
             ],
@@ -686,6 +721,65 @@ mod tests {
         resolve_bindings(&mut value, &stores);
         assert_eq!(value[0]["type"], json!("empty_state"));
         assert_eq!(value[0]["props"]["title"], json!("No tickets"));
+    }
+
+    #[test]
+    fn bind_if_keeps_node_when_item_path_is_truthy() {
+        let stores = stores_with_sessions();
+        let mut value = json!({
+            "$kind": "bind_list",
+            "source": "/session",
+            "where": { "session_uuid": "sess-a" },
+            "item_template": {
+                "type": "stack",
+                "props": { "direction": "vertical" },
+                "children": [
+                    {
+                        "$kind": "bind_if",
+                        "path": "@/connected",
+                        "node": {
+                            "type": "button",
+                            "props": {
+                                "label": "Open",
+                                "action": {
+                                    "id": "botster.nav.open",
+                                    "payload": { "path": { "$bind": "@/path" } }
+                                }
+                            }
+                        }
+                    }
+                ]
+            }
+        });
+        resolve_bindings(&mut value, &stores);
+        assert_eq!(value[0]["children"].as_array().expect("children").len(), 1);
+        assert_eq!(
+            value[0]["children"][0]["props"]["action"]["payload"]["path"],
+            json!("/sessions/a")
+        );
+    }
+
+    #[test]
+    fn bind_if_drops_node_when_item_path_is_false() {
+        let stores = stores_with_sessions();
+        let mut value = json!({
+            "$kind": "bind_list",
+            "source": "/session",
+            "where": { "session_uuid": "sess-b" },
+            "item_template": {
+                "type": "stack",
+                "props": { "direction": "vertical" },
+                "children": [
+                    {
+                        "$kind": "bind_if",
+                        "path": "@/connected",
+                        "node": { "type": "text", "props": { "text": "connected" } }
+                    }
+                ]
+            }
+        });
+        resolve_bindings(&mut value, &stores);
+        assert_eq!(value[0]["children"].as_array().expect("children").len(), 0);
     }
 
     #[test]

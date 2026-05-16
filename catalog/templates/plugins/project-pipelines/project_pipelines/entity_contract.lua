@@ -3,7 +3,7 @@
 -- @category plugins
 -- @dest plugins/project-pipelines/project_pipelines/entity_contract.lua
 -- @scope device
--- @version 1.5.0
+-- @version 1.6.0
 
 local M = {}
 
@@ -228,6 +228,21 @@ M.screens = {
             },
         },
         {
+            name = "steps",
+            source = "/" .. M.types.run_step,
+            where_fields = { "run_id" },
+            fields = {
+                "detail",
+                "has_terminal",
+                "name",
+                "prompt_text",
+                "sequence_label",
+                "status_label",
+                "terminal_button_id",
+                "terminal_path",
+            },
+        },
+        {
             name = "reviews",
             source = "/" .. M.types.review,
             where_fields = { "run_id" },
@@ -285,15 +300,15 @@ M.repo_rendered_screens = {
         },
     },
     run = {
-        reason = "run detail still renders one composite overview for header actions and step cards",
+        reason = "run detail still uses targeted repo reads for conditional header actions",
         repo_calls = {
+            "get_ticket",
             "get_project",
             "get_run_step_visit",
-            "run_detail_overview",
+            "get_run",
         },
         migration_sources = {
             "/" .. M.types.run,
-            "/" .. M.types.run_step,
             "/" .. M.types.ticket,
             "/" .. M.types.project,
         },

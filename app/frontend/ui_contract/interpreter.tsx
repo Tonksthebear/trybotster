@@ -50,6 +50,7 @@ function renderConditional(
   ctx: RenderContext,
   key: string | number,
 ): ReactNode {
+  if (wrapper.$kind === 'bind_if') return null
   const matches = matchesCondition(wrapper.condition, ctx.viewport)
   const shouldRender = wrapper.$kind === 'when' ? matches : !matches
   if (!shouldRender) return null

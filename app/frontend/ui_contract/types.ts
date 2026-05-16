@@ -100,6 +100,7 @@ export type UiCondition = {
 export type UiConditional =
   | { $kind: 'when'; condition: UiCondition; node: UiNode }
   | { $kind: 'hidden'; condition: UiCondition; node: UiNode }
+  | { $kind: 'bind_if'; path: string; node: UiNode }
 
 // ---------- Core node + action + capabilities ----------
 
@@ -412,7 +413,8 @@ export type UiPrimitiveType =
 
 export function isConditional(child: UiChild): child is UiConditional {
   return (child as UiConditional).$kind === 'when' ||
-    (child as UiConditional).$kind === 'hidden'
+    (child as UiConditional).$kind === 'hidden' ||
+    (child as UiConditional).$kind === 'bind_if'
 }
 
 /** Returns true when `value` is a `$bind` sentinel object. */
