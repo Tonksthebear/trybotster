@@ -226,15 +226,6 @@ function M.register()
         }
     end)
 
-    action.on("project_pipelines.update_ticket_session_draft", "project_pipelines.update_ticket_session_draft", function(envelope, ctx)
-        local payload = value_payload(envelope)
-        if payload.ticket_id and payload.field then
-            current_draft(ctx)["ticket_session_" .. payload.ticket_id .. "_" .. payload.field] = payload.value or ""
-            refresh(ctx)
-        end
-        return action.HANDLED
-    end)
-
     action.on("project_pipelines.spawn_ticket_session", "project_pipelines.spawn_ticket_session", function(envelope, ctx)
         local payload = value_payload(envelope)
         if util.is_blank(payload.ticket_id) then
@@ -248,29 +239,25 @@ function M.register()
             return action.result{ ok = false, error = "Ticket has no spawn target." }
         end
 
-        local draft = current_draft(ctx)
         local prefix = "ticket_session_" .. ticket.id .. "_"
-        local session_type = payload.session_type or draft[prefix .. "type"] or "agent"
+        local session_type = payload.session_type or "agent"
 
         if session_type == "accessory" then
-            local accessory_name = draft[prefix .. "accessory_name"] or payload.accessory_name or "terminal"
             local ok, created = pcall(engine.spawn_ticket_session, {
                 ticket_id = ticket.id,
                 session_type = "accessory",
-                accessory_name = accessory_name,
+                accessory_name = payload.accessory_name,
             }, ctx)
             if not ok then
                 refresh(ctx)
                 return action.result{ ok = false, error = tostring(created) }
             end
         else
-            local agent_name = draft[prefix .. "agent_name"] or payload.agent_name or "codex"
-            local prompt = draft[prefix .. "prompt"]
             local ok, created = pcall(engine.spawn_ticket_session, {
                 ticket_id = ticket.id,
                 session_type = "agent",
-                agent_name = agent_name,
-                prompt = prompt,
+                agent_name = payload.agent_name,
+                prompt = payload.prompt,
             }, ctx)
             if not ok then
                 refresh(ctx)
@@ -278,7 +265,6 @@ function M.register()
             end
         end
 
-        draft[prefix .. "prompt"] = nil
         refresh(ctx)
         return action.result{
             message = "Session requested.",
@@ -286,6 +272,9 @@ function M.register()
                 clear = {
                     "ticket-" .. ticket.id .. "-spawn-agent-open",
                     "ticket-" .. ticket.id .. "-spawn-accessory-open",
+                    prefix .. "agent_name",
+                    prefix .. "prompt",
+                    prefix .. "accessory_name",
                 },
             },
         }

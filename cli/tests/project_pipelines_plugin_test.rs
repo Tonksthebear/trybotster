@@ -748,16 +748,44 @@ fn catalog_plugin_project_pipelines_spawn_modal_uses_local_presentation_state() 
         .expect("read actions");
 
     assert!(ticket_screen.contains("ui.local_state(agent_dialog_key, false)"));
+    assert!(ticket_screen.contains(r#"local default_agent_name = "codex""#));
+    assert!(ticket_screen.contains(r#"local default_prompt = """#));
+    assert!(ticket_screen.contains(r#"local default_accessory_name = "terminal""#));
+    assert!(ticket_screen.contains("value = ui.local_state(agent_name_key, default_agent_name)"));
+    assert!(ticket_screen.contains("value = ui.local_state(prompt_key, default_prompt)"));
+    assert!(ticket_screen.contains("value = ui.local_state(accessory_name_key, default_accessory_name)"));
+    assert!(ticket_screen.contains("agent_name = ui.local_state(agent_name_key, default_agent_name)"));
+    assert!(ticket_screen.contains("prompt = ui.local_state(prompt_key, default_prompt)"));
+    assert!(ticket_screen.contains("accessory_name = ui.local_state(accessory_name_key, default_accessory_name)"));
     assert!(ticket_screen.contains("botster.presentation.set"));
     assert!(ticket_screen.contains("botster.presentation.clear"));
     assert!(ticket_screen.contains("project_pipelines.spawn_ticket_session"));
+    assert!(
+        !ticket_screen.contains("project_pipelines.update_ticket_session_draft"),
+        "spawn modal field edits should stay browser-local instead of round-tripping controlled values through the hub"
+    );
     assert!(
         !surface.contains("/tickets/:ticket_id/spawn"),
         "spawn modal state should not be encoded as a plugin route"
     );
     assert!(
-        actions.contains("presentation = {") && actions.contains("-spawn-agent-open"),
-        "successful spawn should clear browser-local modal state"
+        actions.contains("presentation = {")
+            && actions.contains("-spawn-agent-open")
+            && actions.contains(r#"prefix .. "agent_name""#)
+            && actions.contains(r#"prefix .. "prompt""#)
+            && actions.contains(r#"prefix .. "accessory_name""#),
+        "successful spawn should clear browser-local modal and draft field state"
+    );
+    assert!(
+        actions.contains("agent_name = payload.agent_name")
+            && actions.contains("prompt = payload.prompt")
+            && actions.contains("accessory_name = payload.accessory_name"),
+        "spawn action should use browser-resolved local payload values"
+    );
+    assert!(
+        !actions.contains("project_pipelines.update_ticket_session_draft")
+            && !actions.contains("draft[prefix"),
+        "spawn dialog should not keep a dead hub draft fallback"
     );
     assert!(
         ticket_screen.contains("ui.session_row"),
