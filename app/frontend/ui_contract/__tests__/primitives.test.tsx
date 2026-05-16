@@ -992,6 +992,127 @@ describe('ui_contract registry — dialog', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Close' }))
     expect(screen.queryByRole('dialog')).toBeNull()
   })
+
+  it('local-state form controls update presentation state and spawn actions read latest values', () => {
+    const sendCommand = vi.fn().mockResolvedValue(true)
+    const dispatch = createTransportDispatch({
+      transport: { sendCommand },
+      hubId: 'hub-1',
+      targetSurface: 'pipelines',
+    })
+    const node: UiNode = {
+      type: 'dialog',
+      props: {
+        open: { $local: 'ticket-1-spawn-open', default: true },
+        title: 'Spawn agent',
+        presentation: 'auto',
+      },
+      slots: {
+        body: [
+          {
+            type: 'stack',
+            props: { direction: 'vertical', gap: '3' },
+            children: [
+              {
+                type: 'select',
+                id: 'ticket-1-spawn-agent',
+                props: {
+                  label: 'Agent',
+                  value: { $local: 'ticket-1-agent-name', default: 'codex' },
+                  options: [
+                    { value: 'codex', label: 'Codex' },
+                    { value: 'claude', label: 'Claude' },
+                  ],
+                  onChange: {
+                    id: 'botster.presentation.set',
+                    payload: { key: 'ticket-1-agent-name' },
+                  },
+                },
+              },
+              {
+                type: 'textarea',
+                id: 'ticket-1-spawn-prompt',
+                props: {
+                  label: 'Agent prompt',
+                  value: { $local: 'ticket-1-prompt', default: '' },
+                  onChange: {
+                    id: 'botster.presentation.set',
+                    payload: { key: 'ticket-1-prompt' },
+                  },
+                },
+              },
+            ],
+          },
+        ],
+        footer: [
+          {
+            type: 'button',
+            id: 'ticket-1-spawn-agent-session',
+            props: {
+              label: 'Spawn agent',
+              action: {
+                id: 'project_pipelines.spawn_ticket_session',
+                payload: {
+                  ticket_id: 'ticket-1',
+                  session_type: 'agent',
+                  agent_name: { $local: 'ticket-1-agent-name', default: 'codex' },
+                  prompt: { $local: 'ticket-1-prompt', default: '' },
+                },
+              },
+            },
+          },
+        ],
+      },
+    }
+
+    render(
+      <UiTreeBody
+        node={node}
+        dispatch={dispatch}
+        viewport={REGULAR_FINE}
+        hubId="hub-1"
+        targetSurface="pipelines"
+      />,
+    )
+
+    const agentSelect = screen.getByLabelText('Agent') as HTMLSelectElement
+    const promptInput = screen.getByLabelText('Agent prompt') as HTMLTextAreaElement
+    expect(agentSelect).toHaveValue('codex')
+    expect(promptInput).toHaveValue('')
+
+    fireEvent.change(agentSelect, { target: { value: 'claude' } })
+    fireEvent.change(promptInput, {
+      target: { value: 'Investigate the failing pipeline' },
+    })
+
+    expect(useUiPresentationStore
+      .getState()
+      .localValue('hub-1', 'pipelines', 'ticket-1-agent-name'),
+    ).toBe('claude')
+    expect(useUiPresentationStore
+      .getState()
+      .localValue('hub-1', 'pipelines', 'ticket-1-prompt'),
+    ).toBe('Investigate the failing pipeline')
+    expect(agentSelect).toHaveValue('claude')
+    expect(promptInput).toHaveValue('Investigate the failing pipeline')
+
+    fireEvent.click(screen.getByRole('button', { name: 'Spawn agent' }))
+
+    expect(sendCommand).toHaveBeenCalledOnce()
+    expect(sendCommand).toHaveBeenCalledWith('ui_action', {
+      target_surface: 'pipelines',
+      action_request_id: expect.any(String),
+      envelope: {
+        id: 'project_pipelines.spawn_ticket_session',
+        payload: {
+          ticket_id: 'ticket-1',
+          session_type: 'agent',
+          agent_name: 'claude',
+          prompt: 'Investigate the failing pipeline',
+        },
+      },
+    })
+  })
 })
 
 describe('ui_contract registry — unknown primitive', () => {
