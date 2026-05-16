@@ -57,6 +57,33 @@ local function running_run_template()
             ui.text{ text = ui.bind("@/pipeline_name"), size = "xs", tone = "muted" },
             ui.text{ text = ui.bind("@/current_step_name"), size = "xs", tone = "muted" },
         },
+        end_ = {
+            ui.bind_if("@/has_ticket", ui.button{
+                label = "Ticket",
+                icon = "ticket",
+                variant = "ghost",
+                action = ui.action("botster.nav.open", { path = ui.bind("@/ticket_path") }),
+            }),
+            ui.bind_if("@/has_project", ui.button{
+                label = "Project",
+                icon = "folder",
+                variant = "ghost",
+                action = ui.action("botster.nav.open", { path = ui.bind("@/project_path") }),
+            }),
+            ui.button{
+                label = "Run",
+                icon = "play-circle",
+                variant = "ghost",
+                action = ui.action("botster.nav.open", { path = ui.bind("@/path") }),
+            },
+            ui.bind_if("@/has_current_agent", ui.button{
+                label = "Agent",
+                icon = "command-line",
+                variant = "solid",
+                tone = "accent",
+                action = ui.action("botster.nav.open", { path = ui.bind("@/current_agent_path") }),
+            }),
+        },
     }
 end
 
@@ -153,9 +180,6 @@ function M.render(_view_state, ctx)
             } },
         }) },
         view.panel{ view.section("Running Pipelines", {
-            -- TODO(entity-shape): use the run entity path fields to restore
-            -- row-level Ticket, Project, Run, and Agent actions without
-            -- render-time repo lookups.
             ui.list{ children = {
                 ui.bind_list{
                     source = "/project-pipelines.run",
