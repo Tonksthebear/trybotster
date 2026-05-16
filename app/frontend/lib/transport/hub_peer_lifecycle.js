@@ -28,6 +28,7 @@ export class HubPeerLifecycle {
     if (!conn.signalingConnected) throw new Error(`Signaling not connected for hub ${hubId}`)
 
     console.debug(`[WebRTCTransport] Creating peer connection for hub ${hubId}`)
+    conn.peerGeneration = (conn.peerGeneration || 0) + 1
     conn.peerSetupStartedAt = performance.now()
     conn.offerSentAt = null
     conn.serverReady = false
@@ -134,7 +135,7 @@ export class HubPeerLifecycle {
 
     const dataChannel = pc.createDataChannel("relay", { ordered: true })
     conn.dataChannel = dataChannel
-    this.#callbacks.setupDataChannel(hubId, dataChannel)
+    this.#callbacks.setupDataChannel(hubId, dataChannel, conn.peerGeneration)
 
     const offer = await pc.createOffer()
     await pc.setLocalDescription(offer)

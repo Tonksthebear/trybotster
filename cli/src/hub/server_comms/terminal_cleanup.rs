@@ -2,6 +2,18 @@ use super::*;
 
 impl Hub {
     pub(super) fn stop_terminal_subscription(&mut self, subscription_key: &str) {
+        self.stop_terminal_subscription_with_worker_cleanup(subscription_key, true);
+    }
+
+    pub(super) fn replace_terminal_subscription(&mut self, subscription_key: &str) {
+        self.stop_terminal_subscription_with_worker_cleanup(subscription_key, false);
+    }
+
+    fn stop_terminal_subscription_with_worker_cleanup(
+        &mut self,
+        subscription_key: &str,
+        unregister_browser_worker: bool,
+    ) {
         self.cleanup_pending_session_io_snapshots_for_subscription(subscription_key);
         if let Some(pending) = self.pending_terminal_attaches.remove(subscription_key) {
             pending.request.deactivate();
@@ -30,8 +42,14 @@ impl Hub {
             self.unregister_terminal_subscription_peer(subscription_key, true);
             if let Some((browser_identity, _)) = subscription_key.rsplit_once(':') {
                 if self.browser_client_workers.contains_key(browser_identity) {
-                    if let Some(worker) = self.browser_client_workers.get(browser_identity) {
-                        Self::unregister_worker_session_io_sender(worker, &session_uuid, "WebRTC");
+                    if unregister_browser_worker {
+                        if let Some(worker) = self.browser_client_workers.get(browser_identity) {
+                            Self::unregister_worker_session_io_sender(
+                                worker,
+                                &session_uuid,
+                                "WebRTC",
+                            );
+                        }
                     }
                 } else {
                     self.remove_terminal_client_worker(subscription_key, &session_uuid, "Terminal");

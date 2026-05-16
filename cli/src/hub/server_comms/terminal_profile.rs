@@ -130,6 +130,21 @@ impl Hub {
             .insert(peer_id.to_string());
     }
 
+    pub(super) fn register_terminal_subscription_id(
+        &mut self,
+        subscription_key: &str,
+        subscription_id: &str,
+    ) {
+        self.terminal_subscription_ids
+            .insert(subscription_key.to_string(), subscription_id.to_string());
+    }
+
+    pub(super) fn terminal_subscription_id(&self, subscription_key: &str) -> Option<&str> {
+        self.terminal_subscription_ids
+            .get(subscription_key)
+            .map(String::as_str)
+    }
+
     pub(super) fn unregister_terminal_subscription_peer(
         &mut self,
         subscription_key: &str,
@@ -139,8 +154,10 @@ impl Hub {
         let Some((session_uuid, peer_id)) =
             self.terminal_subscription_peers.remove(subscription_key)
         else {
+            self.terminal_subscription_ids.remove(subscription_key);
             return;
         };
+        self.terminal_subscription_ids.remove(subscription_key);
 
         let mut remove_session_entry = false;
         if let Some(peers) = self.terminal_session_peers.get_mut(&session_uuid) {

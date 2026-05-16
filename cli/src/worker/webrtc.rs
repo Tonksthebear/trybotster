@@ -820,6 +820,9 @@ impl WebRtcPeerRegistry {
         if !self.channels.contains_key(browser_identity) {
             return None;
         }
+        if self.current_offer_generation(browser_identity) != generation {
+            return None;
+        }
         self.connected_at
             .insert(browser_identity.to_string(), Instant::now());
         Some(HubControlMessage::TransportPeerStateChanged {
@@ -919,6 +922,7 @@ impl WebRtcPeerRegistry {
             .file_input_tx(request.file_input_tx);
 
         let mut channel = builder.build();
+        channel.set_offer_generation(generation);
         let config = ChannelConfig {
             channel_name: "WebRtcChannel".to_string(),
             hub_id: request.hub_id,
@@ -2287,6 +2291,8 @@ mod tests {
         let mut registry = WebRtcPeerRegistry::new();
         let browser_identity = "olm-key:tab-1";
         let generation = registry.next_offer_generation(browser_identity);
+        let stale_generation = generation;
+        let generation = registry.next_offer_generation(browser_identity);
         registry
             .channels
             .insert(browser_identity.to_string(), test_channel());
@@ -2324,6 +2330,12 @@ mod tests {
             },
         );
 
+        assert!(
+            registry
+                .mark_data_channel_open(browser_identity, stale_generation)
+                .is_none(),
+            "stale DataChannel-open events must not mark the current peer connected"
+        );
         let opened = registry
             .mark_data_channel_open(browser_identity, generation)
             .expect("open summary");

@@ -19,24 +19,41 @@ impl Hub {
         }
     }
 
-    pub(super) fn handle_dc_opened_event(&mut self, browser_identity: String) {
-        let generation = self.webrtc.current_offer_generation(&browser_identity);
+    pub(super) fn handle_dc_opened_event(&mut self, browser_identity: String, generation: u64) {
+        let opened_started = Instant::now();
+        let current_generation = self.webrtc.current_offer_generation(&browser_identity);
         let Some(peer_state) = self
             .webrtc
             .mark_data_channel_open(&browser_identity, generation)
         else {
+            if current_generation != generation {
+                self.hub_event_metrics
+                    .record_counter("webrtc_open.stale_generation", 1);
+            } else {
+                self.hub_event_metrics
+                    .record_counter("webrtc_open.unknown_peer", 1);
+            }
+            self.hub_event_metrics.record_span_with_threshold(
+                "webrtc_open.total",
+                opened_started.elapsed(),
+                0,
+                Self::HOT_SUBHANDLER_SLOW,
+                &browser_identity,
+            );
             log::warn!(
-                "[WebRTC] DcOpened for unknown peer {}, ignoring stale open event",
-                &browser_identity[..browser_identity.len().min(8)]
+                "[WebRTC] DcOpened for peer {} generation {} ignored (current generation {})",
+                &browser_identity[..browser_identity.len().min(8)],
+                generation,
+                current_generation
             );
             return;
         };
-        self.handle_transport_control_message(peer_state);
         log::info!(
             "[WebRTC] DataChannel opened for {}, firing peer_connected",
             &browser_identity[..browser_identity.len().min(8)],
         );
 
+        let ready_path_started = Instant::now();
         if self.webrtc.start_recv_forwarder(
             &browser_identity,
             &self.tokio_runtime,
@@ -47,6 +64,15 @@ impl Hub {
                 log::warn!(
                     "[WebRTC] DataChannel opened for {} but peer sender was unavailable",
                     &browser_identity[..browser_identity.len().min(8)]
+                );
+                self.hub_event_metrics
+                    .record_counter("webrtc_open.peer_sender_missing", 1);
+                self.hub_event_metrics.record_span_with_threshold(
+                    "webrtc_open.total",
+                    opened_started.elapsed(),
+                    0,
+                    Self::HOT_SUBHANDLER_SLOW,
+                    &browser_identity,
                 );
                 return;
             };
@@ -67,10 +93,31 @@ impl Hub {
                 .insert(browser_identity.clone(), worker);
 
             self.spawn_dc_ping_task(&browser_identity);
+            // Connected is a data-plane-ready state: if recv forwarding or
+            // peer command routing failed above, leave the peer unconnected
+            // and rely on the failure counters/cleanup path instead.
+            self.handle_transport_control_message(peer_state);
+            self.hub_event_metrics.record_span_with_threshold(
+                "webrtc_open.ready_path",
+                ready_path_started.elapsed(),
+                0,
+                Self::HOT_SUBHANDLER_SLOW,
+                &browser_identity,
+            );
             if let Err(e) = self.lua.call_peer_connected(&browser_identity) {
                 log::warn!("[WebRTC] Lua peer_connected callback error: {e}");
             }
+        } else {
+            self.hub_event_metrics
+                .record_counter("webrtc_open.recv_forwarder_failed", 1);
         }
+        self.hub_event_metrics.record_span_with_threshold(
+            "webrtc_open.total",
+            opened_started.elapsed(),
+            0,
+            Self::HOT_SUBHANDLER_SLOW,
+            &browser_identity,
+        );
     }
 
     pub(super) fn handle_webrtc_ingress_backpressure_event(

@@ -264,8 +264,11 @@ impl Hub {
             HubEvent::CleanupTick => {
                 self.handle_cleanup_tick();
             }
-            HubEvent::DcOpened { browser_identity } => {
-                self.handle_dc_opened_event(browser_identity);
+            HubEvent::DcOpened {
+                browser_identity,
+                generation,
+            } => {
+                self.handle_dc_opened_event(browser_identity, generation);
             }
             HubEvent::WebRtcIngressBackpressure {
                 browser_identity,

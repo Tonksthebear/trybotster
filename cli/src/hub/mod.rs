@@ -334,6 +334,12 @@ pub struct Hub {
     /// Keyed by subscription route (`peer:session`, `tui:session`) so teardown
     /// can cleanly remove session peer registrations.
     terminal_subscription_peers: std::collections::HashMap<String, (String, String)>,
+    /// Current route subscription id for each terminal subscription key.
+    ///
+    /// Browser terminal routes use deterministic `peer:session` keys, so a new
+    /// browser subscription id for the same key must replace the old SessionIo
+    /// subscription instead of reusing stale attach state.
+    terminal_subscription_ids: std::collections::HashMap<String, String>,
     /// Focused terminal owner per session.
     ///
     /// Used to ensure OSC color queries are only forwarded to the active
@@ -573,6 +579,7 @@ impl Hub {
             )),
             terminal_session_peers: std::collections::HashMap::new(),
             terminal_subscription_peers: std::collections::HashMap::new(),
+            terminal_subscription_ids: std::collections::HashMap::new(),
             active_terminal_peers: Arc::new(Mutex::new(std::collections::HashMap::new())),
             stream_muxes: std::collections::HashMap::new(),
             paste_files: std::collections::HashMap::new(),

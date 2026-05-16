@@ -10,7 +10,16 @@ export class HubChannelProtocol {
     this.#constants = constants
   }
 
+  #isCurrentPeerGeneration(hubId, generation) {
+    if (typeof this.#callbacks.isCurrentPeerGeneration !== "function") return true
+    return this.#callbacks.isCurrentPeerGeneration(hubId, generation)
+  }
+
   clearPendingSubscription(subscriptionId) {
+    const pending = this.#pendingSubscriptions.get(subscriptionId)
+    if (pending?.timeout) {
+      clearTimeout(pending.timeout)
+    }
     this.#pendingSubscriptions.delete(subscriptionId)
   }
 
@@ -90,7 +99,7 @@ export class HubChannelProtocol {
     throw new Error("Too many concurrent file transfers")
   }
 
-  async handleDataChannelMessage(hubId, data) {
+  async handleDataChannelMessage(hubId, data, generation) {
     const {
       CONTENT_MSG,
       CONTENT_PTY,
@@ -99,6 +108,8 @@ export class HubChannelProtocol {
     } = this.#constants
 
     try {
+      if (!this.#isCurrentPeerGeneration(hubId, generation)) return
+
       const raw = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer || data)
 
       if (raw.length > 0 && raw[0] === MSG_TYPE_BUNDLE_REFRESH) {
@@ -123,6 +134,8 @@ export class HubChannelProtocol {
           const result = await this.#callbacks.decryptBinary(hubId, raw)
           plaintext = result.data
 
+          if (!this.#isCurrentPeerGeneration(hubId, generation)) return
+
           const conn = this.#callbacks.getConnection(hubId)
           if (conn) conn.decryptFailures = 0
         } catch (error) {
@@ -137,7 +150,7 @@ export class HubChannelProtocol {
         if (contentType === CONTENT_MSG) {
           const json = new TextDecoder().decode(plaintext.slice(1))
           const msg = JSON.parse(json)
-          this.#routeControlMessage(hubId, msg)
+          this.#routeControlMessage(hubId, msg, generation)
           return
         }
 
@@ -195,14 +208,16 @@ export class HubChannelProtocol {
     })
   }
 
-  #routeControlMessage(hubId, msg) {
+  #routeControlMessage(hubId, msg, generation) {
+    if (!this.#isCurrentPeerGeneration(hubId, generation)) return
+
     if (msg.type === "subscribed" && msg.subscriptionId) {
       this.handleSubscriptionConfirmed(msg.subscriptionId)
       return
     }
 
     if (msg.type === "dc_ready") {
-      this.#callbacks.markServerReady(hubId)
+      this.#callbacks.markServerReady(hubId, generation)
       return
     }
 

@@ -453,8 +453,9 @@ impl Hub {
             HubControlMessage::DetachClient {
                 client_id,
                 session_uuid,
-                ..
+                subscription_id,
             } => {
+                let is_browser = matches!(&client_id, ClientId::Browser(_));
                 let subscription_key = match client_id {
                     ClientId::Tui => format!("tui:{session_uuid}"),
                     ClientId::Socket(client_id) => format!("{client_id}:{session_uuid}"),
@@ -463,6 +464,18 @@ impl Hub {
                     }
                     ClientId::Internal => return,
                 };
+                if is_browser
+                    && self
+                        .terminal_subscription_id(&subscription_key)
+                        .is_some_and(|current| current != subscription_id)
+                {
+                    log::debug!(
+                        "[ClientWorker] Ignoring stale browser detach for {} subscription={}",
+                        subscription_key,
+                        subscription_id
+                    );
+                    return;
+                }
                 self.stop_terminal_subscription(&subscription_key);
             }
             HubControlMessage::RequestSnapshot {

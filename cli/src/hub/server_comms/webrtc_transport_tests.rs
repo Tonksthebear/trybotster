@@ -498,6 +498,11 @@ pub(super) fn test_webrtc_worker_handle_registered_and_removed_with_subscription
     let (subscription, _delivery) =
         drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
     assert_eq!(subscription.subscription_key, key);
+    assert_eq!(
+        hub.terminal_subscription_id(&key),
+        Some("terminal_sub"),
+        "active WebRTC subscription id should be tracked with the terminal key"
+    );
 
     hub.stop_terminal_subscription(&key);
 
@@ -508,6 +513,11 @@ pub(super) fn test_webrtc_worker_handle_registered_and_removed_with_subscription
     assert!(
         !hub.terminal_subscription_peers.contains_key(&key),
         "stopping WebRTC subscription should remove the SessionIo subscription peer"
+    );
+    assert_eq!(
+        hub.terminal_subscription_id(&key),
+        None,
+        "stopping WebRTC subscription should clear the tracked subscription id"
     );
 }
 
@@ -751,6 +761,10 @@ pub(super) fn test_webrtc_duplicate_subscribe_replaces_subscription_and_preserve
     let (_old_subscription, _old_delivery) =
         drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
     assert!(hub.pending_session_io_snapshots.is_empty());
+    assert_eq!(
+        hub.terminal_subscription_id(&subscription_key),
+        Some("terminal_old_geometry")
+    );
 
     subscribe_browser_terminal(
         &mut hub,
@@ -777,10 +791,130 @@ pub(super) fn test_webrtc_duplicate_subscribe_replaces_subscription_and_preserve
     assert_eq!(new_delivery.rows, 44);
     assert_eq!(new_delivery.cols, 160);
     assert_eq!(new_delivery.subscription_id, "terminal_new_geometry");
+    assert_eq!(
+        hub.terminal_subscription_id(&subscription_key),
+        Some("terminal_new_geometry")
+    );
+    let worker = hub
+        .browser_client_workers
+        .get(browser_identity)
+        .expect("browser worker survives subscription replacement")
+        .clone();
+    let _ = worker.try_send(crate::worker::client::ClientWorkerMessage::SessionInput {
+        session_uuid: session_uuid.to_string(),
+        data: b"after-replace".to_vec(),
+    });
+    settle_webrtc_terminal_attach(&mut hub);
+    assert!(matches!(
+        recv_session_io_request_matching(&mut session_io_rx, |request| matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::PtyInput { data }
+                if data == b"after-replace"
+        )),
+        crate::worker::session_io::SessionIoRequest::PtyInput { .. }
+    ));
     assert!(matches!(
         new_delivery.payload_mode,
         crate::worker::session_io::TerminalSnapshotPayloadMode::PrefixedGzip
     ));
+}
+
+#[test]
+pub(super) fn test_stale_browser_detach_does_not_stop_current_terminal_subscription() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let browser_identity = "browser-stale-detach";
+    let session_uuid = "sess-stale-detach";
+    let subscription_key = format!("{browser_identity}:{session_uuid}");
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(16);
+
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
+    let _command_rx = install_test_browser_worker_unsubscribed(&mut hub, browser_identity);
+
+    subscribe_browser_terminal(
+        &mut hub,
+        browser_identity,
+        session_uuid,
+        "terminal_current",
+        24,
+        80,
+    );
+    settle_webrtc_terminal_attach(&mut hub);
+    let _ = drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
+    assert_eq!(
+        hub.terminal_subscription_id(&subscription_key),
+        Some("terminal_current")
+    );
+
+    hub.handle_client_worker_control(
+        crate::worker::hub_control::HubControlMessage::DetachClient {
+            client_id: crate::client::ClientId::browser(browser_identity.to_string()),
+            session_uuid: session_uuid.to_string(),
+            subscription_id: "terminal_stale".to_string(),
+        },
+    );
+
+    assert!(hub
+        .terminal_subscription_peers
+        .contains_key(&subscription_key));
+    assert_eq!(
+        hub.terminal_subscription_id(&subscription_key),
+        Some("terminal_current")
+    );
+    assert!(session_io_rx.try_recv().is_err());
+}
+
+#[test]
+pub(super) fn test_webrtc_attach_with_new_subscription_id_replaces_active_subscription() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let browser_identity = "browser-direct-replace";
+    let session_uuid = "sess-direct-replace";
+    let subscription_key = format!("{browser_identity}:{session_uuid}");
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(16);
+
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            session_uuid,
+            session_io_tx,
+        ));
+    let _command_rx = install_test_browser_worker_unsubscribed(&mut hub, browser_identity);
+
+    assert!(
+        hub.try_attach_browser_terminal_subscription(&test_browser_subscription_request(
+            browser_identity,
+            session_uuid,
+            "terminal_old"
+        ))
+    );
+    let _ = drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
+
+    assert!(
+        hub.try_attach_browser_terminal_subscription(&test_browser_subscription_request(
+            browser_identity,
+            session_uuid,
+            "terminal_new"
+        ))
+    );
+    assert!(matches!(
+        recv_session_io_request_matching(&mut session_io_rx, |request| matches!(
+            request,
+            crate::worker::session_io::SessionIoRequest::UnsubscribeTerminal {
+                subscription_key: key
+            } if key == &subscription_key
+        )),
+        crate::worker::session_io::SessionIoRequest::UnsubscribeTerminal { .. }
+    ));
+    let (subscription, delivery) =
+        drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
+    assert_eq!(subscription.subscription_id, "terminal_new");
+    assert_eq!(delivery.subscription_id, "terminal_new");
+    assert_eq!(
+        hub.terminal_subscription_id(&subscription_key),
+        Some("terminal_new")
+    );
 }
 
 #[test]
