@@ -1193,6 +1193,7 @@ fn catalog_plugin_project_pipelines_home_render_uses_bounded_notified_session_lo
 
             ui = {{
               bind = function(path) return {{ bind = path }} end,
+              bind_if = function(path, node) return {{ bind_if = path, node = node }} end,
               action = function(name, payload) return {{ name = name, payload = payload }} end,
               list_item = function(props) return {{ type = "list_item", props = props }} end,
               text = function(props) return {{ type = "text", props = props }} end,
@@ -1310,6 +1311,22 @@ fn catalog_plugin_project_pipelines_home_bind_lists_use_entity_empty_templates()
         !home.contains("repo."),
         "home should not call repo.* at render time"
     );
+    for snippet in [
+        r#"source = "/project-pipelines.run""#,
+        r#"ui.bind_if("@/has_ticket""#,
+        r#"path = ui.bind("@/ticket_path")"#,
+        r#"ui.bind_if("@/has_project""#,
+        r#"path = ui.bind("@/project_path")"#,
+        r#"label = "Run""#,
+        r#"path = ui.bind("@/path")"#,
+        r#"ui.bind_if("@/has_current_agent""#,
+        r#"path = ui.bind("@/current_agent_path")"#,
+    ] {
+        assert!(
+            home.contains(snippet),
+            "Running Pipelines rows should expose entity-backed action snippet: {snippet}"
+        );
+    }
 }
 
 #[test]
