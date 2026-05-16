@@ -75,6 +75,37 @@ local function index_by_id(items)
     return out
 end
 
+local function placeholders(count)
+    local parts = {}
+    for index = 1, count do
+        parts[index] = "?"
+    end
+    return table.concat(parts, ",")
+end
+
+local function unique_nonblank(values)
+    local seen = {}
+    local out = {}
+    for _, value in ipairs(values or {}) do
+        if not util.is_blank(value) and not seen[value] then
+            seen[value] = true
+            out[#out + 1] = value
+        end
+    end
+    return out
+end
+
+local function rows_by_id(table_name, fields, ids)
+    ids = unique_nonblank(ids)
+    if #ids == 0 then
+        return {}
+    end
+    return index_by_id(rows(
+        "SELECT " .. fields .. " FROM " .. table_name .. " WHERE id IN (" .. placeholders(#ids) .. ")",
+        ids
+    ))
+end
+
 local function grouped_by(items, key)
     local out = {}
     for _, item in ipairs(items or {}) do
@@ -501,9 +532,13 @@ end
 local function decorate_run_entity(entity, opts)
     opts = opts or {}
     local ticket = opts.ticket
+    local project = opts.project
     local pipeline = opts.pipeline
     local step = opts.step
+    local current_run_step = opts.current_run_step
     local view = opts.view
+    local current_agent_session_uuid = current_run_step and current_run_step.agent_session_uuid or nil
+    assert(entity.id, "run entity requires id")
     entity.ticket_title = ticket and ticket.title or entity.ticket_id
     entity.pipeline_name = pipeline and pipeline.name or entity.pipeline_id
     entity.current_step_name = step and step.name or "No current step"
@@ -511,6 +546,18 @@ local function decorate_run_entity(entity, opts)
     entity.detail_label = entity.pipeline_name .. " - current step: " .. entity.current_step_name
     entity.label = entity.ticket_title .. " - " .. entity.pipeline_name .. " (" .. tostring(entity.status) .. ")"
     entity.path = "/pipelines/runs/" .. entity.id
+    entity.has_ticket = ticket ~= nil
+    entity.ticket_button_id = "run-" .. tostring(entity.id or "") .. "-ticket"
+    entity.ticket_path = ticket and ("/pipelines/tickets/" .. tostring(ticket.id)) or nil
+    entity.has_project = project ~= nil
+    entity.project_button_id = "run-" .. tostring(entity.id or "") .. "-project"
+    entity.project_path = project and ("/pipelines/projects/" .. tostring(project.id)) or nil
+    entity.current_agent_session_uuid = current_agent_session_uuid
+    entity.has_current_agent = not util.is_blank(current_agent_session_uuid)
+    entity.current_agent_button_id = "run-" .. tostring(entity.id or "") .. "-current-agent"
+    entity.current_agent_path = entity.has_current_agent
+        and ("/pipelines/tickets/" .. tostring(entity.ticket_id) .. "/sessions/" .. tostring(current_agent_session_uuid))
+        or nil
     return entity
 end
 
@@ -549,17 +596,26 @@ local function pipeline_entities(pipelines)
 end
 
 local function run_entities(runs)
-    local tickets_by_id = index_by_id(rows("SELECT id, title FROM tickets"))
+    local tickets_by_id = index_by_id(rows("SELECT id, title, project_id FROM tickets"))
+    local projects_by_id = index_by_id(rows("SELECT id FROM projects"))
     local pipelines_by_id = index_by_id(rows("SELECT id, name FROM pipelines"))
     local steps_by_id = index_by_id(rows("SELECT id, name FROM pipeline_steps"))
+    local current_run_step_ids = {}
+    for _, run in ipairs(runs or {}) do
+        current_run_step_ids[#current_run_step_ids + 1] = run.current_run_step_id
+    end
+    local run_steps_by_id = rows_by_id("run_steps", "id, agent_session_uuid", current_run_step_ids)
     local view = with_view()
     local out = {}
     for _, run in ipairs(runs or {}) do
         local entity = copy(run)
+        local ticket = tickets_by_id[run.ticket_id]
         decorate_run_entity(entity, {
-            ticket = tickets_by_id[run.ticket_id],
+            ticket = ticket,
+            project = ticket and projects_by_id[ticket.project_id] or nil,
             pipeline = pipelines_by_id[run.pipeline_id],
             step = run.current_step_id and steps_by_id[run.current_step_id] or nil,
+            current_run_step = run.current_run_step_id and run_steps_by_id[run.current_run_step_id] or nil,
             view = view,
         })
         out[#out + 1] = entity
@@ -570,13 +626,22 @@ end
 local function run_entity(run)
     local entity = copy(run)
     local ticket = rows("SELECT * FROM tickets WHERE id = ? LIMIT 1", run.ticket_id)[1]
+    local project = ticket
+        and not util.is_blank(ticket.project_id)
+        and rows("SELECT * FROM projects WHERE id = ? LIMIT 1", ticket.project_id)[1]
+        or nil
     local pipeline = rows("SELECT * FROM pipelines WHERE id = ? LIMIT 1", run.pipeline_id)[1]
     local step = run.current_step_id and rows("SELECT * FROM pipeline_steps WHERE id = ? LIMIT 1", run.current_step_id)[1] or nil
+    local current_run_step = run.current_run_step_id
+        and rows("SELECT * FROM run_steps WHERE id = ? LIMIT 1", run.current_run_step_id)[1]
+        or nil
     local view = with_view()
     return decorate_run_entity(entity, {
         ticket = ticket,
+        project = project,
         pipeline = pipeline,
         step = step,
+        current_run_step = current_run_step,
         view = view,
     })
 end

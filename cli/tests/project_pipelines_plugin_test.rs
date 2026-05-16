@@ -1470,6 +1470,12 @@ fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_
                 assert(record_fields_by_source[source] and record_fields_by_source[source][field],
                   screen_name .. " bound record field missing from contract for " .. source .. ": " .. field)
               end
+              for var, field in screen:gmatch('ui%.bind_if%(%s*([%w_]+_path)%s*%.%.%s*"%/([%w_]+)"') do
+                local source = path_vars[var]
+                assert(source, screen_name .. " bind_if path variable missing source: " .. var)
+                assert(record_fields_by_source[source] and record_fields_by_source[source][field],
+                  screen_name .. " bound record bind_if field missing from contract for " .. source .. ": " .. field)
+              end
               for path in screen:gmatch('ui%.bind%(%s*"(/[^"]+)"%s*%)') do
                 local source = path:match("^(/[^/]+)")
                 local field = path:match("/([%w_]+)$")
@@ -1511,7 +1517,6 @@ fn catalog_plugin_project_pipelines_entity_contract_covers_registered_types_and_
             end
 
             assert_repo_rendered_screen("new", "{new_path}")
-            assert_repo_rendered_screen("run", "{run_path}")
 
             return "ok"
             "#,

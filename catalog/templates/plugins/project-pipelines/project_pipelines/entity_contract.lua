@@ -3,7 +3,7 @@
 -- @category plugins
 -- @dest plugins/project-pipelines/project_pipelines/entity_contract.lua
 -- @scope device
--- @version 1.6.0
+-- @version 1.7.0
 
 local M = {}
 
@@ -222,8 +222,18 @@ M.screens = {
             source = "/" .. M.types.run,
             where_fields = { "id" },
             fields = {
+                "current_agent_button_id",
+                "current_agent_path",
+                "current_agent_session_uuid",
                 "detail_label",
+                "has_current_agent",
+                "has_project",
+                "has_ticket",
+                "project_button_id",
+                "project_path",
                 "status",
+                "ticket_button_id",
+                "ticket_path",
                 "ticket_title",
             },
         },
@@ -297,20 +307,6 @@ M.repo_rendered_screens = {
             "/" .. M.types.project,
             "/" .. M.types.ticket,
             "/" .. M.types.run,
-        },
-    },
-    run = {
-        reason = "run detail still uses targeted repo reads for conditional header actions",
-        repo_calls = {
-            "get_ticket",
-            "get_project",
-            "get_run_step_visit",
-            "get_run",
-        },
-        migration_sources = {
-            "/" .. M.types.run,
-            "/" .. M.types.ticket,
-            "/" .. M.types.project,
         },
     },
 }
