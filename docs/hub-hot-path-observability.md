@@ -96,6 +96,7 @@ largest observed value instead of summing every sample.
 | `webrtc_send.unknown_peer` | send targeted a peer with no active send task |
 | `webrtc_send.unknown_peer_burst` | unknown-peer burst guardrail fired |
 | `webrtc_channel.closed_after_connect` | channel closed shortly after connected/open |
+| `webrtc_ice.apply_backpressure` | browser ICE candidate dropped because the peer already has the maximum in-flight ICE apply tasks |
 | `webrtc_offer.start_failed` | async channel connect, SDP handling, or answer encryption failed before answer dispatch |
 | `webrtc_open.unknown_peer` | DataChannel-open event arrived for a peer no longer owned by the registry |
 | `webrtc_open.stale_generation` | DataChannel-open event belonged to an older offer generation and was ignored |

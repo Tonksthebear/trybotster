@@ -149,6 +149,8 @@ impl Hub {
         ) {
             crate::worker::webrtc::QueueOrApplyIceOutcome::ApplySpawned => {}
             crate::worker::webrtc::QueueOrApplyIceOutcome::ApplyBackpressure => {
+                self.hub_event_metrics
+                    .record_counter("webrtc_ice.apply_backpressure", 1);
                 log::warn!(
                     "[Lua] Dropping ICE candidate for {} because peer ICE apply tasks are saturated",
                     &browser_identity[..browser_identity.len().min(8)]

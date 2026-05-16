@@ -1581,6 +1581,26 @@ impl WebRtcPeerRegistry {
         );
     }
 
+    #[cfg(test)]
+    pub(crate) fn saturate_test_ice_apply_limit(
+        &mut self,
+        browser_identity: &str,
+    ) -> Vec<tokio::sync::OwnedSemaphorePermit> {
+        let limit = Arc::clone(
+            self.ice_apply_limits
+                .entry(browser_identity.to_string())
+                .or_insert_with(|| {
+                    Arc::new(tokio::sync::Semaphore::new(
+                        WEBRTC_ICE_APPLY_IN_FLIGHT_PER_BROWSER,
+                    ))
+                }),
+        );
+
+        (0..WEBRTC_ICE_APPLY_IN_FLIGHT_PER_BROWSER)
+            .map(|_| Arc::clone(&limit).try_acquire_owned().expect("permit"))
+            .collect()
+    }
+
     pub(crate) fn spawn_peer_sender(
         &mut self,
         browser_identity: &str,
