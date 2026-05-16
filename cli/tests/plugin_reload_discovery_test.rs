@@ -130,6 +130,10 @@ fn reload_plugin_discovers_repo_plugin_missing_from_registry() {
         }})
 
         local loader = require("hub.loader")
+        local reloaded = nil
+        hooks.on("plugin_reloaded", "test.reload-discovery", function(info)
+            reloaded = info
+        end)
         local ok, err = loader.reload_plugin("jupiter-worktree-lifecycle")
         assert(ok, tostring(err))
 
@@ -142,6 +146,10 @@ fn reload_plugin_discovers_repo_plugin_missing_from_registry() {
         assert(entry.repo_root == {repo_root})
         assert(entry.path:match("/%.botster%-dev/plugins/jupiter%-worktree%-lifecycle/init%.lua$"), entry.path)
         assert(_G.jupiter_reload_discovery_loaded == 1, "plugin should load once")
+        assert(reloaded ~= nil, "reload_plugin should emit plugin_reloaded for discovered plugins")
+        assert(reloaded.key == key, "plugin_reloaded should carry scoped key")
+        assert(reloaded.name == "jupiter-worktree-lifecycle")
+        assert(reloaded.repo_root == {repo_root})
         "#,
         device_root = lua_string(&device_root),
         repo_root = lua_string(&repo_root),
@@ -295,6 +303,10 @@ fn reload_plugin_removes_capabilities_that_new_version_no_longer_registers() {
     lua.load(
         r#"
         _G.reload_cleanup_hook_called = false
+        _G.reload_cleanup_reloaded = nil
+        hooks.on("plugin_reloaded", "test.reload-cleanup", function(info)
+            _G.reload_cleanup_reloaded = info
+        end)
         local loader = require("hub.loader")
         local ok, err = loader.reload_plugin("reload-cleanup")
         assert(ok, tostring(err))
@@ -304,6 +316,9 @@ fn reload_plugin_removes_capabilities_that_new_version_no_longer_registers() {
         assert(not require("lib.commands").has("reload_cleanup_command"), "stale command should be removed")
         assert(require("lib.surfaces").get("reload_cleanup_surface") == nil, "stale surface should be removed")
         assert(#require("lib.action").registered_ids() == 0, "stale action should be removed")
+        assert(_G.reload_cleanup_reloaded ~= nil, "reload_plugin should emit plugin_reloaded")
+        assert(_G.reload_cleanup_reloaded.key == "reload-cleanup")
+        assert(_G.reload_cleanup_reloaded.name == "reload-cleanup")
         "#,
     )
     .exec()

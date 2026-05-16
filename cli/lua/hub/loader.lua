@@ -225,6 +225,20 @@ local function update_registry_status(name, status, error_msg)
     hooks.notify("plugin_status_changed", { name = name, status = status, error = error_msg })
 end
 
+local function notify_plugin_reloaded(key, entry)
+    if type(hooks) ~= "table" or type(hooks.notify) ~= "function" then
+        return
+    end
+    hooks.notify("plugin_reloaded", {
+        key = key,
+        name = entry and (entry.name or key) or key,
+        path = entry and entry.path or nil,
+        source = entry and entry.source or nil,
+        repo_root = entry and entry.repo_root or nil,
+        reload_count = entry and entry.reload_count or nil,
+    })
+end
+
 local function upsert_registry_entry(name, path, fields)
     local state = require("hub.state")
     local registry = state.get("plugin_registry", {})
@@ -640,6 +654,7 @@ function M.reload_plugin(name)
         })
         if ok then
             update_registry_status(discovered_key, "loaded", nil)
+            notify_plugin_reloaded(discovered_key, registry[discovered_key] or entry)
         else
             update_registry_status(discovered_key, "errored", err)
         end
@@ -726,6 +741,7 @@ function M.reload_plugin(name)
     end
 
     update_registry_status(name, "loaded", nil)
+    notify_plugin_reloaded(name, registry[name] or entry)
     return true
 end
 

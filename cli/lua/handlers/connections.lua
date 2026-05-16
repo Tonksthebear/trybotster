@@ -220,15 +220,84 @@ end
 -- registered/unregistered. Debounced so a plugin that registers many
 -- surfaces in a tight loop coalesces into a single emission.
 local ROUTE_REGISTRY_DEBOUNCE_SECS = 0.05
+local route_registry_force_tree = false
+local route_registry_refresh_owner_plugins = {}
 
-hooks.on("surfaces_changed", "broadcast_ui_route_registry", function(_info)
+local function schedule_route_registry_broadcast(opts)
+    opts = opts or {}
+    route_registry_force_tree = route_registry_force_tree or opts.force_tree == true
+    if type(opts.owner_plugins) == "table" then
+        for _, owner_plugin in ipairs(opts.owner_plugins) do
+            if type(owner_plugin) == "string" and owner_plugin ~= "" then
+                route_registry_refresh_owner_plugins[owner_plugin] = true
+            end
+        end
+    end
     timer.after_idle("ui_route_registry_broadcast", ROUTE_REGISTRY_DEBOUNCE_SECS, function()
+        if route_registry_force_tree then
+            local TreeSnapshot = require("lib.tree_snapshot")
+            pcall(TreeSnapshot.invalidate)
+        end
+        route_registry_force_tree = false
+        local owner_plugins = route_registry_refresh_owner_plugins
+        route_registry_refresh_owner_plugins = {}
         broadcast_ui_route_registry()
         -- When a surface appears/disappears, the set of layout trees
         -- changes too — force a structural rebroadcast so the new
         -- surface's initial tree reaches existing browsers.
         broadcast_ui_tree_snapshots()
+
+        -- Plugin-owned entity registrations are rebuilt during reload. Ship
+        -- fresh baselines for the reloaded owner so already-open surfaces do
+        -- not wait for another user action to re-request snapshots.
+        for owner_plugin in pairs(owner_plugins) do
+            for _, client in pairs(clients) do
+                for sub_id, sub in pairs(client.subscriptions or {}) do
+                    if sub.channel == "hub" then
+                        local ok, err = pcall(
+                            EB.send_snapshots_to,
+                            client,
+                            sub_id,
+                            { owner_plugin = owner_plugin }
+                        )
+                        if not ok then
+                            log.warn(string.format(
+                                "plugin_reloaded snapshot refresh failed for owner_plugin=%s sub=%s: %s",
+                                tostring(owner_plugin),
+                                tostring(sub_id),
+                                tostring(err)))
+                        end
+                    end
+                end
+            end
+        end
     end)
+end
+
+hooks.on("surfaces_changed", "broadcast_ui_route_registry", function(_info)
+    schedule_route_registry_broadcast()
+end)
+
+-- Explicit plugin reload is a stronger lifecycle boundary than a plain
+-- surface registration. A reload can update render modules, route handlers,
+-- MCP tools, prompts, and plugin-owned state recovery without changing the
+-- route registry shape. Invalidate the tree dedup cache so existing browsers
+-- see freshly loaded code immediately instead of waiting for a hub restart or
+-- a later state change.
+hooks.on("plugin_reloaded", "broadcast_ui_route_registry_after_plugin_reload", function(_info)
+    local info = _info or {}
+    local owner_plugins = {}
+    if type(info.key) == "string" then owner_plugins[#owner_plugins + 1] = info.key end
+    -- Repo-scoped plugin instances have distinct loader keys but may still
+    -- register entities under the display name. Until entity owner keys are
+    -- instance-scoped, refresh by both key and display name.
+    if type(info.name) == "string" and info.name ~= info.key then
+        owner_plugins[#owner_plugins + 1] = info.name
+    end
+    schedule_route_registry_broadcast({
+        force_tree = true,
+        owner_plugins = owner_plugins,
+    })
 end)
 
 hooks.on("agent_created", "broadcast_agent_created", function(info)
@@ -741,8 +810,11 @@ function M._before_reload()
     hooks.off("pty_cursor_visibility", "update_agent_cursor")
     hooks.off("client_disconnected", "unfocus_on_disconnect")
     hooks.off("surfaces_changed", "broadcast_ui_route_registry")
+    hooks.off("plugin_reloaded", "broadcast_ui_route_registry_after_plugin_reload")
     hooks.off("workspace_closed", "broadcast_workspace_closed")
     timer.cancel("ui_route_registry_broadcast")
+    route_registry_force_tree = false
+    route_registry_refresh_owner_plugins = {}
     if output_activity_timer_id then
         timer.cancel(output_activity_timer_id)
         output_activity_timer_id = nil
