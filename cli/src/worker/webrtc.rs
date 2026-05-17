@@ -1207,7 +1207,7 @@ impl WebRtcPeerRegistry {
             return;
         };
 
-        let valid: Vec<_> = candidates
+        let mut valid: Vec<_> = candidates
             .into_iter()
             .filter_map(|(candidate_generation, candidate)| {
                 if candidate_generation != offer_generation {
@@ -1247,6 +1247,12 @@ impl WebRtcPeerRegistry {
         if valid.is_empty() {
             return;
         }
+
+        // Stable sort keeps FIFO order within each priority class while moving
+        // slow mDNS hostname candidates behind immediately parseable ones.
+        valid.sort_by_key(|(_, candidate_str, _, _)| {
+            crate::channel::WebRtcChannel::ice_candidate_application_priority(candidate_str)
+        });
 
         runtime.spawn(async move {
             for (generation, candidate_str, sdp_mid, sdp_mline_index) in valid {
@@ -2453,6 +2459,30 @@ mod tests {
         assert!(candidate.starts_with("candidate:current"));
         assert!(error.contains("No peer connection"));
         assert!(error_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn queued_ice_application_prioritizes_non_mdns_candidates() {
+        let mdns_1 = "candidate:1 1 UDP 2122260223 a4b9c343-f925-4558-b2ce-76521f4bc787.local 54872 typ host";
+        let direct_1 = "candidate:2 1 UDP 2122260223 127.0.0.1 54873 typ host";
+        let mdns_2 = "3 1 UDP 2122260223 e84d042a-c142-44f9-9f96-335c04f505e2.local 54874 typ host";
+        let direct_2 = "candidate:4 1 UDP 2122260223 192.0.2.10 54875 typ host";
+
+        assert_eq!(
+            crate::channel::WebRtcChannel::ice_candidate_application_priority(direct_1),
+            0
+        );
+        assert_eq!(
+            crate::channel::WebRtcChannel::ice_candidate_application_priority(mdns_2),
+            1
+        );
+
+        let mut candidates = [mdns_1, direct_1, mdns_2, direct_2];
+        candidates.sort_by_key(|candidate| {
+            crate::channel::WebRtcChannel::ice_candidate_application_priority(candidate)
+        });
+
+        assert_eq!(candidates, [direct_1, direct_2, mdns_1, mdns_2]);
     }
 
     #[test]
