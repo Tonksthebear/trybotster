@@ -33,6 +33,11 @@ pub(crate) const PEER_SEND_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const BACKPRESSURE_SNAPSHOT_COOLDOWN: Duration = Duration::from_millis(500);
 /// Maximum in-flight ICE candidate apply tasks per browser peer.
 pub(crate) const WEBRTC_ICE_APPLY_IN_FLIGHT_PER_BROWSER: usize = 8;
+/// Maximum queued ICE candidates replayed concurrently after an answer is ready.
+///
+/// Replay is a one-shot post-answer drain, so it gets a smaller budget than
+/// steady-state ICE application while still avoiding serial mDNS timeout tails.
+pub(crate) const WEBRTC_QUEUED_ICE_REPLAY_IN_FLIGHT_PER_BROWSER: usize = 4;
 
 /// Item queued for a per-peer async WebRTC send task.
 #[derive(Debug)]
@@ -1255,18 +1260,41 @@ impl WebRtcPeerRegistry {
         });
 
         runtime.spawn(async move {
+            let limit = Arc::new(tokio::sync::Semaphore::new(
+                WEBRTC_QUEUED_ICE_REPLAY_IN_FLIGHT_PER_BROWSER,
+            ));
+            let mut handles = Vec::with_capacity(valid.len());
+
             for (generation, candidate_str, sdp_mid, sdp_mline_index) in valid {
-                if let Err(error) = channel
-                    .handle_ice_candidate(&candidate_str, sdp_mid.as_deref(), sdp_mline_index)
-                    .await
-                {
-                    on_error(
-                        generation,
-                        &candidate_str,
-                        sdp_mid.as_deref(),
-                        sdp_mline_index,
-                        error,
-                    );
+                let channel = channel.clone();
+                let limit = Arc::clone(&limit);
+                handles.push(tokio::spawn(async move {
+                    let _permit = limit
+                        .acquire_owned()
+                        .await
+                        .expect("queued ICE replay semaphore is never closed");
+                    let result = channel
+                        .handle_ice_candidate(&candidate_str, sdp_mid.as_deref(), sdp_mline_index)
+                        .await;
+                    (generation, candidate_str, sdp_mid, sdp_mline_index, result)
+                }));
+            }
+
+            for handle in handles {
+                match handle.await {
+                    Ok((generation, candidate_str, sdp_mid, sdp_mline_index, Err(error))) => {
+                        on_error(
+                            generation,
+                            &candidate_str,
+                            sdp_mid.as_deref(),
+                            sdp_mline_index,
+                            error,
+                        );
+                    }
+                    Ok((_, _, _, _, Ok(()))) => {}
+                    Err(err) => {
+                        log::warn!("[WebRTC] Queued ICE application task failed: {err}");
+                    }
                 }
             }
         });
@@ -2431,19 +2459,26 @@ mod tests {
             .insert(browser_identity.to_string(), test_channel());
         let (error_tx, error_rx) = std::sync::mpsc::channel();
 
+        let current_candidates = (0..=WEBRTC_QUEUED_ICE_REPLAY_IN_FLIGHT_PER_BROWSER)
+            .map(|index| {
+                (
+                    2,
+                    serde_json::json!({
+                        "candidate": format!("candidate:current-{index} 1 UDP 1 127.0.0.1 9 typ host")
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut candidates = vec![(
+            1,
+            serde_json::json!({"candidate": "candidate:stale 1 UDP 1 127.0.0.1 9 typ host"}),
+        )];
+        candidates.extend(current_candidates);
+
         registry.apply_queued_ice_for_offer(
             browser_identity,
             2,
-            vec![
-                (
-                    1,
-                    serde_json::json!({"candidate": "candidate:stale 1 UDP 1 127.0.0.1 9 typ host"}),
-                ),
-                (
-                    2,
-                    serde_json::json!({"candidate": "candidate:current 1 UDP 1 127.0.0.1 9 typ host"}),
-                ),
-            ],
+            candidates,
             &runtime,
             move |generation, candidate, _, _, error| {
                 error_tx
@@ -2452,12 +2487,19 @@ mod tests {
             },
         );
 
-        let (generation, candidate, error) = error_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("current generation candidate reports async failure");
-        assert_eq!(generation, 2);
-        assert!(candidate.starts_with("candidate:current"));
-        assert!(error.contains("No peer connection"));
+        let mut reported = (0..=WEBRTC_QUEUED_ICE_REPLAY_IN_FLIGHT_PER_BROWSER)
+            .map(|_| {
+                error_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("current generation candidate reports async failure")
+            })
+            .collect::<Vec<_>>();
+        reported.sort_by(|(_, left, _), (_, right, _)| left.cmp(right));
+        for (index, (generation, candidate, error)) in reported.iter().enumerate() {
+            assert_eq!(*generation, 2);
+            assert!(candidate.starts_with(&format!("candidate:current-{index}")));
+            assert!(error.contains("No peer connection"));
+        }
         assert!(error_rx.try_recv().is_err());
     }
 

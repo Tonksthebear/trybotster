@@ -1164,6 +1164,7 @@ impl WebRtcChannel {
         let receiver = daemon
             .resolve_hostname(&hostname, Some(MDNS_HOSTNAME_TIMEOUT_MS))
             .ok()?;
+        let _cleanup = MdnsResolveCleanup::new(daemon.clone(), hostname.clone());
 
         let result = loop {
             match receiver.recv_async().await.ok()? {
@@ -1185,8 +1186,6 @@ impl WebRtcChannel {
                 _ => {}
             }
         };
-
-        let _ = daemon.stop_resolve_hostname(&hostname);
         result
     }
 
@@ -1253,6 +1252,23 @@ impl WebRtcChannel {
         self.peer_olm_key.lock().await.clone().ok_or_else(|| {
             ChannelError::EncryptionError("No peer Olm key (SDP offer not yet handled)".into())
         })
+    }
+}
+
+struct MdnsResolveCleanup {
+    daemon: ServiceDaemon,
+    hostname: String,
+}
+
+impl MdnsResolveCleanup {
+    fn new(daemon: ServiceDaemon, hostname: String) -> Self {
+        Self { daemon, hostname }
+    }
+}
+
+impl Drop for MdnsResolveCleanup {
+    fn drop(&mut self) {
+        let _ = self.daemon.stop_resolve_hostname(&self.hostname);
     }
 }
 
