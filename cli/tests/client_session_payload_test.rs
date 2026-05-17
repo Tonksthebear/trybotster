@@ -218,3 +218,117 @@ fn same_worktree_blocks_delete_even_when_workspace_ids_differ() {
         "another session on the same worktree must block worktree deletion even if workspace IDs differ"
     );
 }
+
+#[test]
+fn batch_close_actions_match_scalar_policy() {
+    let lua = create_lua_vm();
+    load_modules(&lua);
+
+    let matches: bool = lua
+        .load(
+            r#"
+            local sessions = {
+              {
+                id = "sess-1",
+                session_uuid = "sess-1",
+                workspace_id = "ws-1",
+                worktree_path = "/tmp/shared-worktree",
+                in_worktree = true,
+                metadata = {},
+              },
+              {
+                id = "sess-2",
+                session_uuid = "sess-2",
+                workspace_id = "ws-2",
+                worktree_path = "/tmp/shared-worktree",
+                in_worktree = true,
+                metadata = {},
+              },
+              {
+                id = "sess-3",
+                session_uuid = "sess-3",
+                workspace_id = "ws-1",
+                worktree_path = "/tmp/other-worktree",
+                in_worktree = true,
+                metadata = {},
+              },
+              {
+                id = "sess-4",
+                session_uuid = "sess-4",
+                workspace_id = "ws-3",
+                worktree_path = "/tmp/no-delete",
+                in_worktree = false,
+                metadata = {},
+              },
+              {
+                id = "sess-5",
+                session_uuid = "sess-5",
+                worktree_path = "/tmp/no-workspace",
+                in_worktree = true,
+                metadata = {},
+              },
+              {
+                id = "sess-6",
+                session_uuid = "sess-6",
+                workspace_id = "",
+                worktree_path = "/tmp/empty-workspace-a",
+                in_worktree = true,
+                metadata = {},
+              },
+              {
+                id = "sess-7",
+                session_uuid = "sess-7",
+                workspace_id = "",
+                worktree_path = "/tmp/empty-workspace-b",
+                in_worktree = true,
+                metadata = {},
+              },
+              {
+                id = "sess-8",
+                session_uuid = "sess-8",
+                workspace_id = "ws-empty-path",
+                worktree_path = "",
+                in_worktree = true,
+                metadata = {},
+              },
+              {
+                id = "sess-9",
+                session_uuid = "sess-9",
+                workspace_id = "ws-empty-path",
+                worktree_path = "/tmp/empty-path-peer",
+                in_worktree = true,
+                metadata = {},
+              },
+              {
+                id = "sys-1",
+                session_uuid = "sys-1",
+                workspace_id = "ws-1",
+                worktree_path = "/tmp/shared-worktree",
+                in_worktree = true,
+                metadata = { system_session = true },
+                system_session = true,
+              },
+            }
+
+            local batched = policy.close_actions_for_sessions(sessions)
+            for _, session in ipairs(sessions) do
+              local scalar = policy.close_actions_for_session(session, sessions)
+              local batch = batched.by_session_id[session.session_uuid]
+              if scalar.can_close ~= batch.can_close
+                or scalar.can_delete_worktree ~= batch.can_delete_worktree
+                or scalar.delete_worktree_reason ~= batch.delete_worktree_reason
+                or scalar.other_active_sessions ~= batch.other_active_sessions then
+                return false
+              end
+            end
+            return true
+        "#,
+        )
+        .eval()
+        .expect("batch close action comparison should evaluate");
+
+    assert!(
+        matches,
+        "batched close-action derivation should preserve scalar policy semantics"
+    );
+}

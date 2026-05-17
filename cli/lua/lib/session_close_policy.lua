@@ -60,6 +60,38 @@ local function shares_removal_scope(target, other)
     return false
 end
 
+local function default_actions()
+    return {
+        can_close = true,
+        can_delete_worktree = false,
+        delete_worktree_reason = nil,
+        other_active_sessions = 0,
+    }
+end
+
+local function same_session(a, b)
+    local a_id = session_id(a)
+    local b_id = session_id(b)
+    if a_id == nil and b_id == nil then
+        return true
+    end
+    return a_id == b_id
+end
+
+local function non_empty(value)
+    return type(value) == "string" and value ~= ""
+end
+
+local function append_index(index, key, entry)
+    if key == nil then return end
+    local bucket = index[key]
+    if not bucket then
+        bucket = {}
+        index[key] = bucket
+    end
+    bucket[#bucket + 1] = entry
+end
+
 function M.other_active_sessions(target, sessions)
     local others = {}
     if type(target) ~= "table" then return others end
@@ -76,12 +108,7 @@ function M.other_active_sessions(target, sessions)
 end
 
 function M.close_actions_for_session(target, sessions)
-    local actions = {
-        can_close = true,
-        can_delete_worktree = false,
-        delete_worktree_reason = nil,
-        other_active_sessions = 0,
-    }
+    local actions = default_actions()
 
     if type(target) ~= "table" then
         actions.can_close = false
@@ -103,6 +130,77 @@ function M.close_actions_for_session(target, sessions)
 
     actions.can_delete_worktree = true
     return actions
+end
+
+function M.close_actions_for_sessions(sessions)
+    local by_worktree_path = {}
+    local by_workspace_id = {}
+
+    for _, session in ipairs(sessions or {}) do
+        if not system_session(session) then
+            local path = worktree_path(session)
+            if non_empty(path) then
+                append_index(by_worktree_path, path, session)
+            end
+            append_index(by_workspace_id, workspace_id(session), session)
+        end
+    end
+
+    local actions_by_session_id = {}
+    local actions_by_subject = {}
+
+    for _, target in ipairs(sessions or {}) do
+        local actions = default_actions()
+
+        if type(target) ~= "table" then
+            actions.can_close = false
+            actions.delete_worktree_reason = "session_missing"
+        elseif not in_worktree(target) then
+            actions.delete_worktree_reason = "not_in_worktree"
+        else
+            local seen = {}
+            local other_count = 0
+
+            local function count_bucket(bucket)
+                for _, other in ipairs(bucket or {}) do
+                    local key = session_id(other) or other
+                    if not seen[key] and not same_session(target, other) then
+                        seen[key] = true
+                        other_count = other_count + 1
+                    end
+                end
+            end
+
+            local target_worktree_path = worktree_path(target)
+            if non_empty(target_worktree_path) then
+                count_bucket(by_worktree_path[target_worktree_path])
+            end
+
+            local target_workspace_id = workspace_id(target)
+            if target_workspace_id ~= nil then
+                count_bucket(by_workspace_id[target_workspace_id])
+            end
+
+            actions.other_active_sessions = other_count
+            if other_count > 0 then
+                actions.delete_worktree_reason = "other_sessions_active"
+            else
+                actions.can_delete_worktree = true
+            end
+        end
+
+        local id = session_id(target)
+        if id ~= nil then
+            actions_by_session_id[id] = actions
+        else
+            actions_by_subject[target] = actions
+        end
+    end
+
+    return {
+        by_session_id = actions_by_session_id,
+        by_subject = actions_by_subject,
+    }
 end
 
 return M

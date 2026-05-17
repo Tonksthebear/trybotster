@@ -238,10 +238,14 @@ function M.actions_for_session(session)
     return out
 end
 
-function M.all()
+function M.all(sessions)
     local Session = require("lib.session")
     local out = {}
-    for _, session in ipairs(Session.all_info()) do
+    local session_list = sessions
+    if type(session_list) ~= "table" then
+        session_list = Session.all_info()
+    end
+    for _, session in ipairs(session_list) do
         for _, action in ipairs(M.actions_for_session(session)) do
             out[#out + 1] = action
         end
