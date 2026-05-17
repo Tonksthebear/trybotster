@@ -512,8 +512,8 @@ local function registered_type_names(opts)
     return names
 end
 
-local function snapshot_items(entry, entity_type)
-    local ok, items = pcall(entry.all)
+local function snapshot_items(entry, entity_type, context)
+    local ok, items = pcall(entry.all, context)
     if not ok then
         log.warn(string.format(
             "entity_broadcast: all() for %q threw: %s",
@@ -556,11 +556,21 @@ function M.send_snapshots_to(client, sub_id, opts)
     assert(client and type(client.send) == "function",
         "entity_broadcast.send_snapshots_to: client must support :send(msg)")
     local batch_started = PERF and os.clock() or nil
+    local context = {}
+    local plugin_contexts = {}
     local sent = 0
     for _, entity_type in ipairs(registered_type_names(opts)) do
         local started = PERF and os.clock() or nil
         local entry = registry[entity_type]
-        local items = snapshot_items(entry, entity_type)
+        local provider_context = context
+        if entry and entry.owner_plugin then
+            provider_context = plugin_contexts[entry.owner_plugin]
+            if not provider_context then
+                provider_context = {}
+                plugin_contexts[entry.owner_plugin] = provider_context
+            end
+        end
+        local items = snapshot_items(entry, entity_type, provider_context)
         local frame = {
             v = 2,
             type = "entity_snapshot",

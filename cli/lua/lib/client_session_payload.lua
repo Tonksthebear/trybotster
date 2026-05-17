@@ -26,14 +26,22 @@ local function intrinsic_info(subject)
     return subject
 end
 
-function M.build(subject, sessions)
+function M.build(subject, sessions, close_actions)
     local info = shallow_copy(intrinsic_info(subject))
     local session_list = sessions
     if type(session_list) ~= "table" then
         session_list = Agent.all_info()
     end
 
-    info.close_actions = SessionClosePolicy.close_actions_for_session(info, session_list)
+    if type(close_actions) == "table" then
+        local id = info.session_uuid or info.id
+        info.close_actions = close_actions.by_session_id and close_actions.by_session_id[id]
+            or close_actions.by_subject and close_actions.by_subject[subject]
+            or close_actions.by_subject and close_actions.by_subject[info]
+            or SessionClosePolicy.close_actions_for_session(info, session_list)
+    else
+        info.close_actions = SessionClosePolicy.close_actions_for_session(info, session_list)
+    end
     return info
 end
 
@@ -45,8 +53,9 @@ function M.build_many(subjects)
         intrinsic[#intrinsic + 1] = intrinsic_info(subject)
     end
 
+    local close_actions = SessionClosePolicy.close_actions_for_sessions(intrinsic)
     for _, info in ipairs(intrinsic) do
-        list[#list + 1] = M.build(info, intrinsic)
+        list[#list + 1] = M.build(info, intrinsic, close_actions)
     end
 
     return list

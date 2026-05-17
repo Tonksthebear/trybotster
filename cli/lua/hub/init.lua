@@ -92,10 +92,75 @@ if EB then
     local Agent = require("lib.agent")
     local ClientSessionPayload = require("lib.client_session_payload")
 
+    local function spawn_target_registry()
+        local registry = rawget(_G, "spawn_targets")
+        if not registry or type(registry.list) ~= "function" then return nil end
+        return registry
+    end
+
+    local function list_spawn_targets(registry, context)
+        if context and type(context["spawn_target.list"]) == "table" then
+            return context["spawn_target.list"]
+        end
+        if not registry then return {} end
+        local ok, listed = pcall(registry.list)
+        if not ok or type(listed) ~= "table" then return {} end
+        if context then context["spawn_target.list"] = listed end
+        return listed
+    end
+
+    local function inspect_spawn_target(registry, target_path, context)
+        if type(target_path) ~= "string" or target_path == "" then return nil end
+        if not registry or type(registry.inspect) ~= "function" then return nil end
+
+        local inspections = context and context["spawn_target.inspections"]
+        if context and type(inspections) ~= "table" then
+            inspections = {}
+            context["spawn_target.inspections"] = inspections
+        end
+        if inspections and inspections[target_path] ~= nil then
+            return inspections[target_path] or nil
+        end
+
+        local inspect_ok, inspection = pcall(registry.inspect, target_path)
+        if not inspect_ok or type(inspection) ~= "table" then
+            inspection = false
+        end
+        if inspections then inspections[target_path] = inspection end
+        return inspection or nil
+    end
+
+    local function copy_table(source)
+        local out = {}
+        if type(source) ~= "table" then return out end
+        for k, v in pairs(source) do out[k] = v end
+        return out
+    end
+
+    local function target_for_worktree_path(targets, path)
+        if type(path) ~= "string" then return nil end
+        for _, target in ipairs(targets or {}) do
+            local target_path = type(target) == "table" and target.path or nil
+            if type(target_path) == "string"
+                and (
+                    path == target_path
+                    or path:sub(1, #target_path + 1) == (target_path .. "/")
+                )
+            then
+                return target
+            end
+        end
+        return nil
+    end
+
     EB.register("session", {
         id_field = "session_uuid",
-        all = function()
-            return ClientSessionPayload.build_many(Session.all_info())
+        all = function(context)
+            -- Session.all_info returns normalized tables; session_action reuses
+            -- exactly this request-local table when the client asks for both.
+            local sessions = Session.all_info()
+            if context then context["session.info"] = sessions end
+            return ClientSessionPayload.build_many(sessions)
         end,
         filter = function(info)
             return not Session.is_system_session(info)
@@ -103,9 +168,9 @@ if EB then
     })
     EB.register("session_action", {
         id_field = "id",
-        all = function()
+        all = function(context)
             local SessionActions = require("lib.session_actions")
-            return SessionActions.all()
+            return SessionActions.all(context and context["session.info"] or nil)
         end,
     })
     EB.register("workspace", {
@@ -120,23 +185,16 @@ if EB then
     })
     EB.register("spawn_target", {
         id_field = "target_id",
-        all = function()
-            local registry = rawget(_G, "spawn_targets")
-            if not registry or type(registry.list) ~= "function" then
-                return {}
-            end
-            local ok, listed = pcall(registry.list)
-            if not ok or type(listed) ~= "table" then return {} end
+        all = function(context)
+            local registry = spawn_target_registry()
+            local listed = list_spawn_targets(registry, context)
             local out = {}
             for _, target in ipairs(listed) do
                 local merged = target
-                if type(registry.inspect) == "function" and target.path then
-                    local inspect_ok, inspection = pcall(registry.inspect, target.path)
-                    if inspect_ok and type(inspection) == "table" then
-                        merged = {}
-                        for k, v in pairs(target) do merged[k] = v end
-                        for k, v in pairs(inspection) do merged[k] = v end
-                    end
+                local inspection = inspect_spawn_target(registry, target.path, context)
+                if type(inspection) == "table" then
+                    merged = copy_table(target)
+                    for k, v in pairs(inspection) do merged[k] = v end
                 end
                 out[#out + 1] = merged
             end
@@ -145,52 +203,52 @@ if EB then
     })
     EB.register("worktree", {
         id_field = "worktree_path",
-        all = function()
+        all = function(context)
             local worktrees = hub.get_worktrees()
-            local targets = {}
-            local registry = rawget(_G, "spawn_targets")
-            if registry and type(registry.list) == "function" then
-                local ok, listed = pcall(registry.list)
-                if ok and type(listed) == "table" then targets = listed end
-            end
+            local registry = spawn_target_registry()
+            local targets = list_spawn_targets(registry, context)
             local out = {}
+            local by_path = {}
+            local function append_worktree(payload)
+                if type(payload) ~= "table" then return end
+                local path = payload.worktree_path or payload.path
+                if type(path) ~= "string" or path == "" then return end
+                payload.worktree_path = path
+                payload.path = payload.path or path
+                if by_path[path] then
+                    for k, v in pairs(payload) do by_path[path][k] = v end
+                    return
+                end
+                by_path[path] = payload
+                out[#out + 1] = payload
+            end
             for _, worktree_entry in ipairs(worktrees or {}) do
                 if type(worktree_entry) == "table" then
-                    local payload = {}
-                    for k, v in pairs(worktree_entry) do payload[k] = v end
+                    local payload = copy_table(worktree_entry)
                     payload.worktree_path = payload.worktree_path or payload.path
-                    for _, target in ipairs(targets) do
-                        local target_path = type(target) == "table" and target.path or nil
-                        if type(target_path) == "string"
-                            and type(payload.worktree_path) == "string"
-                            and (
-                                payload.worktree_path == target_path
-                                or payload.worktree_path:sub(1, #target_path + 1) == (target_path .. "/")
-                            )
-                        then
-                            payload.target_id = target.target_id or target.id
-                            break
-                        end
+                    local target = target_for_worktree_path(targets, payload.worktree_path)
+                    if target then
+                        payload.target_id = target.target_id or target.id
                     end
-                    out[#out + 1] = payload
+                    append_worktree(payload)
                 end
             end
             for _, target in ipairs(targets) do
                 local target_path = type(target) == "table" and target.path or nil
-                if type(target_path) == "string" and registry and type(registry.inspect) == "function" then
-                    local inspect_ok, inspection = pcall(registry.inspect, target_path)
-                    local target_worktrees = inspect_ok and type(inspection) == "table" and inspection.worktrees or nil
+                if type(target_path) == "string" then
+                    local inspection = inspect_spawn_target(registry, target_path, context)
+                    local target_worktrees = type(inspection) == "table" and inspection.worktrees or nil
                     if type(target_worktrees) == "table" then
                         for _, target_worktree in ipairs(target_worktrees) do
                             if type(target_worktree) == "table" then
                                 local path = target_worktree.worktree_path or target_worktree.path
                                 if type(path) == "string" and path ~= "" then
-                                    out[#out + 1] = {
+                                    append_worktree({
                                         worktree_path = path,
                                         path = path,
                                         branch = target_worktree.branch,
                                         target_id = target.target_id or target.id,
-                                    }
+                                    })
                                 end
                             end
                         end

@@ -471,6 +471,92 @@ fn send_snapshots_to_emits_one_snapshot_per_registered_type() {
 }
 
 #[test]
+fn send_snapshots_to_shares_context_across_entity_providers() {
+    let (lua, eb) = new_eb_lua();
+
+    lua.globals().set("EB", eb).unwrap();
+    let result: bool = lua
+        .load(
+            r#"
+            EB.register("session", {
+              id_field = "session_uuid",
+              all = function(context)
+                context["session.info"] = {
+                  { session_uuid = "sess-1" },
+                }
+                return context["session.info"]
+              end,
+            })
+            EB.register("session1.alpha", {
+              id_field = "id",
+              owner_plugin = "session1",
+              all = function(context)
+                context.session_info = { { session_uuid = "corrupted" } }
+                context["session.info"] = { { session_uuid = "corrupted" } }
+                context.plugin_marker = "shared"
+                return { { id = "plugin-1" } }
+              end,
+            })
+            EB.register("session1.beta", {
+              id_field = "id",
+              owner_plugin = "session1",
+              all = function(context)
+                return { { id = "plugin-2", marker = context.plugin_marker } }
+              end,
+            })
+            EB.register("session2.plugin", {
+              id_field = "id",
+              owner_plugin = "session2",
+              all = function(context)
+                return { { id = "plugin-3", marker = context.plugin_marker or "clean" } }
+              end,
+            })
+            EB.register("session_action", {
+              id_field = "id",
+              all = function(context)
+                local session = context["session.info"] and context["session.info"][1]
+                return {
+                  {
+                    id = session.session_uuid .. ":close",
+                    session_uuid = session.session_uuid,
+                  },
+                }
+              end,
+            })
+
+            local captured = {}
+            local client = {
+              send = function(_, frame)
+                captured[#captured + 1] = frame
+              end,
+            }
+            EB.send_snapshots_to(client, "sub-1", { types = {
+              "session",
+              "session1.alpha",
+              "session1.beta",
+              "session2.plugin",
+              "session_action",
+            } })
+            local by_type = {}
+            for _, frame in ipairs(captured) do
+              by_type[frame.entity_type] = frame
+            end
+            return by_type.session.items[1].session_uuid == "sess-1"
+              and by_type.session_action.items[1].id == "sess-1:close"
+              and by_type["session1.beta"].items[1].marker == "shared"
+              and by_type["session2.plugin"].items[1].marker == "clean"
+        "#,
+        )
+        .eval()
+        .expect("context-sharing snapshot script should evaluate");
+
+    assert!(
+        result,
+        "entity providers should share one request-local context"
+    );
+}
+
+#[test]
 fn send_snapshots_to_core_scope_skips_plugin_types() {
     let (lua, eb) = new_eb_lua();
     register_session_type(&lua, &eb);
