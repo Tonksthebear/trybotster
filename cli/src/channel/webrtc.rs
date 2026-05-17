@@ -1044,10 +1044,14 @@ impl WebRtcChannel {
         _sdp_mid: Option<&str>,
         _sdp_mline_index: Option<u16>,
     ) -> Result<(), ChannelError> {
-        let pc_guard = self.peer_connection.lock().await;
-        let pc = pc_guard
-            .as_ref()
-            .ok_or_else(|| ChannelError::ConnectionFailed("No peer connection".to_string()))?;
+        {
+            let pc_guard = self.peer_connection.lock().await;
+            if pc_guard.is_none() {
+                return Err(ChannelError::ConnectionFailed(
+                    "No peer connection".to_string(),
+                ));
+            }
+        }
 
         // Parse the candidate SDP string (browser sends "candidate:..." format)
         let sdp_str = candidate.trim_start_matches("candidate:");
@@ -1091,6 +1095,11 @@ impl WebRtcChannel {
                 }
             }
         };
+
+        let pc_guard = self.peer_connection.lock().await;
+        let pc = pc_guard
+            .as_ref()
+            .ok_or_else(|| ChannelError::ConnectionFailed("No peer connection".to_string()))?;
 
         pc.add_ice_candidate(ice_candidate).map_err(|e| {
             ChannelError::ConnectionFailed(format!("Failed to add ICE candidate: {e}"))
@@ -1206,6 +1215,16 @@ impl WebRtcChannel {
                     _ => None,
                 })
             })
+    }
+
+    /// Sort key for applying ICE candidates: lower values are applied first.
+    /// mDNS hostnames are deprioritized because resolution can wait up to 750ms.
+    pub(crate) fn ice_candidate_application_priority(candidate: &str) -> u8 {
+        if Self::is_mdns_hostname_candidate(candidate.trim_start_matches("candidate:")) {
+            1
+        } else {
+            0
+        }
     }
 
     fn is_mdns_hostname_candidate(candidate_sdp: &str) -> bool {
