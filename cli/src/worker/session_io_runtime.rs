@@ -26,7 +26,8 @@ use crate::session::protocol::{
 };
 
 use super::session_io::{
-    SessionIoEvent, SessionIoRequest, TerminalInitialSnapshotDelivery, TerminalOutputSubscription,
+    SessionIoEvent, SessionIoRequest, TerminalAttachDeliveryFailureReason,
+    TerminalAttachDeliveryPhase, TerminalInitialSnapshotDelivery, TerminalOutputSubscription,
     prepare_snapshot_payload, write_paste_file,
 };
 
@@ -619,33 +620,38 @@ impl SessionIoRuntime {
         );
         if snapshot.is_empty() {
             if crate::session::session_process_is_live(&self.session_uuid) {
-                let mut outbound_accepted = true;
                 if delivery.confirm_subscription {
-                    outbound_accepted &= delivery
-                        .worker
-                        .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                    if self
+                        .try_send_initial_attach_control(
+                            &delivery,
+                            TerminalAttachDeliveryPhase::SubscribeAck,
                             crate::worker::client::ClientControlFrame::BoundaryJson(
                                 serde_json::json!({
                                     "type": "subscribed",
                                     "subscriptionId": delivery.subscription_id.clone(),
                                 }),
                             ),
-                        ))
-                        .is_ok();
+                        )
+                        .is_err()
+                    {
+                        return;
+                    }
                 }
-                outbound_accepted &= delivery
-                    .worker
-                    .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                if self
+                    .try_send_initial_attach_control(
+                        &delivery,
+                        TerminalAttachDeliveryPhase::AttachState,
                         crate::worker::client::ClientControlFrame::TerminalAttach {
                             subscription_id: delivery.subscription_id.clone(),
                             session_uuid: self.session_uuid.clone(),
                             state: crate::worker::client::TerminalAttachState::Reconnecting,
                         },
-                    ))
-                    .is_ok();
-                if outbound_accepted {
-                    self.emit_initial_attach_timing(&delivery, snapshot.len(), snapshot_ready_at);
+                    )
+                    .is_err()
+                {
+                    return;
                 }
+                self.emit_initial_attach_timing(&delivery, snapshot.len(), snapshot_ready_at);
                 self.activate_live_subscription_after_snapshot(&delivery);
             } else {
                 let _ = delivery.worker.try_send(
@@ -695,10 +701,19 @@ impl SessionIoRuntime {
             )) {
             Ok(()) => {}
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                self.report_initial_snapshot_backpressure(&delivery);
+                self.report_initial_attach_delivery_failure(
+                    &delivery,
+                    TerminalAttachDeliveryPhase::Snapshot,
+                    TerminalAttachDeliveryFailureReason::QueueFull,
+                );
                 return;
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.report_initial_attach_delivery_failure(
+                    &delivery,
+                    TerminalAttachDeliveryPhase::Snapshot,
+                    TerminalAttachDeliveryFailureReason::QueueClosed,
+                );
                 if let Ok(mut subscriptions) = self.terminal_subscriptions.lock() {
                     subscriptions.remove(&delivery.subscription_key);
                 }
@@ -706,33 +721,69 @@ impl SessionIoRuntime {
             }
         }
 
-        let mut outbound_accepted = true;
         if delivery.confirm_subscription {
-            outbound_accepted &= delivery
-                .worker
-                .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+            if self
+                .try_send_initial_attach_control(
+                    &delivery,
+                    TerminalAttachDeliveryPhase::SubscribeAck,
                     crate::worker::client::ClientControlFrame::BoundaryJson(serde_json::json!({
                         "type": "subscribed",
                         "subscriptionId": delivery.subscription_id.clone(),
                     })),
-                ))
-                .is_ok();
+                )
+                .is_err()
+            {
+                return;
+            }
         }
 
-        outbound_accepted &= delivery
-            .worker
-            .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+        if self
+            .try_send_initial_attach_control(
+                &delivery,
+                TerminalAttachDeliveryPhase::AttachState,
                 crate::worker::client::ClientControlFrame::TerminalAttach {
                     subscription_id: delivery.subscription_id.clone(),
                     session_uuid: self.session_uuid.clone(),
                     state: crate::worker::client::TerminalAttachState::Attached,
                 },
-            ))
-            .is_ok();
-        if outbound_accepted {
-            self.emit_initial_attach_timing(&delivery, snapshot_bytes, snapshot_ready_at);
+            )
+            .is_err()
+        {
+            return;
         }
+        self.emit_initial_attach_timing(&delivery, snapshot_bytes, snapshot_ready_at);
         self.activate_live_subscription_after_snapshot(&delivery);
+    }
+
+    fn try_send_initial_attach_control(
+        &self,
+        delivery: &TerminalInitialSnapshotDelivery,
+        phase: TerminalAttachDeliveryPhase,
+        frame: crate::worker::client::ClientControlFrame,
+    ) -> Result<(), ()> {
+        match delivery
+            .worker
+            .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                frame,
+            )) {
+            Ok(()) => Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                self.report_initial_attach_delivery_failure(
+                    delivery,
+                    phase,
+                    TerminalAttachDeliveryFailureReason::QueueFull,
+                );
+                Err(())
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                self.report_initial_attach_delivery_failure(
+                    delivery,
+                    phase,
+                    TerminalAttachDeliveryFailureReason::QueueClosed,
+                );
+                Err(())
+            }
+        }
     }
 
     fn emit_initial_attach_timing(
@@ -797,7 +848,25 @@ impl SessionIoRuntime {
         }
     }
 
-    fn report_initial_snapshot_backpressure(&self, delivery: &TerminalInitialSnapshotDelivery) {
+    fn report_initial_attach_delivery_failure(
+        &self,
+        delivery: &TerminalInitialSnapshotDelivery,
+        phase: TerminalAttachDeliveryPhase,
+        reason: TerminalAttachDeliveryFailureReason,
+    ) {
+        let _ = self.hub_event_tx.send(HubEvent::SessionIo(
+            SessionIoEvent::TerminalAttachDeliveryFailed {
+                request_id: delivery.request_id.clone(),
+                subscription_key: delivery.subscription_key.clone(),
+                session_uuid: self.session_uuid.clone(),
+                subscription_id: delivery.subscription_id.clone(),
+                phase,
+                reason,
+            },
+        ));
+        if reason != TerminalAttachDeliveryFailureReason::QueueFull {
+            return;
+        }
         let _ = self.hub_event_tx.send(HubEvent::ClientWorkerControl(
             crate::worker::hub_control::HubControlMessage::Backpressure(
                 crate::worker::hub_control::WorkerBackpressure {
@@ -1137,6 +1206,19 @@ mod tests {
         tokio_mpsc::Receiver<HubEvent>,
         Arc<AtomicBool>,
     ) {
+        spawn_test_worker_with_session(reader, "sess-test-io")
+    }
+
+    fn spawn_test_worker_with_session(
+        reader: UnixStream,
+        session_uuid: &str,
+    ) -> (
+        tokio_mpsc::Sender<SessionIoRequest>,
+        broadcast::Receiver<PtyEvent>,
+        mpsc::Receiver<Frame>,
+        tokio_mpsc::Receiver<HubEvent>,
+        Arc<AtomicBool>,
+    ) {
         let (event_tx, event_rx) = broadcast::channel(32);
         let (response_tx, response_rx) = mpsc::channel();
         let (hub_tx, hub_rx) = tokio_mpsc::channel(64);
@@ -1148,7 +1230,7 @@ mod tests {
             stream: reader,
             write_stream,
             request_rx: Some(request_rx),
-            session_uuid: "sess-test-io".to_string(),
+            session_uuid: session_uuid.to_string(),
             event_tx,
             kitty_enabled: Arc::new(AtomicBool::new(false)),
             cursor_visible: Arc::new(AtomicBool::new(true)),
@@ -1398,6 +1480,97 @@ mod tests {
     }
 
     #[test]
+    fn partial_initial_attach_delivery_reports_failure_and_does_not_activate_live_output() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (request_tx, _event_rx, _response_rx, mut hub_rx, _alive) =
+            spawn_test_worker_with_requests(reader);
+        let (client_tx, mut client_rx) =
+            tokio_mpsc::channel::<crate::worker::client::ClientWorkerMessage>(1);
+        let worker = crate::worker::client::ClientWorkerHandle {
+            client_id: crate::client::ClientId::Socket("client".to_string()),
+            tx: client_tx,
+        };
+        let live_subscription = TerminalOutputSubscription {
+            subscription_key: "client:sess-test-io".to_string(),
+            subscription_id: "terminal_sess-test-io".to_string(),
+            worker: worker.clone(),
+            output_prefix: Vec::new(),
+            filter: crate::worker::session_io::TerminalOutputFilter::None,
+        };
+
+        block_on_with_timeout(async {
+            request_tx
+                .send(SessionIoRequest::GetInitialSnapshot {
+                    delivery: crate::worker::session_io::TerminalInitialSnapshotDelivery {
+                        request_id: "initial-partial".to_string(),
+                        subscription_key: "client:sess-test-io".to_string(),
+                        session_uuid: "sess-test-io".to_string(),
+                        subscription_id: "terminal_sess-test-io".to_string(),
+                        worker,
+                        rows: 24,
+                        cols: 80,
+                        kitty_enabled: false,
+                        payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
+                        confirm_subscription: true,
+                        live_subscription: Some(live_subscription),
+                        attach_requested_at: Some(Instant::now()),
+                        client_worker_subscribed_at: Some(Instant::now()),
+                        session_io_snapshot_queued_at: Some(Instant::now()),
+                        session_io_accepted_at: None,
+                    },
+                })
+                .await
+                .expect("request partial initial snapshot");
+        });
+        std::thread::sleep(Duration::from_millis(10));
+
+        writer
+            .write_all(&encode_frame(FRAME_SNAPSHOT, b"initial-partial-snapshot"))
+            .expect("write snapshot frame");
+
+        match block_on_with_timeout(async {
+            client_rx
+                .recv()
+                .await
+                .expect("client worker initial snapshot")
+        }) {
+            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::Scrollback { data, .. },
+            ) => assert_eq!(data, b"initial-partial-snapshot"),
+            other => panic!("expected Scrollback control frame, got {other:?}"),
+        }
+
+        match recv_hub_event(&mut hub_rx) {
+            HubEvent::SessionIo(SessionIoEvent::TerminalAttachDeliveryFailed {
+                request_id,
+                phase,
+                reason,
+                ..
+            }) => {
+                assert_eq!(request_id, "initial-partial");
+                assert_eq!(phase, TerminalAttachDeliveryPhase::SubscribeAck);
+                assert_eq!(reason, TerminalAttachDeliveryFailureReason::QueueFull);
+            }
+            other => panic!("expected TerminalAttachDeliveryFailed, got {other:?}"),
+        }
+        assert!(matches!(
+            recv_hub_event(&mut hub_rx),
+            HubEvent::ClientWorkerControl(
+                crate::worker::hub_control::HubControlMessage::Backpressure(_)
+            )
+        ));
+
+        writer
+            .write_all(&encode_frame(FRAME_PTY_OUTPUT, b"live-after-partial"))
+            .expect("write live output");
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            client_rx.try_recv().is_err(),
+            "partial attach must not activate live output delivery"
+        );
+    }
+
+    #[test]
     fn initial_snapshot_barrier_delivers_snapshot_before_following_live_output() {
         let (mut writer, reader) = UnixStream::pair().expect("unix pair");
         let (request_tx, mut event_rx, _response_rx, _hub_rx, _alive) =
@@ -1514,7 +1687,7 @@ mod tests {
 
         let (mut writer, reader) = UnixStream::pair().expect("unix pair");
         let (request_tx, _event_rx, _response_rx, _hub_rx, _alive) =
-            spawn_test_worker_with_requests(reader);
+            spawn_test_worker_with_session(reader, &session_uuid);
         let (client_tx, mut client_rx) =
             tokio_mpsc::channel::<crate::worker::client::ClientWorkerMessage>(8);
         let worker = crate::worker::client::ClientWorkerHandle {
@@ -1584,6 +1757,111 @@ mod tests {
             }
             other => panic!("expected reconnecting terminal attach, got {other:?}"),
         }
+
+        if let Ok(path) = crate::session::session_socket_path(&session_uuid) {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Ok(path) = crate::session::session_pid_path(&session_uuid) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn empty_live_initial_snapshot_failure_does_not_activate_live_output() {
+        let session_uuid = "sess-test-io-empty-partial".to_string();
+        let socket_path =
+            crate::session::session_socket_path(&session_uuid).expect("session socket path");
+        std::fs::write(&socket_path, b"").expect("create live session socket");
+        crate::session::write_session_pid_file(&session_uuid, std::process::id())
+            .expect("write live session pid");
+
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (request_tx, _event_rx, _response_rx, mut hub_rx, _alive) =
+            spawn_test_worker_with_session(reader, &session_uuid);
+        let (client_tx, mut client_rx) =
+            tokio_mpsc::channel::<crate::worker::client::ClientWorkerMessage>(1);
+        let worker = crate::worker::client::ClientWorkerHandle {
+            client_id: crate::client::ClientId::Socket("client".to_string()),
+            tx: client_tx,
+        };
+        let live_subscription = TerminalOutputSubscription {
+            subscription_key: format!("client:{session_uuid}"),
+            subscription_id: "terminal_empty_partial".to_string(),
+            worker: worker.clone(),
+            output_prefix: Vec::new(),
+            filter: crate::worker::session_io::TerminalOutputFilter::None,
+        };
+
+        block_on_with_timeout(async {
+            request_tx
+                .send(SessionIoRequest::GetInitialSnapshot {
+                    delivery: crate::worker::session_io::TerminalInitialSnapshotDelivery {
+                        request_id: "initial-empty-partial".to_string(),
+                        subscription_key: format!("client:{session_uuid}"),
+                        session_uuid: session_uuid.clone(),
+                        subscription_id: "terminal_empty_partial".to_string(),
+                        worker,
+                        rows: 24,
+                        cols: 80,
+                        kitty_enabled: false,
+                        payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
+                        confirm_subscription: true,
+                        live_subscription: Some(live_subscription),
+                        attach_requested_at: Some(Instant::now()),
+                        client_worker_subscribed_at: Some(Instant::now()),
+                        session_io_snapshot_queued_at: Some(Instant::now()),
+                        session_io_accepted_at: None,
+                    },
+                })
+                .await
+                .expect("request empty partial initial snapshot");
+        });
+        std::thread::sleep(Duration::from_millis(10));
+
+        writer
+            .write_all(&encode_frame(FRAME_SNAPSHOT, b""))
+            .expect("write empty snapshot frame");
+
+        match block_on_with_timeout(async {
+            client_rx.recv().await.expect("subscription confirmation")
+        }) {
+            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::BoundaryJson(value),
+            ) => assert_eq!(
+                value.get("type").and_then(|value| value.as_str()),
+                Some("subscribed")
+            ),
+            other => panic!("expected subscribed boundary, got {other:?}"),
+        }
+
+        match recv_hub_event(&mut hub_rx) {
+            HubEvent::SessionIo(SessionIoEvent::TerminalAttachDeliveryFailed {
+                request_id,
+                phase,
+                reason,
+                ..
+            }) => {
+                assert_eq!(request_id, "initial-empty-partial");
+                assert_eq!(phase, TerminalAttachDeliveryPhase::AttachState);
+                assert_eq!(reason, TerminalAttachDeliveryFailureReason::QueueFull);
+            }
+            other => panic!("expected TerminalAttachDeliveryFailed, got {other:?}"),
+        }
+        assert!(matches!(
+            recv_hub_event(&mut hub_rx),
+            HubEvent::ClientWorkerControl(
+                crate::worker::hub_control::HubControlMessage::Backpressure(_)
+            )
+        ));
+
+        writer
+            .write_all(&encode_frame(FRAME_PTY_OUTPUT, b"live-after-empty-partial"))
+            .expect("write live output");
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(
+            client_rx.try_recv().is_err(),
+            "empty partial attach must not activate live output delivery"
+        );
 
         if let Ok(path) = crate::session::session_socket_path(&session_uuid) {
             let _ = std::fs::remove_file(path);
