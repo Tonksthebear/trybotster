@@ -78,7 +78,10 @@ at 100ms. Manifest writes are slow at 10ms.
 subscribe acknowledgement, and attach control frame are accepted by the client
 worker queue. If these spans look healthy while a browser still misses attach
 confirmation, check `client_worker.backpressure`, `snapshot.queue_full`, and
-`snapshot.queue_closed` counters.
+`snapshot.queue_closed` counters. Partial initial attach delivery is explicit:
+if any snapshot/ack/attach frame cannot be queued, SessionIo reports
+`terminal_attach.delivery_failed.*` counters and does not activate live output
+for that subscription.
 
 Session-process PTY output no longer reaches the hub as a hot-path byte event.
 The session I/O worker coalesces durable-session output and fans it to
@@ -131,6 +134,9 @@ largest observed value instead of summing every sample.
 | `webrtc_open.peer_sender_missing` | DataChannel opened but no peer command sender was available after sender setup; connected state is not emitted |
 | `client_worker.backpressure` | terminal/client worker queue rejected work |
 | `client_worker.session_io_missing` | terminal input or resize arrived without a registered session I/O sender |
+| `terminal_attach.delivery_failed` | initial terminal attach did not queue a complete snapshot/ack/attach sequence |
+| `terminal_attach.delivery_failed.phase.snapshot` / `.subscribe_ack` / `.attach_state` | attach delivery failure by failed frame phase |
+| `terminal_attach.delivery_failed.reason.queue_full` / `.queue_closed` | attach delivery failure by client-worker queue condition |
 | `pty_osc.title`, `pty_osc.cwd`, `pty_osc.prompt`, `pty_osc.cursor`, `pty_osc.other` | OSC subtype volume |
 | `pty_osc.volume_burst` | OSC volume guardrail fired |
 | `timer_fired.count` | timer events fired |

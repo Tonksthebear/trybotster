@@ -1,4 +1,5 @@
 use super::*;
+use crate::worker::session_io::{TerminalAttachDeliveryFailureReason, TerminalAttachDeliveryPhase};
 
 impl Hub {
     /// Remove paste files tracked for a closed session.
@@ -71,6 +72,9 @@ impl Hub {
             SessionIoEvent::TerminalAttachTiming(timing) => {
                 self.record_terminal_attach_timing(timing);
             }
+            SessionIoEvent::TerminalAttachDeliveryFailed { phase, reason, .. } => {
+                self.record_terminal_attach_delivery_failure(phase, reason);
+            }
             SessionIoEvent::Snapshot {
                 request_id,
                 session_uuid,
@@ -141,5 +145,39 @@ impl Hub {
                 label,
             );
         }
+    }
+
+    fn record_terminal_attach_delivery_failure(
+        &self,
+        phase: TerminalAttachDeliveryPhase,
+        reason: TerminalAttachDeliveryFailureReason,
+    ) {
+        self.hub_event_metrics
+            .record_counter("terminal_attach.delivery_failed", 1);
+        self.hub_event_metrics.record_counter(
+            match phase {
+                TerminalAttachDeliveryPhase::Snapshot => {
+                    "terminal_attach.delivery_failed.phase.snapshot"
+                }
+                TerminalAttachDeliveryPhase::SubscribeAck => {
+                    "terminal_attach.delivery_failed.phase.subscribe_ack"
+                }
+                TerminalAttachDeliveryPhase::AttachState => {
+                    "terminal_attach.delivery_failed.phase.attach_state"
+                }
+            },
+            1,
+        );
+        self.hub_event_metrics.record_counter(
+            match reason {
+                TerminalAttachDeliveryFailureReason::QueueFull => {
+                    "terminal_attach.delivery_failed.reason.queue_full"
+                }
+                TerminalAttachDeliveryFailureReason::QueueClosed => {
+                    "terminal_attach.delivery_failed.reason.queue_closed"
+                }
+            },
+            1,
+        );
     }
 }

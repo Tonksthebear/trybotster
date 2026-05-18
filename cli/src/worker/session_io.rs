@@ -198,6 +198,26 @@ pub struct TerminalAttachTiming {
     pub attach_to_client_worker_accepted: Option<Duration>,
 }
 
+/// Initial attach delivery step that failed while queueing frames to a client worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalAttachDeliveryPhase {
+    /// Initial scrollback snapshot frame.
+    Snapshot,
+    /// Optional subscribe acknowledgement frame.
+    SubscribeAck,
+    /// Terminal attach state control frame.
+    AttachState,
+}
+
+/// Why an initial attach delivery step failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminalAttachDeliveryFailureReason {
+    /// Client worker queue was full.
+    QueueFull,
+    /// Client worker queue was closed.
+    QueueClosed,
+}
+
 impl TerminalOutputFilter {
     /// Apply this filter to a chunk, preserving incomplete OSC query fragments
     /// in `buffer` across calls.
@@ -372,6 +392,22 @@ pub enum SessionIoEvent {
     /// Initial terminal attach timing emitted after snapshot delivery is queued
     /// to the client worker.
     TerminalAttachTiming(TerminalAttachTiming),
+    /// Initial terminal attach delivery failed before a complete
+    /// snapshot/ack/attach sequence could be queued.
+    TerminalAttachDeliveryFailed {
+        /// Request identifier for the initial snapshot barrier.
+        request_id: RequestId,
+        /// Stable route key for the terminal subscription.
+        subscription_key: String,
+        /// Session being attached.
+        session_uuid: SessionUuid,
+        /// Transport-local subscription id.
+        subscription_id: String,
+        /// Delivery phase that failed.
+        phase: TerminalAttachDeliveryPhase,
+        /// Failure reason.
+        reason: TerminalAttachDeliveryFailureReason,
+    },
     /// Terminal mode flags response.
     ModeFlags {
         /// Request identifier from `GetModeFlags`.

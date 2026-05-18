@@ -132,6 +132,32 @@ pub(super) fn test_terminal_attach_timing_records_boundary_spans() {
 }
 
 #[test]
+pub(super) fn test_terminal_attach_delivery_failure_records_counters() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    hub.handle_session_io_event(
+        crate::worker::session_io::SessionIoEvent::TerminalAttachDeliveryFailed {
+            request_id: "terminal-failed".to_string(),
+            subscription_key: "browser-failed:sess-failed".to_string(),
+            session_uuid: "sess-failed".to_string(),
+            subscription_id: "sub-failed".to_string(),
+            phase: crate::worker::session_io::TerminalAttachDeliveryPhase::AttachState,
+            reason: crate::worker::session_io::TerminalAttachDeliveryFailureReason::QueueClosed,
+        },
+    );
+
+    let snapshot = hub.hub_event_metrics.snapshot();
+    assert_eq!(snapshot.counters["terminal_attach.delivery_failed"], 1);
+    assert_eq!(
+        snapshot.counters["terminal_attach.delivery_failed.phase.attach_state"],
+        1
+    );
+    assert_eq!(
+        snapshot.counters["terminal_attach.delivery_failed.reason.queue_closed"],
+        1
+    );
+}
+
+#[test]
 pub(super) fn test_snapshot_enqueue_failure_cleans_existing_pending_request() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let session_uuid = "sess-snapshot-enqueue-cleanup";
