@@ -498,13 +498,11 @@ impl SessionIoRuntime {
     fn handle_frame(&mut self, frame: Frame) -> bool {
         match frame.frame_type {
             FRAME_PTY_OUTPUT => {
-                self.flush_metadata();
                 self.resize_pending.store(false, Ordering::Release);
                 self.last_output_at.store(now_millis(), Ordering::Relaxed);
                 self.coalescer.push_output(frame.payload);
             }
             FRAME_TITLE_CHANGED => {
-                self.flush_output();
                 self.coalescer
                     .set_title(String::from_utf8_lossy(&frame.payload).into_owned());
             }
@@ -515,13 +513,11 @@ impl SessionIoRuntime {
                     .send(PtyEvent::notification(AgentNotification::Bell));
             }
             FRAME_MODE_CHANGED => {
-                self.flush_output();
                 if let Ok(mode) = frame.json::<ModeChanged>() {
                     self.coalescer.merge_mode(mode);
                 }
             }
             FRAME_CWD_CHANGED => {
-                self.flush_output();
                 self.coalescer
                     .set_cwd(String::from_utf8_lossy(&frame.payload).into_owned());
             }
@@ -1791,11 +1787,51 @@ mod tests {
         payload.extend_from_slice(&encode_frame(FRAME_PTY_OUTPUT, b"after"));
         writer.write_all(&payload).expect("write frames");
 
+        assert_eq!(recv_output(&mut event_rx), b"after");
         match event_rx.blocking_recv().expect("cursor event") {
             PtyEvent::CursorVisibilityChanged(false) => {}
             other => panic!("expected cursor hidden, got {other:?}"),
         }
-        assert_eq!(recv_output(&mut event_rx), b"after");
+    }
+
+    #[test]
+    fn title_metadata_storm_flushes_latest_value_after_output_window() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (mut event_rx, _response_rx, _hub_rx, _alive) = spawn_test_worker(reader);
+
+        let mut payload = Vec::new();
+        for title in ["step-1", "step-2", "step-3"] {
+            payload.extend_from_slice(&encode_frame(FRAME_TITLE_CHANGED, title.as_bytes()));
+            payload.extend_from_slice(&encode_frame(FRAME_PTY_OUTPUT, title.as_bytes()));
+        }
+        writer.write_all(&payload).expect("write metadata storm");
+        writer.shutdown(Shutdown::Both).expect("shutdown writer");
+
+        assert_eq!(recv_output(&mut event_rx), b"step-1step-2step-3");
+        match event_rx.blocking_recv().expect("title event") {
+            PtyEvent::TitleChanged(title) => assert_eq!(title, "step-3"),
+            other => panic!("expected latest title, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cwd_metadata_storm_flushes_latest_value_after_output_window() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (mut event_rx, _response_rx, _hub_rx, _alive) = spawn_test_worker(reader);
+
+        let mut payload = Vec::new();
+        for cwd in ["/tmp/one", "/tmp/two", "/tmp/three"] {
+            payload.extend_from_slice(&encode_frame(FRAME_CWD_CHANGED, cwd.as_bytes()));
+            payload.extend_from_slice(&encode_frame(FRAME_PTY_OUTPUT, cwd.as_bytes()));
+        }
+        writer.write_all(&payload).expect("write metadata storm");
+        writer.shutdown(Shutdown::Both).expect("shutdown writer");
+
+        assert_eq!(recv_output(&mut event_rx), b"/tmp/one/tmp/two/tmp/three");
+        match event_rx.blocking_recv().expect("cwd event") {
+            PtyEvent::CwdChanged(cwd) => assert_eq!(cwd, "/tmp/three"),
+            other => panic!("expected latest cwd, got {other:?}"),
+        }
     }
 
     #[test]
