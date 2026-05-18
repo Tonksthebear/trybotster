@@ -76,7 +76,59 @@ pub(super) fn test_browser_initial_snapshot_uses_direct_session_io_delivery() {
         delivery.payload_mode,
         crate::worker::session_io::TerminalSnapshotPayloadMode::PrefixedGzip
     ));
+    assert!(delivery.attach_requested_at.is_some());
+    assert!(delivery.client_worker_subscribed_at.is_some());
+    assert!(delivery.session_io_snapshot_queued_at.is_some());
     hub.stop_terminal_subscription("browser-direct-snapshot:sess-browser-initial-direct-snapshot");
+}
+
+#[test]
+pub(super) fn test_terminal_attach_timing_records_boundary_spans() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    hub.handle_session_io_event(
+        crate::worker::session_io::SessionIoEvent::TerminalAttachTiming(
+            crate::worker::session_io::TerminalAttachTiming {
+                request_id: "terminal-timing".to_string(),
+                subscription_key: "browser-timing:sess-timing".to_string(),
+                session_uuid: "sess-timing".to_string(),
+                subscription_id: "sub-timing".to_string(),
+                snapshot_bytes: 4096,
+                attach_to_client_worker_subscribed: Some(std::time::Duration::from_millis(1)),
+                attach_to_session_io_queued: Some(std::time::Duration::from_millis(2)),
+                attach_to_session_io_accepted: Some(std::time::Duration::from_millis(3)),
+                attach_to_snapshot_ready: Some(std::time::Duration::from_millis(150)),
+                snapshot_ready_to_client_worker_accepted: std::time::Duration::from_millis(5),
+                attach_to_client_worker_accepted: Some(std::time::Duration::from_millis(6)),
+            },
+        ),
+    );
+
+    let snapshot = hub.hub_event_metrics.snapshot();
+    for span in [
+        "terminal_attach.client_worker_subscribe",
+        "terminal_attach.session_io_queue",
+        "terminal_attach.session_io_accept",
+        "terminal_attach.snapshot_ready",
+        "terminal_attach.client_worker_accept",
+        "terminal_attach.total_to_client_worker",
+    ] {
+        assert_eq!(snapshot.spans[span].count, 1, "missing span {span}");
+    }
+    assert_eq!(
+        snapshot.spans["terminal_attach.snapshot_ready"].bytes_total,
+        4096
+    );
+    assert_eq!(
+        snapshot.spans["terminal_attach.snapshot_ready"].slow_count,
+        1
+    );
+    assert!(
+        snapshot.slow_samples.iter().any(|sample| {
+            sample.span == "terminal_attach.snapshot_ready"
+                && sample.label == "browser-timing:sess-timi"
+        }),
+        "slow terminal attach sample should be capped and retained"
+    );
 }
 
 #[test]
@@ -221,9 +273,10 @@ pub(super) fn test_pending_session_io_snapshot_cleanup_paths() {
     hub.cleanup_pending_session_io_snapshots_for_peer("browser-a");
     assert!(!hub.pending_session_io_snapshots.contains_key("by-peer"));
     hub.cleanup_pending_session_io_snapshots_for_subscription("browser-b:sess-b");
-    assert!(!hub
-        .pending_session_io_snapshots
-        .contains_key("by-subscription"));
+    assert!(
+        !hub.pending_session_io_snapshots
+            .contains_key("by-subscription")
+    );
     hub.handle_hub_event(crate::hub::events::HubEvent::SessionUnregistered {
         session_uuid: "sess-c".to_string(),
     });

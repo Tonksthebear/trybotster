@@ -62,10 +62,23 @@ The most useful span names are:
 | `cleanup.webrtc_channel` | cleanup of one WebRTC channel |
 | `snapshot.rpc_get` | blocking terminal snapshot retrieval |
 | `snapshot.gzip_queue` | snapshot gzip and queue preparation, emitted while the session I/O data-plane helper prepares transport bytes |
+| `terminal_attach.client_worker_subscribe` | hub accepted terminal attach and queued the client-worker subscription |
+| `terminal_attach.session_io_queue` | hub accepted terminal attach and queued the initial snapshot request to the session I/O worker |
+| `terminal_attach.session_io_accept` | hub accepted terminal attach and session I/O worker accepted the initial snapshot request |
+| `terminal_attach.snapshot_ready` | hub accepted terminal attach and session I/O received the initial snapshot response |
+| `terminal_attach.client_worker_accept` | session I/O received the initial snapshot and queued snapshot/ack/attach frames to the client worker |
+| `terminal_attach.total_to_client_worker` | hub accepted terminal attach through client-worker acceptance of the initial snapshot/ack/attach frames |
 | `manifest.write` | hub runtime manifest write from hub-owned call sites |
 
 Hot socket/WebRTC subhandlers and cleanup scans are slow at 50ms. Snapshot RPC
-and gzip/queue spans are slow at 100ms. Manifest writes are slow at 10ms.
+and gzip/queue spans are slow at 100ms. Terminal attach boundary spans are slow
+at 100ms. Manifest writes are slow at 10ms.
+
+`terminal_attach.*` spans are emitted only after the initial snapshot, optional
+subscribe acknowledgement, and attach control frame are accepted by the client
+worker queue. If these spans look healthy while a browser still misses attach
+confirmation, check `client_worker.backpressure`, `snapshot.queue_full`, and
+`snapshot.queue_closed` counters.
 
 Session-process PTY output no longer reaches the hub as a hot-path byte event.
 The session I/O worker coalesces durable-session output and fans it to

@@ -68,6 +68,9 @@ impl Hub {
                     recovery,
                 );
             }
+            SessionIoEvent::TerminalAttachTiming(timing) => {
+                self.record_terminal_attach_timing(timing);
+            }
             SessionIoEvent::Snapshot {
                 request_id,
                 session_uuid,
@@ -76,6 +79,67 @@ impl Hub {
                 self.route_terminal_client_initial_snapshot(request_id, session_uuid, payload);
             }
             _ => {}
+        }
+    }
+
+    fn record_terminal_attach_timing(
+        &self,
+        timing: crate::worker::session_io::TerminalAttachTiming,
+    ) {
+        const TERMINAL_ATTACH_SLOW: std::time::Duration = std::time::Duration::from_millis(100);
+
+        let label = timing.subscription_key.as_str();
+        if let Some(elapsed) = timing.attach_to_client_worker_subscribed {
+            self.hub_event_metrics.record_span_with_threshold(
+                "terminal_attach.client_worker_subscribe",
+                elapsed,
+                0,
+                TERMINAL_ATTACH_SLOW,
+                label,
+            );
+        }
+        if let Some(elapsed) = timing.attach_to_session_io_queued {
+            self.hub_event_metrics.record_span_with_threshold(
+                "terminal_attach.session_io_queue",
+                elapsed,
+                0,
+                TERMINAL_ATTACH_SLOW,
+                label,
+            );
+        }
+        if let Some(elapsed) = timing.attach_to_session_io_accepted {
+            self.hub_event_metrics.record_span_with_threshold(
+                "terminal_attach.session_io_accept",
+                elapsed,
+                0,
+                TERMINAL_ATTACH_SLOW,
+                label,
+            );
+        }
+        if let Some(elapsed) = timing.attach_to_snapshot_ready {
+            self.hub_event_metrics.record_span_with_threshold(
+                "terminal_attach.snapshot_ready",
+                elapsed,
+                timing.snapshot_bytes,
+                TERMINAL_ATTACH_SLOW,
+                label,
+            );
+        }
+        self.hub_event_metrics.record_span_with_threshold(
+            "terminal_attach.client_worker_accept",
+            timing.snapshot_ready_to_client_worker_accepted,
+            timing.snapshot_bytes,
+            TERMINAL_ATTACH_SLOW,
+            label,
+        );
+        if let Some(elapsed) = timing.attach_to_client_worker_accepted {
+            self.hub_event_metrics.record_span_with_threshold(
+                "terminal_attach.total_to_client_worker",
+                elapsed,
+                timing.snapshot_bytes,
+                TERMINAL_ATTACH_SLOW,
+                label,
+            );
         }
     }
 }

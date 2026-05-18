@@ -18,16 +18,16 @@ use crate::agent::notification::AgentNotification;
 use crate::agent::pty::{PromptMark, PtyEvent};
 use crate::hub::events::{HubEvent, HubEventTx};
 use crate::session::protocol::{
-    encode_empty, encode_frame, encode_json, Frame, FrameDecoder, ModeChanged, NotificationPayload,
-    PromptMarkPayload, FRAME_BELL, FRAME_CWD_CHANGED, FRAME_GET_MODE_FLAGS, FRAME_GET_SCREEN,
-    FRAME_GET_SNAPSHOT, FRAME_MODE_CHANGED, FRAME_NOTIFICATION, FRAME_PROCESS_EXITED,
-    FRAME_PROMPT_MARK, FRAME_PTY_INPUT, FRAME_PTY_OUTPUT, FRAME_RESIZE, FRAME_SET_COLOR_PROFILE,
-    FRAME_SHUTDOWN, FRAME_SNAPSHOT, FRAME_TITLE_CHANGED,
+    FRAME_BELL, FRAME_CWD_CHANGED, FRAME_GET_MODE_FLAGS, FRAME_GET_SCREEN, FRAME_GET_SNAPSHOT,
+    FRAME_MODE_CHANGED, FRAME_NOTIFICATION, FRAME_PROCESS_EXITED, FRAME_PROMPT_MARK,
+    FRAME_PTY_INPUT, FRAME_PTY_OUTPUT, FRAME_RESIZE, FRAME_SET_COLOR_PROFILE, FRAME_SHUTDOWN,
+    FRAME_SNAPSHOT, FRAME_TITLE_CHANGED, Frame, FrameDecoder, ModeChanged, NotificationPayload,
+    PromptMarkPayload, encode_empty, encode_frame, encode_json,
 };
 
 use super::session_io::{
-    prepare_snapshot_payload, write_paste_file, SessionIoEvent, SessionIoRequest,
-    TerminalInitialSnapshotDelivery, TerminalOutputSubscription,
+    SessionIoEvent, SessionIoRequest, TerminalInitialSnapshotDelivery, TerminalOutputSubscription,
+    prepare_snapshot_payload, write_paste_file,
 };
 
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;
@@ -214,7 +214,7 @@ impl SessionIoRequestProcessor {
                         }));
                 }
             }
-            SessionIoRequest::GetInitialSnapshot { delivery } => {
+            SessionIoRequest::GetInitialSnapshot { mut delivery } => {
                 log::info!(
                     "[session-io] request initial snapshot for {} subscription={} key={} target={}x{} request={}",
                     self.session_uuid,
@@ -224,6 +224,7 @@ impl SessionIoRequestProcessor {
                     delivery.rows,
                     delivery.request_id
                 );
+                delivery.session_io_accepted_at = Some(Instant::now());
                 if let Ok(mut pending) = self.pending_snapshot_requests.lock() {
                     pending.push_back(PendingSnapshotRequest::Initial {
                         delivery: delivery.clone(),
@@ -606,6 +607,7 @@ impl SessionIoRuntime {
         delivery: TerminalInitialSnapshotDelivery,
         snapshot: Vec<u8>,
     ) {
+        let snapshot_ready_at = Instant::now();
         log::info!(
             "[session-io] deliver initial snapshot for {} subscription={} key={} target={}x{} snapshot_bytes={}",
             self.session_uuid,
@@ -617,27 +619,33 @@ impl SessionIoRuntime {
         );
         if snapshot.is_empty() {
             if crate::session::session_process_is_live(&self.session_uuid) {
+                let mut outbound_accepted = true;
                 if delivery.confirm_subscription {
-                    let _ = delivery.worker.try_send(
-                        crate::worker::client::ClientWorkerMessage::ControlFrame(
+                    outbound_accepted &= delivery
+                        .worker
+                        .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
                             crate::worker::client::ClientControlFrame::BoundaryJson(
                                 serde_json::json!({
                                     "type": "subscribed",
                                     "subscriptionId": delivery.subscription_id.clone(),
                                 }),
                             ),
-                        ),
-                    );
+                        ))
+                        .is_ok();
                 }
-                let _ = delivery.worker.try_send(
-                    crate::worker::client::ClientWorkerMessage::ControlFrame(
+                outbound_accepted &= delivery
+                    .worker
+                    .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
                         crate::worker::client::ClientControlFrame::TerminalAttach {
                             subscription_id: delivery.subscription_id.clone(),
                             session_uuid: self.session_uuid.clone(),
                             state: crate::worker::client::TerminalAttachState::Reconnecting,
                         },
-                    ),
-                );
+                    ))
+                    .is_ok();
+                if outbound_accepted {
+                    self.emit_initial_attach_timing(&delivery, snapshot.len(), snapshot_ready_at);
+                }
                 self.activate_live_subscription_after_snapshot(&delivery);
             } else {
                 let _ = delivery.worker.try_send(
@@ -660,6 +668,7 @@ impl SessionIoRuntime {
             return;
         }
 
+        let snapshot_bytes = snapshot.len();
         let data = match delivery.payload_mode {
             crate::worker::session_io::TerminalSnapshotPayloadMode::Raw => snapshot,
             crate::worker::session_io::TerminalSnapshotPayloadMode::PrefixedGzip => {
@@ -697,21 +706,20 @@ impl SessionIoRuntime {
             }
         }
 
+        let mut outbound_accepted = true;
         if delivery.confirm_subscription {
-            let _ =
-                delivery
-                    .worker
-                    .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
-                        crate::worker::client::ClientControlFrame::BoundaryJson(
-                            serde_json::json!({
-                                "type": "subscribed",
-                                "subscriptionId": delivery.subscription_id.clone(),
-                            }),
-                        ),
-                    ));
+            outbound_accepted &= delivery
+                .worker
+                .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                    crate::worker::client::ClientControlFrame::BoundaryJson(serde_json::json!({
+                        "type": "subscribed",
+                        "subscriptionId": delivery.subscription_id.clone(),
+                    })),
+                ))
+                .is_ok();
         }
 
-        let _ = delivery
+        outbound_accepted &= delivery
             .worker
             .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
                 crate::worker::client::ClientControlFrame::TerminalAttach {
@@ -719,8 +727,56 @@ impl SessionIoRuntime {
                     session_uuid: self.session_uuid.clone(),
                     state: crate::worker::client::TerminalAttachState::Attached,
                 },
-            ));
+            ))
+            .is_ok();
+        if outbound_accepted {
+            self.emit_initial_attach_timing(&delivery, snapshot_bytes, snapshot_ready_at);
+        }
         self.activate_live_subscription_after_snapshot(&delivery);
+    }
+
+    fn emit_initial_attach_timing(
+        &self,
+        delivery: &TerminalInitialSnapshotDelivery,
+        snapshot_bytes: usize,
+        snapshot_ready_at: Instant,
+    ) {
+        if delivery.attach_requested_at.is_none() {
+            return;
+        }
+        let outbound_accepted_at = Instant::now();
+        let timing = crate::worker::session_io::TerminalAttachTiming {
+            request_id: delivery.request_id.clone(),
+            subscription_key: delivery.subscription_key.clone(),
+            session_uuid: delivery.session_uuid.clone(),
+            subscription_id: delivery.subscription_id.clone(),
+            snapshot_bytes,
+            attach_to_client_worker_subscribed: delivery.attach_requested_at.and_then(|started| {
+                delivery
+                    .client_worker_subscribed_at
+                    .map(|ended| ended - started)
+            }),
+            attach_to_session_io_queued: delivery.attach_requested_at.and_then(|started| {
+                delivery
+                    .session_io_snapshot_queued_at
+                    .map(|ended| ended - started)
+            }),
+            attach_to_session_io_accepted: delivery
+                .attach_requested_at
+                .and_then(|started| delivery.session_io_accepted_at.map(|ended| ended - started)),
+            attach_to_snapshot_ready: delivery
+                .attach_requested_at
+                .map(|started| snapshot_ready_at - started),
+            snapshot_ready_to_client_worker_accepted: outbound_accepted_at - snapshot_ready_at,
+            attach_to_client_worker_accepted: delivery
+                .attach_requested_at
+                .map(|started| outbound_accepted_at - started),
+        };
+        let _ = self
+            .hub_event_tx
+            .send(HubEvent::SessionIo(SessionIoEvent::TerminalAttachTiming(
+                timing,
+            )));
     }
 
     fn activate_live_subscription_after_snapshot(
@@ -1207,6 +1263,10 @@ mod tests {
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: false,
                         live_subscription: None,
+                        attach_requested_at: None,
+                        client_worker_subscribed_at: None,
+                        session_io_snapshot_queued_at: None,
+                        session_io_accepted_at: None,
                     },
                 })
                 .await
@@ -1246,6 +1306,98 @@ mod tests {
     }
 
     #[test]
+    fn initial_snapshot_with_attach_timestamps_emits_terminal_attach_timing() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (request_tx, _event_rx, _response_rx, mut hub_rx, _alive) =
+            spawn_test_worker_with_requests(reader);
+        let (client_tx, mut client_rx) =
+            tokio_mpsc::channel::<crate::worker::client::ClientWorkerMessage>(8);
+        let worker = crate::worker::client::ClientWorkerHandle {
+            client_id: crate::client::ClientId::Socket("client".to_string()),
+            tx: client_tx,
+        };
+        let attach_requested_at = Instant::now();
+        let client_worker_subscribed_at = attach_requested_at + Duration::from_millis(1);
+        let session_io_snapshot_queued_at = attach_requested_at + Duration::from_millis(2);
+
+        block_on_with_timeout(async {
+            request_tx
+                .send(SessionIoRequest::GetInitialSnapshot {
+                    delivery: crate::worker::session_io::TerminalInitialSnapshotDelivery {
+                        request_id: "initial-timing".to_string(),
+                        subscription_key: "client:sess-test-io".to_string(),
+                        session_uuid: "sess-test-io".to_string(),
+                        subscription_id: "terminal_sess-test-io".to_string(),
+                        worker,
+                        rows: 24,
+                        cols: 80,
+                        kitty_enabled: false,
+                        payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
+                        confirm_subscription: true,
+                        live_subscription: None,
+                        attach_requested_at: Some(attach_requested_at),
+                        client_worker_subscribed_at: Some(client_worker_subscribed_at),
+                        session_io_snapshot_queued_at: Some(session_io_snapshot_queued_at),
+                        session_io_accepted_at: None,
+                    },
+                })
+                .await
+                .expect("request initial snapshot timing");
+        });
+        std::thread::sleep(Duration::from_millis(10));
+
+        writer
+            .write_all(&encode_frame(FRAME_SNAPSHOT, b"initial-timing-snapshot"))
+            .expect("write snapshot frame");
+
+        for expected in ["Scrollback", "BoundaryJson", "TerminalAttach"] {
+            let message = block_on_with_timeout(async {
+                client_rx
+                    .recv()
+                    .await
+                    .expect("client worker attach message")
+            });
+            match (expected, message) {
+                (
+                    "Scrollback",
+                    crate::worker::client::ClientWorkerMessage::ControlFrame(
+                        crate::worker::client::ClientControlFrame::Scrollback { data, .. },
+                    ),
+                ) => assert_eq!(data, b"initial-timing-snapshot"),
+                (
+                    "BoundaryJson",
+                    crate::worker::client::ClientWorkerMessage::ControlFrame(
+                        crate::worker::client::ClientControlFrame::BoundaryJson(value),
+                    ),
+                ) => assert_eq!(value["type"], "subscribed"),
+                (
+                    "TerminalAttach",
+                    crate::worker::client::ClientWorkerMessage::ControlFrame(
+                        crate::worker::client::ClientControlFrame::TerminalAttach { state, .. },
+                    ),
+                ) => assert_eq!(state, crate::worker::client::TerminalAttachState::Attached),
+                (expected, other) => panic!("expected {expected}, got {other:?}"),
+            }
+        }
+
+        match recv_hub_event(&mut hub_rx) {
+            HubEvent::SessionIo(SessionIoEvent::TerminalAttachTiming(timing)) => {
+                assert_eq!(timing.request_id, "initial-timing");
+                assert_eq!(timing.subscription_key, "client:sess-test-io");
+                assert_eq!(timing.session_uuid, "sess-test-io");
+                assert_eq!(timing.subscription_id, "terminal_sess-test-io");
+                assert_eq!(timing.snapshot_bytes, b"initial-timing-snapshot".len());
+                assert!(timing.attach_to_client_worker_subscribed.is_some());
+                assert!(timing.attach_to_session_io_queued.is_some());
+                assert!(timing.attach_to_session_io_accepted.is_some());
+                assert!(timing.attach_to_snapshot_ready.is_some());
+                assert!(timing.attach_to_client_worker_accepted.is_some());
+            }
+            other => panic!("expected TerminalAttachTiming, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn initial_snapshot_barrier_delivers_snapshot_before_following_live_output() {
         let (mut writer, reader) = UnixStream::pair().expect("unix pair");
         let (request_tx, mut event_rx, _response_rx, _hub_rx, _alive) =
@@ -1279,6 +1431,10 @@ mod tests {
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: false,
                         live_subscription: Some(live_subscription),
+                        attach_requested_at: None,
+                        client_worker_subscribed_at: None,
+                        session_io_snapshot_queued_at: None,
+                        session_io_accepted_at: None,
                     },
                 })
                 .await
@@ -1381,6 +1537,10 @@ mod tests {
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: true,
                         live_subscription: None,
+                        attach_requested_at: None,
+                        client_worker_subscribed_at: None,
+                        session_io_snapshot_queued_at: None,
+                        session_io_accepted_at: None,
                     },
                 })
                 .await
