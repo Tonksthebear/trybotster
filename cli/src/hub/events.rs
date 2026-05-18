@@ -1475,6 +1475,110 @@ mod tests {
     }
 
     #[test]
+    fn terminal_subscribe_survives_metadata_and_snapshot_backpressure_storm() {
+        let (bulk_tx, mut bulk_rx) = mpsc::channel(4);
+        let (priority_tx, mut priority_rx) = mpsc::channel(4);
+        let metrics = Arc::new(HubEventMetrics::default());
+        let sender = HubEventTx::new_with_priority(bulk_tx, priority_tx, Arc::clone(&metrics));
+
+        for i in 0..4 {
+            sender
+                .send(HubEvent::UserFileWatch {
+                    watch_id: format!("bulk-filler-{i}"),
+                    events: Vec::new(),
+                })
+                .expect("fill bulk lane");
+        }
+
+        for i in 0..128 {
+            assert!(
+                sender
+                    .send(HubEvent::PtyOscEvent {
+                        session_uuid: format!("storm-title-{i}"),
+                        session_name: "agent".to_string(),
+                        event: crate::agent::pty::PtyEvent::title_changed(format!("title-{i}")),
+                    })
+                    .is_err()
+            );
+            assert!(
+                sender
+                    .send(HubEvent::ClientWorkerControl(
+                        crate::worker::hub_control::HubControlMessage::RequestSnapshot {
+                            client_id: crate::client::ClientId::Socket(format!("socket:{i}")),
+                            session_uuid: format!("storm-snapshot-{i}"),
+                            subscription_id: format!("sub-{i}"),
+                            rows: 24,
+                            cols: 80,
+                        },
+                    ))
+                    .is_err()
+            );
+        }
+
+        sender
+            .send(HubEvent::LuaPtyRequest(
+                PtyRequest::SubscribeBrowserTerminal(
+                    crate::lua::primitives::pty::BrowserTerminalSubscriptionRequest {
+                        peer_id: "browser-fast-lane".to_string(),
+                        session_uuid: "sess-fast-lane".to_string(),
+                        prefix: None,
+                        subscription_id: "sub-fast-lane".to_string(),
+                        rows: 24,
+                        cols: 80,
+                        active_flag: Arc::new(Mutex::new(true)),
+                    },
+                ),
+            ))
+            .expect("terminal subscribe must bypass bulk backpressure");
+        sender
+            .send(HubEvent::LuaPtyRequest(PtyRequest::RefreshSnapshot(
+                crate::lua::primitives::pty::RefreshSnapshotRequest {
+                    peer_id: "browser-fast-lane".to_string(),
+                    session_uuid: "sess-fast-lane".to_string(),
+                    subscription_id: "sub-fast-lane".to_string(),
+                    rows: 24,
+                    cols: 80,
+                },
+            )))
+            .expect("terminal snapshot refresh must bypass bulk backpressure");
+
+        assert!(matches!(
+            priority_rx.try_recv(),
+            Ok(HubEvent::LuaPtyRequest(
+                PtyRequest::SubscribeBrowserTerminal(_)
+            ))
+        ));
+        assert!(matches!(
+            priority_rx.try_recv(),
+            Ok(HubEvent::LuaPtyRequest(PtyRequest::RefreshSnapshot(_)))
+        ));
+        assert!(priority_rx.try_recv().is_err());
+
+        let mut bulk_count = 0;
+        while let Ok(event) = bulk_rx.try_recv() {
+            match event {
+                HubEvent::UserFileWatch { .. } => bulk_count += 1,
+                other => panic!("unexpected bulk event: {other:?}"),
+            }
+        }
+        assert_eq!(bulk_count, 4);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.by_type["user_file_watch"].pending_high_water, 4);
+        assert_eq!(snapshot.by_type["lua_pty_request"].enqueue_failed, 0);
+        assert_eq!(snapshot.by_type["lua_pty_request"].pending_high_water, 2);
+        assert_eq!(snapshot.counters["hub_event.queue_full"], 256);
+        assert_eq!(
+            snapshot.counters["hub_event.repeatable_rejected.pty_osc"],
+            128
+        );
+        assert_eq!(
+            snapshot.counters["hub_event.repeatable_rejected.client_worker_control"],
+            128
+        );
+    }
+
+    #[test]
     fn sender_coalesces_duplicate_repeatable_events_until_dequeued() {
         let (bulk_tx, mut bulk_rx) = mpsc::channel(8);
         let (priority_tx, mut priority_rx) = mpsc::channel(8);
