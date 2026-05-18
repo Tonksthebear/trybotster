@@ -100,6 +100,7 @@ impl Hub {
             TerminalSnapshotPayloadMode,
         };
 
+        let attach_requested_at = Instant::now();
         if let Err(e) = spec.worker.try_send(ClientWorkerMessage::SubscribeSession {
             session_uuid: spec.session_uuid.clone(),
             subscription_id: spec.subscription_id.clone(),
@@ -113,6 +114,7 @@ impl Hub {
             );
             return false;
         }
+        let client_worker_subscribed_at = Instant::now();
 
         let request_id = Self::next_session_io_request_id("terminal-snapshot");
         let payload_mode = match &spec.initial_snapshot {
@@ -147,6 +149,7 @@ impl Hub {
             output_prefix: spec.output_prefix.clone(),
             filter: spec.filter.to_session_io_filter(),
         };
+        let session_io_snapshot_queued_at = Instant::now();
         let snapshot_result =
             spec.pty_handle
                 .enqueue_session_io_request(SessionIoRequest::GetInitialSnapshot {
@@ -162,6 +165,10 @@ impl Hub {
                         payload_mode,
                         confirm_subscription: spec.confirm_subscription,
                         live_subscription: Some(live_subscription),
+                        attach_requested_at: Some(attach_requested_at),
+                        client_worker_subscribed_at: Some(client_worker_subscribed_at),
+                        session_io_snapshot_queued_at: Some(session_io_snapshot_queued_at),
+                        session_io_accepted_at: None,
                     },
                 });
 

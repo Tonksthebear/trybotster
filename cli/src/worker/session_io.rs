@@ -10,6 +10,7 @@ use super::{BoundedQueueConfig, RequestId, SessionUuid};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Default bounded mailbox config for session-I/O worker input.
 pub const SESSION_IO_WORKER_QUEUE: BoundedQueueConfig =
@@ -160,6 +161,41 @@ pub struct TerminalInitialSnapshotDelivery {
     /// barrier has been delivered. PTY output before the snapshot frame is
     /// represented by the snapshot; output after the frame follows live.
     pub live_subscription: Option<TerminalOutputSubscription>,
+    /// Hub-side time when terminal attach orchestration started.
+    pub attach_requested_at: Option<Instant>,
+    /// Hub-side time when the client-worker subscription was accepted.
+    pub client_worker_subscribed_at: Option<Instant>,
+    /// Hub-side time when the initial snapshot request was queued to SessionIo.
+    pub session_io_snapshot_queued_at: Option<Instant>,
+    /// SessionIo-worker time when it accepted the initial snapshot request.
+    pub session_io_accepted_at: Option<Instant>,
+}
+
+/// Timing summary for one initial terminal attach barrier.
+#[derive(Debug, Clone)]
+pub struct TerminalAttachTiming {
+    /// Request identifier for the initial snapshot barrier.
+    pub request_id: RequestId,
+    /// Stable route key for the terminal subscription.
+    pub subscription_key: String,
+    /// Session that accepted the attach.
+    pub session_uuid: SessionUuid,
+    /// Transport-local subscription id.
+    pub subscription_id: String,
+    /// Raw snapshot byte length before transport preparation.
+    pub snapshot_bytes: usize,
+    /// Duration from hub attach start to client-worker subscription acceptance.
+    pub attach_to_client_worker_subscribed: Option<Duration>,
+    /// Duration from hub attach start to session-I/O snapshot enqueue.
+    pub attach_to_session_io_queued: Option<Duration>,
+    /// Duration from hub attach start to session-I/O worker acceptance.
+    pub attach_to_session_io_accepted: Option<Duration>,
+    /// Duration from hub attach start to snapshot response availability.
+    pub attach_to_snapshot_ready: Option<Duration>,
+    /// Duration from snapshot response availability to client-worker queue acceptance.
+    pub snapshot_ready_to_client_worker_accepted: Duration,
+    /// Duration from hub attach start to client-worker queue acceptance.
+    pub attach_to_client_worker_accepted: Option<Duration>,
 }
 
 impl TerminalOutputFilter {
@@ -333,6 +369,9 @@ pub enum SessionIoEvent {
         /// Whether this payload is for backpressure recovery.
         recovery: bool,
     },
+    /// Initial terminal attach timing emitted after snapshot delivery is queued
+    /// to the client worker.
+    TerminalAttachTiming(TerminalAttachTiming),
     /// Terminal mode flags response.
     ModeFlags {
         /// Request identifier from `GetModeFlags`.
@@ -511,8 +550,8 @@ pub(crate) fn prepare_snapshot_payload(snapshot: &[u8]) -> Option<PreparedSnapsh
     plain.extend_from_slice(snapshot);
 
     let payload = {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
 
         let mut encoder = GzEncoder::new(
