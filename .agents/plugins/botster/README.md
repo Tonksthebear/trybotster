@@ -22,7 +22,8 @@ source.
 - `.codex-plugin/plugin.json` — plugin manifest.
 - `.claude-plugin/plugin.json` — Claude Code plugin manifest.
 - `.mcp.json` — single MCP server named `botster`.
-- `skills/botster-install/SKILL.md` — first-agent setup and MCP checks.
+- `skills/botster-install/SKILL.md` — first-time installation guidance for
+  device config, repo config, spawn targets, and initial agent definitions.
 - `skills/botster-customize-tui/SKILL.md` — TUI layout/keybinding guidance.
 - `skills/botster-customize-hub/SKILL.md` — hub hooks and lifecycle guidance.
 - `skills/botster-customize-plugin/SKILL.md` — Botster Lua plugin authoring.
