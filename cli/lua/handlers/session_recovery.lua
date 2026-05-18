@@ -18,6 +18,15 @@ local Agent = require("lib.agent")
 local Accessory = require("lib.accessory")
 local workspace_store = require("lib.workspace_store")
 
+local function copy_identity_table(source)
+    local out = {}
+    if type(source) ~= "table" then return out end
+    for k, v in pairs(source) do
+        if k ~= "metadata" then out[k] = v end
+    end
+    return out
+end
+
 --- Parse ISO 8601 timestamp to epoch seconds.
 local function parse_timestamp(value)
     if type(value) == "number" then return value end
@@ -31,6 +40,53 @@ local function parse_timestamp(value)
         end
     end
     return os.time()
+end
+
+local function build_recovery_config(sess, session_uuid, handle, socket_info, record)
+    local dims = (sess.pty_dimensions or {})["0"] or {}
+    local rows = socket_info.rows or dims.rows or 24
+    local cols = socket_info.cols or dims.cols or 80
+
+    local ws_name = sess.workspace_name
+    if not ws_name and record and record.data_dir and sess.workspace_id then
+        local ws_manifest = workspace_store.read_workspace(record.data_dir, sess.workspace_id)
+        ws_name = ws_manifest and ws_manifest.name or nil
+    end
+
+    return {
+        session_uuid      = session_uuid,
+        session_type      = sess.session_type or "agent",
+        session_name      = sess.session_name,
+        repo              = sess.repo,
+        target_id         = sess.target_id,
+        target_path       = sess.target_path,
+        target_repo       = sess.target_repo,
+        branch_name       = sess.branch_name,
+        worktree_path     = sess.worktree_path,
+        agent_name        = sess.agent_name,
+        owner_plugin      = sess.owner_plugin,
+        visibility        = sess.visibility,
+        surface           = sess.surface,
+        metadata          = sess.metadata,
+        workspace_id      = sess.workspace_id,
+        workspace_name    = ws_name,
+        created_at        = parse_timestamp(sess.created_at),
+        title             = sess.title,
+        cwd               = sess.cwd,
+        prompt            = sess.prompt,
+        label             = sess.label,
+        task              = sess.task,
+        in_worktree       = sess.in_worktree,
+        handle            = handle,
+        dims              = { rows = rows, cols = cols },
+    }
+end
+
+local function instantiate_recovered_session(recovery_config)
+    if recovery_config.session_type == "accessory" then
+        return Accessory.from_recovery(recovery_config)
+    end
+    return Agent.from_recovery(recovery_config)
 end
 
 --- Recover a session from its manifest and a live session socket.
@@ -55,51 +111,11 @@ local function recover_session(record, socket_info, recovered, seen_keys)
         return
     end
 
-    local dims = (sess.pty_dimensions or {})["0"] or {}
-    local rows = socket_info.rows or dims.rows or 24
-    local cols = socket_info.cols or dims.cols or 80
-
-    -- Read workspace name
-    local ws_name = sess.workspace_name
-    if not ws_name then
-        local data_dir = record.data_dir
-        local ws_manifest = workspace_store.read_workspace(data_dir, sess.workspace_id)
-        ws_name = ws_manifest and ws_manifest.name or nil
-    end
-
-    -- Build recovery config
-    local recovery_config = {
-        session_uuid      = session_uuid,
-        session_type      = sess.session_type or "agent",
-        session_name      = sess.session_name,
-        repo              = sess.repo,
-        target_id         = sess.target_id,
-        target_path       = sess.target_path,
-        target_repo       = sess.target_repo,
-        branch_name       = sess.branch_name,
-        worktree_path     = sess.worktree_path,
-        agent_name        = sess.agent_name,
-        metadata          = sess.metadata,
-        workspace_id      = sess.workspace_id,
-        workspace_name    = ws_name,
-        created_at        = parse_timestamp(sess.created_at),
-        title             = sess.title,
-        cwd               = sess.cwd,
-        prompt            = sess.prompt,
-        label             = sess.label,
-        task              = sess.task,
-        in_worktree       = sess.in_worktree,
-        handle            = handle,
-        dims              = { rows = rows, cols = cols },
-    }
+    local recovery_config = build_recovery_config(sess, session_uuid, handle, socket_info, record)
 
     -- Construct a real session instance
     local ok2, session = pcall(function()
-        if recovery_config.session_type == "accessory" then
-            return Accessory.from_recovery(recovery_config)
-        else
-            return Agent.from_recovery(recovery_config)
-        end
+        return instantiate_recovered_session(recovery_config)
     end)
 
     if not ok2 or not session then
@@ -111,6 +127,78 @@ local function recover_session(record, socket_info, recovered, seen_keys)
         pcall(handle.kill, handle)
         return
     end
+
+    pcall(function()
+        session:_sync_workspace_manifest()
+        session:_sync_session_manifest()
+    end)
+
+    seen_keys[session_uuid] = true
+    recovered[#recovered + 1] = session
+end
+
+local function recover_session_from_process_identity(socket_info, recovered, seen_keys)
+    local session_uuid = socket_info and socket_info.session_uuid
+    if not session_uuid or session_uuid == "" or seen_keys[session_uuid] then return end
+
+    local identity = socket_info.recovery_identity
+    if type(identity) ~= "table" then
+        log.warn(string.format(
+            "[session_recovery] No manifest or process identity for session socket %s",
+            tostring(session_uuid)
+        ))
+        return
+    end
+
+    if identity.schema_version ~= 1 then
+        log.warn(string.format(
+            "[session_recovery] unsupported process identity schema for session %s: %s",
+            tostring(session_uuid),
+            tostring(identity.schema_version)
+        ))
+        return
+    end
+
+    if tostring(identity.session_uuid or "") ~= session_uuid then
+        log.warn(string.format(
+            "[session_recovery] process identity UUID mismatch for socket %s: identity=%s",
+            tostring(session_uuid),
+            tostring(identity.session_uuid)
+        ))
+        return
+    end
+
+    local ok, handle = pcall(
+        hub.connect_session, session_uuid, socket_info.socket_path
+    )
+    if not ok or not handle then
+        log.warn(string.format("[session_recovery] identity connect failed for %s: %s",
+            tostring(session_uuid), tostring(handle)))
+        return
+    end
+
+    local sess = copy_identity_table(identity)
+    sess.session_uuid = session_uuid
+    sess.status = "active"
+
+    local recovery_config = build_recovery_config(sess, session_uuid, handle, socket_info, {
+        data_dir = config.data_dir and config.data_dir() or nil,
+    })
+    local ok2, session = pcall(function()
+        return instantiate_recovered_session(recovery_config)
+    end)
+    if not ok2 or not session then
+        log.warn(string.format("[session_recovery] Failed to recover session %s from process identity: %s",
+            session_uuid, tostring(session)))
+        pcall(hub.unregister_session, session_uuid)
+        pcall(handle.kill, handle)
+        return
+    end
+
+    -- Process identity is self-attested and frozen at spawn. It is enough to
+    -- keep a live terminal reachable, but existing manifests remain the
+    -- canonical mutable workspace/session record. This intentionally recovers
+    -- only a degraded plugin context unless a plugin rehydrates from elsewhere.
 
     seen_keys[session_uuid] = true
     recovered[#recovered + 1] = session
@@ -217,10 +305,7 @@ _event_sub = events.on("sessions_discovered", function(data)
         if record then
             recover_session(record, socket_info, recovered, seen_keys)
         else
-            log.debug(string.format(
-                "[session_recovery] No manifest for session socket %s",
-                tostring(session_uuid)
-            ))
+            recover_session_from_process_identity(socket_info, recovered, seen_keys)
         end
     end
 

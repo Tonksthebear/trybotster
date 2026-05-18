@@ -454,6 +454,27 @@ function Session._init(self, config)
         rows = rows,
         cols = cols,
     }
+    spawn_config.recovery_identity = {
+        schema_version = 1,
+        session_uuid = self.session_uuid,
+        session_type = self.session_type,
+        session_name = self.session_name,
+        repo = self.repo,
+        target_id = self.target_id,
+        target_path = self.target_path,
+        target_repo = self.target_repo,
+        branch_name = self.branch_name,
+        worktree_path = self.worktree_path,
+        workspace_id = self._workspace_id,
+        workspace_name = self._workspace_name,
+        agent_name = self.agent_name,
+        owner_plugin = self.owner_plugin,
+        visibility = self.visibility,
+        surface = self.surface,
+        label = self.label,
+        in_worktree = self._is_worktree or false,
+        created_at = self.created_at,
+    }
 
     -- Build init_commands from init_script (absolute path from config resolver)
     spawn_config.init_commands = {}

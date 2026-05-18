@@ -231,6 +231,9 @@ pub struct SpawnConfig {
     /// Boot-probed palette entries for OSC 4 queries and indexed color rendering.
     #[serde(default)]
     pub palette_colors: Vec<(u8, crate::terminal::Rgb)>,
+    /// Immutable session identity returned during reconnect handshakes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_identity: Option<serde_json::Value>,
 }
 
 /// Run the session process.
@@ -292,6 +295,13 @@ pub fn run(session_uuid: &str, socket_path: &str, timeout_secs: u64) -> Result<(
     if let Ok(pid_path) = session_pid_path(session_uuid) {
         remove_file_logged(session_uuid, &pid_path, "session_exit_pid_cleanup");
     }
+    if let Ok(identity_path) = session_recovery_identity_path(session_uuid) {
+        remove_file_logged(
+            session_uuid,
+            &identity_path,
+            "session_exit_recovery_identity_cleanup",
+        );
+    }
     if run_result.is_err() && socket_path.exists() {
         remove_socket_path_logged(session_uuid, socket_path, "session_start_or_run_error");
     }
@@ -348,6 +358,7 @@ fn run_session(
             cwd: None,
             port: None,
             mode_flags: ModeFlags::default(),
+            recovery_identity: None,
         },
     )
     .context("initial handshake")?;
@@ -364,6 +375,15 @@ fn run_session(
     let mut decoder = FrameDecoder::new();
     let config = read_spawn_config(&mut stream, &mut decoder)?;
     let session_port = config.port;
+    let recovery_identity = config.recovery_identity.clone();
+    if let Some(identity) = &recovery_identity {
+        if let Err(e) = write_session_recovery_identity(session_uuid, identity) {
+            log::warn!(
+                "[session {}] failed to write optional recovery identity: {e:#}",
+                &session_uuid[..session_uuid.len().min(16)]
+            );
+        }
+    }
 
     // Create PTY
     let pty_system = portable_pty::native_pty_system();
@@ -679,6 +699,7 @@ fn run_session(
                                 cwd: parser_cwd(&parser),
                                 port: session_port,
                                 mode_flags: parser_mode_flags(&parser),
+                                recovery_identity: recovery_identity.clone(),
                             },
                         );
                         hub_decoder = FrameDecoder::new();
@@ -1205,6 +1226,12 @@ pub fn sessions_socket_dir() -> Result<PathBuf> {
     let dir = PathBuf::from(format!("/tmp/botster-{uid}/sessions"));
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create sessions dir: {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("set sessions dir permissions: {}", dir.display()))?;
+    }
     Ok(dir)
 }
 
@@ -1218,6 +1245,114 @@ pub fn session_socket_path(session_uuid: &str) -> Result<PathBuf> {
 pub fn session_pid_path(session_uuid: &str) -> Result<PathBuf> {
     let dir = sessions_socket_dir()?;
     Ok(dir.join(format!("{session_uuid}.pid")))
+}
+
+/// Process-owned recovery identity path for a specific session.
+pub fn session_recovery_identity_path(session_uuid: &str) -> Result<PathBuf> {
+    let dir = sessions_socket_dir()?;
+    Ok(dir.join(format!("{session_uuid}.identity.json")))
+}
+
+/// Write immutable recovery identity that discovery can read without connecting.
+pub fn write_session_recovery_identity(
+    session_uuid: &str,
+    identity: &serde_json::Value,
+) -> Result<()> {
+    let path = session_recovery_identity_path(session_uuid)?;
+    let payload = serde_json::to_vec(identity).context("serialize session recovery identity")?;
+    let tmp_path = path.with_file_name(format!(
+        "{session_uuid}.identity.json.{}.tmp",
+        std::process::id()
+    ));
+    {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp_path)
+            .with_context(|| {
+                format!(
+                    "open temporary session recovery identity: {}",
+                    tmp_path.display()
+                )
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| {
+                    format!(
+                        "set temporary session recovery identity permissions: {}",
+                        tmp_path.display()
+                    )
+                })?;
+        }
+        file.write_all(&payload).with_context(|| {
+            format!(
+                "write temporary session recovery identity: {}",
+                tmp_path.display()
+            )
+        })?;
+        file.sync_all().with_context(|| {
+            format!(
+                "sync temporary session recovery identity: {}",
+                tmp_path.display()
+            )
+        })?;
+    }
+    std::fs::rename(&tmp_path, &path).with_context(|| {
+        format!(
+            "rename session recovery identity into place: {} -> {}",
+            tmp_path.display(),
+            path.display()
+        )
+    })?;
+    Ok(())
+}
+
+/// Read immutable recovery identity if the session process published one.
+pub fn read_session_recovery_identity(session_uuid: &str) -> Result<Option<serde_json::Value>> {
+    let path = session_recovery_identity_path(session_uuid)?;
+    let metadata = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("stat session recovery identity: {}", path.display()))
+        }
+    };
+    if metadata.len() > 64 * 1024 {
+        bail!(
+            "session recovery identity too large: {} bytes at {}",
+            metadata.len(),
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = unsafe { libc::getuid() };
+        if metadata.uid() != uid {
+            bail!(
+                "session recovery identity owner mismatch: uid={} expected={} path={}",
+                metadata.uid(),
+                uid,
+                path.display()
+            );
+        }
+    }
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("read session recovery identity: {}", path.display()))
+        }
+    };
+
+    let identity = serde_json::from_str(&content)
+        .with_context(|| format!("parse session recovery identity: {}", path.display()))?;
+    Ok(Some(identity))
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -1331,6 +1466,9 @@ fn cleanup_stale_session_files(session_uuid: &str) {
     if let Ok(path) = session_pid_path(session_uuid) {
         remove_file_logged(session_uuid, &path, "orphan_cleanup_dead_identity");
     }
+    if let Ok(path) = session_recovery_identity_path(session_uuid) {
+        remove_file_logged(session_uuid, &path, "orphan_cleanup_dead_identity");
+    }
 }
 
 fn remove_socket_path_logged(session_uuid: &str, path: &Path, reason: &str) -> bool {
@@ -1398,11 +1536,22 @@ pub fn cleanup_orphaned_session_files() {
             let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
                 continue;
             };
-            if ext != "sock" && ext != "pid" {
+            let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            let is_identity_sidecar = file_name.ends_with(".identity.json");
+            let is_identity_tmp = file_name.contains(".identity.json.") && ext == "tmp";
+            if ext != "sock" && ext != "pid" && !is_identity_sidecar && !is_identity_tmp {
                 continue;
             }
-            let Some(session_uuid) = path.file_stem().and_then(|stem| stem.to_str()) else {
-                continue;
+            let session_uuid = if is_identity_tmp {
+                match file_name.split_once(".identity.json.") {
+                    Some((uuid, _)) if !uuid.is_empty() => uuid,
+                    _ => continue,
+                }
+            } else {
+                let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+                    continue;
+                };
+                stem.strip_suffix(".identity").unwrap_or(stem)
             };
 
             let identity = read_session_identity_file(session_uuid).ok().flatten();
@@ -1419,6 +1568,19 @@ pub fn cleanup_orphaned_session_files() {
                     remove_file_logged(session_uuid, &pid_path, "orphan_cleanup_dead_pid_only");
                     removed += 1;
                 }
+                if let Ok(identity_path) = session_recovery_identity_path(session_uuid) {
+                    remove_file_logged(
+                        session_uuid,
+                        &identity_path,
+                        "orphan_cleanup_dead_pid_only",
+                    );
+                }
+            } else if is_identity_sidecar && !socket_exists {
+                remove_file_logged(session_uuid, &path, "orphan_cleanup_identity_only");
+                removed += 1;
+            } else if is_identity_tmp && !socket_exists {
+                remove_file_logged(session_uuid, &path, "orphan_cleanup_identity_tmp_only");
+                removed += 1;
             }
         }
     }
