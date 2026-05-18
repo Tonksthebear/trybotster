@@ -40,6 +40,11 @@ local function system_session(entry)
     return Session.is_system_session(entry)
 end
 
+local function canonical(entry)
+    if type(entry) ~= "table" then return false end
+    return entry.canonical ~= false
+end
+
 local function shares_removal_scope(target, other)
     local target_worktree_path = worktree_path(target)
     local other_worktree_path = worktree_path(other)
@@ -116,6 +121,11 @@ function M.close_actions_for_session(target, sessions)
         return actions
     end
 
+    if not canonical(target) then
+        actions.delete_worktree_reason = "non_canonical_recovery"
+        return actions
+    end
+
     if not in_worktree(target) then
         actions.delete_worktree_reason = "not_in_worktree"
         return actions
@@ -155,6 +165,8 @@ function M.close_actions_for_sessions(sessions)
         if type(target) ~= "table" then
             actions.can_close = false
             actions.delete_worktree_reason = "session_missing"
+        elseif not canonical(target) then
+            actions.delete_worktree_reason = "non_canonical_recovery"
         elseif not in_worktree(target) then
             actions.delete_worktree_reason = "not_in_worktree"
         else
