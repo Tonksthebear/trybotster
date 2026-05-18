@@ -526,7 +526,12 @@ impl HubEvent {
                 event,
                 ..
             } => match event {
-                crate::agent::pty::PtyEvent::TitleChanged(_) => None,
+                crate::agent::pty::PtyEvent::TitleChanged(_) => {
+                    Some(HubEventCoalescingKey::PtyOsc {
+                        session_uuid: session_uuid.clone(),
+                        kind: "title",
+                    })
+                }
                 crate::agent::pty::PtyEvent::CwdChanged(_) => Some(HubEventCoalescingKey::PtyOsc {
                     session_uuid: session_uuid.clone(),
                     kind: "cwd",
@@ -1009,6 +1014,10 @@ impl HubEventTx {
         if let Some(key) = &coalescing_key {
             if let Ok(mut pending) = self.pending_coalesced.lock() {
                 if !pending.insert(key.clone()) {
+                    // This is intentionally drop-newest while the first event
+                    // remains queued. Producers should pre-coalesce
+                    // latest-value payloads before they reach the hub event
+                    // lane when exact last-write-wins delivery matters.
                     self.metrics.record_counter("hub_event.coalesced", 1);
                     match kind {
                         "client_worker_control" => self
@@ -1198,7 +1207,7 @@ mod tests {
     }
 
     #[test]
-    fn sender_does_not_coalesce_title_updates() {
+    fn sender_coalesces_duplicate_title_updates_until_dequeued() {
         let (bulk_tx, mut bulk_rx) = mpsc::channel(8);
         let (priority_tx, mut priority_rx) = mpsc::channel(8);
         let metrics = Arc::new(HubEventMetrics::default());
@@ -1217,7 +1226,7 @@ mod tests {
                 session_name: "agent".to_string(),
                 event: crate::agent::pty::PtyEvent::title_changed("step-2"),
             })
-            .expect("send second title");
+            .expect("coalesced second title is not an error");
 
         assert!(matches!(
             bulk_rx.try_recv(),
@@ -1226,16 +1235,11 @@ mod tests {
                 ..
             }) if title == "step-1"
         ));
-        assert!(matches!(
-            bulk_rx.try_recv(),
-            Ok(HubEvent::PtyOscEvent {
-                event: crate::agent::pty::PtyEvent::TitleChanged(title),
-                ..
-            }) if title == "step-2"
-        ));
         assert!(bulk_rx.try_recv().is_err());
         assert!(priority_rx.try_recv().is_err());
-        assert_eq!(metrics.snapshot().counters.get("hub_event.coalesced"), None);
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.counters["hub_event.coalesced"], 1);
+        assert_eq!(snapshot.counters["hub_event.coalesced.pty_osc"], 1);
     }
 
     #[test]

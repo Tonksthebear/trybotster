@@ -79,6 +79,13 @@ Backpressure recovery snapshot delivery records the same gzip queue span and
 the `snapshot.backpressure_recovery.*` counter family so recovery paths remain
 visible even when normal hot PTY delivery is congested.
 
+PTY title, cwd, cursor, and mode updates are latest-value metadata, not
+scrollback boundary markers. Under load they may arrive after output bytes from
+the same session I/O frame batch; plugins should treat `pty_title_changed`,
+`pty_cwd_changed`, and cursor/mode notifications as last-known state for chrome,
+presence, and routing decisions. Prompt marks, bells, notifications, snapshots,
+and process exits remain ordered side-effect boundaries.
+
 ## Counters
 
 Counters are cumulative within the daemon process. High-water counters keep the
