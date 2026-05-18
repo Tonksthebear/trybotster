@@ -5,6 +5,7 @@
 
 #[cfg(test)]
 mod protocol_tests {
+    use crate::session::SpawnConfig;
     use crate::session::protocol::*;
 
     #[test]
@@ -119,6 +120,10 @@ mod protocol_tests {
                 focus_reporting: true,
                 application_cursor: false,
             },
+            recovery_identity: Some(serde_json::json!({
+                "session_type": "agent",
+                "workspace_id": "ws-test",
+            })),
         };
         let json = serde_json::to_vec(&meta).unwrap();
         let decoded: SessionMetadata = serde_json::from_slice(&json).unwrap();
@@ -137,6 +142,99 @@ mod protocol_tests {
         assert!(decoded.mode_flags.alt_screen);
         assert!(decoded.mode_flags.focus_reporting);
         assert!(!decoded.mode_flags.application_cursor);
+        let identity = decoded.recovery_identity.expect("recovery identity");
+        assert_eq!(identity["session_type"], "agent");
+        assert_eq!(identity["workspace_id"], "ws-test");
+    }
+
+    #[test]
+    fn legacy_session_metadata_deserializes_without_recovery_identity() {
+        let json = serde_json::json!({
+            "session_uuid": "sess-legacy",
+            "pid": 123,
+            "rows": 24,
+            "cols": 80,
+            "last_output_at": 0,
+            "title": null,
+            "cwd": null,
+            "port": null,
+            "mode_flags": {
+                "kitty_enabled": false,
+                "cursor_visible": true,
+                "bracketed_paste": false,
+                "mouse_mode": 0,
+                "alt_screen": false,
+                "focus_reporting": false,
+                "application_cursor": false,
+            },
+        });
+
+        let decoded: SessionMetadata = serde_json::from_value(json).unwrap();
+
+        assert_eq!(decoded.session_uuid, "sess-legacy");
+        assert!(decoded.recovery_identity.is_none());
+    }
+
+    #[test]
+    fn legacy_spawn_config_deserializes_without_recovery_identity() {
+        let json = serde_json::json!({
+            "command": "bash",
+            "args": [],
+            "env": [],
+            "cwd": null,
+            "rows": 24,
+            "cols": 80,
+            "tee_path": null,
+            "tee_cap": 0,
+        });
+
+        let decoded: SpawnConfig = serde_json::from_value(json).unwrap();
+
+        assert_eq!(decoded.command, "bash");
+        assert!(decoded.recovery_identity.is_none());
+    }
+
+    #[test]
+    fn recovery_identity_metadata_stays_well_below_handshake_cap() {
+        let meta = SessionMetadata {
+            session_uuid: "sess-size-check".to_string(),
+            pid: std::process::id(),
+            rows: 24,
+            cols: 80,
+            last_output_at: 0,
+            title: None,
+            cwd: None,
+            port: None,
+            mode_flags: ModeFlags::default(),
+            recovery_identity: Some(serde_json::json!({
+                "schema_version": 1,
+                "session_uuid": "sess-size-check",
+                "session_type": "agent",
+                "session_name": "codex",
+                "repo": "/repo",
+                "target_id": "target",
+                "target_path": "/repo",
+                "target_repo": "/repo",
+                "branch_name": "feature/session-recovery",
+                "worktree_path": "/repo",
+                "workspace_id": "ws",
+                "workspace_name": "Workspace",
+                "agent_name": "codex",
+                "owner_plugin": "project_pipelines",
+                "visibility": "workspace",
+                "surface": "main",
+                "label": "agent",
+                "in_worktree": true,
+                "created_at": 1779120000,
+            })),
+        };
+
+        let json = serde_json::to_vec(&meta).unwrap();
+
+        assert!(
+            json.len() < 4096,
+            "recovery identity should remain tiny relative to the 64KB handshake cap"
+        );
     }
 }
 
@@ -346,8 +444,10 @@ mod socket_path_tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::session::{
-        cleanup_orphaned_session_files, read_session_pid_file, run, session_pid_path,
-        session_process_is_live, session_socket_path, sessions_socket_dir, write_session_pid_file,
+        cleanup_orphaned_session_files, read_session_pid_file, read_session_recovery_identity, run,
+        session_pid_path, session_process_is_live, session_recovery_identity_path,
+        session_socket_path, sessions_socket_dir, write_session_pid_file,
+        write_session_recovery_identity,
     };
 
     fn unique_session_uuid(suffix: &str) -> String {
@@ -527,5 +627,153 @@ mod socket_path_tests {
         );
 
         let _ = std::fs::remove_file(&pid_path);
+    }
+
+    #[test]
+    fn session_recovery_identity_roundtrips_as_process_owned_sidecar() {
+        let session_uuid = unique_session_uuid("recovery-identity");
+        let identity_path = session_recovery_identity_path(&session_uuid).unwrap();
+        let _ = std::fs::remove_file(&identity_path);
+
+        let identity = serde_json::json!({
+            "schema_version": 1,
+            "session_uuid": session_uuid.clone(),
+            "session_type": "agent",
+            "workspace_id": "ws-1",
+        });
+
+        write_session_recovery_identity(&session_uuid, &identity).unwrap();
+
+        assert_eq!(
+            read_session_recovery_identity(&session_uuid).unwrap(),
+            Some(identity)
+        );
+
+        let _ = std::fs::remove_file(&identity_path);
+    }
+
+    #[test]
+    fn cleanup_orphaned_session_files_removes_identity_sidecar_for_dead_session() {
+        let session_uuid = unique_session_uuid("dead-recovery-identity");
+        let socket_path = session_socket_path(&session_uuid).unwrap();
+        let pid_path = session_pid_path(&session_uuid).unwrap();
+        let identity_path = session_recovery_identity_path(&session_uuid).unwrap();
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&pid_path);
+        let _ = std::fs::remove_file(&identity_path);
+
+        write_session_recovery_identity(
+            &session_uuid,
+            &serde_json::json!({
+                "schema_version": 1,
+                "session_uuid": session_uuid.clone(),
+            }),
+        )
+        .unwrap();
+
+        cleanup_orphaned_session_files();
+
+        assert!(
+            !identity_path.exists(),
+            "cleanup should remove sidecar identity when no live session socket remains"
+        );
+    }
+
+    #[test]
+    fn cleanup_orphaned_session_files_preserves_sidecar_for_live_session() {
+        let session_uuid = unique_session_uuid("live-recovery-identity");
+        let socket_path = session_socket_path(&session_uuid).unwrap();
+        let pid_path = session_pid_path(&session_uuid).unwrap();
+        let identity_path = session_recovery_identity_path(&session_uuid).unwrap();
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&pid_path);
+        let _ = std::fs::remove_file(&identity_path);
+
+        std::fs::write(&socket_path, b"placeholder").unwrap();
+        write_session_pid_file(&session_uuid, std::process::id()).unwrap();
+        write_session_recovery_identity(
+            &session_uuid,
+            &serde_json::json!({
+                "schema_version": 1,
+                "session_uuid": session_uuid,
+            }),
+        )
+        .unwrap();
+
+        cleanup_orphaned_session_files();
+
+        assert!(
+            identity_path.exists(),
+            "cleanup should preserve sidecar identity while the session is live"
+        );
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&pid_path);
+        let _ = std::fs::remove_file(&identity_path);
+    }
+
+    #[test]
+    fn oversized_session_recovery_identity_is_rejected() {
+        let session_uuid = unique_session_uuid("oversized-recovery-identity");
+        let identity_path = session_recovery_identity_path(&session_uuid).unwrap();
+        let _ = std::fs::remove_file(&identity_path);
+
+        std::fs::write(&identity_path, "x".repeat(64 * 1024 + 1)).unwrap();
+
+        let err = read_session_recovery_identity(&session_uuid)
+            .expect_err("oversized recovery identity should fail");
+        assert!(
+            err.to_string().contains("too large"),
+            "unexpected error: {err:#}"
+        );
+
+        let _ = std::fs::remove_file(&identity_path);
+    }
+
+    #[test]
+    fn malformed_session_recovery_identity_is_rejected_without_cleanup() {
+        let session_uuid = unique_session_uuid("malformed-recovery-identity");
+        let identity_path = session_recovery_identity_path(&session_uuid).unwrap();
+        let _ = std::fs::remove_file(&identity_path);
+
+        std::fs::write(&identity_path, "{not-json").unwrap();
+
+        let err = read_session_recovery_identity(&session_uuid)
+            .expect_err("malformed recovery identity should fail");
+        assert!(
+            err.to_string().contains("parse session recovery identity"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            identity_path.exists(),
+            "malformed identity should remain for inspection"
+        );
+
+        let _ = std::fs::remove_file(&identity_path);
+    }
+
+    #[test]
+    fn cleanup_orphaned_session_files_removes_orphaned_identity_tmp_file() {
+        let session_uuid = unique_session_uuid("tmp-recovery-identity");
+        let socket_path = session_socket_path(&session_uuid).unwrap();
+        let pid_path = session_pid_path(&session_uuid).unwrap();
+        let tmp_path = session_recovery_identity_path(&session_uuid)
+            .unwrap()
+            .with_file_name(format!("{session_uuid}.identity.json.{}.tmp", std::process::id()));
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&pid_path);
+        let _ = std::fs::remove_file(&tmp_path);
+
+        std::fs::write(&tmp_path, "{}").unwrap();
+
+        cleanup_orphaned_session_files();
+
+        assert!(
+            !tmp_path.exists(),
+            "cleanup should remove orphaned temporary sidecar files"
+        );
     }
 }

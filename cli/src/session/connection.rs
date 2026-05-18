@@ -107,6 +107,7 @@ impl SessionConnection {
                 cwd: None,
                 port: None,
                 mode_flags: ModeFlags::default(),
+                recovery_identity: None,
             },
         }
     }

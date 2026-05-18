@@ -139,6 +139,15 @@ pub struct SessionMetadata {
     /// issuing an RPC before the SessionIo reader owns the socket.
     #[serde(default)]
     pub mode_flags: ModeFlags,
+    /// Immutable product identity captured when the session process was born.
+    ///
+    /// This lets a hub reconnect recover enough semantic identity from the
+    /// surviving session process even when the workspace manifest scan misses.
+    /// The hub still owns mutable plugin metadata and lifecycle policy.
+    /// The value is self-attested by the session process, frozen at spawn, and
+    /// must not win over an existing manifest because workspace fields can move.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_identity: Option<serde_json::Value>,
 }
 
 /// Terminal mode flags reported on reconnect.
@@ -609,6 +618,10 @@ mod tests {
                 focus_reporting: true,
                 application_cursor: true,
             },
+            recovery_identity: Some(serde_json::json!({
+                "session_type": "agent",
+                "workspace_id": "ws-test",
+            })),
         };
 
         // Simulate daemon endpoint -> session -> daemon endpoint via in-memory buffers
@@ -664,5 +677,8 @@ mod tests {
         assert!(decoded.mode_flags.alt_screen);
         assert!(decoded.mode_flags.focus_reporting);
         assert!(decoded.mode_flags.application_cursor);
+        let identity = decoded.recovery_identity.expect("recovery identity");
+        assert_eq!(identity["session_type"], "agent");
+        assert_eq!(identity["workspace_id"], "ws-test");
     }
 }

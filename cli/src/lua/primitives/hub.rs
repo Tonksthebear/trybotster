@@ -652,6 +652,14 @@ pub(crate) fn register(
                 let port: Option<u16> = opts.get("port").ok();
                 let tee_path: Option<String> = opts.get("tee_path").ok();
                 let tee_cap: u64 = opts.get("tee_cap").unwrap_or(10 * 1024 * 1024);
+                let recovery_identity_value: LuaValue =
+                    opts.get("recovery_identity").unwrap_or(LuaValue::Nil);
+                let recovery_identity: Option<serde_json::Value> =
+                    if matches!(recovery_identity_value, LuaValue::Nil) {
+                        None
+                    } else {
+                        Some(_lua_ctx.from_value(recovery_identity_value)?)
+                    };
 
                 // Parse env table
                 let mut env_pairs = Vec::new();
@@ -781,6 +789,7 @@ pub(crate) fn register(
                     default_background,
                     default_cursor,
                     palette_colors,
+                    recovery_identity,
                 };
                 conn.send_spawn_config(&spawn_config).map_err(|e| {
                     LuaError::runtime(format!("spawn_session: send config failed: {e}"))
@@ -840,6 +849,13 @@ pub(crate) fn register(
                         &session_uuid[..session_uuid.len().min(16)]
                     ))
                 })?;
+                if conn.metadata.session_uuid != session_uuid {
+                    return Err(LuaError::runtime(format!(
+                        "connect_session('{}'): handshake UUID mismatch: {}",
+                        &session_uuid[..session_uuid.len().min(16)],
+                        conn.metadata.session_uuid
+                    )));
+                }
 
                 let rows = conn.metadata.rows;
                 let cols = conn.metadata.cols;

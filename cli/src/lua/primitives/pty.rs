@@ -452,6 +452,24 @@ impl LuaUserData for PtySessionHandle {
         // session:port() -> number or nil
         methods.add_method("port", |_, this, ()| Ok(this.port));
 
+        // session:recovery_identity() -> table or nil
+        //
+        // Returns the immutable identity envelope supplied at spawn time and
+        // echoed by the surviving session process during reconnect. Old
+        // sessions do not have this envelope and return nil.
+        methods.add_method("recovery_identity", |lua, this, ()| {
+            if let Some(conn) = this.session_connection.get() {
+                if let Ok(guard) = conn.lock() {
+                    if let Some(session) = guard.as_ref() {
+                        if let Some(identity) = &session.metadata.recovery_identity {
+                            return crate::lua::primitives::json::json_to_lua(lua, identity);
+                        }
+                    }
+                }
+            }
+            Ok(LuaValue::Nil)
+        });
+
         // session:is_alive() -> boolean
         //
         // Checks whether the PTY writer is still available, which indicates

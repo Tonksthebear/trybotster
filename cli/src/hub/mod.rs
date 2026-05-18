@@ -804,10 +804,35 @@ impl Hub {
                 "[session] discovered socket: {}",
                 &session_uuid[..session_uuid.len().min(16)]
             );
-            discovered.push(serde_json::json!({
+            let mut socket_info = serde_json::json!({
                 "session_uuid": session_uuid,
                 "socket_path": socket_path.display().to_string(),
-            }));
+            });
+            // Lua's session_recovery handler treats this as a degraded,
+            // process-attested fallback and must not prefer it over manifests.
+            match crate::session::read_session_recovery_identity(&session_uuid) {
+                Ok(Some(identity)) => {
+                    let embedded_uuid = identity.get("session_uuid").and_then(|uuid| uuid.as_str());
+                    if embedded_uuid == Some(session_uuid.as_str()) {
+                        if let Some(obj) = socket_info.as_object_mut() {
+                            obj.insert("recovery_identity".to_string(), identity);
+                        }
+                    } else {
+                        log::warn!(
+                            "[session] ignoring recovery identity for {}: embedded UUID mismatch ({embedded_uuid:?})",
+                            &session_uuid[..session_uuid.len().min(16)]
+                        );
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    log::warn!(
+                        "[session] failed to read recovery identity for {}: {e:#}",
+                        &session_uuid[..session_uuid.len().min(16)]
+                    );
+                }
+            }
+            discovered.push(socket_info);
         }
 
         let count = discovered.len();
