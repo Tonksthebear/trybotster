@@ -160,7 +160,7 @@ local function sync_manifest_workspaces()
     local ws_ids = {}
     local seen = {}
     for _, session in pairs(sessions) do
-        local ws_id = session._workspace_id
+        local ws_id = session.canonical == false and nil or session._workspace_id
         if ws_id and not seen[ws_id] then
             seen[ws_id] = true
             ws_ids[#ws_ids + 1] = ws_id
@@ -304,6 +304,9 @@ function Session._init(self, config)
     self.owner_plugin = config.owner_plugin or metadata.owner_plugin
     self.visibility = config.visibility or metadata.visibility or "workspace"
     self.surface = config.surface or metadata.surface
+    self.recovery_source = config.recovery_source or "created"
+    self.canonical = config.canonical
+    if self.canonical == nil then self.canonical = true end
     self.created_at = os.time()
     self.status = "running"
     self.title = nil          -- window title from OSC 0/2 (set by pty_title_changed hook)
@@ -644,6 +647,9 @@ function Session._init_recovered(self, config)
     self.notification    = false
     self.output_activity = "idle"
     self.session         = config.handle
+    self.recovery_source = config.recovery_source or "manifest"
+    self.canonical       = config.canonical
+    if self.canonical == nil then self.canonical = true end
     self._session_config = nil
     self._port           = config.port
     if self._port == nil and config.handle and type(config.handle.port) == "function" then
@@ -810,6 +816,14 @@ end
 --- Sync the Central Session Store session manifest.
 -- Writes self:info() shape so session recovery can load it directly.
 function Session:_sync_session_manifest()
+    if self.canonical == false then
+        log.debug(string.format(
+            "Session %s: skip session manifest sync for non-canonical recovered session (recovery_source=%s)",
+            tostring(self.session_uuid),
+            tostring(self.recovery_source)
+        ))
+        return
+    end
     if not self._data_dir or not self._workspace_id then
         log.debug(string.format("Session %s: skip manifest sync (data_dir=%s, workspace_id=%s)",
             tostring(self.session_uuid),
@@ -874,6 +888,14 @@ end
 
 --- Sync the Central Session Store workspace manifest.
 function Session:_sync_workspace_manifest()
+    if self.canonical == false then
+        log.debug(string.format(
+            "Session %s: skip workspace manifest sync for non-canonical recovered session (recovery_source=%s)",
+            tostring(self.session_uuid),
+            tostring(self.recovery_source)
+        ))
+        return
+    end
     if not self._data_dir or not self._workspace_id then return end
     local ws = require("lib.workspace_store")
     local current = ws.read_workspace(self._data_dir, self._workspace_id) or {}
@@ -912,6 +934,15 @@ end
 -- @return string|nil error
 function Session:move_to_workspace(opts)
     opts = opts or {}
+    if self.canonical == false then
+        local message = string.format(
+            "Session %s: refusing workspace move for non-canonical recovered session (recovery_source=%s)",
+            tostring(self.session_uuid),
+            tostring(self.recovery_source)
+        )
+        log.warn(message)
+        return nil, message
+    end
     if not self._data_dir then
         return nil, "No data_dir configured for workspace operations"
     end
@@ -1070,7 +1101,13 @@ function Session:close(delete_worktree)
     -- Mark the Central Session Store session as closed.
     -- Explicit user close is authoritative; hub restart recovery does not use
     -- Session:close(), so a closed manifest here is a do-not-recover tombstone.
-    if self._data_dir and self._workspace_id then
+    if self.canonical == false then
+        log.debug(string.format(
+            "Session %s: skip close manifest tombstone for non-canonical recovered session (recovery_source=%s)",
+            tostring(self.session_uuid),
+            tostring(self.recovery_source)
+        ))
+    elseif self._data_dir and self._workspace_id then
         local ws = require("lib.workspace_store")
         local manifest = ws.read_session(self._data_dir, self._workspace_id, self.session_uuid)
         if manifest then
@@ -1092,17 +1129,24 @@ function Session:close(delete_worktree)
 
     -- Queue worktree deletion if requested
     if delete_worktree then
-        local ok3, err3 = pcall(worktree.delete, self.worktree_path, self.branch_name)
-        if not ok3 then
-            log.warn(string.format("Session %s: failed to delete worktree: %s",
-                key, tostring(err3)))
+        if self.canonical == false then
+            log.warn(string.format(
+                "Session %s: refusing worktree deletion for non-canonical recovered session (recovery_source=%s)",
+                tostring(self.session_uuid),
+                tostring(self.recovery_source)
+            ))
+        else
+            local ok3, err3 = pcall(worktree.delete, self.worktree_path, self.branch_name)
+            if not ok3 then
+                log.warn(string.format("Session %s: failed to delete worktree: %s",
+                    key, tostring(err3)))
+            end
+            hooks.notify("worktree_deleted", {
+                path = self.worktree_path,
+                branch = self.branch_name,
+                session_uuid = self.session_uuid,
+            })
         end
-        hooks.notify("worktree_deleted", {
-            path = self.worktree_path,
-            branch = self.branch_name,
-            session_uuid = key,
-            session_uuid = self.session_uuid,
-        })
     end
 
     -- Notify observers
@@ -1254,6 +1298,8 @@ function Session:info()
         label = self.label,
         task = self.task,
         output_activity = self.output_activity or "idle",
+        recovery_source = self.recovery_source,
+        canonical = self.canonical,
     }
 end
 

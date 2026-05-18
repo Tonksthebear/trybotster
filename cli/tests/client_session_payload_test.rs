@@ -32,7 +32,17 @@ fn create_lua_vm() -> Lua {
         _G.config = {
           data_dir = function() return nil end,
         }
-        _G.worktree = { list = function() return {} end }
+        _G.hub = {
+          register_session = function() return 1 end,
+          unregister_session = function() return true end,
+          update_manifest_workspaces = function() return true end,
+          hub_id = function() return nil end,
+        }
+        _G.worktree_delete_count = 0
+        _G.worktree = {
+          list = function() return {} end,
+          delete = function() _G.worktree_delete_count = _G.worktree_delete_count + 1 end,
+        }
     "#,
     )
     .exec()
@@ -50,6 +60,180 @@ fn load_modules(lua: &Lua) {
     )
     .exec()
     .expect("load client payload modules");
+}
+
+#[test]
+fn recovered_session_info_exposes_canonicality() {
+    let lua = create_lua_vm();
+
+    let exposed: bool = lua
+        .load(
+            r#"
+            local Agent = require("lib.agent")
+
+            local manifest = Agent.from_recovery({
+              session_uuid = "sess-manifest",
+              session_type = "agent",
+              session_name = "agent",
+              repo = "owner/repo",
+              target_id = "target-1",
+              target_path = "/tmp/repo",
+              target_repo = "owner/repo",
+              branch_name = "main",
+              worktree_path = "/tmp/worktree",
+              workspace_id = "ws-1",
+              metadata = {},
+              handle = {},
+            })
+
+            local degraded = Agent.from_recovery({
+              session_uuid = "sess-identity",
+              session_type = "agent",
+              session_name = "agent",
+              repo = "owner/repo",
+              target_id = "target-1",
+              target_path = "/tmp/repo",
+              target_repo = "owner/repo",
+              branch_name = "main",
+              worktree_path = "/tmp/worktree",
+              workspace_id = "ws-1",
+              metadata = {},
+              recovery_source = "process_identity",
+              canonical = false,
+              handle = {},
+            })
+
+            local manifest_info = manifest:info()
+            local degraded_info = degraded:info()
+            return manifest_info.recovery_source == "manifest"
+              and manifest_info.canonical == true
+              and degraded_info.recovery_source == "process_identity"
+              and degraded_info.canonical == false
+        "#,
+        )
+        .eval()
+        .expect("recovery info canonicality should evaluate");
+
+    assert!(
+        exposed,
+        "Session:info() should expose manifest/degraded recovery canonicality"
+    );
+}
+
+#[test]
+fn noncanonical_recovered_session_does_not_sync_or_move_workspaces() {
+    let lua = create_lua_vm();
+
+    let guarded: bool = lua
+        .load(
+            r#"
+            _G.config.data_dir = function() return "/tmp/botster-test-noncanonical" end
+            local Agent = require("lib.agent")
+            local ws = require("lib.workspace_store")
+            local writes = 0
+            ws.write_session = function() writes = writes + 1 end
+            ws.write_workspace = function() writes = writes + 1 end
+            ws.refresh_workspace_status = function() end
+
+            local degraded = Agent.from_recovery({
+              session_uuid = "sess-identity-guard",
+              session_type = "agent",
+              session_name = "agent",
+              repo = "owner/repo",
+              target_id = "target-1",
+              target_path = "/tmp/repo",
+              target_repo = "owner/repo",
+              branch_name = "main",
+              worktree_path = "/tmp/worktree",
+              workspace_id = "ws-stale",
+              metadata = {},
+              recovery_source = "process_identity",
+              canonical = false,
+              handle = {},
+            })
+
+            degraded:update({ label = "new label" })
+            degraded:set_meta("workflow_id", "wf-1")
+            local moved, err = degraded:move_to_workspace({ workspace_id = "ws-next" })
+            degraded:close(true)
+
+            return writes == 0
+              and _G.worktree_delete_count == 0
+              and moved == nil
+              and type(err) == "string"
+              and err:match("non%-canonical") ~= nil
+        "#,
+        )
+        .eval()
+        .expect("non-canonical guard should evaluate");
+
+    assert!(
+        guarded,
+        "non-canonical recovered sessions must not write manifests or move workspaces"
+    );
+}
+
+#[test]
+fn session_entity_payload_preserves_recovery_canonicality() {
+    let lua = create_lua_vm();
+    load_modules(&lua);
+
+    let preserved: bool = lua
+        .load(
+            r#"
+            local rendered = payload.build({
+              id = "sess-identity",
+              session_uuid = "sess-identity",
+              recovery_source = "process_identity",
+              canonical = false,
+              metadata = {},
+            }, {})
+
+            return rendered.recovery_source == "process_identity"
+              and rendered.canonical == false
+        "#,
+        )
+        .eval()
+        .expect("entity payload canonicality should evaluate");
+
+    assert!(
+        preserved,
+        "session entity payload should keep recovery_source and canonical fields"
+    );
+}
+
+#[test]
+fn noncanonical_worktree_sessions_cannot_offer_delete_worktree_action() {
+    let lua = create_lua_vm();
+    load_modules(&lua);
+
+    let blocked: bool = lua
+        .load(
+            r#"
+            local rendered = payload.build_many({
+              {
+                id = "sess-identity",
+                session_uuid = "sess-identity",
+                recovery_source = "process_identity",
+                canonical = false,
+                workspace_id = "ws-1",
+                worktree_path = "/tmp/ws-1",
+                in_worktree = true,
+                metadata = {},
+              },
+            })
+            local close = rendered[1].close_actions
+            return close.can_delete_worktree == false
+              and close.delete_worktree_reason == "non_canonical_recovery"
+        "#,
+        )
+        .eval()
+        .expect("non-canonical close action policy should evaluate");
+
+    assert!(
+        blocked,
+        "non-canonical recovered sessions must not offer destructive worktree deletion"
+    );
 }
 
 #[test]

@@ -22,6 +22,9 @@ local function copy_identity_table(source)
     local out = {}
     if type(source) ~= "table" then return out end
     for k, v in pairs(source) do
+        -- Process identity is spawn-time sidecar data, not the mutable
+        -- canonical session record. Drop plugin metadata so stale sidecar data
+        -- cannot silently rehydrate ownership/workflow state after manifest loss.
         if k ~= "metadata" then out[k] = v end
     end
     return out
@@ -77,6 +80,8 @@ local function build_recovery_config(sess, session_uuid, handle, socket_info, re
         label             = sess.label,
         task              = sess.task,
         in_worktree       = sess.in_worktree,
+        recovery_source   = sess.recovery_source or "manifest",
+        canonical         = sess.canonical ~= false,
         handle            = handle,
         dims              = { rows = rows, cols = cols },
     }
@@ -111,6 +116,8 @@ local function recover_session(record, socket_info, recovered, seen_keys)
         return
     end
 
+    sess.recovery_source = "manifest"
+    sess.canonical = true
     local recovery_config = build_recovery_config(sess, session_uuid, handle, socket_info, record)
 
     -- Construct a real session instance
@@ -180,6 +187,8 @@ local function recover_session_from_process_identity(socket_info, recovered, see
     local sess = copy_identity_table(identity)
     sess.session_uuid = session_uuid
     sess.status = "active"
+    sess.recovery_source = "process_identity"
+    sess.canonical = false
 
     local recovery_config = build_recovery_config(sess, session_uuid, handle, socket_info, {
         data_dir = config.data_dir and config.data_dir() or nil,

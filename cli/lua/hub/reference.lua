@@ -370,6 +370,8 @@ M.session_info_fields = {
     { name = "target_path",    type = "string?",     desc = "Spawn target root path" },
     { name = "target_repo",    type = "string?",     desc = "Live repo identity for the target" },
     { name = "metadata",       type = "table",       desc = "Plugin key-value store" },
+    { name = "recovery_source", type = "string",      desc = "'created', 'manifest', or 'process_identity'" },
+    { name = "canonical",      type = "boolean",     desc = "False when recovered from degraded process identity instead of manifest" },
     { name = "workspace_name", type = "string?",     desc = "Workspace display name" },
     { name = "workspace_id",   type = "string?",     desc = "Workspace ID" },
     { name = "branch_name",    type = "string",      desc = "Git branch name" },
