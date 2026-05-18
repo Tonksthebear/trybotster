@@ -92,6 +92,13 @@ Backpressure recovery snapshot delivery records the same gzip queue span and
 the `snapshot.backpressure_recovery.*` counter family so recovery paths remain
 visible even when normal hot PTY delivery is congested.
 
+Terminal control requests from Lua are routed through the hub priority lane
+when they affect live terminal orchestration: browser/TUI/socket subscribe,
+stop subscription, refresh snapshot, PTY input, and resize. Non-control PTY
+observer setup stays on the bulk lane. This keeps the shared local and remote
+terminal path unified while preventing metadata, timers, file-watch traffic, or
+other repeatable work in the bulk lane from delaying attach/input control.
+
 PTY title, cwd, cursor, and mode updates are latest-value metadata, not
 scrollback boundary markers. Under load they may arrive after output bytes from
 the same session I/O frame batch; plugins should treat `pty_title_changed`,

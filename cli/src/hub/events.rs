@@ -477,29 +477,44 @@ impl HubEvent {
 
     #[must_use]
     pub(crate) fn is_high_priority(&self) -> bool {
-        matches!(
-            self,
+        match self {
+            Self::LuaPtyRequest(request) => Self::is_terminal_control_request(request),
             Self::AcChannelMessage { .. }
-                | Self::LuaActionCableRequest(_)
-                | Self::WebRtcOfferNegotiated(_)
-                | Self::WebRtcOutgoingSignal(_)
-                | Self::DcOpened { .. }
-                | Self::WebRtcMessage { .. }
-                | Self::WebRtcIngressBackpressure { .. }
-                | Self::BrowserPushControl { .. }
-                | Self::WebRtcSend(_)
-                | Self::CleanupTick
-                | Self::DropPendingSessionIoSnapshot { .. }
-                | Self::PluginWorkerParentRequest(_)
-                | Self::SessionProcessExited { .. }
-                | Self::SessionUnregistered { .. }
-                | Self::SessionReconnectReady { .. }
-                | Self::WorktreeDeleteCompleted { .. }
-                | Self::SocketClientConnected { .. }
-                | Self::SocketClientDisconnected { .. }
-                | Self::SocketMessage { .. }
-                | Self::SocketSend(_)
-        )
+            | Self::LuaActionCableRequest(_)
+            | Self::WebRtcOfferNegotiated(_)
+            | Self::WebRtcOutgoingSignal(_)
+            | Self::DcOpened { .. }
+            | Self::WebRtcMessage { .. }
+            | Self::WebRtcIngressBackpressure { .. }
+            | Self::BrowserPushControl { .. }
+            | Self::WebRtcSend(_)
+            | Self::CleanupTick
+            | Self::DropPendingSessionIoSnapshot { .. }
+            | Self::PluginWorkerParentRequest(_)
+            | Self::SessionProcessExited { .. }
+            | Self::SessionUnregistered { .. }
+            | Self::SessionReconnectReady { .. }
+            | Self::WorktreeDeleteCompleted { .. }
+            | Self::SocketClientConnected { .. }
+            | Self::SocketClientDisconnected { .. }
+            | Self::SocketMessage { .. }
+            | Self::SocketSend(_) => true,
+            _ => false,
+        }
+    }
+
+    #[must_use]
+    fn is_terminal_control_request(request: &PtyRequest) -> bool {
+        match request {
+            PtyRequest::SubscribeBrowserTerminal(_)
+            | PtyRequest::SubscribeTuiTerminal(_)
+            | PtyRequest::SubscribeSocketTerminal(_)
+            | PtyRequest::StopTerminalSubscription { .. }
+            | PtyRequest::RefreshSnapshot(_)
+            | PtyRequest::WritePty { .. }
+            | PtyRequest::ResizePty { .. } => true,
+            PtyRequest::SpawnNotificationWatcher { .. } => false,
+        }
     }
 
     #[must_use]
@@ -1166,10 +1181,12 @@ mod tests {
             snapshot.slow_samples.len(),
             HubEventMetrics::SLOW_SAMPLE_LOG_LIMIT
         );
-        assert!(snapshot
-            .slow_samples
-            .iter()
-            .all(|sample| sample.label.chars().count() <= 24));
+        assert!(
+            snapshot
+                .slow_samples
+                .iter()
+                .all(|sample| sample.label.chars().count() <= 24)
+        );
         assert_eq!(snapshot.slow_samples[0].elapsed_us, 99_000);
     }
 
@@ -1300,6 +1317,161 @@ mod tests {
             priority_rx.try_recv(),
             Ok(HubEvent::DropPendingSessionIoSnapshot { .. })
         ));
+    }
+
+    #[test]
+    fn sender_routes_terminal_control_lua_pty_requests_to_priority_lane() {
+        let (bulk_tx, mut bulk_rx) = mpsc::channel(8);
+        let (priority_tx, mut priority_rx) = mpsc::channel(8);
+        let metrics = Arc::new(HubEventMetrics::default());
+        let sender = HubEventTx::new_with_priority(bulk_tx, priority_tx, metrics);
+
+        sender
+            .send(HubEvent::LuaPtyRequest(
+                PtyRequest::SubscribeBrowserTerminal(
+                    crate::lua::primitives::pty::BrowserTerminalSubscriptionRequest {
+                        peer_id: "browser-priority".to_string(),
+                        session_uuid: "sess-priority".to_string(),
+                        prefix: None,
+                        subscription_id: "sub-priority".to_string(),
+                        rows: 24,
+                        cols: 80,
+                        active_flag: Arc::new(Mutex::new(true)),
+                    },
+                ),
+            ))
+            .expect("send browser terminal subscribe");
+        sender
+            .send(HubEvent::LuaPtyRequest(
+                PtyRequest::StopTerminalSubscription {
+                    subscription_key: "browser-priority:sess-priority".to_string(),
+                },
+            ))
+            .expect("send terminal stop");
+        sender
+            .send(HubEvent::LuaPtyRequest(PtyRequest::SubscribeTuiTerminal(
+                crate::lua::primitives::pty::TuiTerminalSubscriptionRequest {
+                    session_uuid: "sess-priority".to_string(),
+                    subscription_id: "tui-sub-priority".to_string(),
+                    rows: 24,
+                    cols: 80,
+                    active_flag: Arc::new(Mutex::new(true)),
+                },
+            )))
+            .expect("send tui terminal subscribe");
+        sender
+            .send(HubEvent::LuaPtyRequest(
+                PtyRequest::SubscribeSocketTerminal(
+                    crate::lua::primitives::pty::SocketTerminalSubscriptionRequest {
+                        client_id: "socket:priority".to_string(),
+                        session_uuid: "sess-priority".to_string(),
+                        subscription_id: "socket-sub-priority".to_string(),
+                        rows: 24,
+                        cols: 80,
+                        active_flag: Arc::new(Mutex::new(true)),
+                    },
+                ),
+            ))
+            .expect("send socket terminal subscribe");
+        sender
+            .send(HubEvent::LuaPtyRequest(PtyRequest::ResizePty {
+                session_uuid: "sess-priority".to_string(),
+                rows: 30,
+                cols: 120,
+            }))
+            .expect("send terminal resize");
+        sender
+            .send(HubEvent::LuaPtyRequest(
+                PtyRequest::SpawnNotificationWatcher {
+                    watcher_key: "sess-priority:agent".to_string(),
+                    session_uuid: "sess-priority".to_string(),
+                    session_name: "agent".to_string(),
+                    observe_output: false,
+                    event_tx: tokio::sync::broadcast::channel(1).0,
+                },
+            ))
+            .expect("send non-control pty request");
+
+        assert!(matches!(
+            priority_rx.try_recv(),
+            Ok(HubEvent::LuaPtyRequest(
+                PtyRequest::SubscribeBrowserTerminal(_)
+            ))
+        ));
+        assert!(matches!(
+            priority_rx.try_recv(),
+            Ok(HubEvent::LuaPtyRequest(
+                PtyRequest::StopTerminalSubscription { .. }
+            ))
+        ));
+        assert!(matches!(
+            priority_rx.try_recv(),
+            Ok(HubEvent::LuaPtyRequest(PtyRequest::SubscribeTuiTerminal(_)))
+        ));
+        assert!(matches!(
+            priority_rx.try_recv(),
+            Ok(HubEvent::LuaPtyRequest(
+                PtyRequest::SubscribeSocketTerminal(_)
+            ))
+        ));
+        assert!(matches!(
+            priority_rx.try_recv(),
+            Ok(HubEvent::LuaPtyRequest(PtyRequest::ResizePty { .. }))
+        ));
+        assert!(priority_rx.try_recv().is_err());
+        assert!(matches!(
+            bulk_rx.try_recv(),
+            Ok(HubEvent::LuaPtyRequest(
+                PtyRequest::SpawnNotificationWatcher { .. }
+            ))
+        ));
+        assert!(bulk_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn terminal_control_bypasses_saturated_bulk_lane() {
+        let (bulk_tx, mut bulk_rx) = mpsc::channel(1);
+        let (priority_tx, mut priority_rx) = mpsc::channel(4);
+        let metrics = Arc::new(HubEventMetrics::default());
+        let sender = HubEventTx::new_with_priority(bulk_tx, priority_tx, Arc::clone(&metrics));
+
+        sender
+            .send(HubEvent::UserFileWatch {
+                watch_id: "bulk-filler".to_string(),
+                events: Vec::new(),
+            })
+            .expect("fill bulk lane");
+        sender
+            .send(HubEvent::LuaPtyRequest(PtyRequest::WritePty {
+                session_uuid: "sess-priority".to_string(),
+                data: b"input".to_vec(),
+            }))
+            .expect("terminal input bypasses saturated bulk lane");
+        sender
+            .send(HubEvent::LuaPtyRequest(PtyRequest::RefreshSnapshot(
+                crate::lua::primitives::pty::RefreshSnapshotRequest {
+                    peer_id: "browser-priority".to_string(),
+                    session_uuid: "sess-priority".to_string(),
+                    subscription_id: "sub-priority".to_string(),
+                    rows: 24,
+                    cols: 80,
+                },
+            )))
+            .expect("snapshot refresh bypasses saturated bulk lane");
+
+        assert!(matches!(
+            bulk_rx.try_recv(),
+            Ok(HubEvent::UserFileWatch { .. })
+        ));
+        assert!(matches!(
+            priority_rx.try_recv(),
+            Ok(HubEvent::LuaPtyRequest(PtyRequest::WritePty { .. }))
+        ));
+        assert!(matches!(
+            priority_rx.try_recv(),
+            Ok(HubEvent::LuaPtyRequest(PtyRequest::RefreshSnapshot(_)))
+        ));
+        assert_eq!(metrics.snapshot().enqueue_failed_total, 0);
     }
 
     #[test]
