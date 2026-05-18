@@ -41,11 +41,32 @@ local hub_recovery_state = state.get("connections.hub_recovery_state", {
 })
 local last_connection_code = state.get("connections.last_connection_code", nil)
 local pending_osc_session_updates = state.get("connections.pending_osc_session_updates", {})
+local pending_osc_session_patches = state.get("connections.pending_osc_session_patches", {})
+local pending_osc_session_patch_timers = {}
 
 local OSC_SESSION_UPDATE_DEBOUNCE_SECS = 0.5
+-- Use a short one-shot timer, not after_idle: chatty OSC title spinners still
+-- need visible UI updates while coalescing subscriber fanout.
+local OSC_SESSION_PATCH_DEBOUNCE_SECS = 0.05
 local OUTPUT_ACTIVITY_POLL_SECS = 0.5
 local OUTPUT_ACTIVITY_ACTIVE_WINDOW_MS = 3000
 local output_activity_timer_id = nil
+
+local function flush_osc_session_patch(session_uuid)
+    local current = pending_osc_session_patches[session_uuid]
+    pending_osc_session_patches[session_uuid] = nil
+
+    local agent = Agent.get(session_uuid)
+    if not agent or type(current) ~= "table" or next(current) == nil then return end
+
+    hooks.notify("session_updated", {
+        session_uuid = session_uuid,
+        source = "osc_live",
+        fields = current,
+    })
+    EntityModel.patch_session(agent, current)
+    require("lib.session_actions").publish_for_session(agent)
+end
 
 local function notification_text(info)
     info = info or {}
@@ -544,25 +565,27 @@ local function queue_osc_session_update(session_uuid, fields)
     local changed_fields = {}
     for k, v in pairs(fields) do
         if agent[k] ~= v then
+            local pending_patch = pending_osc_session_patches[session_uuid]
+            if type(pending_patch) ~= "table" then
+                pending_patch = {}
+                pending_osc_session_patches[session_uuid] = pending_patch
+            end
             agent[k] = v
             pending[k] = v
+            pending_patch[k] = v
             changed_fields[k] = v
             changed = true
         end
     end
     if not changed then return end
 
-    -- OSC title/cwd changes are live UI facts. Patch connected clients now;
-    -- debounce only the durable manifest write below. Using after_idle for
-    -- the wire patch made continuously changing titles look frozen because
-    -- the timer never fired until the terminal went quiet.
-    hooks.notify("session_updated", {
-        session_uuid = session_uuid,
-        source = "osc_live",
-        fields = changed_fields,
-    })
-    EntityModel.patch_session(agent, changed_fields)
-    require("lib.session_actions").publish_for_session(agent)
+    if not pending_osc_session_patch_timers[session_uuid] then
+        pending_osc_session_patch_timers[session_uuid] =
+            timer.after(OSC_SESSION_PATCH_DEBOUNCE_SECS, function()
+                pending_osc_session_patch_timers[session_uuid] = nil
+                flush_osc_session_patch(session_uuid)
+            end)
+    end
 
     timer.after_idle("session_osc_update:" .. session_uuid, OSC_SESSION_UPDATE_DEBOUNCE_SECS, function()
         local current = pending_osc_session_updates[session_uuid]
@@ -795,6 +818,13 @@ function M._before_reload()
         events.off(sub_id)
     end
     _event_subs = {}
+    for session_uuid, timer_id in pairs(pending_osc_session_patch_timers) do
+        timer.cancel(timer_id)
+        pending_osc_session_patch_timers[session_uuid] = nil
+    end
+    for session_uuid in pairs(pending_osc_session_patches) do
+        flush_osc_session_patch(session_uuid)
+    end
     for session_uuid in pairs(pending_osc_session_updates) do
         timer.cancel("session_osc_update:" .. session_uuid)
         pending_osc_session_updates[session_uuid] = nil

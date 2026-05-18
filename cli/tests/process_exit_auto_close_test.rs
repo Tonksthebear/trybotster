@@ -155,7 +155,7 @@ fn process_exited_accepts_string_true_for_auto_close_metadata() {
 }
 
 #[test]
-fn pty_title_changed_patches_clients_without_waiting_for_manifest_debounce() {
+fn pty_title_changed_patches_clients_after_short_wire_debounce() {
     let lua = new_lua();
     let script = r#"
         local hook_callbacks = {}
@@ -173,15 +173,23 @@ fn pty_title_changed_patches_clients_without_waiting_for_manifest_debounce() {
           notify = function(...) end,
         }
 
-        local timer_calls = { after_idle = 0 }
+        local timer_calls = { after_idle = 0, after = 0, cancel = 0 }
+        local after_callbacks = {}
         timer = {
+          after = function(_delay, fn)
+            timer_calls.after = timer_calls.after + 1
+            after_callbacks[#after_callbacks + 1] = fn
+            return "timer:osc_patch:" .. tostring(timer_calls.after)
+          end,
           after_idle = function(_key, _delay, _fn)
             timer_calls.after_idle = timer_calls.after_idle + 1
           end,
           every = function(_delay, _fn)
             return "timer:output_activity"
           end,
-          cancel = function(_id) end,
+          cancel = function(_id)
+            timer_calls.cancel = timer_calls.cancel + 1
+          end,
         }
 
         events = {
@@ -196,6 +204,7 @@ fn pty_title_changed_patches_clients_without_waiting_for_manifest_debounce() {
         local session = {
           session_uuid = "sess-title",
           title = nil,
+          cwd = nil,
           sync_count = 0,
           _sync_session_manifest = function(self)
             self.sync_count = self.sync_count + 1
@@ -232,7 +241,10 @@ fn pty_title_changed_patches_clients_without_waiting_for_manifest_debounce() {
           upsert_hub = function(...) end,
         }
         package.loaded["lib.session_actions"] = {
-          publish_for_session = function(...) end,
+          publish_count = 0,
+          publish_for_session = function(...)
+            package.loaded["lib.session_actions"].publish_count = package.loaded["lib.session_actions"].publish_count + 1
+          end,
         }
         package.loaded["lib.terminal_clients"] = {
           set_focused = function(...) end,
@@ -249,25 +261,68 @@ fn pty_title_changed_patches_clients_without_waiting_for_manifest_debounce() {
           path = function(...) return nil end,
         }
 
-        require("handlers.connections")
+        local connections = require("handlers.connections")
         hook_callbacks.pty_title_changed({ session_uuid = "sess-title", title = "⠋ Working" })
+        hook_callbacks.pty_title_changed({ session_uuid = "sess-title", title = "⠙ Working" })
+        hook_callbacks.pty_cwd_changed({ session_uuid = "sess-title", cwd = "/tmp/botster" })
+        local immediate_patch_count = #patches
+        after_callbacks[1]()
+        hook_callbacks.pty_title_changed({ session_uuid = "sess-title", title = "⠙ Working" })
+        local after_same_value_timer_count = timer_calls.after
+        hook_callbacks.pty_title_changed({ session_uuid = "sess-title", title = "Done" })
+        local rearmed_patch_count = #patches
+        connections._before_reload()
 
-        return session.title, #patches, patches[1].title, patches[1].display_name, session.sync_count, timer_calls.after_idle
+        return session.title, session.cwd, immediate_patch_count, rearmed_patch_count, #patches, patches[1].title, patches[1].cwd, patches[1].display_name, patches[2].title, session.sync_count, timer_calls.after_idle, timer_calls.after, after_same_value_timer_count, timer_calls.cancel, package.loaded["lib.session_actions"].publish_count
         "#;
 
-    let (title, patch_count, patch_title, patch_display_name, sync_count, timer_count): (
+    let (
+        title,
+        cwd,
+        immediate_patch_count,
+        rearmed_patch_count,
+        patch_count,
+        patch_title,
+        patch_cwd,
+        patch_display_name,
+        reload_patch_title,
+        sync_count,
+        after_idle_count,
+        after_count,
+        after_same_value_timer_count,
+        cancel_count,
+        publish_count,
+    ): (
         String,
+        String,
+        i64,
+        i64,
         i64,
         String,
         String,
+        String,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
         i64,
         i64,
     ) = lua.load(script).eval().expect("run pty title patch case");
 
-    assert_eq!(title, "⠋ Working");
-    assert_eq!(patch_count, 1);
-    assert_eq!(patch_title, "⠋ Working");
-    assert_eq!(patch_display_name, "⠋ Working");
+    assert_eq!(title, "Done");
+    assert_eq!(cwd, "/tmp/botster");
+    assert_eq!(immediate_patch_count, 0);
+    assert_eq!(rearmed_patch_count, 1);
+    assert_eq!(patch_count, 2);
+    assert_eq!(patch_title, "⠙ Working");
+    assert_eq!(patch_cwd, "/tmp/botster");
+    assert_eq!(patch_display_name, "⠙ Working");
+    assert_eq!(reload_patch_title, "Done");
     assert_eq!(sync_count, 0);
-    assert_eq!(timer_count, 1);
+    assert_eq!(after_idle_count, 4);
+    assert_eq!(after_count, 2);
+    assert_eq!(after_same_value_timer_count, 1);
+    assert_eq!(cancel_count, 4);
+    assert_eq!(publish_count, 2);
 }
