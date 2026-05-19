@@ -299,10 +299,9 @@ pub(super) fn test_pending_session_io_snapshot_cleanup_paths() {
     hub.cleanup_pending_session_io_snapshots_for_peer("browser-a");
     assert!(!hub.pending_session_io_snapshots.contains_key("by-peer"));
     hub.cleanup_pending_session_io_snapshots_for_subscription("browser-b:sess-b");
-    assert!(
-        !hub.pending_session_io_snapshots
-            .contains_key("by-subscription")
-    );
+    assert!(!hub
+        .pending_session_io_snapshots
+        .contains_key("by-subscription"));
     hub.handle_hub_event(crate::hub::events::HubEvent::SessionUnregistered {
         session_uuid: "sess-c".to_string(),
     });

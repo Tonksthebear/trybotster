@@ -586,8 +586,8 @@ pub(crate) fn prepare_snapshot_payload(snapshot: &[u8]) -> Option<PreparedSnapsh
     plain.extend_from_slice(snapshot);
 
     let payload = {
-        use flate2::Compression;
         use flate2::write::GzEncoder;
+        use flate2::Compression;
         use std::io::Write;
 
         let mut encoder = GzEncoder::new(

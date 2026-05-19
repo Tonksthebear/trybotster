@@ -1181,12 +1181,10 @@ mod tests {
             snapshot.slow_samples.len(),
             HubEventMetrics::SLOW_SAMPLE_LOG_LIMIT
         );
-        assert!(
-            snapshot
-                .slow_samples
-                .iter()
-                .all(|sample| sample.label.chars().count() <= 24)
-        );
+        assert!(snapshot
+            .slow_samples
+            .iter()
+            .all(|sample| sample.label.chars().count() <= 24));
         assert_eq!(snapshot.slow_samples[0].elapsed_us, 99_000);
     }
 
@@ -1491,28 +1489,24 @@ mod tests {
         }
 
         for i in 0..128 {
-            assert!(
-                sender
-                    .send(HubEvent::PtyOscEvent {
-                        session_uuid: format!("storm-title-{i}"),
-                        session_name: "agent".to_string(),
-                        event: crate::agent::pty::PtyEvent::title_changed(format!("title-{i}")),
-                    })
-                    .is_err()
-            );
-            assert!(
-                sender
-                    .send(HubEvent::ClientWorkerControl(
-                        crate::worker::hub_control::HubControlMessage::RequestSnapshot {
-                            client_id: crate::client::ClientId::Socket(format!("socket:{i}")),
-                            session_uuid: format!("storm-snapshot-{i}"),
-                            subscription_id: format!("sub-{i}"),
-                            rows: 24,
-                            cols: 80,
-                        },
-                    ))
-                    .is_err()
-            );
+            assert!(sender
+                .send(HubEvent::PtyOscEvent {
+                    session_uuid: format!("storm-title-{i}"),
+                    session_name: "agent".to_string(),
+                    event: crate::agent::pty::PtyEvent::title_changed(format!("title-{i}")),
+                })
+                .is_err());
+            assert!(sender
+                .send(HubEvent::ClientWorkerControl(
+                    crate::worker::hub_control::HubControlMessage::RequestSnapshot {
+                        client_id: crate::client::ClientId::Socket(format!("socket:{i}")),
+                        session_uuid: format!("storm-snapshot-{i}"),
+                        subscription_id: format!("sub-{i}"),
+                        rows: 24,
+                        cols: 80,
+                    },
+                ))
+                .is_err());
         }
 
         sender
