@@ -139,3 +139,168 @@ pub(super) fn test_null_fields_dont_crash_real_lua_handlers() {
     // If we get here without panic, null fields were handled correctly
     // by real Lua handlers via json_to_lua()
 }
+
+#[test]
+pub(super) fn test_surface_subpath_rerender_is_deferred_and_coalesced() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+
+    hub.lua
+        .lua()
+        .load(
+            r#"
+            local Client = require("lib.client")
+            test_surface_snapshot_count = 0
+            test_surface_snapshot_surface = nil
+            test_surface_snapshot_subpath = nil
+
+            test_surface_client = Client.new("browser-surface-defer", {
+                send = function(_) end,
+                send_binary = function(_) end,
+            })
+            test_surface_client.subscriptions = {
+                hub_sub = { channel = "hub" },
+            }
+            function test_surface_client:send_ui_tree_snapshots(_sub_id, opts)
+                test_surface_snapshot_count = test_surface_snapshot_count + 1
+                test_surface_snapshot_surface = opts.only_surface
+                test_surface_snapshot_subpath = self.surface_subpaths[opts.only_surface]
+                return 1
+            end
+
+            test_surface_client:set_surface_subpath("pipelines", "/runs/1", { delay_secs = 0.01 })
+            test_surface_client:set_surface_subpath("pipelines", "/runs/2", { delay_secs = 0.01 })
+            "#,
+        )
+        .exec()
+        .expect("install surface subpath test client");
+
+    let count_before: i32 = hub
+        .lua
+        .lua()
+        .load("return test_surface_snapshot_count")
+        .eval()
+        .expect("read snapshot count before timer");
+    assert_eq!(
+        count_before, 0,
+        "surface subpath action should return before rendering a tree snapshot"
+    );
+    let stored_before: String = hub
+        .lua
+        .lua()
+        .load(r#"return test_surface_client.surface_subpaths["pipelines"]"#)
+        .eval()
+        .expect("read stored subpath before timer");
+    assert_eq!(
+        stored_before, "/runs/2",
+        "surface subpath should be stored synchronously before the deferred render"
+    );
+
+    hub.tokio_runtime.block_on(async {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    });
+    hub.poll_hub_events();
+
+    let count_after: i32 = hub
+        .lua
+        .lua()
+        .load("return test_surface_snapshot_count")
+        .eval()
+        .expect("read snapshot count after timer");
+    let surface: String = hub
+        .lua
+        .lua()
+        .load("return test_surface_snapshot_surface")
+        .eval()
+        .expect("read snapshot surface");
+    let subpath: String = hub
+        .lua
+        .lua()
+        .load("return test_surface_snapshot_subpath")
+        .eval()
+        .expect("read snapshot subpath");
+
+    assert_eq!(count_after, 1, "same-surface updates should coalesce");
+    assert_eq!(surface, "pipelines");
+    assert_eq!(subpath, "/runs/2");
+}
+
+#[test]
+pub(super) fn test_surface_subpath_debounce_key_includes_peer_and_surface() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+
+    hub.lua
+        .lua()
+        .load(
+            r#"
+            local Client = require("lib.client")
+            test_surface_snapshot_keys = {}
+
+            local function make_client(peer_id)
+                local client = Client.new(peer_id, {
+                    send = function(_) end,
+                    send_binary = function(_) end,
+                })
+                client.subscriptions = {
+                    hub_sub = { channel = "hub" },
+                }
+                function client:send_ui_tree_snapshots(_sub_id, opts)
+                    table.insert(
+                        test_surface_snapshot_keys,
+                        self.peer_id .. ":" .. opts.only_surface .. ":" .. self.surface_subpaths[opts.only_surface]
+                    )
+                    return 1
+                end
+                return client
+            end
+
+            test_surface_client_a = make_client("browser-surface-a")
+            test_surface_client_b = make_client("browser-surface-b")
+
+            test_surface_client_a:set_surface_subpath("pipelines", "/runs/1", { delay_secs = 0.01 })
+            test_surface_client_a:set_surface_subpath("agents", "/sessions/1", { delay_secs = 0.01 })
+            test_surface_client_b:set_surface_subpath("pipelines", "/runs/2", { delay_secs = 0.01 })
+            "#,
+        )
+        .exec()
+        .expect("install surface subpath key test clients");
+
+    hub.tokio_runtime.block_on(async {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    });
+    hub.poll_hub_events();
+
+    let count: i32 = hub
+        .lua
+        .lua()
+        .load("return #test_surface_snapshot_keys")
+        .eval()
+        .expect("read snapshot key count");
+    let mut keys: Vec<String> = hub
+        .lua
+        .lua()
+        .load(
+            r#"
+            local keys = {}
+            for i = 1, #test_surface_snapshot_keys do
+                keys[i] = test_surface_snapshot_keys[i]
+            end
+            return keys
+            "#,
+        )
+        .eval()
+        .expect("read snapshot keys");
+
+    assert_eq!(
+        count, 3,
+        "different peers and surfaces should use independent debounce timers"
+    );
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "browser-surface-a:agents:/sessions/1".to_string(),
+            "browser-surface-a:pipelines:/runs/1".to_string(),
+            "browser-surface-b:pipelines:/runs/2".to_string(),
+        ]
+    );
+}

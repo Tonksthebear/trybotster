@@ -543,13 +543,14 @@ impl Hub {
                     payload.len(),
                     browser_identity,
                 );
+                let metric_label = Self::webrtc_lua_message_metric_label(browser_identity, &msg);
                 let started = Instant::now();
                 self.call_lua_webrtc_message(browser_identity, msg);
                 self.record_hot_span(
                     "webrtc_message.lua",
                     started,
                     payload.len(),
-                    browser_identity,
+                    &metric_label,
                 );
             }
             crate::worker::webrtc::WebRtcIngressOutcome::ClientWorker(other) => {
@@ -631,6 +632,36 @@ impl Hub {
                 .record_counter("webrtc_message.lua_error", 1);
             log::error!("[WebRTC-LUA] Lua callback error: {e}");
         }
+    }
+
+    fn webrtc_lua_message_metric_label(
+        browser_identity: &str,
+        msg: &serde_json::Value,
+    ) -> String {
+        let msg_type = msg
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown");
+        let action_id = msg
+            .get("envelope")
+            .and_then(|value| value.get("id"))
+            .and_then(|value| value.as_str());
+        let detail = action_id.unwrap_or(msg_type);
+        // Slow samples cap labels at 24 chars; keep the command/action detail first.
+        format!(
+            "{}:{}:{}",
+            detail,
+            msg_type,
+            Self::short_ascii_prefix(browser_identity, 8)
+        )
+    }
+
+    fn short_ascii_prefix(value: &str, max_chars: usize) -> &str {
+        value
+            .char_indices()
+            .nth(max_chars)
+            .map(|(idx, _)| &value[..idx])
+            .unwrap_or(value)
     }
 
     pub(super) fn queue_webrtc_peer_command(

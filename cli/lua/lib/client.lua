@@ -355,14 +355,16 @@ function Client:send_ui_tree_snapshots(sub_id, opts)
     return #frames
 end
 
---- Record the browser's current subpath for a surface and trigger a
+--- Record the browser's current subpath for a surface and schedule a
 --- targeted re-render. Called from the `botster.surface.subpath` action
---- handler (action.lua) when a client explicitly requests a surface/subpath.
+--- handler when a client explicitly requests a surface/subpath.
 --
 -- @param surface_name string
 -- @param subpath string Sub-path within the surface ("/" / "/board/42" / ...)
--- @param opts table? { rebroadcast = bool } — default true. Set false when a
---        caller only wants to record URL state without sending a frame yet.
+-- @param opts table? { rebroadcast = bool, defer = bool, delay_secs = number }
+--        rebroadcast defaults true. Set false when a caller only wants to
+--        record URL state without sending a frame yet. defer defaults true;
+--        delay_secs defaults to 0.02.
 function Client:set_surface_subpath(surface_name, subpath, opts)
     if type(surface_name) ~= "string" or surface_name == "" then return end
     if type(subpath) ~= "string" or subpath == "" then subpath = "/" end
@@ -370,22 +372,36 @@ function Client:set_surface_subpath(surface_name, subpath, opts)
     self.surface_subpaths[surface_name] = subpath
     opts = opts or {}
     if opts.rebroadcast == false then return end
-    -- Only re-render THIS surface for subscriptions on the hub channel.
-    -- `force = true` guarantees the frame ships even if the surface's
-    -- rendered tree happens to hash-match the previous one; otherwise the
-    -- browser would stay in its loading state forever waiting for a
-    -- subpath-matched frame that dedup or same-subpath suppression silently
-    -- skipped. Dedup remains
-    -- correct for ordinary data-change re-broadcasts because those use
-    -- `send_ui_layout_trees(sub_id)` without `force`.
-    for sub_id, sub in pairs(self.subscriptions or {}) do
-        if sub.channel == "hub" then
-            pcall(self.send_ui_tree_snapshots, self, sub_id, {
-                only_surface = surface_name,
-                force = true,
-            })
+
+    local function send_surface_snapshot()
+        -- Only re-render THIS surface for subscriptions on the hub channel.
+        -- `force = true` guarantees the frame ships even if the surface's
+        -- rendered tree happens to hash-match the previous one; otherwise the
+        -- browser would stay in its loading state forever waiting for a
+        -- subpath-matched frame that dedup or same-subpath suppression silently
+        -- skipped. Dedup remains correct for ordinary data-change re-broadcasts
+        -- because those use `send_ui_layout_trees(sub_id)` without `force`.
+        for sub_id, sub in pairs(self.subscriptions or {}) do
+            if sub.channel == "hub" then
+                pcall(self.send_ui_tree_snapshots, self, sub_id, {
+                    only_surface = surface_name,
+                    force = true,
+                })
+            end
         end
     end
+
+    if opts.defer == false or type(timer) ~= "table" or type(timer.after_idle) ~= "function" then
+        send_surface_snapshot()
+        return
+    end
+
+    local peer_id = tostring(self.peer_id or "unknown")
+    timer.after_idle(
+        "client_surface_subpath:" .. peer_id .. ":" .. surface_name,
+        opts.delay_secs or 0.02,
+        send_surface_snapshot
+    )
 end
 
 --- Send the `ui_route_registry` frame for a HubChannel subscription.
