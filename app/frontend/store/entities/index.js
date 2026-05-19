@@ -1,8 +1,9 @@
 // Wire protocol — entity store registry + wire-frame dispatcher.
 //
 // This module is the SINGLE entry point used by `hub_connection.js` to
-// route incoming wire envelopes (`entity_snapshot` / `entity_upsert` /
-// `entity_patch` / `entity_remove`) into the right Zustand store. Plugin
+// route incoming wire envelopes (`entity_snapshot` /
+// `entity_scoped_snapshot` / `entity_upsert` / `entity_patch` /
+// `entity_remove`) into the right Zustand store. Plugin
 // entity types (`<plugin>.<type>`) are registered lazily on first frame
 // via `pluginEntityStore`.
 //
@@ -69,6 +70,7 @@ export function storeFor(entityType) {
 export function isEntityFrame(messageType) {
   return (
     messageType === 'entity_snapshot' ||
+    messageType === 'entity_scoped_snapshot' ||
     messageType === 'entity_upsert' ||
     messageType === 'entity_patch' ||
     messageType === 'entity_remove'
@@ -95,6 +97,11 @@ export function applyEntityFrame(frame) {
     case 'entity_snapshot': {
       const items = Array.isArray(frame.items) ? frame.items : []
       store.applySnapshot(items, seq)
+      break
+    }
+    case 'entity_scoped_snapshot': {
+      const items = Array.isArray(frame.items) ? frame.items : []
+      store.applyScopedSnapshot(frame.scope ?? {}, items, seq)
       break
     }
     case 'entity_upsert': {

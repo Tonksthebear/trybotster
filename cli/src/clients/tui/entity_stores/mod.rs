@@ -53,6 +53,7 @@ pub use worktree_store::WorktreeStore;
 /// Wire envelope types the stores recognize.
 const ENTITY_FRAME_TYPES: &[&str] = &[
     "entity_snapshot",
+    "entity_scoped_snapshot",
     "entity_upsert",
     "entity_patch",
     "entity_remove",
@@ -97,6 +98,62 @@ impl EntityStore {
                 continue;
             };
             self.order.push(id.clone());
+            self.by_id.insert(id, item);
+        }
+    }
+
+    /// Replace only records matching an exact equality scope, preserving
+    /// unrelated records for the same entity type.
+    ///
+    /// Scope keys are exact top-level entity-field matches. The hub pre-filters
+    /// scoped query results the same way; the client removes stale rows in that
+    /// scope before inserting the replacement set.
+    pub fn apply_scoped_snapshot(
+        &mut self,
+        scope: &JsonValue,
+        items: Vec<JsonValue>,
+        id_field: &str,
+        snapshot_seq: u64,
+    ) {
+        if scope
+            .as_object()
+            .map(|scope| scope.is_empty())
+            .unwrap_or(true)
+        {
+            log::warn!("tui entity_stores: ignoring scoped snapshot with empty scope");
+            return;
+        }
+        if snapshot_seq != 0 && snapshot_seq < self.snapshot_seq {
+            log::debug!(
+                "tui entity_stores: dropping stale scoped snapshot (seq={snapshot_seq}, last={prev})",
+                prev = self.snapshot_seq
+            );
+            return;
+        }
+        let retained_order: Vec<String> = self
+            .order
+            .iter()
+            .filter(|id| {
+                self.by_id
+                    .get(*id)
+                    .map(|entity| !entity_matches_scope(entity, scope))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        self.by_id
+            .retain(|_, entity| !entity_matches_scope(entity, scope));
+        self.order = retained_order;
+        for item in items {
+            let Some(id) = extract_id(&item, id_field) else {
+                log::warn!(
+                    "tui entity_stores: scoped snapshot item missing id_field {id_field:?}: {item}"
+                );
+                continue;
+            };
+            if !self.by_id.contains_key(&id) {
+                self.order.push(id.clone());
+            }
             self.by_id.insert(id, item);
         }
     }
@@ -191,6 +248,18 @@ fn extract_id(entity: &JsonValue, id_field: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+fn entity_matches_scope(entity: &JsonValue, scope: &JsonValue) -> bool {
+    let Some(scope) = scope.as_object() else {
+        return false;
+    };
+    for (key, value) in scope {
+        if entity.get(key) != Some(value) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Aggregate of all built-in entity stores plus a HashMap for plugin
 /// entity types. Owned by [`crate::clients::tui::runner::TuiRunner`] and updated by
 /// the wire-frame dispatcher.
@@ -270,6 +339,15 @@ impl TuiEntityStores {
                     .cloned()
                     .unwrap_or_default();
                 store.apply_snapshot(items, id_field, snapshot_seq);
+            }
+            "entity_scoped_snapshot" => {
+                let items = frame
+                    .get("items")
+                    .and_then(JsonValue::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let scope = frame.get("scope").cloned().unwrap_or(JsonValue::Null);
+                store.apply_scoped_snapshot(&scope, items, id_field, snapshot_seq);
             }
             "entity_upsert" => {
                 let Some(id) = frame.get("id").and_then(|v| v.as_str()).map(str::to_string) else {
@@ -351,6 +429,17 @@ mod tests {
             "v": 2,
             "type": "entity_snapshot",
             "entity_type": "session",
+            "items": items,
+            "snapshot_seq": seq
+        })
+    }
+
+    fn scoped_snap_frame(scope: JsonValue, items: Vec<JsonValue>, seq: u64) -> JsonValue {
+        json!({
+            "v": 2,
+            "type": "entity_scoped_snapshot",
+            "entity_type": "session",
+            "scope": scope,
             "items": items,
             "snapshot_seq": seq
         })
@@ -493,6 +582,64 @@ mod tests {
     }
 
     #[test]
+    fn scoped_snapshot_replaces_only_matching_scope() {
+        let mut stores = TuiEntityStores::new();
+        stores.apply_frame(&snap_frame(
+            vec![
+                json!({ "session_uuid": "sess-a", "workspace_id": "ws-1", "title": "old a" }),
+                json!({ "session_uuid": "sess-b", "workspace_id": "ws-2", "title": "old b" }),
+                json!({ "session_uuid": "sess-c", "workspace_id": "ws-1", "title": "old c" }),
+            ],
+            1,
+        ));
+        stores.apply_frame(&scoped_snap_frame(
+            json!({ "workspace_id": "ws-1" }),
+            vec![json!({ "session_uuid": "sess-d", "workspace_id": "ws-1", "title": "new d" })],
+            2,
+        ));
+        let store = stores.store("session").expect("store");
+        assert_eq!(store.order, vec!["sess-b", "sess-d"]);
+        assert_eq!(store.by_id["sess-b"]["title"], json!("old b"));
+        assert_eq!(store.by_id["sess-d"]["title"], json!("new d"));
+    }
+
+    #[test]
+    fn scoped_snapshot_ignores_empty_scope() {
+        let mut stores = TuiEntityStores::new();
+        stores.apply_frame(&snap_frame(
+            vec![json!({ "session_uuid": "sess-a", "title": "old a" })],
+            1,
+        ));
+        stores.apply_frame(&scoped_snap_frame(json!({}), vec![], 2));
+        let store = stores.store("session").expect("store");
+        assert_eq!(store.order, vec!["sess-a"]);
+        assert_eq!(store.by_id["sess-a"]["title"], json!("old a"));
+    }
+
+    #[test]
+    fn scoped_snapshot_does_not_advance_whole_type_sequence_gate() {
+        let mut stores = TuiEntityStores::new();
+        stores.apply_frame(&snap_frame(
+            vec![json!({ "session_uuid": "sess-a", "workspace_id": "ws-1", "title": "old a" })],
+            5,
+        ));
+        stores.apply_frame(&scoped_snap_frame(
+            json!({ "workspace_id": "ws-1" }),
+            vec![json!({ "session_uuid": "sess-b", "workspace_id": "ws-1", "title": "new b" })],
+            6,
+        ));
+        stores.apply_frame(&upsert_frame(
+            "sess-c",
+            json!({ "session_uuid": "sess-c", "title": "delta with same seq" }),
+            6,
+        ));
+
+        let store = stores.store("session").expect("store");
+        assert_eq!(store.snapshot_seq, 6);
+        assert_eq!(store.by_id["sess-c"]["title"], json!("delta with same seq"));
+    }
+
+    #[test]
     fn out_of_order_frames_are_dropped() {
         let mut stores = TuiEntityStores::new();
         stores.apply_frame(&snap_frame(
@@ -533,6 +680,7 @@ mod tests {
     #[test]
     fn handles_frame_recognises_only_v2_entity_envelopes() {
         assert!(TuiEntityStores::handles_frame("entity_snapshot"));
+        assert!(TuiEntityStores::handles_frame("entity_scoped_snapshot"));
         assert!(TuiEntityStores::handles_frame("entity_upsert"));
         assert!(TuiEntityStores::handles_frame("entity_patch"));
         assert!(TuiEntityStores::handles_frame("entity_remove"));

@@ -201,13 +201,16 @@ TUI clients consume those read models through the generic entity store; Project
 Pipelines must not add plugin-specific browser stores, custom data channels, or
 renderer subscription state as an alternate model path.
 
-`project_pipelines/entities.lua` publishes targeted recovery baselines with
-`publish_snapshots()`, and exposes targeted `upsert` / `remove` helpers so repo
-mutators can update clients after persistence changes. Plugin-owned entity
-families are not part of the initial browser/TUI hub baseline; surfaces should
-request the specific plugin data they need. The browser does this by inspecting
-the opened surface tree for `ui.bind` / `ui.bind_list` sources and requesting
-those entity families on demand.
+`project_pipelines/entities.lua` publishes recovery baselines with
+`publish_snapshots()`, exposes targeted `upsert` / `remove` helpers so repo
+mutators can update clients after persistence changes, and registers
+`query(request, context)` providers for route and overview hydration.
+Plugin-owned entity families are not part of the initial browser/TUI hub
+baseline; surfaces request the specific plugin data they need. The browser does
+this by inspecting the opened surface tree for `ui.bind` / `ui.bind_list`
+sources. Unfiltered lists request whole-family snapshots, direct record binds
+request id upserts/removes, and filtered `bind_list{ where = { ... } }`
+sections request scoped snapshots that replace only matching rows.
 
 The contract module describes the published read-model shape, not the plugin.db
 table schema. Persistence models may have different names, decoded JSON fields,
@@ -254,11 +257,15 @@ Runs, ticket handoffs, ticket questions, run steps, run reviews, findings,
 artifacts, events, pipeline steps, and pipeline gates use `ui.bind_list` /
 `ui.bind` against the entity families above. Detail subsections scope child rows
 with `ui.bind_list{ where = { ... } }` instead of pre-rendering per-run or
-per-step collections into the tree snapshot. `/project-pipelines.ticket`
-publishes standalone and project-scoped tickets; standalone lists and project
-timelines filter the shared entity family in the view layer. Route scaffolding
-and form controls that depend on the current path or available actions still
-render structurally.
+per-step collections into the tree snapshot. Overview sections also use scoped
+bindings for active runs, open questions, open projects, standalone tickets,
+and merge-ready tickets; those filter fields (`status`, `standalone`,
+`latest_run_status`, etc.) are explicit read-model fields and are supported by
+the matching `query` providers. `/project-pipelines.ticket` publishes
+standalone and project-scoped tickets; standalone lists and project timelines
+filter the shared entity family in the view layer. Route scaffolding and form
+controls that depend on the current path or available actions still render
+structurally.
 Pipeline steps and gates are first-class entities, not embedded arrays on the
 pipeline entity, because the editor mutates individual step and gate fields and
 detail screens need row-level handoff updates. Snapshot publishing is reserved
@@ -310,8 +317,9 @@ browser components:
   Publish filterable record supersets and explicit read-model fields rather
   than per-view browser stores.
 - Detail rows use `ui.bind_list{ where = { ... } }` for filtered children when
-  they need dynamic entity-backed rows. Keep `ui_tree_snapshot` for route
-  scaffolding, current-path controls, and other presentation structure.
+  they need dynamic entity-backed rows. Filtered overview rows use the same
+  scoped entity hydration path. Keep `ui_tree_snapshot` for route scaffolding,
+  current-path controls, and other presentation structure.
 - Ephemeral browser-only state uses `ui.local_state(key, default)` with
   `botster.presentation.set`, `botster.presentation.clear`, or
   `botster.presentation.toggle`. Use this for modal open flags and local
@@ -346,7 +354,7 @@ dialog keys while leaving navigation on the current ticket route.
 
 ### Entity-Only UI Migration Plan
 
-The current Project Pipelines UI is only partially entity-backed. Keep the next
+The current Project Pipelines UI is mostly entity-backed. Keep the next
 slices small: migrate one screen section at a time from render-time `repo.*`
 queries into existing or new plugin entity families, then remove the
 corresponding repo-rendered code, refresh-only `ui_tree_snapshot` dependency,
@@ -392,19 +400,15 @@ Add only the smallest new families needed to replace embedded model snapshots:
 
 Screen migration order:
 
-1. Overview: replace `running_pipeline_rows` and `merge_work_rows` in
-   `project_pipelines/web/screens/home.lua` with `ui.bind_list` rows from
-   `/project-pipelines.run`, `/project-pipelines.ticket`,
-   `/project-pipelines.pipeline`, `/project-pipelines.pipeline_step`,
-   `/project-pipelines.run_step`, `/project-pipelines.pr_link`,
-   `/project-pipelines.artifact`, and `/project-pipelines.event`. This removes
-   the largest overview `repo.list_runs`, `repo.visible_tickets`, event,
-   artifact, and PR-link snapshot load while leaving existing project, ticket,
-   question, and pipeline lists untouched.
-2. Run detail: the header display, header actions, step cards, reviews,
+1. Run detail: the header display, header actions, step cards, reviews,
    findings, artifacts, and recent events now use `/project-pipelines.run`
    record bindings plus filtered `ui.bind_list` sources. Use this completed
    screen as the reference pattern for migrating the larger ticket timeline.
+2. Overview: questions, active runs, merge-ready tickets, open projects,
+   standalone tickets, and pipeline definitions now render through entity binds
+   and targeted/scoped hydration. Keep future overview changes in
+   `entity_contract.lua` and `entities.lua`; do not reintroduce render-time
+   repo queries for dynamic rows.
 3. Ticket timeline and terminal sections: replace `handoff_rows`,
    `session_rows`, `run_rows`, `merge_controls`, `merge_result_rows`, and
    dependency option lists in `project_pipelines/web/screens/ticket.lua` with

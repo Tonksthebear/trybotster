@@ -10,6 +10,7 @@
 --
 -- Wire envelopes (all carry `v = 2`):
 --   { type = "entity_snapshot", entity_type, items, snapshot_seq }
+--   { type = "entity_scoped_snapshot", entity_type, scope, items, snapshot_seq }
 --   { type = "entity_upsert",   entity_type, id, entity, snapshot_seq }
 --   { type = "entity_patch",    entity_type, id, patch, snapshot_seq }
 --   { type = "entity_remove",   entity_type, id, snapshot_seq }
@@ -68,6 +69,7 @@ local BUILTIN_ENTITY_TYPES = {
 -- entity_type -> {
 --   id_field = string,
 --   all = function,
+--   query = function?,
 --   filter = function?,
 --   owner_plugin = string?,
 -- }
@@ -311,6 +313,7 @@ end
 --- @param opts table {
 ---   id_field = string,        -- payload field that supplies the entity id
 ---   all = function -> array,  -- snapshot source called on request
+---   query = function? -> array, -- targeted merge-hydration source
 ---   filter = function? -> bool, -- optional per-item gate (true = include)
 ---   owner_plugin = string?,   -- required for plugin types outside plugin load
 --- }
@@ -325,6 +328,9 @@ function M.register(entity_type, opts)
         "entity_broadcast.register: opts.id_field must be a non-empty string")
     assert(type(opts.all) == "function",
         "entity_broadcast.register: opts.all must be a function")
+    if opts.query ~= nil and type(opts.query) ~= "function" then
+        error("entity_broadcast.register: opts.query must be a function or nil")
+    end
     if opts.filter ~= nil and type(opts.filter) ~= "function" then
         error("entity_broadcast.register: opts.filter must be a function or nil")
     end
@@ -343,6 +349,7 @@ function M.register(entity_type, opts)
     registry[entity_type] = {
         id_field = opts.id_field,
         all = opts.all,
+        query = opts.query,
         filter = opts.filter,
         owner_plugin = owner_plugin,
     }
@@ -512,6 +519,76 @@ local function registered_type_names(opts)
     return names
 end
 
+local function requested_entity_queries(opts)
+    opts = opts or {}
+    local out = {}
+    local raw = opts.requests or opts.entity_requests
+    if type(raw) ~= "table" then return out end
+    for _, request in ipairs(raw) do
+        if #out >= 50 then
+            log.warn("entity_broadcast.query: dropping targeted requests over cap=50")
+            break
+        end
+        if type(request) == "table" then
+            local entity_type = request.entity_type or request.type
+            if type(entity_type) == "string" and entity_type ~= "" then
+                local copy = { entity_type = entity_type }
+                if type(request.id) == "string" and request.id ~= "" and #request.id <= 256 then
+                    copy.id = request.id
+                end
+                local where = request.where
+                if type(where) == "table" then
+                    local sanitized = {}
+                    local count = 0
+                    for key, value in pairs(where) do
+                        count = count + 1
+                        if count > 8 then
+                            log.warn(string.format(
+                                "entity_broadcast.query: dropping extra scope keys for %q",
+                                entity_type))
+                            break
+                        end
+                        local value_type = type(value)
+                        if type(key) == "string" and key ~= ""
+                            and (value_type == "string" or value_type == "number" or value_type == "boolean")
+                        then
+                            sanitized[key] = value
+                        end
+                    end
+                    if next(sanitized) ~= nil then
+                        copy.where = sanitized
+                    end
+                end
+                if copy.id and copy.where then
+                    log.warn(string.format(
+                        "entity_broadcast.query: dropping mixed id+where request for %q",
+                        entity_type))
+                elseif copy.id or copy.where then
+                    out[#out + 1] = copy
+                else
+                    log.warn(string.format(
+                        "entity_broadcast.query: dropping malformed targeted request for %q",
+                        entity_type))
+                end
+            end
+        end
+    end
+    return out
+end
+
+local function table_has_entries(value)
+    if type(value) ~= "table" then return false end
+    return next(value) ~= nil
+end
+
+local function item_matches_scope(item, scope)
+    if type(item) ~= "table" or type(scope) ~= "table" then return false end
+    for key, value in pairs(scope) do
+        if item[key] ~= value then return false end
+    end
+    return true
+end
+
 local function snapshot_items(entry, entity_type, context)
     local ok, items = pcall(entry.all, context)
     if not ok then
@@ -542,6 +619,71 @@ local function snapshot_items(entry, entity_type, context)
         end
     end
     return kept
+end
+
+local function query_items(entry, entity_type, request, context)
+    if type(entry.query) ~= "function" then
+        log.warn(string.format(
+            "entity_broadcast.query: %q does not support targeted hydration",
+            entity_type))
+        -- Unsupported query paths are non-authoritative. Emit no frame rather
+        -- than clearing scoped rows or synthesizing removes for a provider that
+        -- has not opted into targeted hydration.
+        return nil
+    end
+    local ok, items = pcall(entry.query, request, context)
+    if not ok then
+        log.warn(string.format(
+            "entity_broadcast.query: query() for %q threw: %s",
+            entity_type, tostring(items)))
+        return {}
+    end
+    if type(items) ~= "table" then
+        log.warn(string.format(
+            "entity_broadcast.query: query() for %q returned %s, expected table",
+            entity_type, type(items)))
+        return {}
+    end
+    local out = {}
+    local requested_id = request.id
+    local scope = table_has_entries(request.where) and request.where or nil
+    for _, item in ipairs(items) do
+        if type(item) ~= "table" then
+            log.warn(string.format(
+                "entity_broadcast.query: dropping non-table item for %q",
+                entity_type))
+        else
+            local id = resolve_id(entry, item, "query")
+            if id then
+                local keep = true
+                if requested_id and id ~= requested_id then
+                    keep = false
+                    log.warn(string.format(
+                        "entity_broadcast.query: dropping %q item %q that does not match requested id %q",
+                        entity_type, id, requested_id))
+                end
+                if keep and scope and not item_matches_scope(item, scope) then
+                    keep = false
+                    log.warn(string.format(
+                        "entity_broadcast.query: dropping %q item %q outside requested scope",
+                        entity_type, id))
+                end
+                if keep and entry.filter then
+                    local ok_f, filter_keep = pcall(entry.filter, item)
+                    if not ok_f then
+                        keep = false
+                        log.warn(string.format(
+                            "entity_broadcast.query: filter for %q threw: %s",
+                            entity_type, tostring(filter_keep)))
+                    elseif not filter_keep then
+                        keep = false
+                    end
+                end
+                if keep then out[#out + 1] = item end
+            end
+        end
+    end
+    return out
 end
 
 --- Send `entity_snapshot` frames to a single subscriber.
@@ -619,6 +761,132 @@ local function send_snapshot_type(client, sub_id, entity_type, context, plugin_c
     return 1
 end
 
+local function send_query_request(client, sub_id, request, context, plugin_contexts)
+    local entity_type = request.entity_type
+    local started = os.clock()
+    local entry = registry[entity_type]
+    if not entry then return 0 end
+
+    local items = query_items(entry, entity_type, request, context_for_entry(context, plugin_contexts, entry))
+    if items == nil then
+        return 0
+    end
+    local scope = table_has_entries(request.where) and request.where or nil
+    if scope then
+        local frame = {
+            v = 2,
+            type = "entity_scoped_snapshot",
+            entity_type = entity_type,
+            scope = scope,
+            items = items,
+            snapshot_seq = current_seq(entity_type),
+        }
+        if sub_id ~= nil then frame.subscriptionId = sub_id end
+        local ok_send, send_err = pcall(client.send, client, frame)
+        if not ok_send then
+            log.warn(string.format(
+                "entity_broadcast.query: send failed for type=%s sub=%s: %s",
+                tostring(entity_type),
+                tostring(sub_id or "nil"),
+                tostring(send_err)))
+            return 0, false
+        end
+        local elapsed = elapsed_ms(started)
+        log_perf(string.format(
+            "query scoped type=%s items=%d sub=%s elapsed_ms=%d",
+            tostring(entity_type),
+            #items,
+            tostring(sub_id or "nil"),
+            elapsed))
+        if elapsed > 250 then
+            log.warn(string.format(
+                "entity_broadcast.query_slow: type=%s items=%d sub=%s elapsed_ms=%d",
+                tostring(entity_type),
+                #items,
+                tostring(sub_id or "nil"),
+                elapsed))
+        end
+        log.info(string.format(
+            "entity_broadcast.query: type=%s scoped_items=%d sub=%s",
+            tostring(entity_type),
+            #items,
+            tostring(sub_id or "nil")))
+        return 1
+    end
+
+    local sent = 0
+    local matched_requested_id = false
+    for _, item in ipairs(items) do
+        local id = resolve_id(entry, item, "query")
+        if id then
+            if request.id and id == request.id then
+                matched_requested_id = true
+            end
+            local frame = {
+                v = 2,
+                type = "entity_upsert",
+                entity_type = entity_type,
+                id = id,
+                entity = item,
+                snapshot_seq = next_seq(entity_type),
+            }
+            if sub_id ~= nil then frame.subscriptionId = sub_id end
+            local ok_send, send_err = pcall(client.send, client, frame)
+            if not ok_send then
+                log.warn(string.format(
+                    "entity_broadcast.query: send failed for type=%s sub=%s: %s",
+                    tostring(entity_type),
+                    tostring(sub_id or "nil"),
+                    tostring(send_err)))
+                return sent, false
+            end
+            sent = sent + 1
+        end
+    end
+    if request.id and not matched_requested_id then
+        local frame = {
+            v = 2,
+            type = "entity_remove",
+            entity_type = entity_type,
+            id = request.id,
+            snapshot_seq = next_seq(entity_type),
+        }
+        if sub_id ~= nil then frame.subscriptionId = sub_id end
+        local ok_send, send_err = pcall(client.send, client, frame)
+        if not ok_send then
+            log.warn(string.format(
+                "entity_broadcast.query: send failed for type=%s sub=%s: %s",
+                tostring(entity_type),
+                tostring(sub_id or "nil"),
+                tostring(send_err)))
+            return sent, false
+        end
+        sent = sent + 1
+    end
+    local elapsed = elapsed_ms(started)
+    log_perf(string.format(
+        "query type=%s items=%d sub=%s elapsed_ms=%d",
+        tostring(entity_type),
+        #items,
+        tostring(sub_id or "nil"),
+        elapsed))
+    if elapsed > 250 then
+        log.warn(string.format(
+            "entity_broadcast.query_slow: type=%s items=%d sub=%s elapsed_ms=%d",
+            tostring(entity_type),
+            #items,
+            tostring(sub_id or "nil"),
+            elapsed))
+    end
+    log.info(string.format(
+        "entity_broadcast.query: type=%s items=%d upserts=%d sub=%s",
+        tostring(entity_type),
+        #items,
+        sent,
+        tostring(sub_id or "nil")))
+    return sent
+end
+
 local function log_snapshot_batch(sent, sub_id, batch_started, suffix)
     log.info(string.format(
         "entity_broadcast.snapshot%s: sent %d type snapshot(s) to sub=%s",
@@ -650,6 +918,14 @@ function M.send_snapshots_to(client, sub_id, opts)
             return
         end
     end
+    for _, request in ipairs(requested_entity_queries(opts)) do
+        local request_sent, ok = send_query_request(client, sub_id, request, context, plugin_contexts)
+        sent = sent + request_sent
+        if ok == false then
+            log_snapshot_batch(sent, sub_id, batch_started, " canceled")
+            return
+        end
+    end
     log_snapshot_batch(sent, sub_id, batch_started)
 end
 
@@ -671,10 +947,12 @@ function M.schedule_snapshots_to(client, sub_id, opts)
     end
 
     local names = registered_type_names(opts)
+    local requests = requested_entity_queries(opts)
     local batch_started = PERF and os.clock() or nil
     local context = {}
     local plugin_contexts = {}
     local index = 1
+    local request_index = 1
     local sent = 0
 
     local function step()
@@ -684,19 +962,33 @@ function M.schedule_snapshots_to(client, sub_id, opts)
         end
 
         local entity_type = names[index]
-        if entity_type == nil then
-            log_snapshot_batch(sent, sub_id, batch_started, " scheduled")
+        if entity_type ~= nil then
+            index = index + 1
+            local type_sent, ok = send_snapshot_type(client, sub_id, entity_type, context, plugin_contexts)
+            sent = sent + type_sent
+            if ok == false then
+                log_snapshot_batch(sent, sub_id, batch_started, " canceled")
+                return
+            end
+            timer.after(0, step)
             return
         end
 
-        index = index + 1
-        local type_sent, ok = send_snapshot_type(client, sub_id, entity_type, context, plugin_contexts)
-        sent = sent + type_sent
-        if ok == false then
-            log_snapshot_batch(sent, sub_id, batch_started, " canceled")
+        local request = requests[request_index]
+        if request ~= nil then
+            request_index = request_index + 1
+            local request_sent, ok = send_query_request(client, sub_id, request, context, plugin_contexts)
+            sent = sent + request_sent
+            if ok == false then
+                log_snapshot_batch(sent, sub_id, batch_started, " canceled")
+                return
+            end
+            timer.after(0, step)
             return
         end
-        timer.after(0, step)
+
+        log_snapshot_batch(sent, sub_id, batch_started, " scheduled")
+        return
     end
 
     timer.after(0, step)

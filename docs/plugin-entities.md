@@ -134,6 +134,13 @@ EB.register(ENTITY_TYPE, {
   id_field = "id",
   owner_plugin = OWNER,
   all = ticket_rows,
+  query = function(request, context)
+    local id = request.id
+    if id then
+      return rows("SELECT * FROM tickets WHERE id = ? LIMIT 1", id)
+    end
+    return ticket_rows()
+  end,
 })
 
 Hub.get():entity_snapshot(ENTITY_TYPE, ticket_rows(), {
@@ -160,13 +167,53 @@ explicit client baseline request. Use `entity_upsert` when a mutator creates or
 replaces one record. Use `entity_patch` for sparse top-level field changes.
 Use `entity_remove` when clients should drop one record.
 
-Browser surfaces request their initial plugin baselines by inspecting the
-received UI tree for `$bind` and `bind_list` sources. A surface that binds
-`/project-pipelines.ticket` therefore pulls the `project-pipelines.ticket`
-snapshot when that surface is opened, not during hub subscribe.
+Browser surfaces request plugin data by inspecting the received UI tree for
+`$bind` and `bind_list` sources. A surface that binds an unfiltered
+`/project-pipelines.ticket` list pulls a full `project-pipelines.ticket`
+snapshot when that surface is opened, not during hub subscribe. A surface that
+binds `/project-pipelines.ticket/ticket_123/title` sends a targeted id request.
+A `ui.bind_list{ source = "/project-pipelines.run_step", where = { run_id =
+"run_123" } }` sends a scoped request for that exact top-level field set.
 
 Patch semantics are intentionally shallow: nested tables replace the old nested
 value. Send the full nested value you want clients to keep.
+
+### Targeted And Scoped Hydration
+
+Plugins that expose entity-backed detail or filtered overview screens should
+register a `query(request, context)` provider for each entity family used by
+concrete id bindings or filtered `bind_list` sections. The provider returns the
+same read-model row shape as `all()`, but only for the requested route or
+working set.
+
+Supported request shapes are intentionally separate:
+
+- `{ id = "record-id" }` means merge this one record into the client store.
+  If the provider returns no visible row for that id, Botster sends an
+  `entity_remove` for that id so stale client rows disappear.
+- `{ where = { field = value, ... } }` means replace only the client rows whose
+  top-level fields exactly match that scope. Botster sends an
+  `entity_scoped_snapshot` frame and preserves unrelated rows for the same
+  entity family.
+
+Do not mix `id` and `where` in one request. The hub rejects mixed requests so
+id merge semantics and scoped replacement semantics stay unambiguous. `where`
+values are scalar only (`string`, `number`, or `boolean`) and match exact
+top-level read-model fields. If a screen filters on `latest_run_status`,
+`standalone`, `ticket_id`, or `has_pr_url`, those fields must exist on the
+entity records returned by both `all()` and `query()`.
+
+Scoped snapshots do not advance the whole-family sequence gate. Browser stores
+therefore maintain a local render revision counter so same-size scoped
+replacements still re-render. TUI stores apply the same scoped replacement
+semantics. Unsupported query providers emit no authoritative empty frame; they
+log and leave existing client state alone. That makes missing providers safe,
+but plugin authors should still add query providers for every scoped list or
+concrete id binding that must hydrate a route directly.
+
+Use the optional `context` table passed to `all()` and `query()` to share
+expensive lookups across one batch. Keep the context ephemeral and derived; it
+is for amortizing read-model projection work, not storing durable state.
 
 ## UI Binding Lifecycle
 
@@ -318,6 +365,8 @@ renderer-specific pending flags.
   plugin; keep published records flat and renderer-ready.
 - Register every entity family before publishing snapshots or deltas.
 - Keep `all()` callbacks array-shaped and resilient; bad records are skipped.
+- Add `query(request, context)` providers for concrete id bindings and filtered
+  `bind_list` scopes; return the same read-model shape as `all()`.
 - Publish snapshots for baselines and targeted deltas for mutators.
 - Use `entity_patch` only for top-level sparse changes.
 - Keep `ui_tree_snapshot` focused on route structure, stable node ids, and
@@ -326,7 +375,9 @@ renderer-specific pending flags.
   entity family owns that section.
 - Use `ui.local_state` and `botster.presentation.*` for per-browser modal,
   disclosure, focus state, and not-yet-submitted modal field values.
-- Use `ui.bind_list{ where = { ... } }` for filtered child collections.
+- Use `ui.bind_list{ where = { ... } }` for filtered child and overview
+  collections only when the filtered fields are explicit top-level read-model
+  fields and the entity family has a matching `query` provider.
 - Give repeated submitters stable node `id` values so `ui_action_result`
   feedback scopes to the clicked control.
 - Remove dead dual paths cold-turkey when a section migrates to entities.

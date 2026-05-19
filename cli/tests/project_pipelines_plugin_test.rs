@@ -2040,6 +2040,241 @@ fn catalog_plugin_project_pipelines_keeps_run_snapshots_complete_for_direct_rout
 }
 
 #[test]
+fn catalog_plugin_project_pipelines_registers_targeted_detail_hydration() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local registered = {{}}
+            package.loaded["lib.entity_broadcast"] = {{
+              register = function(entity_type, opts)
+                registered[entity_type] = opts
+              end,
+            }}
+
+            package.loaded["project_pipelines.web.ui"] = {{
+              status_tone = function() return "muted" end,
+              status_label = function(status) return tostring(status or "") end,
+              status_state = function() return "neutral" end,
+              ticket_notification_count = function() return 0 end,
+            }}
+
+            local function normalize(sql)
+              return (sql:gsub("%s+", " "))
+            end
+
+            local saw = {{ run = false, run_step = false, review = false, pr_link = false }}
+            local db = {{}}
+            function db:eval(sql, param)
+              local compact = normalize(sql)
+              if compact == "SELECT * FROM runs WHERE id = ? LIMIT 1" then
+                saw.run = param == "historical-run"
+                return {{ {{ id = "historical-run", ticket_id = "closed-ticket", pipeline_id = "pipeline-1", status = "blocked" }} }}
+              end
+              if compact:find("FROM run_steps WHERE run_id = %?") then
+                saw.run_step = param == "historical-run"
+                return {{ {{ id = "step-1", run_id = "historical-run", step_id = "pipeline-step-1", status = "blocked", sequence = 1 }} }}
+              end
+              if compact == "SELECT * FROM reviews WHERE run_id = ? ORDER BY created_at ASC, id ASC" then
+                saw.review = param == "historical-run"
+                return {{ {{ id = "review-1", run_id = "historical-run", verdict = "needs_work" }} }}
+              end
+              if compact:find("FROM pr_links WHERE ticket_id = %?") then
+                saw.pr_link = param == "open-ticket"
+                return {{ {{ id = "pr-1", ticket_id = "open-ticket", pr_url = "https://example.com/pull/1", status = "open" }} }}
+              end
+              if compact:find("SELECT id, title, project_id FROM tickets WHERE id IN") then
+                return {{ {{ id = "closed-ticket", title = "Closed ticket", project_id = "closed-project" }} }}
+              end
+              if compact:find("SELECT id FROM projects WHERE id IN") then
+                return {{ {{ id = "closed-project" }} }}
+              end
+              if compact:find("SELECT id, name FROM pipelines WHERE id IN") then
+                return {{ {{ id = "pipeline-1", name = "Pipeline" }} }}
+              end
+              if compact:find("FROM tickets WHERE id = %? LIMIT 1") then
+                if param == "open-ticket" then
+                  return {{ {{ id = param, title = "Open ticket", status = "open", project_id = "" }} }}
+                end
+                return {{ {{ id = param, title = "Closed ticket", status = "closed", project_id = "closed-project" }} }}
+              end
+              if compact:find("FROM projects WHERE id = %? LIMIT 1") then
+                return {{ {{ id = param, name = "Closed project", status = "closed" }} }}
+              end
+              if compact:find("FROM pipelines WHERE id = %? LIMIT 1") then
+                return {{ {{ id = param, name = "Pipeline" }} }}
+              end
+              if compact:find("FROM pipeline_steps WHERE id = %? LIMIT 1") then
+                return {{ {{ id = param, name = "Implement", kind = "agent" }} }}
+              end
+              if compact:find("FROM pipeline_steps") then
+                return {{ {{ id = "pipeline-step-1", name = "Implement", kind = "agent" }} }}
+              end
+              if compact:find("SELECT id, ticket_id, pipeline_id FROM runs") then
+                return {{ {{ id = "historical-run", ticket_id = "closed-ticket", pipeline_id = "pipeline-1" }} }}
+              end
+              return {{}}
+            end
+            package.loaded["project_pipelines.db"] = db
+
+            local entities = require("project_pipelines.entities")
+            entities.register()
+
+            local run_items = registered[entities.types.run].query({{ id = "historical-run" }})
+            local step_items = registered[entities.types.run_step].query({{ where = {{ run_id = "historical-run" }} }})
+            local review_items = registered[entities.types.review].query({{ where = {{ run_id = "historical-run" }} }})
+            local pr_link_items = registered[entities.types.pr_link].query({{ where = {{ ticket_id = "open-ticket", has_pr_url = true }} }})
+
+            assert(saw.run)
+            assert(saw.run_step)
+            assert(saw.review)
+            assert(saw.pr_link)
+            assert(#run_items == 1 and run_items[1].id == "historical-run")
+            assert(run_items[1].ticket_title == "Closed ticket")
+            assert(#step_items == 1 and step_items[1].run_id == "historical-run")
+            assert(step_items[1].ticket_id == "closed-ticket")
+            assert(#review_items == 1 and review_items[1].id == "review-1")
+            assert(#pr_link_items == 1 and pr_link_items[1].id == "pr-1")
+            assert(pr_link_items[1].has_pr_url == true)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines targeted detail hydration");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_registers_targeted_overview_hydration() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local registered = {{}}
+            package.loaded["lib.entity_broadcast"] = {{
+              register = function(entity_type, opts)
+                registered[entity_type] = opts
+              end,
+            }}
+
+            package.loaded["project_pipelines.web.ui"] = {{
+              status_tone = function() return "muted" end,
+              status_label = function(status) return tostring(status or "") end,
+              status_state = function() return "neutral" end,
+              ticket_notification_count = function() return 0 end,
+            }}
+
+            local function normalize(sql)
+              return (sql:gsub("%s+", " "))
+            end
+
+            local db = {{}}
+            function db:eval(sql, param)
+              local compact = normalize(sql)
+              if compact:find("FROM tickets t LEFT JOIN projects p") then
+                return {{
+                  {{ id = "ticket-merge", title = "Ready", status = "open", project_id = "project-1", target_id = "target-1", created_at = 1 }},
+                  {{ id = "ticket-standalone", title = "Standalone", status = "open", project_id = "", target_id = "target-1", created_at = 2 }},
+                }}
+              end
+              if compact == "SELECT * FROM runs ORDER BY updated_at DESC, created_at DESC, id DESC" then
+                return {{
+                  {{ id = "run-active", ticket_id = "ticket-standalone", pipeline_id = "pipeline-1", status = "active" }},
+                  {{ id = "run-done", ticket_id = "ticket-merge", pipeline_id = "pipeline-1", status = "done" }},
+                }}
+              end
+              if compact == "SELECT * FROM runs ORDER BY ticket_id ASC, created_at DESC, id DESC" then
+                return {{
+                  {{ id = "run-done", ticket_id = "ticket-merge", pipeline_id = "pipeline-1", status = "done" }},
+                  {{ id = "run-active", ticket_id = "ticket-standalone", pipeline_id = "pipeline-1", status = "active" }},
+                }}
+              end
+              if compact:find("SELECT id, title, project_id FROM tickets WHERE id IN") then
+                return {{
+                  {{ id = "ticket-standalone", title = "Standalone", project_id = "" }},
+                  {{ id = "ticket-merge", title = "Ready", project_id = "project-1" }},
+                }}
+              end
+              if compact:find("SELECT id FROM projects WHERE id IN") then
+                return {{ {{ id = "project-1" }} }}
+              end
+              if compact:find("SELECT id, name FROM pipelines WHERE id IN") then
+                return {{ {{ id = "pipeline-1", name = "Pipeline" }} }}
+              end
+              if compact == "SELECT * FROM projects WHERE COALESCE(status, 'open') != 'closed' ORDER BY updated_at DESC, created_at DESC" then
+                return {{ {{ id = "project-1", name = "Project", status = "open" }} }}
+              end
+              if compact:find("FROM questions q") then
+                return {{ {{ id = "question-1", ticket_id = "ticket-standalone", status = "open", question = "Proceed?", kind = "human" }} }}
+              end
+              if compact:find("SELECT id, title FROM tickets WHERE id IN") then
+                return {{ {{ id = "ticket-standalone", title = "Standalone" }} }}
+              end
+              if compact:find("FROM ticket_dependencies") then
+                return {{}}
+              end
+              if compact:find("FROM events") then
+                return {{}}
+              end
+              if compact:find("FROM pr_links") then
+                return {{}}
+              end
+              if compact:find("FROM pipeline_steps") then
+                return {{}}
+              end
+              return {{}}
+            end
+            package.loaded["project_pipelines.db"] = db
+
+            local entities = require("project_pipelines.entities")
+            entities.register()
+
+            local ticket_items = registered[entities.types.ticket].query({{ where = {{ status = "open", standalone = true }} }})
+            local merge_items = registered[entities.types.ticket].query({{ where = {{ status = "open", latest_run_status = "done" }} }})
+            local run_items = registered[entities.types.run].query({{ where = {{ status = "active" }} }})
+            local project_items = registered[entities.types.project].query({{ where = {{ status = "open" }} }})
+            local question_items = registered[entities.types.question].query({{ where = {{ status = "open" }} }})
+
+            local saw_standalone = false
+            local saw_done = false
+            for _, item in ipairs(ticket_items) do
+              if item.standalone == true then saw_standalone = true end
+            end
+            for _, item in ipairs(merge_items) do
+              if item.latest_run_status == "done" then saw_done = true end
+            end
+
+            assert(#ticket_items >= 1, "overview ticket scoped query should return working-set ticket rows")
+            assert(saw_standalone, "ticket entities should expose standalone for EB scope filtering")
+            assert(#merge_items >= 1, "overview merge scoped query should return decorated ticket rows")
+            assert(saw_done, "ticket entities should expose latest_run_status for EB scope filtering")
+            assert(#run_items >= 1 and run_items[1].status == "active")
+            assert(#project_items == 1 and project_items[1].status == "open")
+            assert(#question_items == 1 and question_items[1].status == "open")
+            assert(question_items[1].ticket_title == "Standalone")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines targeted overview hydration");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_run_entities_decorate_relationship_and_agent_fields() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");

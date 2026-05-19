@@ -691,6 +691,356 @@ fn schedule_snapshots_to_cancels_after_send_failure() {
 }
 
 #[test]
+fn schedule_snapshots_to_sends_targeted_queries_as_upserts() {
+    let (lua, eb) = new_eb_lua();
+    lua.globals().set("EB", eb).unwrap();
+
+    let result: bool = lua
+        .load(
+            r#"
+            local queue = {}
+            timer = {
+              after = function(_delay, fn)
+                queue[#queue + 1] = fn
+                return "timer-" .. tostring(#queue)
+              end,
+            }
+
+            local saw_request = false
+            EB.register("plugin.ticket", {
+              id_field = "id",
+              owner_plugin = "plugin",
+              all = function(_context)
+                return { { id = "default-ticket" } }
+              end,
+              query = function(request, _context)
+                saw_request = request.id == "closed-ticket"
+                return { { id = request.id, status = "closed" } }
+              end,
+            })
+
+            local captured = {}
+            local client = {
+              subscriptions = { ["sub-1"] = { channel = "hub" } },
+              send = function(_, frame)
+                captured[#captured + 1] = frame
+              end,
+            }
+
+            EB.schedule_snapshots_to(client, "sub-1", {
+              types = {},
+              entity_requests = {
+                { entity_type = "plugin.ticket", id = "closed-ticket" },
+              },
+            })
+
+            queue[1]()
+            return saw_request
+              and #captured == 1
+              and captured[1].type == "entity_upsert"
+              and captured[1].entity_type == "plugin.ticket"
+              and captured[1].id == "closed-ticket"
+              and captured[1].entity.status == "closed"
+        "#,
+        )
+        .eval()
+        .expect("targeted query snapshot script should evaluate");
+
+    assert!(
+        result,
+        "targeted entity requests should merge detail rows as upserts"
+    );
+}
+
+#[test]
+fn schedule_snapshots_to_sends_scoped_queries_as_scoped_snapshots() {
+    let (lua, eb) = new_eb_lua();
+    lua.globals().set("EB", eb).unwrap();
+
+    let result: bool = lua
+        .load(
+            r#"
+            local queue = {}
+            timer = {
+              after = function(_delay, fn)
+                queue[#queue + 1] = fn
+                return "timer-" .. tostring(#queue)
+              end,
+            }
+
+            local saw_scope = false
+            EB.register("plugin.run_step", {
+              id_field = "id",
+              owner_plugin = "plugin",
+              all = function(_context)
+                return { { id = "default-step" } }
+              end,
+              query = function(request, _context)
+                saw_scope = request.where and request.where.run_id == "run-1"
+                return { { id = "step-1", run_id = "run-1" } }
+              end,
+            })
+
+            local captured = {}
+            local client = {
+              subscriptions = { ["sub-1"] = { channel = "hub" } },
+              send = function(_, frame)
+                captured[#captured + 1] = frame
+              end,
+            }
+
+            EB.schedule_snapshots_to(client, "sub-1", {
+              types = {},
+              entity_requests = {
+                { entity_type = "plugin.run_step", where = { run_id = "run-1" } },
+              },
+            })
+
+            queue[1]()
+            return saw_scope
+              and #captured == 1
+              and captured[1].type == "entity_scoped_snapshot"
+              and captured[1].entity_type == "plugin.run_step"
+              and captured[1].scope.run_id == "run-1"
+              and captured[1].items[1].id == "step-1"
+        "#,
+        )
+        .eval()
+        .expect("scoped query snapshot script should evaluate");
+
+    assert!(
+        result,
+        "scoped entity requests should replace only matching scoped rows"
+    );
+}
+
+#[test]
+fn schedule_snapshots_to_filters_targeted_queries_and_removes_missing_ids() {
+    let (lua, eb) = new_eb_lua();
+    lua.globals().set("EB", eb).unwrap();
+
+    let result: bool = lua
+        .load(
+            r#"
+            local queue = {}
+            timer = {
+              after = function(_delay, fn)
+                queue[#queue + 1] = fn
+                return "timer-" .. tostring(#queue)
+              end,
+            }
+
+            EB.register("plugin.ticket", {
+              id_field = "id",
+              owner_plugin = "plugin",
+              all = function(_context) return {} end,
+              query = function(request, _context)
+                return {
+                  { id = request.id, status = "closed" },
+                  { id = "other", status = "open" },
+                }
+              end,
+              filter = function(item)
+                return item.status == "open"
+              end,
+            })
+
+            local captured = {}
+            local client = {
+              subscriptions = { ["sub-1"] = { channel = "hub" } },
+              send = function(_, frame)
+                captured[#captured + 1] = frame
+              end,
+            }
+
+            EB.schedule_snapshots_to(client, "sub-1", {
+              types = {},
+              entity_requests = {
+                { entity_type = "plugin.ticket", id = "closed-ticket" },
+              },
+            })
+
+            queue[1]()
+            return #captured == 1
+              and captured[1].type == "entity_remove"
+              and captured[1].entity_type == "plugin.ticket"
+              and captured[1].id == "closed-ticket"
+        "#,
+        )
+        .eval()
+        .expect("filtered targeted query script should evaluate");
+
+    assert!(
+        result,
+        "filtered or missing targeted id requests should synthesize a remove"
+    );
+}
+
+#[test]
+fn schedule_snapshots_to_filters_scoped_query_items_to_requested_scope() {
+    let (lua, eb) = new_eb_lua();
+    lua.globals().set("EB", eb).unwrap();
+
+    let result: bool = lua
+        .load(
+            r#"
+            local queue = {}
+            timer = {
+              after = function(_delay, fn)
+                queue[#queue + 1] = fn
+                return "timer-" .. tostring(#queue)
+              end,
+            }
+
+            EB.register("plugin.run_step", {
+              id_field = "id",
+              owner_plugin = "plugin",
+              all = function(_context) return {} end,
+              query = function(_request, _context)
+                return {
+                  { id = "step-1", run_id = "run-1" },
+                  { id = "step-2", run_id = "run-2" },
+                }
+              end,
+            })
+
+            local captured = {}
+            local client = {
+              subscriptions = { ["sub-1"] = { channel = "hub" } },
+              send = function(_, frame)
+                captured[#captured + 1] = frame
+              end,
+            }
+
+            EB.schedule_snapshots_to(client, "sub-1", {
+              types = {},
+              entity_requests = {
+                { entity_type = "plugin.run_step", where = { run_id = "run-1" } },
+              },
+            })
+
+            queue[1]()
+            return #captured == 1
+              and captured[1].type == "entity_scoped_snapshot"
+              and #captured[1].items == 1
+              and captured[1].items[1].id == "step-1"
+        "#,
+        )
+        .eval()
+        .expect("scoped query filter script should evaluate");
+
+    assert!(
+        result,
+        "scoped query responses should not ship rows outside the requested scope"
+    );
+}
+
+#[test]
+fn schedule_snapshots_to_skips_unsupported_targeted_queries() {
+    let (lua, eb) = new_eb_lua();
+    lua.globals().set("EB", eb).unwrap();
+
+    let result: bool = lua
+        .load(
+            r#"
+            local queue = {}
+            timer = {
+              after = function(_delay, fn)
+                queue[#queue + 1] = fn
+                return "timer-" .. tostring(#queue)
+              end,
+            }
+
+            EB.register("plugin.ticket", {
+              id_field = "id",
+              owner_plugin = "plugin",
+              all = function(_context) return {} end,
+            })
+
+            local captured = {}
+            local client = {
+              subscriptions = { ["sub-1"] = { channel = "hub" } },
+              send = function(_, frame)
+                captured[#captured + 1] = frame
+              end,
+            }
+
+            EB.schedule_snapshots_to(client, "sub-1", {
+              types = {},
+              entity_requests = {
+                { entity_type = "plugin.ticket", where = { status = "closed" } },
+              },
+            })
+
+            queue[1]()
+            return #captured == 0
+        "#,
+        )
+        .eval()
+        .expect("unsupported targeted query script should evaluate");
+
+    assert!(
+        result,
+        "unsupported query requests should not emit empty scoped snapshots"
+    );
+}
+
+#[test]
+fn schedule_snapshots_to_rejects_mixed_id_and_scope_queries() {
+    let (lua, eb) = new_eb_lua();
+    lua.globals().set("EB", eb).unwrap();
+
+    let result: bool = lua
+        .load(
+            r#"
+            local queue = {}
+            timer = {
+              after = function(_delay, fn)
+                queue[#queue + 1] = fn
+                return "timer-" .. tostring(#queue)
+              end,
+            }
+
+            local queried = false
+            EB.register("plugin.ticket", {
+              id_field = "id",
+              owner_plugin = "plugin",
+              all = function(_context) return {} end,
+              query = function(_request, _context)
+                queried = true
+                return { { id = "ticket-1", status = "open" } }
+              end,
+            })
+
+            local captured = {}
+            local client = {
+              subscriptions = { ["sub-1"] = { channel = "hub" } },
+              send = function(_, frame)
+                captured[#captured + 1] = frame
+              end,
+            }
+
+            EB.schedule_snapshots_to(client, "sub-1", {
+              types = {},
+              entity_requests = {
+                { entity_type = "plugin.ticket", id = "ticket-1", where = { status = "open" } },
+              },
+            })
+
+            if queue[1] then queue[1]() end
+            return queried == false and #captured == 0
+        "#,
+        )
+        .eval()
+        .expect("mixed targeted query script should evaluate");
+
+    assert!(
+        result,
+        "mixed id+where targeted requests should be rejected before querying"
+    );
+}
+
+#[test]
 fn send_snapshots_to_shares_context_across_entity_providers() {
     let (lua, eb) = new_eb_lua();
 

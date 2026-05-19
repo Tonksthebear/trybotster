@@ -23,8 +23,8 @@ const SNAPSHOT_RESET_SEQ = 0
  * @param {string} entityType - Wire identifier ("session", "workspace", ...).
  * @param {object} options - { idField?: string }
  * @returns {import('zustand').UseBoundStore} a Zustand bound store with
- *   { byId, order, snapshotSeq, applySnapshot, applyUpsert, applyPatch,
- *     applyRemove, _reset }.
+ *   { byId, order, snapshotSeq, applySnapshot, applyScopedSnapshot,
+ *     applyUpsert, applyPatch, applyRemove, _reset }.
  */
 export function createEntityStore(entityType, { idField = 'id' } = {}) {
   return create((set, get) => ({
@@ -34,6 +34,8 @@ export function createEntityStore(entityType, { idField = 'id' } = {}) {
     byId: {},
     /** Most recent snapshot_seq applied. */
     snapshotSeq: 0,
+    /** Local render invalidation counter, incremented for every applied mutation. */
+    revision: 0,
 
     /**
      * Replace the store with a fresh snapshot. Order comes from items so the
@@ -58,7 +60,56 @@ export function createEntityStore(entityType, { idField = 'id' } = {}) {
         order.push(id)
         byId[id] = item
       }
-      set({ order, byId, snapshotSeq: seq })
+      set({ order, byId, snapshotSeq: seq, revision: get().revision + 1 })
+    },
+
+    /**
+     * Replace only records matching an exact equality scope, preserving
+     * unrelated records for the same entity type.
+     *
+     * Scope keys match exact top-level entity fields. The hub pre-filters
+     * scoped query results the same way; this client-side match removes stale
+     * rows in the scope before inserting the replacement set.
+     */
+    applyScopedSnapshot(scope, items, snapshotSeq) {
+      const seq = normaliseSeq(snapshotSeq)
+      if (seq !== SNAPSHOT_RESET_SEQ && seq < get().snapshotSeq) {
+        // eslint-disable-next-line no-console
+        console.debug(`entity store ${entityType}: dropping stale scoped snapshot (seq=${seq}, last=${get().snapshotSeq})`)
+        return
+      }
+      const scopeObject = scope && typeof scope === 'object' ? scope : {}
+      if (Object.keys(scopeObject).length === 0) {
+        // eslint-disable-next-line no-console
+        console.warn(`entity store ${entityType}: ignoring scoped snapshot with empty scope`)
+        return
+      }
+      const { byId, order } = get()
+      const nextById = {}
+      const nextOrder = []
+      const nextIds = new Set()
+      for (const id of order) {
+        const entity = byId[id]
+        if (!entityMatchesScope(entity, scopeObject)) {
+          nextById[id] = entity
+          nextOrder.push(id)
+          nextIds.add(id)
+        }
+      }
+      for (const item of items || []) {
+        const id = extractId(item, idField)
+        if (id == null) {
+          // eslint-disable-next-line no-console
+          console.warn(`entity store ${entityType}: scoped snapshot item missing id_field=${idField}`, item)
+          continue
+        }
+        if (!nextIds.has(id)) {
+          nextOrder.push(id)
+          nextIds.add(id)
+        }
+        nextById[id] = item
+      }
+      set({ order: nextOrder, byId: nextById, revision: get().revision + 1 })
     },
 
     /**
@@ -70,7 +121,12 @@ export function createEntityStore(entityType, { idField = 'id' } = {}) {
       const { byId, order } = get()
       const nextById = { ...byId, [id]: entity }
       const nextOrder = order.includes(id) ? order : [...order, id]
-      set({ byId: nextById, order: nextOrder, snapshotSeq: normaliseSeq(snapshotSeq) })
+      set({
+        byId: nextById,
+        order: nextOrder,
+        snapshotSeq: normaliseSeq(snapshotSeq),
+        revision: get().revision + 1,
+      })
     },
 
     /**
@@ -88,7 +144,9 @@ export function createEntityStore(entityType, { idField = 'id' } = {}) {
         console.debug(`entity store ${entityType}: patch for unknown id ${id} — will reconcile on next snapshot`)
         // Still bump the seq so subsequent strictly-ordered patches don't
         // re-trigger this branch unnecessarily. The next snapshot rebuilds.
-        set({ snapshotSeq: normaliseSeq(snapshotSeq) })
+        set({
+          snapshotSeq: normaliseSeq(snapshotSeq),
+        })
         return
       }
       if (!patch || typeof patch !== 'object') return
@@ -99,6 +157,7 @@ export function createEntityStore(entityType, { idField = 'id' } = {}) {
       set({
         byId: { ...byId, [id]: merged },
         snapshotSeq: normaliseSeq(snapshotSeq),
+        revision: get().revision + 1,
       })
     },
 
@@ -107,7 +166,9 @@ export function createEntityStore(entityType, { idField = 'id' } = {}) {
       if (!acceptSeq(get(), snapshotSeq, 'remove')) return
       const { byId, order } = get()
       if (!(id in byId)) {
-        set({ snapshotSeq: normaliseSeq(snapshotSeq) })
+        set({
+          snapshotSeq: normaliseSeq(snapshotSeq),
+        })
         return
       }
       const { [id]: _removed, ...rest } = byId
@@ -115,6 +176,7 @@ export function createEntityStore(entityType, { idField = 'id' } = {}) {
         byId: rest,
         order: order.filter((existing) => existing !== id),
         snapshotSeq: normaliseSeq(snapshotSeq),
+        revision: get().revision + 1,
       })
     },
 
@@ -129,9 +191,17 @@ export function createEntityStore(entityType, { idField = 'id' } = {}) {
 
     /** Test-only — reset to empty. */
     _reset() {
-      set({ order: [], byId: {}, snapshotSeq: 0 })
+      set({ order: [], byId: {}, snapshotSeq: 0, revision: 0 })
     },
   }))
+}
+
+function entityMatchesScope(entity, scope) {
+  if (!entity || typeof entity !== 'object') return false
+  for (const [key, value] of Object.entries(scope || {})) {
+    if (entity[key] !== value) return false
+  }
+  return true
 }
 
 function extractId(entity, idField) {
