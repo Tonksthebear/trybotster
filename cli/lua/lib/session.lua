@@ -815,7 +815,10 @@ end
 
 --- Sync the Central Session Store session manifest.
 -- Writes self:info() shape so session recovery can load it directly.
-function Session:_sync_session_manifest()
+-- @param opts table|nil Options. Set refresh_workspace_status=false when
+-- syncing metadata-only fields that cannot affect workspace liveness/status.
+function Session:_sync_session_manifest(opts)
+    opts = opts or {}
     if self.canonical == false then
         log.debug(string.format(
             "Session %s: skip session manifest sync for non-canonical recovered session (recovery_source=%s)",
@@ -883,7 +886,9 @@ function Session:_sync_session_manifest()
         return
     end
     log.info(string.format("Session %s: manifest written", self.session_uuid))
-    pcall(ws.refresh_workspace_status, self._data_dir, self._workspace_id)
+    if opts.refresh_workspace_status ~= false then
+        pcall(ws.refresh_workspace_status, self._data_dir, self._workspace_id)
+    end
 end
 
 --- Sync the Central Session Store workspace manifest.

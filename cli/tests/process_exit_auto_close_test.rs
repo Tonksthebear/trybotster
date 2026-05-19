@@ -175,14 +175,18 @@ fn pty_title_changed_patches_clients_after_short_wire_debounce() {
 
         local timer_calls = { after_idle = 0, after = 0, cancel = 0 }
         local after_callbacks = {}
+        local after_idle_callbacks = {}
+        local after_idle_delays = {}
         timer = {
           after = function(_delay, fn)
             timer_calls.after = timer_calls.after + 1
             after_callbacks[#after_callbacks + 1] = fn
             return "timer:osc_patch:" .. tostring(timer_calls.after)
           end,
-          after_idle = function(_key, _delay, _fn)
+          after_idle = function(_key, delay, fn)
             timer_calls.after_idle = timer_calls.after_idle + 1
+            after_idle_delays[#after_idle_delays + 1] = delay
+            after_idle_callbacks[#after_idle_callbacks + 1] = fn
           end,
           every = function(_delay, _fn)
             return "timer:output_activity"
@@ -206,8 +210,10 @@ fn pty_title_changed_patches_clients_after_short_wire_debounce() {
           title = nil,
           cwd = nil,
           sync_count = 0,
-          _sync_session_manifest = function(self)
+          sync_refresh_workspace_status = nil,
+          _sync_session_manifest = function(self, opts)
             self.sync_count = self.sync_count + 1
+            self.sync_refresh_workspace_status = opts and opts.refresh_workspace_status
           end,
         }
 
@@ -271,58 +277,53 @@ fn pty_title_changed_patches_clients_after_short_wire_debounce() {
         local after_same_value_timer_count = timer_calls.after
         hook_callbacks.pty_title_changed({ session_uuid = "sess-title", title = "Done" })
         local rearmed_patch_count = #patches
+        after_idle_callbacks[#after_idle_callbacks]()
         connections._before_reload()
 
-        return session.title, session.cwd, immediate_patch_count, rearmed_patch_count, #patches, patches[1].title, patches[1].cwd, patches[1].display_name, patches[2].title, session.sync_count, timer_calls.after_idle, timer_calls.after, after_same_value_timer_count, timer_calls.cancel, package.loaded["lib.session_actions"].publish_count
+        return {
+          title = session.title,
+          cwd = session.cwd,
+          immediate_patch_count = immediate_patch_count,
+          rearmed_patch_count = rearmed_patch_count,
+          patch_count = #patches,
+          patch_title = patches[1].title,
+          patch_cwd = patches[1].cwd,
+          patch_display_name = patches[1].display_name,
+          reload_patch_title = patches[2].title,
+          sync_count = session.sync_count,
+          sync_refresh_workspace_status = session.sync_refresh_workspace_status,
+          after_idle_count = timer_calls.after_idle,
+          after_idle_delay = after_idle_delays[1],
+          after_count = timer_calls.after,
+          after_same_value_timer_count = after_same_value_timer_count,
+          cancel_count = timer_calls.cancel,
+          publish_count = package.loaded["lib.session_actions"].publish_count,
+        }
         "#;
 
-    let (
-        title,
-        cwd,
-        immediate_patch_count,
-        rearmed_patch_count,
-        patch_count,
-        patch_title,
-        patch_cwd,
-        patch_display_name,
-        reload_patch_title,
-        sync_count,
-        after_idle_count,
-        after_count,
-        after_same_value_timer_count,
-        cancel_count,
-        publish_count,
-    ): (
-        String,
-        String,
-        i64,
-        i64,
-        i64,
-        String,
-        String,
-        String,
-        String,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-    ) = lua.load(script).eval().expect("run pty title patch case");
+    let result: mlua::Table = lua.load(script).eval().expect("run pty title patch case");
 
-    assert_eq!(title, "Done");
-    assert_eq!(cwd, "/tmp/botster");
-    assert_eq!(immediate_patch_count, 0);
-    assert_eq!(rearmed_patch_count, 1);
-    assert_eq!(patch_count, 2);
-    assert_eq!(patch_title, "⠙ Working");
-    assert_eq!(patch_cwd, "/tmp/botster");
-    assert_eq!(patch_display_name, "⠙ Working");
-    assert_eq!(reload_patch_title, "Done");
-    assert_eq!(sync_count, 0);
-    assert_eq!(after_idle_count, 4);
-    assert_eq!(after_count, 2);
-    assert_eq!(after_same_value_timer_count, 1);
-    assert_eq!(cancel_count, 4);
-    assert_eq!(publish_count, 2);
+    assert_eq!(result.get::<String>("title").unwrap(), "Done");
+    assert_eq!(result.get::<String>("cwd").unwrap(), "/tmp/botster");
+    assert_eq!(result.get::<i64>("immediate_patch_count").unwrap(), 0);
+    assert_eq!(result.get::<i64>("rearmed_patch_count").unwrap(), 1);
+    assert_eq!(result.get::<i64>("patch_count").unwrap(), 2);
+    assert_eq!(result.get::<String>("patch_title").unwrap(), "⠙ Working");
+    assert_eq!(result.get::<String>("patch_cwd").unwrap(), "/tmp/botster");
+    assert_eq!(
+        result.get::<String>("patch_display_name").unwrap(),
+        "⠙ Working"
+    );
+    assert_eq!(result.get::<String>("reload_patch_title").unwrap(), "Done");
+    assert_eq!(result.get::<i64>("sync_count").unwrap(), 1);
+    assert!(!result.get::<bool>("sync_refresh_workspace_status").unwrap());
+    assert_eq!(result.get::<i64>("after_idle_count").unwrap(), 4);
+    assert_eq!(result.get::<f64>("after_idle_delay").unwrap(), 5.0);
+    assert_eq!(result.get::<i64>("after_count").unwrap(), 2);
+    assert_eq!(
+        result.get::<i64>("after_same_value_timer_count").unwrap(),
+        1
+    );
+    assert_eq!(result.get::<i64>("cancel_count").unwrap(), 3);
+    assert_eq!(result.get::<i64>("publish_count").unwrap(), 2);
 }
