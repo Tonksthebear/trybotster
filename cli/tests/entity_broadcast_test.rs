@@ -471,6 +471,226 @@ fn send_snapshots_to_emits_one_snapshot_per_registered_type() {
 }
 
 #[test]
+fn schedule_snapshots_to_defers_work_and_cancels_unsubscribed_clients() {
+    let (lua, eb) = new_eb_lua();
+    lua.globals().set("EB", eb).unwrap();
+
+    let result: bool = lua
+        .load(
+            r#"
+            local queue = {}
+            timer = {
+              after = function(_delay, fn)
+                queue[#queue + 1] = fn
+                return "timer-" .. tostring(#queue)
+              end,
+            }
+
+            local calls = 0
+            EB.register("session", {
+              id_field = "session_uuid",
+              all = function(_context)
+                calls = calls + 1
+                return { { session_uuid = "sess-1" } }
+              end,
+            })
+            EB.register("workspace", {
+              id_field = "workspace_id",
+              all = function(_context)
+                calls = calls + 1
+                return { { workspace_id = "ws-1" } }
+              end,
+            })
+
+            local captured = {}
+            local client = {
+              subscriptions = { ["sub-1"] = { channel = "hub" } },
+              send = function(_, frame)
+                captured[#captured + 1] = frame
+              end,
+            }
+
+            local scheduled = EB.schedule_snapshots_to(client, "sub-1", {
+              types = { "session", "workspace" },
+            })
+            local deferred = scheduled == 0 and #captured == 0 and #queue == 1 and calls == 0
+
+            queue[1]()
+            local sent_one = #captured == 1 and captured[1].entity_type == "session"
+              and #queue == 2 and calls == 1
+
+            client.subscriptions["sub-1"] = nil
+            queue[2]()
+            local canceled = #captured == 1 and calls == 1
+
+            return deferred and sent_one and canceled
+        "#,
+        )
+        .eval()
+        .expect("scheduled snapshot script should evaluate");
+
+    assert!(
+        result,
+        "scheduled snapshots should leave the command turn, step by type, and stop after unsubscribe"
+    );
+}
+
+#[test]
+fn schedule_snapshots_to_shares_context_across_plugin_entity_providers() {
+    let (lua, eb) = new_eb_lua();
+    lua.globals().set("EB", eb).unwrap();
+
+    let result: bool = lua
+        .load(
+            r#"
+            local queue = {}
+            timer = {
+              after = function(_delay, fn)
+                queue[#queue + 1] = fn
+                return "timer-" .. tostring(#queue)
+              end,
+            }
+
+            EB.register("plugin.alpha", {
+              id_field = "id",
+              owner_plugin = "plugin",
+              all = function(context)
+                context.shared_rows = { { id = "row-1" } }
+                return { { id = "alpha" } }
+              end,
+            })
+            EB.register("plugin.beta", {
+              id_field = "id",
+              owner_plugin = "plugin",
+              all = function(context)
+                local shared = context.shared_rows and context.shared_rows[1]
+                return { { id = "beta", shared_id = shared and shared.id or "missing" } }
+              end,
+            })
+
+            local captured = {}
+            local client = {
+              subscriptions = { ["sub-1"] = { channel = "hub" } },
+              send = function(_, frame)
+                captured[#captured + 1] = frame
+              end,
+            }
+
+            EB.schedule_snapshots_to(client, "sub-1", {
+              types = { "plugin.alpha", "plugin.beta" },
+            })
+
+            queue[1]()
+            queue[2]()
+            return #captured == 2
+              and captured[1].entity_type == "plugin.alpha"
+              and captured[2].entity_type == "plugin.beta"
+              and captured[2].items[1].shared_id == "row-1"
+        "#,
+        )
+        .eval()
+        .expect("scheduled context-sharing snapshot script should evaluate");
+
+    assert!(
+        result,
+        "scheduled snapshots should reuse one plugin context across timer ticks"
+    );
+}
+
+#[test]
+fn schedule_snapshots_to_falls_back_when_timer_is_unavailable() {
+    let (lua, eb) = new_eb_lua();
+    lua.globals().set("EB", eb).unwrap();
+
+    let result: bool = lua
+        .load(
+            r#"
+            timer = nil
+
+            EB.register("session", {
+              id_field = "session_uuid",
+              all = function(_context)
+                return { { session_uuid = "sess-1" } }
+              end,
+            })
+
+            local captured = {}
+            local client = {
+              send = function(_, frame)
+                captured[#captured + 1] = frame
+              end,
+            }
+
+            EB.schedule_snapshots_to(client, "sub-1", { types = { "session" } })
+            return #captured == 1 and captured[1].entity_type == "session"
+        "#,
+        )
+        .eval()
+        .expect("timer fallback snapshot script should evaluate");
+
+    assert!(
+        result,
+        "scheduled snapshots should preserve synchronous behavior when timer is unavailable"
+    );
+}
+
+#[test]
+fn schedule_snapshots_to_cancels_after_send_failure() {
+    let (lua, eb) = new_eb_lua();
+    lua.globals().set("EB", eb).unwrap();
+
+    let result: bool = lua
+        .load(
+            r#"
+            local queue = {}
+            timer = {
+              after = function(_delay, fn)
+                queue[#queue + 1] = fn
+                return "timer-" .. tostring(#queue)
+              end,
+            }
+
+            local calls = 0
+            EB.register("session", {
+              id_field = "session_uuid",
+              all = function(_context)
+                calls = calls + 1
+                return { { session_uuid = "sess-1" } }
+              end,
+            })
+            EB.register("workspace", {
+              id_field = "workspace_id",
+              all = function(_context)
+                calls = calls + 1
+                return { { workspace_id = "ws-1" } }
+              end,
+            })
+
+            local client = {
+              subscriptions = { ["sub-1"] = { channel = "hub" } },
+              send = function()
+                error("closed transport")
+              end,
+            }
+
+            EB.schedule_snapshots_to(client, "sub-1", {
+              types = { "session", "workspace" },
+            })
+
+            local ok = pcall(queue[1])
+            return ok and calls == 1 and #queue == 1
+        "#,
+        )
+        .eval()
+        .expect("send failure snapshot script should evaluate");
+
+    assert!(
+        result,
+        "scheduled snapshots should catch send errors and stop the batch explicitly"
+    );
+}
+
+#[test]
 fn send_snapshots_to_shares_context_across_entity_providers() {
     let (lua, eb) = new_eb_lua();
 

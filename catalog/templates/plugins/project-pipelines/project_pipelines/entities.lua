@@ -31,6 +31,72 @@ local function rows(sql, ...)
     return {}
 end
 
+local VISIBLE_TICKET_WHERE = [[COALESCE(t.status, 'open') != 'closed'
+  AND (t.project_id IS NULL OR t.project_id = '' OR COALESCE(p.status, 'open') != 'closed')]]
+
+local function visible_ticket_rows()
+    return rows([[SELECT t.*
+                  FROM tickets t
+                  LEFT JOIN projects p ON p.id = t.project_id
+                  WHERE ]] .. VISIBLE_TICKET_WHERE .. [[
+                  ORDER BY t.updated_at DESC, t.created_at DESC]])
+end
+
+local function visible_project_rows()
+    return rows([[SELECT *
+                  FROM projects
+                  WHERE COALESCE(status, 'open') != 'closed'
+                  ORDER BY updated_at DESC, created_at DESC]])
+end
+
+local function status_is_open(status)
+    return tostring(status or "open") ~= "closed"
+end
+
+local function project_is_visible(project)
+    return project ~= nil and status_is_open(project.status)
+end
+
+local function project_id_is_visible(project_id)
+    if util.is_blank(project_id) then
+        return true
+    end
+    local project = rows("SELECT status FROM projects WHERE id = ? LIMIT 1", project_id)[1]
+    return project == nil or project_is_visible(project)
+end
+
+local function ticket_is_visible(ticket)
+    if type(ticket) ~= "table" or not status_is_open(ticket.status) then
+        return false
+    end
+    return project_id_is_visible(ticket.project_id)
+end
+
+local function ticket_id_is_visible(ticket_id)
+    if util.is_blank(ticket_id) then
+        return false
+    end
+    local ticket = rows("SELECT id, status, project_id FROM tickets WHERE id = ? LIMIT 1", ticket_id)[1]
+    return ticket_is_visible(ticket)
+end
+
+local function project_target_is_visible(target)
+    if type(target) ~= "table" then
+        return false
+    end
+    return project_id_is_visible(target.project_id)
+end
+
+local function question_is_visible(question)
+    return type(question) == "table"
+        and question.status == "open"
+        and ticket_id_is_visible(question.ticket_id)
+end
+
+local function ticket_dependency_is_visible(dependency)
+    return type(dependency) == "table" and ticket_id_is_visible(dependency.ticket_id)
+end
+
 local function copy(row)
     return util.copy(row or {})
 end
@@ -118,6 +184,18 @@ local function grouped_by(items, key)
     return out
 end
 
+local function cached(context, key, fn)
+    if type(context) ~= "table" then
+        return fn()
+    end
+    if context[key] ~= nil then
+        return context[key]
+    end
+    local value = fn()
+    context[key] = value
+    return value
+end
+
 local function ticket_dependency_levels(tickets, dependencies)
     local by_id = {}
     local deps_by_ticket = grouped_by(dependencies or {}, "ticket_id")
@@ -186,6 +264,22 @@ local function latest_pr_links_by(field)
         local key = link[field]
         if key and not out[key] then
             out[key] = link
+        end
+    end
+    return out
+end
+
+local function latest_pr_links_by_fields()
+    local out = {
+        run_id = {},
+        ticket_id = {},
+    }
+    for _, link in ipairs(rows("SELECT * FROM pr_links ORDER BY updated_at DESC, created_at DESC, id DESC")) do
+        if link.run_id and not out.run_id[link.run_id] then
+            out.run_id[link.run_id] = link
+        end
+        if link.ticket_id and not out.ticket_id[link.ticket_id] then
+            out.ticket_id[link.ticket_id] = link
         end
     end
     return out
@@ -324,9 +418,21 @@ local function decorate_ticket_entity(entity, opts)
     return entity
 end
 
-local function build_ticket_notification_counts(repo, view)
+local function build_ticket_notification_counts(tickets, repo, view)
     if not repo or not view then
         return {}
+    end
+    if type(view.ticket_notification_counts) == "function" then
+        local ticket_ids = {}
+        for _, ticket in ipairs(tickets or {}) do
+            if not util.is_blank(ticket.id) then
+                ticket_ids[#ticket_ids + 1] = ticket.id
+            end
+        end
+        local ok, counts = pcall(view.ticket_notification_counts, repo, ticket_ids)
+        if ok and type(counts) == "table" then
+            return counts
+        end
     end
 
     local uuid_by_ticket = {}
@@ -418,21 +524,28 @@ local function build_ticket_notification_counts(repo, view)
     return counts
 end
 
-local function ticket_entities(tickets)
+local function ticket_entities(tickets, context)
     local repo = with_repo()
     local view = with_view()
-    local runs_by_ticket = grouped_by(rows("SELECT * FROM runs ORDER BY ticket_id ASC, created_at DESC, id DESC"), "ticket_id")
-    local steps_by_id = index_by_id(rows("SELECT * FROM pipeline_steps"))
-    local dependencies = rows([[SELECT td.*, t.title AS depends_on_title, t.status AS depends_on_status
-                                FROM ticket_dependencies td
-                                LEFT JOIN tickets t ON t.id = td.depends_on_ticket_id
-                                ORDER BY td.created_at ASC, td.id ASC]])
+    local runs_by_ticket = cached(context, "project_pipelines.runs_by_ticket", function()
+        return grouped_by(rows("SELECT * FROM runs ORDER BY ticket_id ASC, created_at DESC, id DESC"), "ticket_id")
+    end)
+    local steps_by_id = cached(context, "project_pipelines.steps_by_id", function()
+        return index_by_id(rows("SELECT * FROM pipeline_steps"))
+    end)
+    local dependencies = cached(context, "project_pipelines.ticket_dependencies_with_titles", function()
+        return rows([[SELECT td.*, t.title AS depends_on_title, t.status AS depends_on_status
+                      FROM ticket_dependencies td
+                      LEFT JOIN tickets t ON t.id = td.depends_on_ticket_id
+                      ORDER BY td.created_at ASC, td.id ASC]])
+    end)
     local dependency_levels, dependencies_by_ticket = ticket_dependency_levels(tickets, dependencies)
-    local merge_events = latest_merge_events_by_ticket()
-    local merge_artifacts = merge_artifacts_by_run()
-    local pr_links_by_run = latest_pr_links_by("run_id")
-    local pr_links_by_ticket = latest_pr_links_by("ticket_id")
-    local notification_counts = build_ticket_notification_counts(repo, view)
+    local merge_events = cached(context, "project_pipelines.latest_merge_events_by_ticket", latest_merge_events_by_ticket)
+    local merge_artifacts = cached(context, "project_pipelines.merge_artifacts_by_run", merge_artifacts_by_run)
+    local pr_links = cached(context, "project_pipelines.latest_pr_links", latest_pr_links_by_fields)
+    local notification_counts = cached(context, "project_pipelines.ticket_notification_counts", function()
+        return build_ticket_notification_counts(tickets, repo, view)
+    end)
     local out = {}
     for _, ticket in ipairs(tickets or {}) do
         out[#out + 1] = decorate_ticket_entity(copy(ticket), {
@@ -443,8 +556,8 @@ local function ticket_entities(tickets)
             dependency_level = dependency_levels[ticket.id] or 0,
             merge_event = merge_events[ticket.id],
             merge_artifacts_by_run = merge_artifacts,
-            pr_links_by_run = pr_links_by_run,
-            pr_links_by_ticket = pr_links_by_ticket,
+            pr_links_by_run = pr_links.run_id,
+            pr_links_by_ticket = pr_links.ticket_id,
             notifications = notification_counts[ticket.id] or 0,
         })
     end
@@ -807,15 +920,18 @@ end
 
 local ENTITY = {
     [M.types.ticket] = {
-        all = function()
-            return ticket_entities(rows("SELECT * FROM tickets ORDER BY updated_at DESC, created_at DESC"))
+        all = function(context)
+            local tickets = cached(context, "project_pipelines.tickets", function()
+                return visible_ticket_rows()
+            end)
+            return ticket_entities(tickets, context)
         end,
         one = ticket_entity,
     },
     [M.types.project] = {
         all = function()
             local out = {}
-            for _, project in ipairs(rows("SELECT * FROM projects ORDER BY updated_at DESC, created_at DESC")) do
+            for _, project in ipairs(visible_project_rows()) do
                 out[#out + 1] = project_entity(project)
             end
             return out
@@ -825,7 +941,13 @@ local ENTITY = {
     [M.types.project_target] = {
         all = function()
             local out = {}
-            for _, target in ipairs(rows("SELECT * FROM project_targets ORDER BY created_at ASC, id ASC")) do
+            for _, target in ipairs(rows([[SELECT pt.*
+                                           FROM project_targets pt
+                                           LEFT JOIN projects p ON p.id = pt.project_id
+                                           WHERE (pt.project_id IS NULL
+                                                  OR pt.project_id = ''
+                                                  OR COALESCE(p.status, 'open') != 'closed')
+                                           ORDER BY pt.created_at ASC, pt.id ASC]])) do
                 out[#out + 1] = project_target_entity(target)
             end
             return out
@@ -835,9 +957,12 @@ local ENTITY = {
     [M.types.ticket_dependency] = {
         all = function()
             local out = {}
-            for _, dependency in ipairs(rows([[SELECT td.*, t.title AS depends_on_title, t.status AS depends_on_status
+            for _, dependency in ipairs(rows([[SELECT td.*, dep.title AS depends_on_title, dep.status AS depends_on_status
                                                FROM ticket_dependencies td
-                                               LEFT JOIN tickets t ON t.id = td.depends_on_ticket_id
+                                               JOIN tickets t ON t.id = td.ticket_id
+                                               LEFT JOIN projects p ON p.id = t.project_id
+                                               LEFT JOIN tickets dep ON dep.id = td.depends_on_ticket_id
+                                               WHERE ]] .. VISIBLE_TICKET_WHERE .. [[
                                                ORDER BY td.created_at ASC, td.id ASC]])) do
                 out[#out + 1] = ticket_dependency_entity(dependency)
             end
@@ -914,7 +1039,13 @@ local ENTITY = {
     [M.types.question] = {
         all = function()
             local out = {}
-            for _, question in ipairs(rows("SELECT * FROM questions ORDER BY updated_at DESC, created_at DESC, id DESC")) do
+            for _, question in ipairs(rows([[SELECT q.*
+                                             FROM questions q
+                                             JOIN tickets t ON t.id = q.ticket_id
+                                             LEFT JOIN projects p ON p.id = t.project_id
+                                             WHERE q.status = 'open'
+                                               AND ]] .. VISIBLE_TICKET_WHERE .. [[
+                                             ORDER BY q.updated_at DESC, q.created_at DESC, q.id DESC]])) do
                 out[#out + 1] = question_entity(question)
             end
             return out
@@ -959,6 +1090,14 @@ local ENTITY = {
     },
 }
 
+local VISIBLE = {
+    [M.types.ticket] = ticket_is_visible,
+    [M.types.project] = project_is_visible,
+    [M.types.project_target] = project_target_is_visible,
+    [M.types.ticket_dependency] = ticket_dependency_is_visible,
+    [M.types.question] = question_is_visible,
+}
+
 local function opts()
     return { owner_plugin = OWNER }
 end
@@ -971,6 +1110,7 @@ function M.register()
             id_field = "id",
             owner_plugin = OWNER,
             all = spec.all,
+            filter = VISIBLE[entity_type],
         })
     end
 end
@@ -996,6 +1136,11 @@ function M.upsert(entity_type, row)
     end
     local spec = ENTITY[entity_type]
     if not spec then
+        return
+    end
+    local visible = VISIBLE[entity_type]
+    if visible and not visible(row) then
+        M.remove(entity_type, row.id)
         return
     end
     local Hub = require("lib.hub")
