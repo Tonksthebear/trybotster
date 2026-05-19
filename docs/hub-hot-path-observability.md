@@ -194,6 +194,19 @@ increments the matching `*.volume_burst` counter:
 [HubEvent-Guardrail] event=volume_burst subtype=... count=... window_ms=30000
 ```
 
+Recurring Lua timer callbacks that run for at least 250ms emit attribution so
+the slow callback can be traced back to a plugin and stable handler id:
+
+```text
+[timer] slow recurring callback id=... kind=every owner_plugin=... handler_id=... interval_ms=... callback_ms=... total_ms=...
+```
+
+When `BOTSTER_LUA_PERF=1`, every timer performance line includes the same
+`kind`, `owner_plugin`, `handler_id`, recurring flag, and interval fields.
+Zero-second recurring timers are clamped to a small minimum interval and log the
+affected timer id and owner plugin; use `timer.after(0, ...)` for cooperative
+single-step deferral.
+
 Manifest writes log from `cli/src/hub/daemon.rs` even when no `HubEventMetrics`
 handle is available. More than 3 writes in a 10s window emits one warning for
 that hub/window:

@@ -101,6 +101,22 @@ impl Hub {
         peer_id: &str,
         colors: std::collections::HashMap<usize, crate::terminal::Rgb>,
     ) {
+        if colors.is_empty() {
+            return;
+        }
+
+        let changed = self
+            .terminal_client_profiles
+            .get(peer_id)
+            .map_or(true, |existing| {
+                colors
+                    .iter()
+                    .any(|(key, value)| existing.get(key) != Some(value))
+            });
+        if !changed {
+            return;
+        }
+
         // Merge into the shared boot cache so newly spawned sessions inherit
         // current colors. Uses extend (not replace) so a partial client profile
         // (e.g. fg/bg only) doesn't erase existing palette entries.
@@ -248,6 +264,12 @@ impl Hub {
         };
 
         if focused {
+            if active
+                .get(session_uuid)
+                .is_some_and(|current| current == peer_id)
+            {
+                return;
+            }
             active.insert(session_uuid.to_string(), peer_id.to_string());
         } else if active
             .get(session_uuid)

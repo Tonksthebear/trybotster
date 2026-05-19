@@ -41,6 +41,9 @@ use mlua::prelude::*;
 use crate::hub::events::HubEvent;
 use crate::lua::primitives::plugin_worker::PluginWorkerEventTx;
 
+const MIN_REPEATING_TIMER_INTERVAL: Duration = Duration::from_millis(10);
+const SLOW_RECURRING_TIMER_MS: u128 = 250;
+
 /// A single timer entry in the registry.
 struct TimerEntry {
     /// Lua registry key for the callback function.
@@ -53,6 +56,8 @@ struct TimerEntry {
     fire_at: Instant,
     /// If `Some`, the timer repeats with this interval.
     repeat_interval: Option<Duration>,
+    /// Lua primitive that created the timer.
+    kind: TimerKind,
     /// Whether this timer has been cancelled.
     cancelled: bool,
     /// Handle for the spawned tokio timer task (production mode).
@@ -88,6 +93,33 @@ pub struct TimerEntries {
     worker_event_tx: Option<PluginWorkerEventTx>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimerKind {
+    After,
+    Every,
+    AfterIdle,
+}
+
+impl TimerKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::After => "after",
+            Self::Every => "every",
+            Self::AfterIdle => "after_idle",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TimerAttribution {
+    pub(crate) timer_id: String,
+    pub(crate) kind: &'static str,
+    pub(crate) owner_plugin: Option<String>,
+    pub(crate) handler_id: Option<String>,
+    pub(crate) recurring: bool,
+    pub(crate) interval_ms: Option<u128>,
+}
+
 fn timer_perf_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -120,6 +152,33 @@ fn next_plugin_handler_id(entries: &mut TimerEntries, owner: &str) -> String {
     let handler_id = format!("{owner}:timer_{next}");
     *next += 1;
     handler_id
+}
+
+fn duration_from_lua_seconds(primitive: &str, seconds: f64) -> LuaResult<Duration> {
+    if !seconds.is_finite() || seconds < 0.0 || seconds > u64::MAX as f64 {
+        return Err(LuaError::external(format!(
+            "{primitive}: seconds must be a finite non-negative number"
+        )));
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
+
+fn normalize_repeating_interval(seconds: f64) -> LuaResult<(Duration, bool)> {
+    let interval = duration_from_lua_seconds("timer.every", seconds)?;
+    if interval.is_zero() {
+        Ok((MIN_REPEATING_TIMER_INTERVAL, true))
+    } else {
+        Ok((interval, false))
+    }
+}
+
+fn log_zero_repeating_interval(timer_id: &str, owner_plugin: Option<&str>) {
+    log::warn!(
+        "[timer] recurring timer requested below-minimum interval; clamped to {}ms id={} owner_plugin={}",
+        MIN_REPEATING_TIMER_INTERVAL.as_millis(),
+        timer_id,
+        owner_plugin.unwrap_or("-")
+    );
 }
 
 fn explicit_plugin_handler_id(owner: Option<&str>, timer_id: &str) -> Option<String> {
@@ -294,7 +353,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                 .as_deref()
                 .map(|owner| next_plugin_handler_id(&mut entries, owner));
 
-            let duration = Duration::from_secs_f64(seconds);
+            let duration = duration_from_lua_seconds("timer.after", seconds)?;
 
             // Spawn a delivery task when an event sink is available.
             let cancel_flag = entries.worker_event_tx.as_ref().map(|tx| {
@@ -326,6 +385,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                     owner_plugin,
                     fire_at: Instant::now() + duration,
                     repeat_interval: None,
+                    kind: TimerKind::After,
                     cancelled: false,
                     task_handle,
                     cancel_flag,
@@ -352,13 +412,16 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                 LuaError::external(format!("timer.every: failed to store callback: {e}"))
             })?;
 
-            let interval = Duration::from_secs_f64(seconds);
+            let (interval, clamped) = normalize_repeating_interval(seconds)?;
             let mut entries = reg2.lock().expect("TimerEntries mutex poisoned");
             let id = format!("timer_{}", entries.next_id);
             entries.next_id += 1;
             let handler_id = owner_plugin
                 .as_deref()
                 .map(|owner| next_plugin_handler_id(&mut entries, owner));
+            if clamped {
+                log_zero_repeating_interval(&id, owner_plugin.as_deref());
+            }
 
             // Spawn looping delivery task if an event sink is available.
             let cancel_flag = entries.worker_event_tx.as_ref().map(|tx| {
@@ -399,6 +462,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                     owner_plugin,
                     fire_at: Instant::now() + interval,
                     repeat_interval: Some(interval),
+                    kind: TimerKind::Every,
                     cancelled: false,
                     task_handle,
                     cancel_flag,
@@ -431,7 +495,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                     LuaError::external(format!("timer.after_idle: failed to store callback: {e}"))
                 })?;
 
-                let duration = Duration::from_secs_f64(seconds);
+                let duration = duration_from_lua_seconds("timer.after_idle", seconds)?;
                 let mut entries = reg_idle.lock().expect("TimerEntries mutex poisoned");
 
                 // Refresh a single slot for this ID instead of appending a new
@@ -474,6 +538,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                     entry.owner_plugin = owner_plugin;
                     entry.fire_at = Instant::now() + duration;
                     entry.repeat_interval = None;
+                    entry.kind = TimerKind::AfterIdle;
                     entry.cancelled = false;
                     entry.task_handle = task_handle;
                     entry.cancel_flag = cancel_flag;
@@ -486,6 +551,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
                             owner_plugin,
                             fire_at: Instant::now() + duration,
                             repeat_interval: None,
+                            kind: TimerKind::AfterIdle,
                             cancelled: false,
                             task_handle,
                             cancel_flag,
@@ -508,6 +574,7 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
     // Returns true if the timer was found.
     let reg3 = registry;
     let reg4 = Arc::clone(&reg3);
+    let reg5 = Arc::clone(&reg3);
     let cancel_fn = lua
         .create_function(move |_, timer_id: String| {
             let mut entries = reg3.lock().expect("TimerEntries mutex poisoned");
@@ -561,6 +628,56 @@ pub fn register(lua: &Lua, registry: TimerRegistry) -> Result<()> {
     timer_table
         .set("_invoke_registered", invoke_fn)
         .map_err(|e| anyhow!("Failed to set timer._invoke_registered: {e}"))?;
+
+    let unregister_by_plugin_fn = lua
+        .create_function(move |lua, owner_plugin: String| {
+            if owner_plugin.is_empty() {
+                return Ok(0);
+            }
+
+            let removed = {
+                let mut entries = reg5.lock().expect("TimerEntries mutex poisoned");
+
+                for (_, entry) in &mut entries.entries {
+                    if entry.owner_plugin.as_deref() == Some(owner_plugin.as_str()) {
+                        entry.cancelled = true;
+                        if let Some(handle) = entry.task_handle.take() {
+                            handle.abort();
+                        }
+                        if let Some(flag) = entry.cancel_flag.take() {
+                            flag.store(true, Ordering::SeqCst);
+                        }
+                    }
+                }
+
+                let mut removed = Vec::new();
+                let mut index = 0;
+                while index < entries.entries.len() {
+                    if entries.entries[index].1.owner_plugin.as_deref()
+                        == Some(owner_plugin.as_str())
+                        && entries.entries[index].1.cancelled
+                    {
+                        removed.push(entries.entries.remove(index));
+                    } else {
+                        index += 1;
+                    }
+                }
+                entries.plugin_handler_counters.remove(&owner_plugin);
+                removed
+            };
+
+            let count = removed.len();
+            for (_, entry) in removed {
+                let _ = lua.remove_registry_value(entry.callback_key);
+            }
+
+            Ok(count)
+        })
+        .map_err(|e| anyhow!("Failed to create timer._unregister_by_plugin function: {e}"))?;
+
+    timer_table
+        .set("_unregister_by_plugin", unregister_by_plugin_fn)
+        .map_err(|e| anyhow!("Failed to set timer._unregister_by_plugin: {e}"))?;
 
     lua.globals()
         .set("timer", timer_table)
@@ -694,7 +811,7 @@ pub(crate) fn fire_single_timer(lua: &Lua, registry: &TimerRegistry, timer_id: &
     let total_started = Instant::now();
 
     // Phase 1: look up entry under lock, clone callback, handle one-shot.
-    let (fired_timer, one_shot) = {
+    let (fired_timer, one_shot, attribution) = {
         let mut entries = registry.lock().expect("TimerEntries mutex poisoned");
 
         let entry_pos = entries
@@ -757,8 +874,16 @@ pub(crate) fn fire_single_timer(lua: &Lua, registry: &TimerRegistry, timer_id: &
         };
 
         let one_shot = entry.repeat_interval.is_none();
+        let attribution = TimerAttribution {
+            timer_id: timer_id.to_string(),
+            kind: entry.kind.as_str(),
+            owner_plugin: entry.owner_plugin.clone(),
+            handler_id: entry.handler_id.clone(),
+            recurring: entry.repeat_interval.is_some(),
+            interval_ms: entry.repeat_interval.map(|duration| duration.as_millis()),
+        };
 
-        (fired, one_shot)
+        (fired, one_shot, attribution)
     };
     let lookup_done = Instant::now();
     // Lock released — callback can safely call timer functions.
@@ -774,7 +899,15 @@ pub(crate) fn fire_single_timer(lua: &Lua, registry: &TimerRegistry, timer_id: &
     let callback_done = Instant::now();
 
     if let Err(e) = result {
-        log::warn!("[timer] Callback error for {timer_id}: {e}");
+        log::warn!(
+            "[timer] Callback error id={} kind={} owner_plugin={} handler_id={} recurring={}: {}",
+            attribution.timer_id,
+            attribution.kind,
+            attribution.owner_plugin.as_deref().unwrap_or("-"),
+            attribution.handler_id.as_deref().unwrap_or("-"),
+            attribution.recurring,
+            e
+        );
     }
 
     // Phase 3: clean up temporary registry key.
@@ -798,11 +931,36 @@ pub(crate) fn fire_single_timer(lua: &Lua, registry: &TimerRegistry, timer_id: &
         }
     }
     let cleanup_done = Instant::now();
+    let callback_ms = callback_done.duration_since(lookup_done).as_millis();
+
+    if attribution.recurring && callback_ms >= SLOW_RECURRING_TIMER_MS {
+        log::warn!(
+            "[timer] slow recurring callback id={} kind={} owner_plugin={} handler_id={} interval_ms={} callback_ms={} total_ms={}",
+            attribution.timer_id,
+            attribution.kind,
+            attribution.owner_plugin.as_deref().unwrap_or("-"),
+            attribution.handler_id.as_deref().unwrap_or("-"),
+            attribution
+                .interval_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            callback_ms,
+            cleanup_done.duration_since(total_started).as_millis()
+        );
+    }
 
     if perf {
         log::info!(
-            "[PERF][lua] timer_fired id={} lookup_us={} callback_us={} cleanup_us={} total_us={}",
-            timer_id,
+            "[PERF][lua] timer_fired id={} kind={} owner_plugin={} handler_id={} recurring={} interval_ms={} lookup_us={} callback_us={} cleanup_us={} total_us={}",
+            attribution.timer_id,
+            attribution.kind,
+            attribution.owner_plugin.as_deref().unwrap_or("-"),
+            attribution.handler_id.as_deref().unwrap_or("-"),
+            attribution.recurring,
+            attribution
+                .interval_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string()),
             lookup_done.duration_since(total_started).as_micros(),
             callback_done.duration_since(lookup_done).as_micros(),
             cleanup_done.duration_since(callback_done).as_micros(),
@@ -911,6 +1069,74 @@ mod tests {
     }
 
     #[test]
+    fn test_every_zero_interval_is_clamped() {
+        let lua = Lua::new();
+        let registry = new_timer_registry();
+
+        register(&lua, Arc::clone(&registry)).expect("Should register");
+
+        lua.load("timer.every(0, function() end)")
+            .exec()
+            .expect("timer.every should succeed");
+
+        let entries = registry.lock().expect("mutex");
+        assert_eq!(
+            entries.entries[0].1.repeat_interval,
+            Some(MIN_REPEATING_TIMER_INTERVAL)
+        );
+        assert_eq!(entries.entries[0].1.kind, TimerKind::Every);
+    }
+
+    #[test]
+    fn test_timer_rejects_invalid_durations() {
+        let lua = Lua::new();
+        let registry = new_timer_registry();
+
+        register(&lua, Arc::clone(&registry)).expect("Should register");
+
+        lua.load(
+            r#"
+            assert(pcall(function() timer.after(-1, function() end) end) == false)
+            assert(pcall(function() timer.every(0/0, function() end) end) == false)
+            assert(pcall(function() timer.after_idle("idle:bad", math.huge, function() end) end) == false)
+            "#,
+        )
+        .exec()
+        .expect("invalid durations should be Lua errors");
+
+        let entries = registry.lock().expect("mutex");
+        assert!(entries.entries.is_empty());
+    }
+
+    #[test]
+    fn test_plugin_timer_records_attribution() {
+        let lua = Lua::new();
+        let registry = new_timer_registry();
+
+        register(&lua, Arc::clone(&registry)).expect("Should register");
+
+        lua.globals()
+            .set("_loading_plugin_key", "demo_plugin")
+            .expect("set plugin key");
+        let id: String = lua
+            .load("return timer.every(1, function() end)")
+            .eval()
+            .expect("timer.every should succeed");
+
+        let entries = registry.lock().expect("mutex");
+        assert_eq!(entries.entries[0].0, id);
+        assert_eq!(
+            entries.entries[0].1.owner_plugin.as_deref(),
+            Some("demo_plugin")
+        );
+        assert_eq!(
+            entries.entries[0].1.handler_id.as_deref(),
+            Some("demo_plugin:timer_0")
+        );
+        assert_eq!(entries.entries[0].1.kind, TimerKind::Every);
+    }
+
+    #[test]
     fn test_cancel_existing_timer() {
         let lua = Lua::new();
         let registry = new_timer_registry();
@@ -1008,7 +1234,8 @@ mod tests {
 
         lua.load("repeat_count = 0").exec().expect("setup counter");
 
-        // Create a repeating timer with 0s interval
+        // Create a repeating timer with 0s interval. The primitive clamps
+        // zero-second recurring timers to avoid hot loops.
         lua.load(
             r#"
             timer.every(0, function()
@@ -1019,7 +1246,7 @@ mod tests {
         .exec()
         .expect("create timer");
 
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(MIN_REPEATING_TIMER_INTERVAL + Duration::from_millis(5));
 
         // First poll should fire
         let count = poll_timers(&lua, &registry);
@@ -1036,7 +1263,7 @@ mod tests {
             assert!(!entries.entries[0].1.cancelled);
         }
 
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(MIN_REPEATING_TIMER_INTERVAL + Duration::from_millis(5));
 
         // Second poll should fire again
         let count = poll_timers(&lua, &registry);
@@ -1187,6 +1414,67 @@ mod tests {
         );
         assert_eq!(entries.entries[0].0, "idle:test");
         assert!(!entries.entries[0].1.cancelled);
+    }
+
+    #[test]
+    fn test_unregister_by_plugin_cancels_owned_timers_only() {
+        let lua = Lua::new();
+        let registry = new_timer_registry();
+
+        register(&lua, Arc::clone(&registry)).expect("Should register");
+
+        let removed: i32 = lua
+            .load(
+                r#"
+                _G._loading_plugin_key = "owned-plugin"
+                timer.after(10, function() end)
+                timer.after_idle("owned:idle", 10, function() end)
+                _G._loading_plugin_key = nil
+                timer.after(10, function() end)
+                local unowned_cancelled = timer.after(10, function() end)
+                timer.cancel(unowned_cancelled)
+                return timer._unregister_by_plugin("owned-plugin")
+                "#,
+            )
+            .eval()
+            .expect("unregister plugin timers");
+
+        assert_eq!(removed, 2);
+
+        let entries = registry.lock().expect("mutex");
+        assert_eq!(entries.entries.len(), 2);
+        assert_eq!(entries.entries[0].1.owner_plugin, None);
+        assert_eq!(entries.entries[1].1.owner_plugin, None);
+        assert!(entries.entries[1].1.cancelled);
+    }
+
+    #[test]
+    fn test_unregister_by_plugin_resets_handler_counter() {
+        let lua = Lua::new();
+        let registry = new_timer_registry();
+
+        register(&lua, Arc::clone(&registry)).expect("Should register");
+
+        lua.load(
+            r#"
+            _G._loading_plugin_key = "owned-plugin"
+            timer.every(10, function() end)
+            timer.every(10, function() end)
+            _G._loading_plugin_key = nil
+            assert(timer._unregister_by_plugin("owned-plugin") == 2)
+            _G._loading_plugin_key = "owned-plugin"
+            timer.every(10, function() end)
+            "#,
+        )
+        .exec()
+        .expect("reset plugin timer counter");
+
+        let entries = registry.lock().expect("mutex");
+        assert_eq!(entries.entries.len(), 1);
+        assert_eq!(
+            entries.entries[0].1.handler_id.as_deref(),
+            Some("owned-plugin:timer_0")
+        );
     }
 
     #[test]
