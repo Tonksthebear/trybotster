@@ -44,7 +44,9 @@ local pending_osc_session_updates = state.get("connections.pending_osc_session_u
 local pending_osc_session_patches = state.get("connections.pending_osc_session_patches", {})
 local pending_osc_session_patch_timers = {}
 
-local OSC_SESSION_UPDATE_DEBOUNCE_SECS = 0.5
+-- Keep title/cwd durable for recovery without letting prompt spinners write
+-- manifests every few hundred milliseconds.
+local OSC_SESSION_MANIFEST_DEBOUNCE_SECS = 5.0
 -- Use a short one-shot timer, not after_idle: chatty OSC title spinners still
 -- need visible UI updates while coalescing subscriber fanout.
 local OSC_SESSION_PATCH_DEBOUNCE_SECS = 0.05
@@ -587,14 +589,14 @@ local function queue_osc_session_update(session_uuid, fields)
             end)
     end
 
-    timer.after_idle("session_osc_update:" .. session_uuid, OSC_SESSION_UPDATE_DEBOUNCE_SECS, function()
+    timer.after_idle("session_osc_update:" .. session_uuid, OSC_SESSION_MANIFEST_DEBOUNCE_SECS, function()
         local current = pending_osc_session_updates[session_uuid]
         pending_osc_session_updates[session_uuid] = nil
 
         local s = Agent.get(session_uuid)
         if not s or type(current) ~= "table" or next(current) == nil then return end
 
-        s:_sync_session_manifest()
+        s:_sync_session_manifest({ refresh_workspace_status = false })
     end)
 end
 
@@ -827,6 +829,10 @@ function M._before_reload()
     end
     for session_uuid in pairs(pending_osc_session_updates) do
         timer.cancel("session_osc_update:" .. session_uuid)
+        local session = Agent.get(session_uuid)
+        if session then
+            session:_sync_session_manifest({ refresh_workspace_status = false })
+        end
         pending_osc_session_updates[session_uuid] = nil
     end
     hooks.off("agent_created", "broadcast_agent_created")
