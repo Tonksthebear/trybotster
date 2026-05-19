@@ -1758,6 +1758,288 @@ fn catalog_plugin_project_pipelines_run_snapshot_bounds_relationship_lookups() {
 }
 
 #[test]
+fn catalog_plugin_project_pipelines_default_snapshots_use_visible_working_set() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local frames = {{}}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  entity_snapshot = function(_self, entity_type, items, opts)
+                    frames[entity_type] = {{ items = items, owner_plugin = opts.owner_plugin }}
+                  end,
+                }}
+              end,
+            }}
+
+            package.loaded["project_pipelines.web.ui"] = {{
+              target_label = function(target_id) return target_id or "No target" end,
+              status_tone = function() return "muted" end,
+              status_label = function(status) return tostring(status or "") end,
+              status_state = function() return "neutral" end,
+              ticket_notification_counts = function() return {{}} end,
+            }}
+
+            local saw = {{
+              tickets = false,
+              projects = false,
+              project_targets = false,
+              dependencies = false,
+              questions = false,
+            }}
+
+            local function normalize(sql)
+              return (sql:gsub("%s+", " "))
+            end
+
+            local db = {{}}
+            function db:eval(sql, _params)
+              local compact = normalize(sql)
+              if compact:find("FROM tickets t LEFT JOIN projects p") then
+                saw.tickets = compact:find("COALESCE%(t%.status, 'open'%) != 'closed'") ~= nil
+                  and compact:find("COALESCE%(p%.status, 'open'%) != 'closed'") ~= nil
+                return {{
+                  {{ id = "ticket-open", title = "Open ticket", status = "open", target_id = "target-1", created_at = 1, updated_at = 2 }},
+                }}
+              end
+              if compact:find("FROM projects WHERE COALESCE%(status, 'open'%) != 'closed'") then
+                saw.projects = true
+                return {{
+                  {{ id = "project-open", name = "Open project", status = "open" }},
+                }}
+              end
+              if compact:find("FROM project_targets pt LEFT JOIN projects p") then
+                saw.project_targets = compact:find("COALESCE%(p%.status, 'open'%) != 'closed'") ~= nil
+                  and compact:find("pt%.project_id IS NULL") ~= nil
+                return {{
+                  {{ id = "target-row", project_id = "project-open", target_id = "target-1" }},
+                }}
+              end
+              if compact:find("FROM ticket_dependencies td JOIN tickets t") then
+                saw.dependencies = compact:find("COALESCE%(t%.status, 'open'%) != 'closed'") ~= nil
+                return {{
+                  {{ id = "dep-1", ticket_id = "ticket-open", depends_on_ticket_id = "ticket-dep", depends_on_title = "Dependency", depends_on_status = "open" }},
+                }}
+              end
+              if compact:find("FROM questions q JOIN tickets t") then
+                saw.questions = compact:find("q.status = 'open'") ~= nil
+                  and compact:find("COALESCE%(t%.status, 'open'%) != 'closed'") ~= nil
+                return {{
+                  {{ id = "question-open", ticket_id = "ticket-open", question = "Proceed?", status = "open", blocking = 1 }},
+                }}
+              end
+              if compact:find("FROM tickets WHERE id = %? LIMIT 1") then
+                return {{ {{ id = "ticket-open", title = "Open ticket" }} }}
+              end
+              return {{}}
+            end
+            package.loaded["project_pipelines.db"] = db
+
+            local entities = require("project_pipelines.entities")
+            entities.snapshot(entities.types.ticket)
+            entities.snapshot(entities.types.project)
+            entities.snapshot(entities.types.project_target)
+            entities.snapshot(entities.types.ticket_dependency)
+            entities.snapshot(entities.types.question)
+
+            assert(frames[entities.types.ticket].owner_plugin == "project-pipelines")
+            assert(#frames[entities.types.ticket].items == 1)
+            assert(frames[entities.types.ticket].items[1].id == "ticket-open")
+            assert(#frames[entities.types.project].items == 1)
+            assert(frames[entities.types.project].items[1].id == "project-open")
+            assert(#frames[entities.types.project_target].items == 1)
+            assert(#frames[entities.types.ticket_dependency].items == 1)
+            assert(#frames[entities.types.question].items == 1)
+
+            for key, value in pairs(saw) do
+              assert(value, "visible working-set query was not used for " .. key)
+            end
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines visible working-set snapshots");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_visibility_upsert_removes_hidden_default_entities() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local removes = {{}}
+            local upserts = {{}}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  entity_remove = function(_self, entity_type, id, opts)
+                    removes[#removes + 1] = {{ entity_type = entity_type, id = id, opts = opts }}
+                  end,
+                  entity_upsert = function(_self, entity_type, entity, opts)
+                    upserts[#upserts + 1] = {{ entity_type = entity_type, entity = entity, opts = opts }}
+                  end,
+                }}
+              end,
+            }}
+
+            package.loaded["project_pipelines.web.ui"] = {{
+              target_label = function(target_id) return target_id or "No target" end,
+              status_tone = function() return "muted" end,
+              status_label = function(status) return tostring(status or "") end,
+              status_state = function() return "neutral" end,
+              ticket_notification_count = function() return 0 end,
+            }}
+
+            package.loaded["project_pipelines.db"] = {{
+              eval = function(_self, sql, param)
+                if sql:match("FROM projects WHERE id = %? LIMIT 1") then
+                  if param == "closed-project" then
+                    return {{ {{ id = "closed-project", status = "closed" }} }}
+                  end
+                  return {{ {{ id = param, status = "open" }} }}
+                end
+                if sql:match("SELECT id, status, project_id FROM tickets WHERE id = %? LIMIT 1") then
+                  if param == "closed-ticket" then
+                    return {{ {{ id = "closed-ticket", status = "closed" }} }}
+                  end
+                  return {{ {{ id = param, status = "open" }} }}
+                end
+                return {{}}
+              end,
+            }}
+
+            local entities = require("project_pipelines.entities")
+            entities.upsert(entities.types.ticket, {{
+              id = "closed-ticket",
+              title = "Closed",
+              status = "closed",
+            }})
+            entities.upsert(entities.types.project, {{
+              id = "closed-project",
+              name = "Closed",
+              status = "closed",
+            }})
+            entities.upsert(entities.types.project_target, {{
+              id = "target-closed",
+              project_id = "closed-project",
+              target_id = "target-1",
+            }})
+            entities.upsert(entities.types.question, {{
+              id = "question-answered",
+              ticket_id = "open-ticket",
+              status = "answered",
+            }})
+
+            assert(#upserts == 0)
+            assert(#removes == 4)
+            assert(removes[1].entity_type == entities.types.ticket and removes[1].id == "closed-ticket")
+            assert(removes[2].entity_type == entities.types.project and removes[2].id == "closed-project")
+            assert(removes[3].entity_type == entities.types.project_target and removes[3].id == "target-closed")
+            assert(removes[4].entity_type == entities.types.question and removes[4].id == "question-answered")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines hidden upserts should publish removes");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_keeps_run_snapshots_complete_for_direct_routes() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local frames = {{}}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  entity_snapshot = function(_self, entity_type, items, opts)
+                    frames[entity_type] = {{ items = items, opts = opts }}
+                  end,
+                }}
+              end,
+            }}
+
+            package.loaded["project_pipelines.web.ui"] = {{
+              status_tone = function() return "muted" end,
+              status_label = function(status) return tostring(status or "") end,
+              status_state = function() return "neutral" end,
+            }}
+
+            local saw_complete_run_query = false
+            local saw_complete_run_step_query = false
+            local db = {{}}
+            function db:eval(sql, param)
+              local compact = (sql:gsub("%s+", " "))
+              if compact == "SELECT * FROM runs ORDER BY updated_at DESC, created_at DESC, id DESC" then
+                saw_complete_run_query = true
+                return {{
+                  {{ id = "run-closed-ticket", ticket_id = "closed-ticket", pipeline_id = "pipeline-1", status = "blocked" }},
+                }}
+              end
+              if compact == "SELECT * FROM run_steps ORDER BY run_id ASC, COALESCE(sequence, 0) ASC, created_at ASC, id ASC" then
+                saw_complete_run_step_query = true
+                return {{
+                  {{ id = "step-closed-ticket", run_id = "run-closed-ticket", status = "blocked" }},
+                }}
+              end
+              if compact:find("FROM tickets WHERE id = %? LIMIT 1") then
+                return {{ {{ id = param, title = "Closed ticket", status = "closed", project_id = "closed-project" }} }}
+              end
+              if compact:find("FROM projects WHERE id = %? LIMIT 1") then
+                return {{ {{ id = param, name = "Closed project", status = "closed" }} }}
+              end
+              if compact:find("FROM pipelines WHERE id = %? LIMIT 1") then
+                return {{ {{ id = param, name = "Pipeline" }} }}
+              end
+              return {{}}
+            end
+            package.loaded["project_pipelines.db"] = db
+
+            local entities = require("project_pipelines.entities")
+            entities.snapshot(entities.types.run)
+            entities.snapshot(entities.types.run_step)
+
+            assert(saw_complete_run_query)
+            assert(saw_complete_run_step_query)
+            assert(#frames[entities.types.run].items == 1)
+            assert(frames[entities.types.run].items[1].id == "run-closed-ticket")
+            assert(#frames[entities.types.run_step].items == 1)
+            assert(frames[entities.types.run_step].items[1].id == "step-closed-ticket")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines run snapshots should keep direct-route rows");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_run_entities_decorate_relationship_and_agent_fields() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");

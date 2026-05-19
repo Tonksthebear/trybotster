@@ -276,7 +276,7 @@ local function schedule_route_registry_broadcast(opts)
                 for sub_id, sub in pairs(client.subscriptions or {}) do
                     if sub.channel == "hub" then
                         local ok, err = pcall(
-                            EB.send_snapshots_to,
+                            EB.schedule_snapshots_to,
                             client,
                             sub_id,
                             { owner_plugin = owner_plugin }

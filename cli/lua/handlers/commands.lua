@@ -587,7 +587,7 @@ commands.register("hub:entities", function(client, sub_id, command)
     end
 
     local EB = require("lib.entity_broadcast")
-    EB.send_snapshots_to(client, sub_id, {
+    EB.schedule_snapshots_to(client, sub_id, {
         types = entity_types,
     })
 end, { description = "Send requested entity snapshots on demand" })

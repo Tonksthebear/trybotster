@@ -552,6 +552,89 @@ end
 --- per-client memory before a plugin surface asks for them.
 ---
 --- `opts.types = { ... }` restricts the snapshot to an explicit client request.
+local function subscription_is_active(client, sub_id)
+    if sub_id == nil then return true end
+    local subscriptions = client and client.subscriptions
+    if type(subscriptions) ~= "table" then return false end
+    return subscriptions[sub_id] ~= nil
+end
+
+local function context_for_entry(context, plugin_contexts, entry)
+    if entry and entry.owner_plugin then
+        local provider_context = plugin_contexts[entry.owner_plugin]
+        if not provider_context then
+            provider_context = {}
+            plugin_contexts[entry.owner_plugin] = provider_context
+        end
+        return provider_context
+    end
+    return context
+end
+
+local function send_snapshot_type(client, sub_id, entity_type, context, plugin_contexts)
+    local started = os.clock()
+    local entry = registry[entity_type]
+    if not entry then return 0 end
+
+    local items = snapshot_items(entry, entity_type, context_for_entry(context, plugin_contexts, entry))
+    local frame = {
+        v = 2,
+        type = "entity_snapshot",
+        entity_type = entity_type,
+        items = items,
+        snapshot_seq = current_seq(entity_type),
+    }
+    if sub_id ~= nil then frame.subscriptionId = sub_id end
+    local ok_send, send_err = pcall(client.send, client, frame)
+    if not ok_send then
+        log.warn(string.format(
+            "entity_broadcast.snapshot: send failed for type=%s sub=%s: %s",
+            tostring(entity_type),
+            tostring(sub_id or "nil"),
+            tostring(send_err)))
+        return 0, false
+    end
+    local elapsed = elapsed_ms(started)
+    log_perf(string.format(
+        "type=%s items=%d seq=%s sub=%s elapsed_ms=%d",
+        tostring(entity_type),
+        #items,
+        tostring(frame.snapshot_seq),
+        tostring(sub_id or "nil"),
+        elapsed))
+    if elapsed > 250 then
+        log.warn(string.format(
+            "entity_broadcast.snapshot_slow: type=%s items=%d sub=%s elapsed_ms=%d",
+            tostring(entity_type),
+            #items,
+            tostring(sub_id or "nil"),
+            elapsed))
+    end
+    log.info(string.format(
+        "entity_broadcast.snapshot: type=%s items=%d seq=%s sub=%s",
+        tostring(entity_type),
+        #items,
+        tostring(frame.snapshot_seq),
+        tostring(sub_id or "nil")))
+    return 1
+end
+
+local function log_snapshot_batch(sent, sub_id, batch_started, suffix)
+    log.info(string.format(
+        "entity_broadcast.snapshot%s: sent %d type snapshot(s) to sub=%s",
+        suffix or "",
+        sent,
+        tostring(sub_id or "nil")))
+    if batch_started then
+        log_perf(string.format(
+            "sent=%d sub=%s elapsed_ms=%d%s",
+            sent,
+            tostring(sub_id or "nil"),
+            elapsed_ms(batch_started),
+            suffix or ""))
+    end
+end
+
 function M.send_snapshots_to(client, sub_id, opts)
     assert(client and type(client.send) == "function",
         "entity_broadcast.send_snapshots_to: client must support :send(msg)")
@@ -560,54 +643,64 @@ function M.send_snapshots_to(client, sub_id, opts)
     local plugin_contexts = {}
     local sent = 0
     for _, entity_type in ipairs(registered_type_names(opts)) do
-        local started = PERF and os.clock() or nil
-        local entry = registry[entity_type]
-        local provider_context = context
-        if entry and entry.owner_plugin then
-            provider_context = plugin_contexts[entry.owner_plugin]
-            if not provider_context then
-                provider_context = {}
-                plugin_contexts[entry.owner_plugin] = provider_context
-            end
+        local type_sent, ok = send_snapshot_type(client, sub_id, entity_type, context, plugin_contexts)
+        sent = sent + type_sent
+        if ok == false then
+            log_snapshot_batch(sent, sub_id, batch_started, " canceled")
+            return
         end
-        local items = snapshot_items(entry, entity_type, provider_context)
-        local frame = {
-            v = 2,
-            type = "entity_snapshot",
-            entity_type = entity_type,
-            items = items,
-            snapshot_seq = current_seq(entity_type),
-        }
-        if sub_id ~= nil then frame.subscriptionId = sub_id end
-        client:send(frame)
-        sent = sent + 1
-        if started then
-            log_perf(string.format(
-                "type=%s items=%d seq=%s sub=%s elapsed_ms=%d",
-                tostring(entity_type),
-                #items,
-                tostring(frame.snapshot_seq),
-                tostring(sub_id or "nil"),
-                elapsed_ms(started)))
+    end
+    log_snapshot_batch(sent, sub_id, batch_started)
+end
+
+--- Schedule `entity_snapshot` frames one entity type at a time.
+---
+--- Browser requests use this cooperative path so expensive plugin-owned
+--- entity snapshots do not monopolize the WebRTC command handler across the
+--- whole requested batch. Each type still publishes the same snapshot frame as
+--- `send_snapshots_to`, but the work is moved onto timer ticks so
+--- higher-priority hub events can run between requested entity types. A single
+--- expensive provider can still occupy its own tick until it returns; slow
+--- providers are logged so they can be fixed or split.
+function M.schedule_snapshots_to(client, sub_id, opts)
+    assert(client and type(client.send) == "function",
+        "entity_broadcast.schedule_snapshots_to: client must support :send(msg)")
+
+    if type(timer) ~= "table" or type(timer.after) ~= "function" then
+        return M.send_snapshots_to(client, sub_id, opts)
+    end
+
+    local names = registered_type_names(opts)
+    local batch_started = PERF and os.clock() or nil
+    local context = {}
+    local plugin_contexts = {}
+    local index = 1
+    local sent = 0
+
+    local function step()
+        if not subscription_is_active(client, sub_id) then
+            log_snapshot_batch(sent, sub_id, batch_started, " canceled")
+            return
         end
-        log.info(string.format(
-            "entity_broadcast.snapshot: type=%s items=%d seq=%s sub=%s",
-            tostring(entity_type),
-            #items,
-            tostring(frame.snapshot_seq),
-            tostring(sub_id or "nil")))
+
+        local entity_type = names[index]
+        if entity_type == nil then
+            log_snapshot_batch(sent, sub_id, batch_started, " scheduled")
+            return
+        end
+
+        index = index + 1
+        local type_sent, ok = send_snapshot_type(client, sub_id, entity_type, context, plugin_contexts)
+        sent = sent + type_sent
+        if ok == false then
+            log_snapshot_batch(sent, sub_id, batch_started, " canceled")
+            return
+        end
+        timer.after(0, step)
     end
-    log.info(string.format(
-        "entity_broadcast.snapshot: sent %d type snapshot(s) to sub=%s",
-        sent,
-        tostring(sub_id or "nil")))
-    if batch_started then
-        log_perf(string.format(
-            "sent=%d sub=%s elapsed_ms=%d",
-            sent,
-            tostring(sub_id or "nil"),
-            elapsed_ms(batch_started)))
-    end
+
+    timer.after(0, step)
+    return 0
 end
 
 -- -------------------------------------------------------------------------
