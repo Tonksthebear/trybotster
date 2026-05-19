@@ -33,6 +33,12 @@ import {
   titleLine,
 } from '../../store/selectors/session-row'
 import { activeAgentWorkspaces } from '../../lib/entity-selectors'
+import {
+  SessionActionErrorPanel,
+  SessionActionIndicators,
+  type SessionActionRecord,
+  visibleSessionActions,
+} from './SessionActionAffordances'
 import type { RenderContext } from '../../ui_contract/context'
 import { resolveValue } from '../../ui_contract/viewport'
 import type {
@@ -42,7 +48,6 @@ import type {
   UiValue,
 } from '../../ui_contract/types'
 import { IconGlyph } from '../../ui_contract/icons'
-import { Badge, BadgeButton } from '../catalyst/badge'
 
 type SessionRecord = {
   session_uuid?: string
@@ -61,24 +66,6 @@ type SessionRecord = {
   target_name?: string
   branch_name?: string
   agent_name?: string
-  [key: string]: unknown
-}
-
-type SessionActionRecord = {
-  id?: string
-  session_uuid?: string
-  action_id?: string
-  label?: string
-  status?: string | null
-  icon?: string | null
-  visibility?: string | null
-  enabled?: boolean
-  plugin?: string | null
-  url?: string | null
-  link_url?: string | null
-  install_url?: string | null
-  installUrl?: string | null
-  error?: string | null
   [key: string]: unknown
 }
 
@@ -120,40 +107,6 @@ type UiPresentationState = {
 
 export type SessionListProps = UiSessionListProps & {
   ctx: RenderContext
-}
-
-function visibleSessionActions(
-  actionOrder: string[],
-  actionsById: Record<string, SessionActionRecord>,
-  sessionUuid: string,
-): SessionActionRecord[] {
-  return actionOrder
-    .map((id) => actionsById[id])
-    .filter((action): action is SessionActionRecord =>
-      !!action &&
-      action.session_uuid === sessionUuid &&
-      action.visibility !== 'hidden',
-    )
-}
-
-function actionUrl(action: SessionActionRecord): string | undefined {
-  const value = action.url ?? action.link_url ?? action.install_url ?? action.installUrl
-  return typeof value === 'string' && value.length > 0 ? value : undefined
-}
-
-function actionStatusLabel(status: string): string {
-  return status
-    .split(/[\s_-]+/)
-    .filter(Boolean)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join(' ')
-}
-
-function actionStatusColor(status: string): 'emerald' | 'amber' | 'red' | 'zinc' {
-  if (status === 'running' || status === 'ready' || status === 'active') return 'emerald'
-  if (status === 'starting' || status === 'pending' || status === 'loading') return 'amber'
-  if (status === 'error' || status === 'failed') return 'red'
-  return 'zinc'
 }
 
 export function SessionList({
@@ -357,54 +310,6 @@ export function SessionList({
       : rowState === 'active' ? 'border-emerald-500'
       : 'border-zinc-700'
 
-    const actionIndicators = sessionActions
-      .filter((action) =>
-        typeof action.status === 'string' &&
-        action.status.length > 0 &&
-        action.status !== 'inactive' &&
-        action.status !== 'hidden',
-      )
-      .map((action) => {
-        const status = action.status as string
-        const url = actionUrl(action)
-        const label = actionStatusLabel(status)
-        if (url) {
-          return (
-            <BadgeButton
-              key={action.id || action.action_id}
-              color={actionStatusColor(status)}
-              onClick={(event: MouseEvent) => {
-                event.preventDefault()
-                event.stopPropagation()
-                ctx.dispatch(
-                  {
-                    id: 'botster.url.open',
-                    payload: {
-                      sessionUuid,
-                      actionId: action.action_id,
-                      url,
-                    },
-                  } as UiAction,
-                  { element: event.currentTarget as Element },
-                )
-              }}
-              data-testid="session-action-link"
-            >
-              {label}
-            </BadgeButton>
-          )
-        }
-        return (
-          <Badge
-            key={action.id || action.action_id}
-            color={actionStatusColor(status)}
-            data-testid={`session-action-status-${status}`}
-          >
-            {label}
-          </Badge>
-        )
-      })
-
     // In-row actions trigger. Catalyst <Button plain> doesn't fit here —
     // its base padding is row-sized, which would visually balloon every
     // session row. We keep a styled <button> sized for the row but use
@@ -479,7 +384,11 @@ export function SessionList({
       <>
         {lines}
         <div className="flex shrink-0 items-center gap-1 pt-0.5">
-          {actionIndicators}
+          <SessionActionIndicators
+            sessionUuid={sessionUuid}
+            actions={sessionActions}
+            ctx={ctx}
+          />
           {actionsTrigger}
         </div>
       </>
@@ -515,49 +424,14 @@ export function SessionList({
       </div>
     )
 
-    const erroredAction = sessionActions.find((action) => (
-      typeof action.error === 'string' && action.error.length > 0
-    ))
-    const errorUrl = erroredAction ? actionUrl(erroredAction) : undefined
-    const errorPanel =
-      erroredAction?.error ? (
-        <div
-          data-testid="session-action-error"
-          className={clsx(
-            'mx-2 mt-0.5 rounded-md border border-red-500/30 bg-red-500/10 px-2 py-1',
-            'text-xs text-red-300',
-            indent > 0 && 'ml-6',
-          )}
-        >
-          <div className="flex items-start gap-1">
-            <span aria-hidden="true">⚠</span>
-            <span className="min-w-0 flex-1">{erroredAction.error}</span>
-          </div>
-          {errorUrl && (
-            <button
-              type="button"
-              onClick={(event) => {
-                event.preventDefault()
-                event.stopPropagation()
-                ctx.dispatch(
-                  {
-                    id: 'botster.url.open',
-                    payload: {
-                      sessionUuid,
-                      actionId: erroredAction.action_id,
-                      url: errorUrl,
-                    },
-                  } as UiAction,
-                  { element: event.currentTarget as Element },
-                )
-              }}
-              className="mt-1 inline-flex text-xs text-red-300 hover:underline"
-            >
-              Open {erroredAction.label ?? 'action link'}
-            </button>
-          )}
-        </div>
-      ) : null
+    const errorPanel = (
+      <SessionActionErrorPanel
+        sessionUuid={sessionUuid}
+        actions={sessionActions}
+        ctx={ctx}
+        indent={indent > 0}
+      />
+    )
 
     return (
       <li

@@ -6,13 +6,22 @@
 import React, { type MouseEvent, type ReactElement } from 'react'
 import clsx from 'clsx'
 
-import { useSessionStore } from '../../store/entities'
+import {
+  useSessionActionStore,
+  useSessionStore,
+} from '../../store/entities'
 import {
   activityState,
   displayName,
   subtext,
   titleLine,
 } from '../../store/selectors/session-row'
+import {
+  SessionActionErrorPanel,
+  SessionActionIndicators,
+  type SessionActionRecord,
+  visibleSessionActions,
+} from './SessionActionAffordances'
 import type {
   SessionRowProps as UiSessionRowProps,
   UiAction,
@@ -46,7 +55,8 @@ export function SessionRow({
   ctx,
 }: SessionRowProps): ReactElement {
   const session = useSessionStore(
-    (state) => state.byId[sessionUuid] as SessionRecord | undefined,
+    (state: { byId: Record<string, SessionRecord> }) =>
+      state.byId[sessionUuid] as SessionRecord | undefined,
   )
   const resolvedDensity =
     resolveValue<UiSurfaceDensity>(
@@ -66,6 +76,17 @@ export function SessionRow({
   }
 
   const sessionId = session.id ?? sessionUuid
+  const sessionActionOrder = useSessionActionStore(
+    (state: { order: string[] }) => state.order,
+  ) as string[]
+  const sessionActionsById = useSessionActionStore(
+    (state: { byId: Record<string, SessionActionRecord> }) => state.byId,
+  ) as Record<string, SessionActionRecord>
+  const sessionActions = visibleSessionActions(
+    sessionActionOrder,
+    sessionActionsById,
+    sessionUuid,
+  )
   const primaryName = displayName(session)
   const subtitle = titleLine(session)
   const tail = subtext(session)
@@ -99,62 +120,76 @@ export function SessionRow({
   }
 
   return (
-    <div
-      className={clsx(
-        'flex items-start gap-2 rounded-md border-l-4 px-2 py-1.5 text-zinc-200',
-        rowStateBorder,
-        resolvedDensity === 'sidebar' && 'py-0.5',
-      )}
-      data-session-uuid={sessionUuid}
-      data-session-id={sessionId}
-      data-row-state={rowState}
-    >
-      <div className="min-w-0 flex-1">
-        <div className="flex min-w-0 items-center gap-2">
-          <span
-            className={clsx(
-              titleSize,
-              'min-w-0 truncate font-mono',
-              isAccessory && 'text-zinc-400',
-            )}
-            data-testid="session-row-primary"
-          >
-            {primaryName}
-          </span>
-        </div>
-        {(subtitle || tail) && (
-          <div className="flex min-w-0 flex-wrap items-center gap-x-2 text-xs text-zinc-500">
-            {subtitle && (
-              <span
-                data-testid="session-row-title-line"
-                className="min-w-0 truncate italic"
-              >
-                {subtitle}
-              </span>
-            )}
-            {tail && (
-              <span
-                data-testid="session-row-subtext"
-                className="min-w-0 truncate"
-              >
-                {tail}
-              </span>
-            )}
-          </div>
-        )}
-      </div>
-      <button
-        type="button"
-        onClick={handleMenuOpen}
-        aria-label="Session actions"
-        data-testid="session-actions-trigger"
+    <div>
+      <div
         className={clsx(
-          'inline-flex size-6 shrink-0 items-center justify-center rounded text-zinc-400',
-          'hover:bg-zinc-800/50 hover:text-zinc-200',
+          'flex items-start gap-2 rounded-md border-l-4 px-2 py-1.5 text-zinc-200',
+          rowStateBorder,
+          resolvedDensity === 'sidebar' && 'py-0.5',
         )}
+        data-session-uuid={sessionUuid}
+        data-session-id={sessionId}
+        data-row-state={rowState}
       >
-        <IconGlyph name="ellipsis-vertical" className="size-4" />
-      </button>
+        <div className="min-w-0 flex-1">
+          <div className="flex min-w-0 items-center gap-2">
+            <span
+              className={clsx(
+                titleSize,
+                'min-w-0 truncate font-mono',
+                isAccessory && 'text-zinc-400',
+              )}
+              data-testid="session-row-primary"
+            >
+              {primaryName}
+            </span>
+          </div>
+          {(subtitle || tail) && (
+            <div className="flex min-w-0 flex-wrap items-center gap-x-2 text-xs text-zinc-500">
+              {subtitle && (
+                <span
+                  data-testid="session-row-title-line"
+                  className="min-w-0 truncate italic"
+                >
+                  {subtitle}
+                </span>
+              )}
+              {tail && (
+                <span
+                  data-testid="session-row-subtext"
+                  className="min-w-0 truncate"
+                >
+                  {tail}
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+        <div className="flex shrink-0 items-center gap-1 pt-0.5">
+          <SessionActionIndicators
+            sessionUuid={sessionUuid}
+            actions={sessionActions}
+            ctx={ctx}
+          />
+          <button
+            type="button"
+            onClick={handleMenuOpen}
+            aria-label="Session actions"
+            data-testid="session-actions-trigger"
+            className={clsx(
+              'inline-flex size-6 shrink-0 items-center justify-center rounded text-zinc-400',
+              'hover:bg-zinc-800/50 hover:text-zinc-200',
+            )}
+          >
+            <IconGlyph name="ellipsis-vertical" className="size-4" />
+          </button>
+        </div>
+      </div>
+      <SessionActionErrorPanel
+        sessionUuid={sessionUuid}
+        actions={sessionActions}
+        ctx={ctx}
+      />
     </div>
   )
 }

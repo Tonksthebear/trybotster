@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 
 import { SessionList } from '../components/composites/SessionList'
+import { SessionRow } from '../components/composites/SessionRow'
 import { WorkspaceList } from '../components/composites/WorkspaceList'
 import {
   useSessionActionStore,
@@ -466,6 +467,80 @@ describe('<SessionList> fidelity row', () => {
 
     expect(screen.getByText('vault worker').closest('a'))
       .toHaveAttribute('href', '/hubs/hub-1/vault/sessions/uuid-vault')
+  })
+})
+
+describe('<SessionRow> session action parity', () => {
+  it('renders live plugin action status links for a single row primitive', () => {
+    seedSession({
+      id: 'uuid-1',
+      session_uuid: 'uuid-1',
+      session_type: 'agent',
+    })
+    seedSessionActions([
+      {
+        id: 'uuid-1:cloudflare.preview.open',
+        session_uuid: 'uuid-1',
+        action_id: 'cloudflare.preview.open',
+        label: 'Cloudflare preview',
+        status: 'running',
+        url: 'https://preview.test',
+        visibility: 'visible',
+        enabled: true,
+      },
+    ])
+    const ctx = fakeCtx()
+    render(<SessionRow sessionUuid="uuid-1" density="panel" ctx={ctx} />)
+
+    const running = screen.getByTestId('session-action-link')
+    fireEvent.click(running)
+    expect(ctx.dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'botster.url.open',
+        payload: expect.objectContaining({ url: 'https://preview.test' }),
+      }),
+      expect.any(Object),
+    )
+  })
+
+  it('renders plugin action errors for a single row primitive', () => {
+    seedSession({
+      id: 'uuid-1',
+      session_uuid: 'uuid-1',
+      session_type: 'agent',
+    })
+    seedSessionActions([
+      {
+        id: 'uuid-1:cloudflare.preview.toggle',
+        session_uuid: 'uuid-1',
+        action_id: 'cloudflare.preview.toggle',
+        label: 'Cloudflare preview',
+        status: 'error',
+        error: 'cloudflared not installed',
+        install_url: 'https://install.cloudflared.test',
+        visibility: 'visible',
+        enabled: true,
+      },
+    ])
+    const ctx = fakeCtx()
+    render(<SessionRow sessionUuid="uuid-1" density="panel" ctx={ctx} />)
+
+    const errorPanel = screen.getByTestId('session-action-error')
+    expect(errorPanel).toHaveTextContent('cloudflared not installed')
+
+    const installButton = within(errorPanel).getByRole('button', {
+      name: /Open Cloudflare preview/i,
+    })
+    fireEvent.click(installButton)
+    expect(ctx.dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: 'botster.url.open',
+        payload: expect.objectContaining({
+          url: 'https://install.cloudflared.test',
+        }),
+      }),
+      expect.any(Object),
+    )
   })
 })
 
