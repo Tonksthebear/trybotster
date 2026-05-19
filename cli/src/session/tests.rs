@@ -5,8 +5,8 @@
 
 #[cfg(test)]
 mod protocol_tests {
-    use crate::session::SpawnConfig;
     use crate::session::protocol::*;
+    use crate::session::SpawnConfig;
 
     #[test]
     fn frame_roundtrip() {
@@ -761,7 +761,10 @@ mod socket_path_tests {
         let pid_path = session_pid_path(&session_uuid).unwrap();
         let tmp_path = session_recovery_identity_path(&session_uuid)
             .unwrap()
-            .with_file_name(format!("{session_uuid}.identity.json.{}.tmp", std::process::id()));
+            .with_file_name(format!(
+                "{session_uuid}.identity.json.{}.tmp",
+                std::process::id()
+            ));
 
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_file(&pid_path);

@@ -18,17 +18,17 @@ use crate::agent::notification::AgentNotification;
 use crate::agent::pty::{PromptMark, PtyEvent};
 use crate::hub::events::{HubEvent, HubEventTx};
 use crate::session::protocol::{
-    FRAME_BELL, FRAME_CWD_CHANGED, FRAME_GET_MODE_FLAGS, FRAME_GET_SCREEN, FRAME_GET_SNAPSHOT,
-    FRAME_MODE_CHANGED, FRAME_NOTIFICATION, FRAME_PROCESS_EXITED, FRAME_PROMPT_MARK,
-    FRAME_PTY_INPUT, FRAME_PTY_OUTPUT, FRAME_RESIZE, FRAME_SET_COLOR_PROFILE, FRAME_SHUTDOWN,
-    FRAME_SNAPSHOT, FRAME_TITLE_CHANGED, Frame, FrameDecoder, ModeChanged, NotificationPayload,
-    PromptMarkPayload, encode_empty, encode_frame, encode_json,
+    encode_empty, encode_frame, encode_json, Frame, FrameDecoder, ModeChanged, NotificationPayload,
+    PromptMarkPayload, FRAME_BELL, FRAME_CWD_CHANGED, FRAME_GET_MODE_FLAGS, FRAME_GET_SCREEN,
+    FRAME_GET_SNAPSHOT, FRAME_MODE_CHANGED, FRAME_NOTIFICATION, FRAME_PROCESS_EXITED,
+    FRAME_PROMPT_MARK, FRAME_PTY_INPUT, FRAME_PTY_OUTPUT, FRAME_RESIZE, FRAME_SET_COLOR_PROFILE,
+    FRAME_SHUTDOWN, FRAME_SNAPSHOT, FRAME_TITLE_CHANGED,
 };
 
 use super::session_io::{
-    SessionIoEvent, SessionIoRequest, TerminalAttachDeliveryFailureReason,
-    TerminalAttachDeliveryPhase, TerminalInitialSnapshotDelivery, TerminalOutputSubscription,
-    prepare_snapshot_payload, write_paste_file,
+    prepare_snapshot_payload, write_paste_file, SessionIoEvent, SessionIoRequest,
+    TerminalAttachDeliveryFailureReason, TerminalAttachDeliveryPhase,
+    TerminalInitialSnapshotDelivery, TerminalOutputSubscription,
 };
 
 const MAX_OUTPUT_BYTES: usize = 32 * 1024;

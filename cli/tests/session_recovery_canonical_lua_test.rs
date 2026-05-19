@@ -159,7 +159,10 @@ fn freshly_created_sessions_are_canonical() {
         .eval()
         .expect("created session canonicality should evaluate");
 
-    assert!(created, "fresh sessions should be canonical with source=created");
+    assert!(
+        created,
+        "fresh sessions should be canonical with source=created"
+    );
 }
 
 #[test]
@@ -213,7 +216,10 @@ fn manifest_recovered_sessions_are_canonical_and_sync_manifests() {
         .eval()
         .expect("manifest recovery canonicality should evaluate");
 
-    assert!(canonical, "manifest recovery should be canonical and writable");
+    assert!(
+        canonical,
+        "manifest recovery should be canonical and writable"
+    );
 }
 
 #[test]

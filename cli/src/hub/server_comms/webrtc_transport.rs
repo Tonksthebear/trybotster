@@ -546,12 +546,7 @@ impl Hub {
                 let metric_label = Self::webrtc_lua_message_metric_label(browser_identity, &msg);
                 let started = Instant::now();
                 self.call_lua_webrtc_message(browser_identity, msg);
-                self.record_hot_span(
-                    "webrtc_message.lua",
-                    started,
-                    payload.len(),
-                    &metric_label,
-                );
+                self.record_hot_span("webrtc_message.lua", started, payload.len(), &metric_label);
             }
             crate::worker::webrtc::WebRtcIngressOutcome::ClientWorker(other) => {
                 self.record_hot_span(
@@ -634,10 +629,7 @@ impl Hub {
         }
     }
 
-    fn webrtc_lua_message_metric_label(
-        browser_identity: &str,
-        msg: &serde_json::Value,
-    ) -> String {
+    fn webrtc_lua_message_metric_label(browser_identity: &str, msg: &serde_json::Value) -> String {
         let msg_type = msg
             .get("type")
             .and_then(|value| value.as_str())

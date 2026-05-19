@@ -203,11 +203,12 @@ impl LayoutLua {
         // layout tables — falls through to the pre-existing parser.
         if let Ok(type_name) = result.get::<String>("type") {
             if crate::clients::tui::ui_contract_adapter::is_ui_node_type(&type_name) {
-                let viewport = crate::clients::tui::ui_contract_adapter::derive_viewport_from_terminal(
-                    ctx.terminal_cols,
-                    ctx.terminal_rows,
-                    false,
-                );
+                let viewport =
+                    crate::clients::tui::ui_contract_adapter::derive_viewport_from_terminal(
+                        ctx.terminal_cols,
+                        ctx.terminal_rows,
+                        false,
+                    );
                 let (render, _actions) =
                     crate::clients::tui::ui_contract_adapter::render_lua_ui_node_with_stores(
                         &self.lua, &result, &viewport, stores,

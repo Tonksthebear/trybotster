@@ -1536,7 +1536,10 @@ pub fn cleanup_orphaned_session_files() {
             let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
                 continue;
             };
-            let file_name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
             let is_identity_sidecar = file_name.ends_with(".identity.json");
             let is_identity_tmp = file_name.contains(".identity.json.") && ext == "tmp";
             if ext != "sock" && ext != "pid" && !is_identity_sidecar && !is_identity_tmp {

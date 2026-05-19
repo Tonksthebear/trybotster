@@ -58,8 +58,8 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
 use crate::client::{TuiOutput, TuiRequest, TuiSessionInput};
-use crate::hub::Hub;
 use crate::clients::tui::layout::terminal_widget_inner_area;
+use crate::hub::Hub;
 
 use super::actions::TuiAction;
 use super::layout_lua::{KeyContext, LayoutLua, LuaKeyAction};
