@@ -12,7 +12,11 @@ import {
   UiTreeBody,
   createTransportDispatch,
 } from '../ui_contract'
-import { bindingEntityTypes } from '../ui_contract/binding'
+import {
+  bindingDefaultEntityTypes,
+  bindingEntityRequests,
+  entityHydrationRequestKey,
+} from '../ui_contract/binding'
 import { waitForHub } from '../lib/hub-bridge'
 import { useSurfaceReadinessStore } from '../store/surface-readiness-store'
 
@@ -245,7 +249,8 @@ export default function UiTree({
     initialTree ?? readCachedTree(hubId, targetSurface, subpath),
   )
   const [transport, setTransport] = useState(null)
-  const requestedEntityTypesRef = useRef(new Set())
+  const requestedDefaultEntityTypesRef = useRef(new Set())
+  const requestedTargetedEntitiesRef = useRef(new Set())
 
   // Wire protocol: collapse + nav-selection state moved into the
   // composite primitives themselves. `<SessionList>` reads collapse state
@@ -317,8 +322,13 @@ export default function UiTree({
   }, [hubId])
 
   useEffect(() => {
-    requestedEntityTypesRef.current.clear()
+    requestedDefaultEntityTypesRef.current.clear()
+    requestedTargetedEntitiesRef.current.clear()
   }, [hubId, transport])
+
+  useEffect(() => {
+    requestedTargetedEntitiesRef.current.clear()
+  }, [targetSurface, subpath])
 
   // Subscribe to ui_tree_snapshot frames matching this target_surface.
   //
@@ -342,19 +352,29 @@ export default function UiTree({
       }
       const nextTree = message.tree ?? null
       if (nextTree && typeof transport.requestEntitySnapshots === 'function') {
-        const neededTypes = bindingEntityTypes(nextTree)
+        const neededTypes = bindingDefaultEntityTypes(nextTree)
+        const neededRequests = bindingEntityRequests(nextTree)
         const missingTypes = neededTypes.filter(
-          (entityType) => !requestedEntityTypesRef.current.has(entityType),
+          (entityType) => !requestedDefaultEntityTypesRef.current.has(entityType),
         )
-        if (missingTypes.length > 0) {
+        const missingRequests = neededRequests.filter(
+          (request) => !requestedTargetedEntitiesRef.current.has(entityHydrationRequestKey(request)),
+        )
+        if (missingTypes.length > 0 || missingRequests.length > 0) {
           for (const entityType of missingTypes) {
-            requestedEntityTypesRef.current.add(entityType)
+            requestedDefaultEntityTypesRef.current.add(entityType)
           }
-          const request = transport.requestEntitySnapshots(missingTypes)
+          for (const request of missingRequests) {
+            requestedTargetedEntitiesRef.current.add(entityHydrationRequestKey(request))
+          }
+          const request = transport.requestEntitySnapshots(missingTypes, missingRequests)
           if (request && typeof request.catch === 'function') {
             request.catch((err) => {
               for (const entityType of missingTypes) {
-                requestedEntityTypesRef.current.delete(entityType)
+                requestedDefaultEntityTypesRef.current.delete(entityType)
+              }
+              for (const request of missingRequests) {
+                requestedTargetedEntitiesRef.current.delete(entityHydrationRequestKey(request))
               }
               console.warn('[UiTree] failed to request bound entity snapshots', err)
             })

@@ -207,8 +207,11 @@ export class HubTransport extends HubRoute {
     return this.sendCommand("hub:route_registry");
   }
 
-  requestEntitySnapshots(entityTypes = []) {
-    return this.sendCommand("hub:entities", { entity_types: entityTypes });
+  requestEntitySnapshots(entityTypes = [], entityRequests = []) {
+    return this.sendCommand("hub:entities", {
+      entity_types: entityTypes,
+      entity_requests: entityRequests,
+    });
   }
 
   /**

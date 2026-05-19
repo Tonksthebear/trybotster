@@ -37,6 +37,8 @@ type EntityRecord = Record<string, unknown>
 type EntityState = {
   order: string[]
   byId: Record<string, unknown>
+  snapshotSeq?: number
+  revision?: number
 }
 type EntityStoreHook = {
   <T>(selector: (state: EntityState) => T): T
@@ -368,13 +370,80 @@ export function bindingEntityTypes(value: unknown): string[] {
   return [...types].sort()
 }
 
+export function bindingDefaultEntityTypes(value: unknown): string[] {
+  const types = new Set<string>()
+  walk(value, (v) => {
+    if (!isBindList(v)) return
+    const entityType = entityTypeFromPath(v.source)
+    if (!entityType) return
+    if (v.where && typeof v.where === 'object' && !Array.isArray(v.where)) return
+    types.add(entityType)
+  })
+  return [...types].sort()
+}
+
+export type EntityHydrationRequest = {
+  entity_type: string
+  id?: string
+  where?: Record<string, unknown>
+}
+
+export function stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? 'null'
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
+  const entries = Object.entries(value as Record<string, unknown>)
+    .sort(([a], [b]) => a.localeCompare(b))
+  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${stableJson(item)}`).join(',')}}`
+}
+
+export function entityHydrationRequestKey(request: EntityHydrationRequest): string {
+  return `${request.entity_type}:${request.id ?? ''}:${stableJson(request.where ?? null)}`
+}
+
+function requestFromPath(path: string): EntityHydrationRequest | null {
+  const entityType = entityTypeFromPath(path)
+  if (!entityType) return null
+  const parts = path.split('/').filter(Boolean)
+  if (parts.length < 2) return null
+  const id = parts[1]
+  if (!id || id.includes('*')) return null
+  return { entity_type: entityType, id }
+}
+
+function requestFromBindList(value: UiBindList): EntityHydrationRequest | null {
+  const entityType = entityTypeFromPath(value.source)
+  if (!entityType) return null
+  const where = value.where
+  if (!where || typeof where !== 'object' || Array.isArray(where)) return null
+  if (Object.keys(where).length === 0) return null
+  return { entity_type: entityType, where: where as Record<string, unknown> }
+}
+
+export function bindingEntityRequests(value: unknown): EntityHydrationRequest[] {
+  const requests = new Map<string, EntityHydrationRequest>()
+  walk(value, (v) => {
+    let request: EntityHydrationRequest | null = null
+    if (isBindSentinel(v)) {
+      request = requestFromPath(v.$bind)
+    } else if (isBindIf(v)) {
+      request = requestFromPath(v.path)
+    } else if (isBindList(v)) {
+      request = requestFromBindList(v)
+    }
+    if (request) requests.set(entityHydrationRequestKey(request), request)
+  })
+  return [...requests.values()].sort((a, b) =>
+    entityHydrationRequestKey(a).localeCompare(entityHydrationRequestKey(b)),
+  )
+}
+
 export function useBindingInvalidation(value: unknown): void {
   const entityTypes = useMemo(() => bindingEntityTypes(value), [value])
   const getSnapshot = () =>
     entityTypes
       .map((entityType) => {
         const state = storeFor(entityType).getState()
-        return `${entityType}:${state.snapshotSeq}:${state.order.length}`
+        return `${entityType}:${state.revision ?? state.snapshotSeq}:${state.order.length}`
       })
       .join('\u0000')
   useSyncExternalStore(

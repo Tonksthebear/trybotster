@@ -142,6 +142,68 @@ describe('createEntityStore', () => {
       ['b', { session_uuid: 'b', title: 'B' }],
     ])
   })
+
+  it('applyScopedSnapshot replaces only records in the requested scope', () => {
+    const s = store.getState()
+    s.applySnapshot(
+      [
+        { session_uuid: 'sess-a', workspace_id: 'ws-1', title: 'old a' },
+        { session_uuid: 'sess-b', workspace_id: 'ws-2', title: 'old b' },
+        { session_uuid: 'sess-c', workspace_id: 'ws-1', title: 'old c' },
+      ],
+      1
+    )
+
+    s.applyScopedSnapshot(
+      { workspace_id: 'ws-1' },
+      [{ session_uuid: 'sess-d', workspace_id: 'ws-1', title: 'new d' }],
+      2
+    )
+
+    expect(store.getState().order).toEqual(['sess-b', 'sess-d'])
+    expect(store.getState().byId).toEqual({
+      'sess-b': { session_uuid: 'sess-b', workspace_id: 'ws-2', title: 'old b' },
+      'sess-d': { session_uuid: 'sess-d', workspace_id: 'ws-1', title: 'new d' },
+    })
+  })
+
+  it('applyScopedSnapshot ignores empty scopes', () => {
+    const s = store.getState()
+    s.applySnapshot([{ session_uuid: 'sess-a', title: 'old a' }], 1)
+    s.applyScopedSnapshot({}, [], 2)
+    expect(store.getState().order).toEqual(['sess-a'])
+    expect(store.getState().byId['sess-a'].title).toBe('old a')
+  })
+
+  it('applyScopedSnapshot does not advance the whole-type sequence gate', () => {
+    const s = store.getState()
+    s.applySnapshot([{ session_uuid: 'sess-a', workspace_id: 'ws-1', title: 'old a' }], 5)
+    s.applyScopedSnapshot(
+      { workspace_id: 'ws-1' },
+      [{ session_uuid: 'sess-b', workspace_id: 'ws-1', title: 'new b' }],
+      6
+    )
+    s.applyUpsert('sess-c', { session_uuid: 'sess-c', title: 'delta with same seq' }, 6)
+
+    expect(store.getState().snapshotSeq).toBe(6)
+    expect(store.getState().byId['sess-c'].title).toBe('delta with same seq')
+  })
+
+  it('applyScopedSnapshot increments the local render revision even when row count is unchanged', () => {
+    const s = store.getState()
+    s.applySnapshot([{ session_uuid: 'sess-a', workspace_id: 'ws-1', title: 'old a' }], 5)
+    const before = store.getState().revision
+
+    s.applyScopedSnapshot(
+      { workspace_id: 'ws-1' },
+      [{ session_uuid: 'sess-a', workspace_id: 'ws-1', title: 'new a' }],
+      5,
+    )
+
+    expect(store.getState().revision).toBe(before + 1)
+    expect(store.getState().order).toEqual(['sess-a'])
+    expect(store.getState().byId['sess-a'].title).toBe('new a')
+  })
 })
 
 describe('frontend entity store dispatch', () => {
@@ -149,8 +211,9 @@ describe('frontend entity store dispatch', () => {
     _resetEntityStoresForTest()
   })
 
-  it('isEntityFrame recognises only the four entity envelope types', () => {
+  it('isEntityFrame recognises only entity envelope types', () => {
     expect(isEntityFrame('entity_snapshot')).toBe(true)
+    expect(isEntityFrame('entity_scoped_snapshot')).toBe(true)
     expect(isEntityFrame('entity_upsert')).toBe(true)
     expect(isEntityFrame('entity_patch')).toBe(true)
     expect(isEntityFrame('entity_remove')).toBe(true)
@@ -169,6 +232,29 @@ describe('frontend entity store dispatch', () => {
     })
     expect(handled).toBe(true)
     expect(useSessionStore.getState().byId['sess-1'].title).toBe('one')
+  })
+
+  it('routes scoped snapshots without clearing unrelated rows', () => {
+    applyEntityFrame({
+      v: 2,
+      type: 'entity_snapshot',
+      entity_type: 'session',
+      items: [
+        { session_uuid: 'sess-a', workspace_id: 'ws-1', title: 'old a' },
+        { session_uuid: 'sess-b', workspace_id: 'ws-2', title: 'old b' },
+      ],
+      snapshot_seq: 1,
+    })
+    applyEntityFrame({
+      v: 2,
+      type: 'entity_scoped_snapshot',
+      entity_type: 'session',
+      scope: { workspace_id: 'ws-1' },
+      items: [{ session_uuid: 'sess-c', workspace_id: 'ws-1', title: 'new c' }],
+      snapshot_seq: 2,
+    })
+
+    expect(useSessionStore.getState().order).toEqual(['sess-b', 'sess-c'])
   })
 
   it('routes workspace frames to the workspace entity store', () => {

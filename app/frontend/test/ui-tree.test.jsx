@@ -28,8 +28,10 @@ import UiTree, {
   useUiTreeDispatch,
 } from '../components/UiTree'
 import {
+  applyEntityFrame,
   useSessionStore,
   useWorkspaceEntityStore,
+  _resetEntityStoresForTest,
 } from '../store/entities'
 import { _resetUiActionLifecycleForTests } from '../ui_contract/action_lifecycle_store'
 
@@ -66,6 +68,7 @@ function immediateHub(transport) {
 }
 
 beforeEach(() => {
+  _resetEntityStoresForTest()
   _resetUiTreeSnapshotCacheForTests()
   _resetUiActionLifecycleForTests()
   fakeTransport = new FakeTransport()
@@ -74,8 +77,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
-  useSessionStore.getState()._reset()
-  useWorkspaceEntityStore.getState()._reset()
+  _resetEntityStoresForTest()
   _resetUiActionLifecycleForTests()
   vi.mocked(legacyDispatch).mockClear()
   vi.restoreAllMocks()
@@ -157,7 +159,189 @@ describe('<UiTree>', () => {
 
     expect(fakeTransport.requestEntitySnapshots).toHaveBeenCalledWith([
       'project-pipelines.ticket',
+    ], [])
+  })
+
+  it('requests targeted entity hydration for route detail bindings', async () => {
+    const detailTree = {
+      type: 'stack',
+      children: [
+        { type: 'text', props: { text: { $bind: '/project-pipelines.run/run-1/status' } } },
+        {
+          $kind: 'bind_list',
+          source: '/project-pipelines.run_step',
+          where: { run_id: 'run-1' },
+          item_template: {
+            type: 'text',
+            props: { text: { $bind: '@/name' } },
+          },
+        },
+      ],
+    }
+
+    render(<UiTree hubId="hub-1" targetSurface="pipelines" subpath="/runs/run-1" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'pipelines',
+        subpath: '/runs/run-1',
+        tree: detailTree,
+      })
+    })
+
+    expect(fakeTransport.requestEntitySnapshots).toHaveBeenCalledWith([], [
+      { entity_type: 'project-pipelines.run_step', where: { run_id: 'run-1' } },
+      { entity_type: 'project-pipelines.run', id: 'run-1' },
     ])
+  })
+
+  it('keeps default entity snapshot dedupe across subpath changes but refreshes targeted requests', async () => {
+    function routeTree(runId) {
+      return {
+        type: 'stack',
+        children: [
+          {
+            $kind: 'bind_list',
+            source: '/project-pipelines.ticket',
+            item_template: { type: 'text', props: { text: { $bind: '@/title' } } },
+          },
+          {
+            $kind: 'bind_list',
+            source: '/project-pipelines.run_step',
+            where: { run_id: runId },
+            item_template: { type: 'text', props: { text: { $bind: '@/name' } } },
+          },
+        ],
+      }
+    }
+
+    const view = render(<UiTree hubId="hub-1" targetSurface="pipelines" subpath="/runs/run-1" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'pipelines',
+        subpath: '/runs/run-1',
+        tree: routeTree('run-1'),
+      })
+    })
+    expect(fakeTransport.requestEntitySnapshots).toHaveBeenLastCalledWith([
+      'project-pipelines.ticket',
+    ], [
+      { entity_type: 'project-pipelines.run_step', where: { run_id: 'run-1' } },
+    ])
+
+    fakeTransport.requestEntitySnapshots.mockClear()
+    view.rerender(<UiTree hubId="hub-1" targetSurface="pipelines" subpath="/runs/run-2" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'pipelines',
+        subpath: '/runs/run-2',
+        tree: routeTree('run-2'),
+      })
+    })
+
+    expect(fakeTransport.requestEntitySnapshots).toHaveBeenCalledWith([], [
+      { entity_type: 'project-pipelines.run_step', where: { run_id: 'run-2' } },
+    ])
+  })
+
+  it('requests a default snapshot when navigating from scoped detail bindings to overview bindings', async () => {
+    const view = render(<UiTree hubId="hub-1" targetSurface="pipelines" subpath="/runs/run-1" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'pipelines',
+        subpath: '/runs/run-1',
+        tree: {
+          type: 'stack',
+          children: [{
+            $kind: 'bind_list',
+            source: '/project-pipelines.run_step',
+            where: { run_id: 'run-1' },
+            item_template: { type: 'text', props: { text: { $bind: '@/name' } } },
+          }],
+        },
+      })
+    })
+    expect(fakeTransport.requestEntitySnapshots).toHaveBeenCalledWith([], [
+      { entity_type: 'project-pipelines.run_step', where: { run_id: 'run-1' } },
+    ])
+
+    fakeTransport.requestEntitySnapshots.mockClear()
+    view.rerender(<UiTree hubId="hub-1" targetSurface="pipelines" subpath="/" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'pipelines',
+        subpath: '/',
+        tree: {
+          type: 'stack',
+          children: [{
+            $kind: 'bind_list',
+            source: '/project-pipelines.run_step',
+            item_template: { type: 'text', props: { text: { $bind: '@/name' } } },
+          }],
+        },
+      })
+    })
+
+    expect(fakeTransport.requestEntitySnapshots).toHaveBeenCalledWith([
+      'project-pipelines.run_step',
+    ], [])
+  })
+
+  it('rerenders filtered bindings after same-size scoped entity snapshots', async () => {
+    const detailTree = {
+      type: 'stack',
+      children: [
+        {
+          $kind: 'bind_list',
+          source: '/project-pipelines.run_step',
+          where: { run_id: 'run-1' },
+          item_template: {
+            type: 'text',
+            props: { text: { $bind: '@/name' } },
+          },
+        },
+      ],
+    }
+
+    render(<UiTree hubId="hub-1" targetSurface="pipelines" subpath="/runs/run-1" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'pipelines',
+        subpath: '/runs/run-1',
+        tree: detailTree,
+      })
+    })
+
+    await act(async () => {
+      applyEntityFrame({
+        v: 2,
+        type: 'entity_scoped_snapshot',
+        entity_type: 'project-pipelines.run_step',
+        scope: { run_id: 'run-1' },
+        items: [{ id: 'step-1', run_id: 'run-1', name: 'Old name' }],
+        snapshot_seq: 1,
+      })
+    })
+    expect(await screen.findByText('Old name')).toBeInTheDocument()
+
+    await act(async () => {
+      applyEntityFrame({
+        v: 2,
+        type: 'entity_scoped_snapshot',
+        entity_type: 'project-pipelines.run_step',
+        scope: { run_id: 'run-1' },
+        items: [{ id: 'step-1', run_id: 'run-1', name: 'New name' }],
+        snapshot_seq: 1,
+      })
+    })
+
+    expect(await screen.findByText('New name')).toBeInTheDocument()
+    expect(screen.queryByText('Old name')).toBeNull()
   })
 
   it('hydrates from the cached tree when a surface remounts', async () => {

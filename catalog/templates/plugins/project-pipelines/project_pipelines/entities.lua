@@ -97,6 +97,20 @@ local function ticket_dependency_is_visible(dependency)
     return type(dependency) == "table" and ticket_id_is_visible(dependency.ticket_id)
 end
 
+local function query_value(request, key)
+    if type(request) ~= "table" then
+        return nil
+    end
+    if not util.is_blank(request[key]) then
+        return request[key]
+    end
+    local where = request.where
+    if type(where) == "table" and not util.is_blank(where[key]) then
+        return where[key]
+    end
+    return nil
+end
+
 local function copy(row)
     return util.copy(row or {})
 end
@@ -194,6 +208,12 @@ local function cached(context, key, fn)
     local value = fn()
     context[key] = value
     return value
+end
+
+local function cache_key_for_ids(prefix, ids)
+    ids = unique_nonblank(ids)
+    table.sort(ids)
+    return prefix .. ":" .. table.concat(ids, ",")
 end
 
 local function ticket_dependency_levels(tickets, dependencies)
@@ -721,7 +741,7 @@ local function pipeline_entities(pipelines)
     return out
 end
 
-local function run_entities(runs)
+local function run_entities(runs, context)
     local ticket_ids = {}
     local pipeline_ids = {}
     local step_ids = {}
@@ -732,15 +752,25 @@ local function run_entities(runs)
         step_ids[#step_ids + 1] = run.current_step_id
         current_run_step_ids[#current_run_step_ids + 1] = run.current_run_step_id
     end
-    local tickets_by_id = rows_by_id("tickets", "id, title, project_id", ticket_ids)
+    local tickets_by_id = cached(context, cache_key_for_ids("project_pipelines.run_entities.tickets_by_id", ticket_ids), function()
+        return rows_by_id("tickets", "id, title, project_id", ticket_ids)
+    end)
     local project_ids = {}
     for _, ticket in pairs(tickets_by_id) do
         project_ids[#project_ids + 1] = ticket.project_id
     end
-    local projects_by_id = rows_by_id("projects", "id", project_ids)
-    local pipelines_by_id = rows_by_id("pipelines", "id, name", pipeline_ids)
-    local steps_by_id = rows_by_id("pipeline_steps", "id, name", step_ids)
-    local run_steps_by_id = rows_by_id("run_steps", "id, agent_session_uuid", current_run_step_ids)
+    local projects_by_id = cached(context, cache_key_for_ids("project_pipelines.run_entities.projects_by_id", project_ids), function()
+        return rows_by_id("projects", "id", project_ids)
+    end)
+    local pipelines_by_id = cached(context, cache_key_for_ids("project_pipelines.run_entities.pipelines_by_id", pipeline_ids), function()
+        return rows_by_id("pipelines", "id, name", pipeline_ids)
+    end)
+    local steps_by_id = cached(context, cache_key_for_ids("project_pipelines.run_entities.steps_by_id", step_ids), function()
+        return rows_by_id("pipeline_steps", "id, name", step_ids)
+    end)
+    local run_steps_by_id = cached(context, cache_key_for_ids("project_pipelines.run_entities.run_steps_by_id", current_run_step_ids), function()
+        return rows_by_id("run_steps", "id, agent_session_uuid", current_run_step_ids)
+    end)
     local view = with_view()
     local out = {}
     for _, run in ipairs(runs or {}) do
@@ -824,9 +854,13 @@ local function run_step_entity(run_step)
     return decorate_run_step_entity(entity, { step = step, run = run })
 end
 
-local function run_step_entities(run_steps)
-    local steps_by_id = index_by_id(rows("SELECT * FROM pipeline_steps"))
-    local runs_by_id = index_by_id(rows("SELECT id, ticket_id, pipeline_id FROM runs"))
+local function run_step_entities(run_steps, context)
+    local steps_by_id = cached(context, "project_pipelines.run_step_entities.steps_by_id", function()
+        return index_by_id(rows("SELECT * FROM pipeline_steps"))
+    end)
+    local runs_by_id = cached(context, "project_pipelines.run_step_entities.runs_by_id", function()
+        return index_by_id(rows("SELECT id, ticket_id, pipeline_id FROM runs"))
+    end)
     local out = {}
     for _, run_step in ipairs(run_steps or {}) do
         local entity = copy(run_step)
@@ -870,6 +904,28 @@ local function question_entity(question)
     return entity
 end
 
+local function question_entities(questions, context)
+    local ticket_ids = {}
+    for _, question in ipairs(questions or {}) do
+        ticket_ids[#ticket_ids + 1] = question.ticket_id
+    end
+    local tickets_by_id = cached(context, cache_key_for_ids("project_pipelines.question_entities.tickets_by_id", ticket_ids), function()
+        return rows_by_id("tickets", "id, title", ticket_ids)
+    end)
+    local out = {}
+    for _, question in ipairs(questions or {}) do
+        local entity = copy(question)
+        local ticket = tickets_by_id[question.ticket_id]
+        entity.ticket_title = ticket and ticket.title or question.ticket_id
+        entity.path = "/pipelines/tickets/" .. tostring(question.ticket_id or "")
+        entity.kind_label = question.kind == "agent" and "agent" or "human"
+        entity.blocking_label = question.blocking == 1 and "blocking" or "question"
+        entity.blocking_tone = question.blocking == 1 and "danger" or "accent"
+        out[#out + 1] = entity
+    end
+    return out
+end
+
 local function ticket_dependency_entity(dependency)
     local entity = copy(dependency)
     local ticket = nil
@@ -882,6 +938,14 @@ local function ticket_dependency_entity(dependency)
     entity.depends_on_label = view and view.status_label(entity.depends_on_status) or tostring(entity.depends_on_status or "")
     entity.depends_on_tone = entity.depends_on_status == "closed" and "success" or "danger"
     return entity
+end
+
+local function ticket_dependency_entities(dependencies, _context)
+    local out = {}
+    for _, dependency in ipairs(dependencies or {}) do
+        out[#out + 1] = ticket_dependency_entity(dependency)
+    end
+    return out
 end
 
 local function pr_link_entity(link)
@@ -1090,6 +1154,140 @@ local ENTITY = {
     },
 }
 
+local function query_by_id(table_name, request, decorate, context)
+    local id = query_value(request, "id")
+    if util.is_blank(id) then return {} end
+    local row = rows("SELECT * FROM " .. table_name .. " WHERE id = ? LIMIT 1", id)[1]
+    if not row then return {} end
+    return { decorate and decorate(row, context) or row }
+end
+
+local function query_by_run_id(table_name, request, decorate, context)
+    local run_id = query_value(request, "run_id")
+    if util.is_blank(run_id) then return {} end
+    local out = {}
+    for _, row in ipairs(rows("SELECT * FROM " .. table_name .. " WHERE run_id = ? ORDER BY created_at ASC, id ASC", run_id)) do
+        out[#out + 1] = decorate and decorate(row, context) or row
+    end
+    return out
+end
+
+local function run_detail(request, context)
+    local id = query_value(request, "id")
+    if util.is_blank(id) then
+        return run_entities(rows("SELECT * FROM runs ORDER BY updated_at DESC, created_at DESC, id DESC"), context)
+    end
+    return run_entities(rows("SELECT * FROM runs WHERE id = ? LIMIT 1", id), context)
+end
+
+local function run_steps_for_detail(request, context)
+    local run_id = query_value(request, "run_id")
+    if util.is_blank(run_id) then return {} end
+    return run_step_entities(rows([[SELECT * FROM run_steps
+                                    WHERE run_id = ?
+                                    ORDER BY COALESCE(sequence, 0) ASC, created_at ASC, id ASC]], run_id), context)
+end
+
+local function ticket_detail(request, context)
+    local id = query_value(request, "id")
+    if util.is_blank(id) then
+        return ticket_entities(visible_ticket_rows(), context)
+    end
+    return ticket_entities(rows("SELECT * FROM tickets WHERE id = ? LIMIT 1", id), context)
+end
+
+local function project_detail(request, context)
+    local id = query_value(request, "id")
+    if util.is_blank(id) then
+        local out = {}
+        for _, project in ipairs(visible_project_rows()) do
+            out[#out + 1] = project_entity(project)
+        end
+        return out
+    end
+    return query_by_id("projects", request, project_entity, context)
+end
+
+local function project_targets_for_detail(request, context)
+    local project_id = query_value(request, "project_id")
+    if util.is_blank(project_id) then return {} end
+    local out = {}
+    for _, row in ipairs(rows("SELECT * FROM project_targets WHERE project_id = ? ORDER BY created_at ASC, id ASC", project_id)) do
+        out[#out + 1] = project_target_entity(row)
+    end
+    return out
+end
+
+local function tickets_for_project_detail(request, context)
+    local project_id = query_value(request, "project_id")
+    if util.is_blank(project_id) then return {} end
+    return ticket_entities(rows([[SELECT t.*
+                                  FROM tickets t
+                                  LEFT JOIN projects p ON p.id = t.project_id
+                                  WHERE t.project_id = ?
+                                    AND ]] .. VISIBLE_TICKET_WHERE .. [[
+                                  ORDER BY t.updated_at DESC, t.created_at DESC, t.id ASC]], project_id), context)
+end
+
+local function questions_for_ticket_detail(request, context)
+    local ticket_id = query_value(request, "ticket_id")
+    if util.is_blank(ticket_id) then
+        return question_entities(rows([[SELECT q.*
+                                        FROM questions q
+                                        JOIN tickets t ON t.id = q.ticket_id
+                                        LEFT JOIN projects p ON p.id = t.project_id
+                                        WHERE q.status = 'open'
+                                          AND ]] .. VISIBLE_TICKET_WHERE .. [[
+                                        ORDER BY q.updated_at DESC, q.created_at DESC, q.id DESC]]), context)
+    end
+    if not ticket_id_is_visible(ticket_id) then return {} end
+    return question_entities(rows([[SELECT *
+                                    FROM questions
+                                    WHERE ticket_id = ?
+                                      AND status = 'open'
+                                    ORDER BY updated_at DESC, created_at DESC, id DESC]], ticket_id), context)
+end
+
+local function dependencies_for_ticket_detail(request, context)
+    local ticket_id = query_value(request, "ticket_id")
+    if util.is_blank(ticket_id) then return {} end
+    if not ticket_id_is_visible(ticket_id) then return {} end
+    return ticket_dependency_entities(rows([[SELECT td.*, t.title AS depends_on_title, t.status AS depends_on_status
+                                             FROM ticket_dependencies td
+                                             LEFT JOIN tickets t ON t.id = td.depends_on_ticket_id
+                                             WHERE td.ticket_id = ?
+                                             ORDER BY td.created_at ASC, td.id ASC]], ticket_id), context)
+end
+
+local function pr_links_for_ticket_detail(request, _context)
+    local ticket_id = query_value(request, "ticket_id")
+    if util.is_blank(ticket_id) then return {} end
+    if not ticket_id_is_visible(ticket_id) then return {} end
+    local out = {}
+    for _, row in ipairs(rows([[SELECT *
+                                FROM pr_links
+                                WHERE ticket_id = ?
+                                ORDER BY updated_at DESC, created_at DESC, id DESC]], ticket_id)) do
+        out[#out + 1] = pr_link_entity(row)
+    end
+    return out
+end
+
+local DETAIL = {
+    [M.types.ticket] = ticket_detail,
+    [M.types.project] = project_detail,
+    [M.types.project_target] = project_targets_for_detail,
+    [M.types.ticket_dependency] = dependencies_for_ticket_detail,
+    [M.types.question] = questions_for_ticket_detail,
+    [M.types.run] = run_detail,
+    [M.types.run_step] = run_steps_for_detail,
+    [M.types.review] = function(request, _context) return query_by_run_id("reviews", request, copy) end,
+    [M.types.finding] = function(request, _context) return query_by_run_id("review_findings", request, finding_entity) end,
+    [M.types.artifact] = function(request, _context) return query_by_run_id("artifacts", request, artifact_entity) end,
+    [M.types.pr_link] = pr_links_for_ticket_detail,
+    [M.types.event] = function(request, _context) return query_by_run_id("events", request, event_entity) end,
+}
+
 local VISIBLE = {
     [M.types.ticket] = ticket_is_visible,
     [M.types.project] = project_is_visible,
@@ -1110,6 +1308,7 @@ function M.register()
             id_field = "id",
             owner_plugin = OWNER,
             all = spec.all,
+            query = DETAIL[entity_type],
             filter = VISIBLE[entity_type],
         })
     end

@@ -11,6 +11,7 @@ import {
   _resetEntityStoresForTest,
 } from '../store/entities'
 import {
+  bindingEntityRequests,
   countBindings,
   resolveBindings,
   resolvePath,
@@ -256,6 +257,72 @@ describe('countBindings', () => {
       ],
     }
     expect(countBindings(tree)).toBe(3)
+  })
+})
+
+describe('bindingEntityRequests', () => {
+  it('extracts targeted requests from detail binds and filtered lists', () => {
+    const tree = {
+      type: 'stack',
+      children: [
+        { type: 'text', props: { text: { $bind: '/project-pipelines.run/run-1/status' } } },
+        {
+          $kind: 'bind_list',
+          source: '/project-pipelines.run_step',
+          where: { run_id: 'run-1' },
+          item_template: { type: 'text', props: { text: { $bind: '@/name' } } },
+        },
+      ],
+    }
+
+    expect(bindingEntityRequests(tree)).toEqual([
+      { entity_type: 'project-pipelines.run_step', where: { run_id: 'run-1' } },
+      { entity_type: 'project-pipelines.run', id: 'run-1' },
+    ])
+  })
+
+  it('extracts targeted requests from bind_if paths', () => {
+    const tree = {
+      type: 'stack',
+      children: [
+        {
+          $kind: 'bind_if',
+          path: '/project-pipelines.ticket/ticket-1/ready',
+          node: { type: 'text', props: { text: 'ready' } },
+        },
+      ],
+    }
+
+    expect(bindingEntityRequests(tree)).toEqual([
+      { entity_type: 'project-pipelines.ticket', id: 'ticket-1' },
+    ])
+  })
+
+  it('deduplicates filtered list requests with stable where-key ordering', () => {
+    const tree = {
+      type: 'stack',
+      children: [
+        {
+          $kind: 'bind_list',
+          source: '/project-pipelines.run_step',
+          where: { run_id: 'run-1', status: 'blocked' },
+          item_template: { type: 'text', props: { text: { $bind: '@/name' } } },
+        },
+        {
+          $kind: 'bind_list',
+          source: '/project-pipelines.run_step',
+          where: { status: 'blocked', run_id: 'run-1' },
+          item_template: { type: 'text', props: { text: { $bind: '@/name' } } },
+        },
+      ],
+    }
+
+    expect(bindingEntityRequests(tree)).toEqual([
+      {
+        entity_type: 'project-pipelines.run_step',
+        where: { run_id: 'run-1', status: 'blocked' },
+      },
+    ])
   })
 })
 
