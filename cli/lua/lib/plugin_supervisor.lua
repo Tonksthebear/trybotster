@@ -77,6 +77,18 @@ function M.cleanup_plugin(plugin_key, metadata)
         end
     end
 
+    local timer_table = rawget(_G, "timer")
+    if type(timer_table) == "table" and type(timer_table._unregister_by_plugin) == "function" then
+        local clean_ok, cleaned = pcall(timer_table._unregister_by_plugin, plugin_key)
+        if clean_ok then
+            count = count + (tonumber(cleaned) or 0)
+        elseif log and log.warn then
+            log.warn(string.format(
+                "plugin_supervisor cleanup failed for %s via timer._unregister_by_plugin: %s",
+                plugin_key, tostring(cleaned)))
+        end
+    end
+
     return count
 end
 

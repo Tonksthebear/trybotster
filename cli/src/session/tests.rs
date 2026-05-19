@@ -253,6 +253,7 @@ mod session_frame_tests {
     #[test]
     fn resize_frame_updates_parser_before_writer_thread_runs() {
         let parser = Arc::new(Mutex::new(TerminalParser::new(24, 80, 100)));
+        let current_dims = Arc::new(Mutex::new((24, 80)));
         let resize_pending = AtomicBool::new(false);
         let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(8);
         let (mut stream, mut peer) = UnixStream::pair().expect("socket pair");
@@ -279,6 +280,7 @@ mod session_frame_tests {
             &decoded,
             &writer_tx,
             &parser,
+            &current_dims,
             &resize_pending,
             &tee,
             &mut stream,
@@ -304,6 +306,69 @@ mod session_frame_tests {
         assert!(
             peer.read(&mut buf).is_err(),
             "resize should not write a reply"
+        );
+    }
+
+    #[test]
+    fn duplicate_resize_frame_uses_applied_dims_before_skipping() {
+        let parser = Arc::new(Mutex::new(TerminalParser::new(37, 132, 100)));
+        let current_dims = Arc::new(Mutex::new((24, 80)));
+        let resize_pending = AtomicBool::new(false);
+        let (writer_tx, writer_rx) = std::sync::mpsc::sync_channel(8);
+        let (mut stream, _peer) = UnixStream::pair().expect("socket pair");
+        let tee = Arc::new(Mutex::new(None));
+        let frame = encode_json(
+            FRAME_RESIZE,
+            &serde_json::json!({
+                "rows": 37,
+                "cols": 132,
+            }),
+        )
+        .expect("resize frame");
+
+        let decoded = {
+            let mut decoder = crate::session::protocol::FrameDecoder::new();
+            decoder
+                .feed(&frame)
+                .into_iter()
+                .next()
+                .expect("decoded frame")
+        };
+
+        handle_hub_frame(
+            &decoded,
+            &writer_tx,
+            &parser,
+            &current_dims,
+            &resize_pending,
+            &tee,
+            &mut stream,
+            &AtomicBool::new(false),
+        );
+
+        assert!(matches!(
+            writer_rx.try_recv(),
+            Ok(PtyWriteCommand::Resize {
+                rows: 37,
+                cols: 132
+            })
+        ));
+
+        *current_dims.lock().expect("dims") = (37, 132);
+        handle_hub_frame(
+            &decoded,
+            &writer_tx,
+            &parser,
+            &current_dims,
+            &resize_pending,
+            &tee,
+            &mut stream,
+            &AtomicBool::new(false),
+        );
+
+        assert!(
+            writer_rx.try_recv().is_err(),
+            "applied duplicate resize should be skipped"
         );
     }
 }

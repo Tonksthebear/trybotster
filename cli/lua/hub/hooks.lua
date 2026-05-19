@@ -38,6 +38,33 @@ local function current_plugin_key()
     return nil
 end
 
+local loading_context_keys = {
+    "_loading_plugin_source",
+    "_loading_plugin_name",
+    "_loading_plugin_display_name",
+    "_loading_plugin_key",
+    "_loading_plugin_repo_root",
+}
+
+local function without_loading_plugin_context(fn, ...)
+    local saved = {}
+    for _, key in ipairs(loading_context_keys) do
+        saved[key] = rawget(_G, key)
+        _G[key] = nil
+    end
+
+    local returns = table.pack(pcall(fn, ...))
+
+    for _, key in ipairs(loading_context_keys) do
+        _G[key] = saved[key]
+    end
+
+    if not returns[1] then
+        error(returns[2])
+    end
+    return table.unpack(returns, 2, returns.n)
+end
+
 local function get_sorted_observers(event)
     if observer_cache[event] then return observer_cache[event] end
     local sorted = {}
@@ -183,7 +210,7 @@ function M.notify(event, ...)
                 },
                 table.unpack(args))
         else
-            ok, err = pcall(entry.h.callback, table.unpack(args))
+            ok, err = pcall(without_loading_plugin_context, entry.h.callback, table.unpack(args))
         end
         if not ok then
             log.error(string.format("hooks.notify %s.%s: %s", event, entry.name, err))
@@ -285,7 +312,7 @@ function M.call(event, ...)
                 table.unpack(result, 1, result.n)))
         else
             returns = table.pack(__hook_timed_pcall(
-                entry.h.callback, timeout_ms, table.unpack(result, 1, result.n)))
+                without_loading_plugin_context, timeout_ms, entry.h.callback, table.unpack(result, 1, result.n)))
         end
 
         local ok = returns[1]

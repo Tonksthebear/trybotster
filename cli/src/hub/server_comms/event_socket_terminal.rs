@@ -73,6 +73,7 @@ impl Hub {
         msg: serde_json::Value,
     ) {
         let bytes = serde_json::to_vec(&msg).map_or(0, |v| v.len());
+        let label = socket_message_label(&msg);
         if msg.get("type").and_then(|v| v.as_str()) == Some("debug_memory") {
             let mut data = self.debug_memory_diagnostics();
             if let Some(request_id) = msg.get("request_id").cloned() {
@@ -81,12 +82,7 @@ impl Hub {
             if let Some(conn) = self.socket_clients.get(&client_id) {
                 conn.send_frame(&crate::socket::framing::Frame::Json(data));
             }
-            self.record_hot_span(
-                "socket_message.debug_memory",
-                Instant::now(),
-                bytes,
-                &client_id,
-            );
+            self.record_hot_span("socket_message.debug_memory", Instant::now(), bytes, &label);
         } else if msg.get("type").and_then(|v| v.as_str()) == Some("focus_changed") {
             let started = Instant::now();
             if let Some(session_uuid) = msg.get("session_uuid").and_then(|v| v.as_str()) {
@@ -97,7 +93,7 @@ impl Hub {
                 self.set_active_terminal_peer(session_uuid, &client_id, focused);
                 self.lua.set_pty_focused(session_uuid, &client_id, focused);
             }
-            self.record_hot_span("socket_message.focus_changed", started, bytes, &client_id);
+            self.record_hot_span("socket_message.focus_changed", started, bytes, &label);
         } else {
             let started = Instant::now();
             if self.handle_terminal_color_profile_message(&client_id, &msg) {
@@ -105,15 +101,15 @@ impl Hub {
                     "socket_message.terminal_color_profile",
                     started,
                     bytes,
-                    &client_id,
+                    &label,
                 );
             } else if let Err(e) = self.lua.call_socket_message(&client_id, msg) {
                 self.hub_event_metrics
                     .record_counter("socket_message.error", 1);
                 log::error!("[Socket] Lua message handling error for {}: {e}", client_id);
-                self.record_hot_span("socket_message.lua", started, bytes, &client_id);
+                self.record_hot_span("socket_message.lua", started, bytes, &label);
             } else {
-                self.record_hot_span("socket_message.lua", started, bytes, &client_id);
+                self.record_hot_span("socket_message.lua", started, bytes, &label);
             }
         }
     }
@@ -204,5 +200,49 @@ impl Hub {
                 );
             }
         }
+    }
+}
+
+fn socket_message_label(msg: &serde_json::Value) -> String {
+    let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("-");
+    if msg.get("_mcp_rid").is_some() {
+        return format!("rpc:{msg_type}");
+    }
+    if msg_type == "subscribe" {
+        let channel = msg.get("channel").and_then(|v| v.as_str()).unwrap_or("-");
+        return format!("sub:{channel}");
+    }
+    if let Some(data_type) = msg
+        .get("data")
+        .and_then(|v| v.get("type"))
+        .and_then(|v| v.as_str())
+    {
+        return format!("{msg_type}:{data_type}");
+    }
+    msg_type.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::socket_message_label;
+
+    #[test]
+    fn socket_message_label_identifies_rpc_and_subscription_routes() {
+        assert_eq!(
+            socket_message_label(&json!({"_mcp_rid": "rid-1", "type": "get_pty_snapshot"})),
+            "rpc:get_pty_snapshot"
+        );
+        assert_eq!(
+            socket_message_label(&json!({"type": "subscribe", "channel": "mcp"})),
+            "sub:mcp"
+        );
+        assert_eq!(
+            socket_message_label(
+                &json!({"type": "message", "subscriptionId": "sub-1", "data": {"type": "tool_call"}})
+            ),
+            "message:tool_call"
+        );
     }
 }

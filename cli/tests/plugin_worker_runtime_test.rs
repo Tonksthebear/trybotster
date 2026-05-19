@@ -1157,6 +1157,43 @@ fn plugin_owned_timer_fires_after_delay_in_plugin_worker_vm() {
 }
 
 #[test]
+fn core_hook_timers_do_not_inherit_plugin_loading_context() {
+    // SAFETY: This integration filter runs this test in isolation and the
+    // runtime must resolve the repository Lua modules instead of user config.
+    unsafe {
+        std::env::set_var(
+            "BOTSTER_LUA_PATH",
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua"),
+        )
+    };
+
+    let runtime = LuaRuntime::new().unwrap();
+    runtime
+        .lua()
+        .load(
+            r#"
+            local hooks = require("hub.hooks")
+            hooks.on("surfaces_changed", "broadcast_ui_route_registry", function()
+                timer.after_idle("ui_route_registry_broadcast", 10, function() end)
+            end)
+
+            _G._loading_plugin_key = "project-pipelines"
+            hooks.notify("surfaces_changed", {})
+            assert(_G._loading_plugin_key == "project-pipelines")
+            _G._loading_plugin_key = nil
+
+            local removed = timer._unregister_by_plugin("project-pipelines")
+            local cancelled = timer.cancel("ui_route_registry_broadcast")
+            assert(removed == 0, tostring(removed))
+            assert(cancelled == true)
+            return true
+            "#,
+        )
+        .eval::<bool>()
+        .unwrap();
+}
+
+#[test]
 fn plugin_owned_event_handler_runs_in_plugin_worker_vm() {
     // SAFETY: This integration filter runs this test in isolation and the
     // worker VM must resolve the repository Lua modules instead of user config.

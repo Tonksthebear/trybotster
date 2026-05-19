@@ -639,6 +639,11 @@ local id = timer.every(seconds, fn())    -- repeating
 timer.cancel(id)
 ```
 
+`timer.after(0, fn)` is the supported way to defer one unit of work onto the
+next hub tick. `timer.every(0, fn)` is treated as a pathological recurring
+timer and is clamped to a small minimum interval so it cannot spin the hub or a
+plugin worker.
+
 ### `watch`
 ```lua
 local id = watch.directory(path, opts?, callback)

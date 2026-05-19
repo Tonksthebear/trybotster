@@ -719,6 +719,7 @@ fn run_session(
                         &frame,
                         &writer_tx,
                         &parser,
+                        &current_dims,
                         &resize_pending,
                         &tee,
                         &mut stream,
@@ -820,6 +821,7 @@ fn handle_hub_frame(
     frame: &Frame,
     writer_tx: &std::sync::mpsc::SyncSender<PtyWriteCommand>,
     parser: &Arc<Mutex<TerminalParser>>,
+    current_dims: &Arc<Mutex<(u16, u16)>>,
     resize_pending: &AtomicBool,
     tee: &SharedTee,
     stream: &mut UnixStream,
@@ -842,6 +844,18 @@ fn handle_hub_frame(
             if let Ok(resize) = frame.json::<serde_json::Value>() {
                 let rows = resize["rows"].as_u64().unwrap_or(24) as u16;
                 let cols = resize["cols"].as_u64().unwrap_or(80) as u16;
+                let already_sized = current_dims
+                    .lock()
+                    .map(|dims| *dims == (rows, cols))
+                    .unwrap_or(false);
+                if already_sized {
+                    log::debug!(
+                        "[session] ignored duplicate resize from hub: {}x{}",
+                        cols,
+                        rows
+                    );
+                    return;
+                }
                 log::info!("[session] received resize from hub: {}x{}", cols, rows);
                 resize_pending.store(true, Ordering::Release);
                 if let Ok(mut p) = parser.lock() {
@@ -1196,20 +1210,26 @@ fn pty_writer_loop(
                 }
                 resize_pending.store(true, Ordering::Release);
                 // Resize the actual PTY (sends SIGWINCH to child)
-                if let Err(e) = master_pty.resize(portable_pty::PtySize {
+                let resize_ok = match master_pty.resize(portable_pty::PtySize {
                     rows: final_rows,
                     cols: final_cols,
                     pixel_width: 0,
                     pixel_height: 0,
                 }) {
-                    log::warn!("[session] PTY resize ioctl failed: {e}");
-                }
+                    Ok(()) => true,
+                    Err(e) => {
+                        log::warn!("[session] PTY resize ioctl failed: {e}");
+                        false
+                    }
+                };
                 // Resize the parser to match
                 if let Ok(mut p) = parser.lock() {
                     p.resize(final_rows, final_cols);
                 }
-                if let Ok(mut dims) = current_dims.lock() {
-                    *dims = (final_rows, final_cols);
+                if resize_ok {
+                    if let Ok(mut dims) = current_dims.lock() {
+                        *dims = (final_rows, final_cols);
+                    }
                 }
                 log::debug!("[session] resize to {}x{}", final_cols, final_rows);
             }
