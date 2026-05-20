@@ -342,6 +342,184 @@ fn catalog_plugin_project_pipelines_template_catalog_entry_is_a_multi_file_plugi
 }
 
 #[test]
+fn catalog_plugin_botster_bugs_template_is_stateless_live_ingress() {
+    let catalog_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates");
+    let plugin_root = catalog_root.join("plugins/botster-bugs");
+    let init_path = plugin_root.join("init.lua");
+    let catalog_root = catalog_root.to_str().unwrap();
+
+    let lua = create_lua_vm();
+
+    let result_lua: Value = lua
+        .load(format!(
+            r#"
+            local catalog = require("lib.template_catalog")
+            local templates = catalog.list({{ source_root = "{catalog_root}" }})
+            local files = {{}}
+            for _, template in ipairs(templates) do
+              if template.dest:match("^plugins/botster%-bugs/") then
+                files[#files + 1] = template.dest
+              end
+            end
+            table.sort(files)
+
+            local calls = {{ tools = {{}}, created = nil, posted = nil, notified = nil, db_called = false }}
+            mcp = {{
+              tool = function(name, spec, handler)
+                calls.tools[name] = {{ spec = spec, handler = handler }}
+              end,
+            }}
+            plugin = {{
+              db = function()
+                calls.db_called = true
+                error("botster-bugs must not use plugin.db")
+              end,
+            }}
+            log = {{ info = function(_) end, warn = function(_) end }}
+            spawn_targets = {{
+              get = function(id)
+                if id == "tgt_botster" then return {{ id = id, name = "trybotster", path = "/repo/trybotster" }} end
+              end,
+              list = function()
+                return {{ {{ id = "tgt_botster", name = "trybotster", path = "/repo/trybotster" }} }}
+              end,
+              inspect = function(path)
+                if path == "/repo/trybotster" then return {{ repo_name = "Tonksthebear/trybotster" }} end
+                return {{}}
+              end,
+            }}
+
+            package.preload["lib.agent"] = function()
+              return {{
+                get = function(session_uuid)
+                  if session_uuid == "caller" then
+                    return {{
+                      info = function()
+                        return {{
+                          session_uuid = "caller",
+                          label = "reporter",
+                          target_id = "tgt_botster",
+                          workspace_name = "Dev",
+                          worktree_path = "/repo/trybotster",
+                        }}
+                      end,
+                    }}
+                  end
+                end,
+              }}
+            end
+            package.preload["lib.hub"] = function()
+              local hub = {{
+                owned = {{}},
+                list_owned_sessions = function(self, owner)
+                  calls.owner = owner
+                  return self.owned
+                end,
+                create_agent = function(self, opts)
+                  calls.created = opts
+                  return {{ request_id = opts.request_id, status = "pending" }}
+                end,
+                post = function(self, session_uuid, opts)
+                  calls.posted = {{ session_uuid = session_uuid, opts = opts }}
+                  return {{ msg_id = "msg-1", status = "delivered" }}
+                end,
+                notify = function(self, session_uuid, opts)
+                  calls.notified = {{ session_uuid = session_uuid, opts = opts }}
+                  return {{ status = "delivered" }}
+                end,
+              }}
+              return {{ get = function() return hub end, _hub = hub }}
+            end
+
+            local chunk = assert(loadfile({init_path}))
+            chunk()
+            local tool = assert(calls.tools.file_botster_bug, "file_botster_bug registered")
+            local created_result = tool.handler({{
+              title = "terminal pane freezes",
+              description = "The terminal pane stops repainting after reconnect.",
+              evidence = "observed in browser console",
+            }}, {{ session_uuid = "caller", hub_id = "hub-1" }})
+
+            local Hub = require("lib.hub")
+            Hub._hub.owned = {{ {{
+              session_uuid = "orchestrator-session",
+              status = "running",
+              metadata = {{ role = "orchestrator", target_id = "tgt_botster" }},
+            }} }}
+            local posted_result = tool.handler({{
+              title = "status badge stale",
+              description = "The badge stays active after the session closes.",
+            }}, {{ session_uuid = "caller", hub_id = "hub-1" }})
+
+            return {{
+              files = files,
+              db_called = calls.db_called,
+              owner = calls.owner,
+              created_result = created_result,
+              created = calls.created,
+              posted_result = posted_result,
+              posted = calls.posted,
+              notified = calls.notified,
+            }}
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval()
+        .expect("Botster Bugs plugin should load and route reports without durable storage");
+    let result: JsonValue = lua
+        .from_value(result_lua)
+        .expect("Botster Bugs plugin result should convert to JSON");
+
+    assert_eq!(
+        result["files"],
+        json!([
+            "plugins/botster-bugs/README.md",
+            "plugins/botster-bugs/init.lua",
+        ])
+    );
+    assert_eq!(result["db_called"], json!(false));
+    assert_eq!(result["owner"], json!("botster-bugs"));
+    assert_eq!(
+        result["created_result"]["routed"],
+        json!("new_orchestrator")
+    );
+    assert_eq!(result["created"]["agent_name"], json!("codex"));
+    assert_eq!(result["created"]["workspace_name"], json!("Botster Bugs"));
+    assert_eq!(result["created"]["target_id"], json!("tgt_botster"));
+    assert_eq!(
+        result["created"]["metadata"],
+        json!({
+            "owner_plugin": "botster-bugs",
+            "visibility": "workspace",
+            "surface": "botster-bugs",
+            "role": "orchestrator",
+        })
+    );
+    assert!(result["created"]["prompt"]
+        .as_str()
+        .is_some_and(|prompt| prompt.contains("project_pipelines_create_ticket")));
+    assert_eq!(
+        result["posted_result"]["routed"],
+        json!("existing_orchestrator")
+    );
+    assert_eq!(
+        result["posted"]["session_uuid"],
+        json!("orchestrator-session")
+    );
+    assert_eq!(
+        result["posted"]["opts"]["payload"]["kind"],
+        json!("botster_bug_report")
+    );
+    assert_eq!(
+        result["notified"]["session_uuid"],
+        json!("orchestrator-session")
+    );
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_dynamic_state_uses_plugin_entities_not_forced_tree_refreshes() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

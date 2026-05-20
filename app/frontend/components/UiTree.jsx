@@ -71,12 +71,61 @@ function useCurrentPathname() {
 
 const InterceptorContext = createContext(null)
 const treeSnapshotCache = new Map()
+const entityHydrationCache = new Map()
+const transportCacheIds = new WeakMap()
+let nextTransportCacheId = 1
 
 function treeCacheKey(hubId, targetSurface, subpath = '/') {
   if (!hubId || !targetSurface) return null
   const normalisedSubpath =
     typeof subpath === 'string' && subpath !== '' ? subpath : '/'
   return `${String(hubId)}\u0000${targetSurface}\u0000${normalisedSubpath}`
+}
+
+function transportCacheId(transport) {
+  if (!transport || (typeof transport !== 'object' && typeof transport !== 'function')) {
+    return 'none'
+  }
+  if (!transportCacheIds.has(transport)) {
+    transportCacheIds.set(transport, nextTransportCacheId)
+    nextTransportCacheId += 1
+  }
+  return String(transportCacheIds.get(transport))
+}
+
+function hydrationCacheKey(hubId, transport) {
+  if (!hubId) return null
+  return `${String(hubId)}\u0000${transportCacheId(transport)}`
+}
+
+function hydrationCacheForHub(hubId, transport) {
+  const key = hydrationCacheKey(hubId, transport)
+  if (!key) {
+    return {
+      defaultTypes: new Set(),
+      targetedRequests: new Set(),
+    }
+  }
+  if (!entityHydrationCache.has(key)) {
+    entityHydrationCache.set(key, {
+      defaultTypes: new Set(),
+      targetedRequests: new Set(),
+    })
+  }
+  return entityHydrationCache.get(key)
+}
+
+function clearHydrationCacheForHub(hubId, transport) {
+  if (!hubId) return
+  const key = hydrationCacheKey(hubId, transport)
+  if (key) {
+    entityHydrationCache.delete(key)
+    return
+  }
+  const prefix = `${String(hubId)}\u0000`
+  for (const existingKey of entityHydrationCache.keys()) {
+    if (existingKey.startsWith(prefix)) entityHydrationCache.delete(existingKey)
+  }
 }
 
 function readCachedTree(hubId, targetSurface, subpath) {
@@ -117,6 +166,7 @@ function requestSurfaceSubpath(transport, targetSurface, subpath) {
 
 export function _resetUiTreeSnapshotCacheForTests() {
   treeSnapshotCache.clear()
+  entityHydrationCache.clear()
 }
 
 /**
@@ -249,8 +299,6 @@ export default function UiTree({
     initialTree ?? readCachedTree(hubId, targetSurface, subpath),
   )
   const [transport, setTransport] = useState(null)
-  const requestedDefaultEntityTypesRef = useRef(new Set())
-  const requestedTargetedEntitiesRef = useRef(new Set())
 
   // Wire protocol: collapse + nav-selection state moved into the
   // composite primitives themselves. `<SessionList>` reads collapse state
@@ -321,15 +369,6 @@ export default function UiTree({
     }
   }, [hubId])
 
-  useEffect(() => {
-    requestedDefaultEntityTypesRef.current.clear()
-    requestedTargetedEntitiesRef.current.clear()
-  }, [hubId, transport])
-
-  useEffect(() => {
-    requestedTargetedEntitiesRef.current.clear()
-  }, [targetSurface, subpath])
-
   // Subscribe to ui_tree_snapshot frames matching this target_surface.
   //
   // Subpath filter: the hub echoes back the subpath it routed for, so a
@@ -352,29 +391,30 @@ export default function UiTree({
       }
       const nextTree = message.tree ?? null
       if (nextTree && typeof transport.requestEntitySnapshots === 'function') {
+        const hydrationCache = hydrationCacheForHub(hubId, transport)
         const neededTypes = bindingDefaultEntityTypes(nextTree)
         const neededRequests = bindingEntityRequests(nextTree)
         const missingTypes = neededTypes.filter(
-          (entityType) => !requestedDefaultEntityTypesRef.current.has(entityType),
+          (entityType) => !hydrationCache.defaultTypes.has(entityType),
         )
         const missingRequests = neededRequests.filter(
-          (request) => !requestedTargetedEntitiesRef.current.has(entityHydrationRequestKey(request)),
+          (request) => !hydrationCache.targetedRequests.has(entityHydrationRequestKey(request)),
         )
         if (missingTypes.length > 0 || missingRequests.length > 0) {
           for (const entityType of missingTypes) {
-            requestedDefaultEntityTypesRef.current.add(entityType)
+            hydrationCache.defaultTypes.add(entityType)
           }
           for (const request of missingRequests) {
-            requestedTargetedEntitiesRef.current.add(entityHydrationRequestKey(request))
+            hydrationCache.targetedRequests.add(entityHydrationRequestKey(request))
           }
           const request = transport.requestEntitySnapshots(missingTypes, missingRequests)
           if (request && typeof request.catch === 'function') {
             request.catch((err) => {
               for (const entityType of missingTypes) {
-                requestedDefaultEntityTypesRef.current.delete(entityType)
+                hydrationCache.defaultTypes.delete(entityType)
               }
               for (const request of missingRequests) {
-                requestedTargetedEntitiesRef.current.delete(entityHydrationRequestKey(request))
+                hydrationCache.targetedRequests.delete(entityHydrationRequestKey(request))
               }
               console.warn('[UiTree] failed to request bound entity snapshots', err)
             })
@@ -418,7 +458,7 @@ export default function UiTree({
     if (!transport || !targetSurface) return undefined
     requestSurfaceSubpath(transport, targetSurface, subpath)
     return undefined
-  }, [transport, targetSurface, subpath])
+  }, [transport, targetSurface, subpath, hubId])
 
   // A reconnect keeps the same transport object, so the mount/change effect
   // above does not rerun. Re-issue the current surface request on future
@@ -430,9 +470,10 @@ export default function UiTree({
     if (!transport || !targetSurface) return undefined
     if (typeof transport.on !== 'function') return undefined
     return transport.on('connected', () => {
+      clearHydrationCacheForHub(hubId, transport)
       requestSurfaceSubpath(transport, targetSurface, subpath)
     })
-  }, [transport, targetSurface, subpath])
+  }, [transport, targetSurface, subpath, hubId])
 
   // -------- Interceptor registry --------
   const interceptorsRef = useRef(new Map())
