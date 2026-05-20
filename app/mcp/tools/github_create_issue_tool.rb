@@ -29,7 +29,7 @@ class GithubCreateIssueTool < ApplicationMCPTool
     label_array = labels.present? ? labels.split(",").map(&:strip) : []
 
     # Add attribution footer to issue body
-    enhanced_body = body.to_s + attribution_footer
+    enhanced_body = normalize_github_markdown_body(body) + attribution_footer
 
     # Create issue using installation token (bot attribution)
     issue = client.create_issue(repo, title, enhanced_body, labels: label_array)
