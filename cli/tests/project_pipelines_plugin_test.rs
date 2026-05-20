@@ -2040,6 +2040,98 @@ fn catalog_plugin_project_pipelines_keeps_run_snapshots_complete_for_direct_rout
 }
 
 #[test]
+fn catalog_plugin_project_pipelines_default_publish_excludes_detail_history_families() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local frames = {{}}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  entity_snapshot = function(_self, entity_type, items, opts)
+                    frames[#frames + 1] = {{ entity_type = entity_type, items = items, opts = opts }}
+                  end,
+                }}
+              end,
+            }}
+
+            package.loaded["project_pipelines.web.ui"] = {{
+              status_tone = function() return "muted" end,
+              status_label = function(status) return tostring(status or "") end,
+              status_state = function() return "neutral" end,
+              ticket_notification_count = function() return 0 end,
+            }}
+
+            local forbidden = {{
+              run_steps = "run_step",
+              reviews = "review",
+              review_findings = "finding",
+              gate_results = "gate_result",
+              artifacts = "artifact",
+              events = "event",
+              project_targets = "project_target",
+              ticket_dependencies = "ticket_dependency",
+              pr_links = "pr_link",
+              checklists = "checklist",
+              checklist_items = "checklist_item",
+            }}
+            local db = {{}}
+            function db:eval(sql, _params)
+              for table_name, entity_name in pairs(forbidden) do
+                if sql:find("FROM " .. table_name) then
+                  error("default publish should not query " .. entity_name .. ": " .. sql)
+                end
+              end
+              if sql:find("FROM tickets") then return {{}} end
+              if sql:find("FROM projects") then return {{}} end
+              if sql:find("FROM pipelines") then return {{}} end
+              if sql:find("FROM questions") then return {{}} end
+              return {{}}
+            end
+            package.loaded["project_pipelines.db"] = db
+
+            local entities = require("project_pipelines.entities")
+            entities.publish_snapshots()
+
+            local seen = {{}}
+            for _, frame in ipairs(frames) do
+              seen[frame.entity_type] = true
+            end
+            assert(seen[entities.types.ticket])
+            assert(seen[entities.types.project])
+            assert(seen[entities.types.pipeline])
+            assert(seen[entities.types.question])
+            assert(not seen[entities.types.run])
+            assert(not seen[entities.types.run_step])
+            assert(not seen[entities.types.pipeline_step])
+            assert(not seen[entities.types.pipeline_gate])
+            assert(not seen[entities.types.project_target])
+            assert(not seen[entities.types.ticket_dependency])
+            assert(not seen[entities.types.review])
+            assert(not seen[entities.types.finding])
+            assert(not seen[entities.types.gate_result])
+            assert(not seen[entities.types.artifact])
+            assert(not seen[entities.types.pr_link])
+            assert(not seen[entities.types.checklist])
+            assert(not seen[entities.types.checklist_item])
+            assert(not seen[entities.types.event])
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines default publish should stay bounded");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_registers_targeted_detail_hydration() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");

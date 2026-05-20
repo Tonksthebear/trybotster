@@ -183,7 +183,12 @@ end
 
 -- Wire up EB to use the broadcast loop. EB.upsert / EB.patch / EB.remove
 -- now ship frames straight to every hub-channel subscriber.
-EB.set_broadcaster(broadcast_frame_to_hub)
+local function install_entity_broadcaster(eb)
+    eb = eb or require("lib.entity_broadcast")
+    eb.set_broadcaster(broadcast_frame_to_hub)
+end
+
+install_entity_broadcaster(EB)
 
 --- Broadcast `ui_tree_snapshot` frames for every hub-channel subscriber.
 ---
@@ -809,6 +814,7 @@ local M = {
     get_client_count = get_client_count,
     get_stats = get_stats,
     broadcast_frame_to_hub = broadcast_frame_to_hub,
+    install_entity_broadcaster = install_entity_broadcaster,
     broadcast_ui_tree_snapshots = broadcast_ui_tree_snapshots,
     broadcast_ui_route_registry = broadcast_ui_route_registry,
     should_emit_pty_notification = should_emit_pty_notification,
