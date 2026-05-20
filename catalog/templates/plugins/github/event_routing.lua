@@ -11,6 +11,7 @@ local Agent = require("lib.agent")
 local Hub = require("lib.hub")
 local state = require("hub.state")
 local routing_state = state.get("github.event_routing", {})
+local GITHUB_FORWARD_MARKER = "👀"
 
 local function github_workspace_name(repo, issue_number, branch_name)
     if issue_number then
@@ -42,10 +43,10 @@ local function format_notification(payload)
     if prompt then
         return string.format(
             "=== NEW MENTION (automated notification) ===\n\n%s\n\n==================",
-            prompt
+            GITHUB_FORWARD_MARKER .. " " .. prompt
         )
     end
-    return "=== NEW MENTION (automated notification) ===\nNew mention\n=================="
+    return "=== NEW MENTION (automated notification) ===\n" .. GITHUB_FORWARD_MARKER .. " New mention\n=================="
 end
 
 local function notify_agent(agent, payload)
@@ -163,10 +164,63 @@ local function emit_pr_review_submitted(event_repo, message, payload)
     return true, false
 end
 
+local function pr_comment_payload(message, payload)
+    local repo = message.repo
+        or payload.repo
+        or payload.repository_full_name
+        or (payload.repository and payload.repository.full_name)
+    local number = payload.pr_number
+        or payload.pull_request_number
+        or payload.issue_number
+        or payload.number
+    local action = message.action or payload.action
+    local event_type = message.event_type or payload.event_type
+
+    if event_type ~= "pull_request_comment" or (action ~= "created" and action ~= "edited") or not number then
+        return nil
+    end
+
+    return {
+        provider = "github",
+        repo = repo,
+        pr_number = tonumber(number),
+        pr_url = payload.pr_url or payload.html_url,
+        comment_id = payload.comment_id,
+        comment_url = payload.comment_html_url or payload.comment_url,
+        comment_api_url = payload.comment_url,
+        comment_body = payload.comment_body or payload.body,
+        comment_author = payload.comment_author or payload.author,
+        action = action,
+        created_at = payload.created_at,
+        updated_at = payload.updated_at,
+        raw_event_type = event_type,
+    }
+end
+
+local function emit_pr_comment(event_repo, message, payload)
+    local event = pr_comment_payload(message, payload)
+    if not event then
+        return false, false
+    end
+    event.repo = event.repo or event_repo
+    if not event.repo then
+        return true, false
+    end
+    if events and events.emit then
+        local ok, err = pcall(events.emit, "pr_comment", event)
+        if ok then
+            return true, true
+        end
+        log.warn("GitHub: failed to emit pr_comment event: " .. tostring(err))
+    end
+    return true, false
+end
+
 local function is_pr_lifecycle_message(message, payload)
     local event_type = tostring(message.event_type or payload.event_type or "")
     return event_type == "pull_request"
         or event_type == "pull_request_review"
+        or event_type == "pull_request_comment"
         or event_type:find("^pr_") ~= nil
         or payload.pull_request ~= nil
         or payload.pr_number ~= nil
@@ -177,9 +231,10 @@ local function handle_message(default_repo, message, channel_id)
     local event_repo = message.repo or default_repo
     local pr_merged_event = emit_pr_merged(event_repo, message, payload)
     local pr_review_event = emit_pr_review_submitted(event_repo, message, payload)
-    local pr_lifecycle_event = pr_merged_event or pr_review_event
+    local pr_comment_event = emit_pr_comment(event_repo, message, payload)
+    local pr_lifecycle_event = pr_merged_event or pr_review_event or pr_comment_event
 
-    if pr_lifecycle_event and is_pr_lifecycle_message(message, payload) and not (payload.prompt or payload.context or payload.comment_body) then
+    if pr_lifecycle_event and is_pr_lifecycle_message(message, payload) then
         action_cable.perform(channel_id, "ack", { id = message.id })
         return
     end

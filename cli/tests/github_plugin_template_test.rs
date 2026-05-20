@@ -1067,6 +1067,7 @@ fn catalog_plugin_github_event_routing_template_notifies_matching_agent_before_c
 
             assert(#notifications == 1)
             assert(notifications[1]:match("Please inspect this"))
+            assert(notifications[1]:match("👀"))
             assert(creates == 0)
             assert(deletes == 0)
             assert(acked == true)
@@ -1153,4 +1154,95 @@ fn catalog_plugin_github_event_routing_emits_pr_review_submitted() {
         json!("changes_requested")
     );
     assert_eq!(result["emitted"][0]["event"]["reviewer"], json!("reviewer"));
+}
+
+#[test]
+fn catalog_plugin_github_event_routing_emits_pr_comment_and_does_not_spawn_agent() {
+    let template_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates/plugins/github/event_routing.lua");
+    let template_path = template_path.to_str().unwrap();
+
+    let lua = create_lua_vm();
+
+    let result: JsonValue = lua
+        .load(format!(
+            r#"
+            local emitted = {{}}
+            local acked = false
+            local callback = nil
+            local find_calls = 0
+            local create_calls = 0
+
+            package.loaded["lib.agent"] = {{
+              find_by_workspace = function()
+                find_calls = find_calls + 1
+                return {{}}
+              end,
+            }}
+            package.loaded["hub.state"] = {{ get = function() return {{}} end }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  create_agent = function()
+                    create_calls = create_calls + 1
+                  end,
+                }}
+              end,
+            }}
+            events = {{
+              emit = function(name, event)
+                emitted[#emitted + 1] = {{ name = name, event = event }}
+                return 1
+              end,
+            }}
+            action_cable = {{
+              connect = function() return "conn-1" end,
+              subscribe = function(_, _, _, cb)
+                callback = cb
+                return "chan-1"
+              end,
+              perform = function(_, action, data)
+                if action == "ack" and data.id == 10 then acked = true end
+              end,
+              close = function() end,
+            }}
+
+            local routing = dofile("{template_path}")
+            routing.start("owner/repo")
+            callback({{
+              id = 10,
+              event_type = "pull_request_comment",
+              repo = "owner/repo",
+              payload = {{
+                action = "created",
+                repo = "owner/repo",
+                pr_number = 42,
+                pr_url = "https://github.com/owner/repo/pull/42",
+                comment_id = 456,
+                comment_html_url = "https://github.com/owner/repo/pull/42#issuecomment-456",
+                comment_body = "Can this be clearer?",
+                comment_author = "reviewer",
+                created_at = "2026-05-20T12:00:00Z",
+                updated_at = "2026-05-20T12:00:00Z",
+              }},
+            }}, "chan-1")
+
+            assert(acked == true)
+            assert(find_calls == 0)
+            assert(create_calls == 0)
+            return {{ emitted = emitted, find_calls = find_calls, create_calls = create_calls }}
+            "#
+        ))
+        .eval()
+        .and_then(|value: Value| lua.from_value(value))
+        .expect("GitHub event routing should emit PR comments without generic agent fallback");
+
+    assert_eq!(result["emitted"][0]["name"], json!("pr_comment"));
+    assert_eq!(result["emitted"][0]["event"]["repo"], json!("owner/repo"));
+    assert_eq!(result["emitted"][0]["event"]["pr_number"], json!(42));
+    assert_eq!(result["emitted"][0]["event"]["comment_body"], json!("Can this be clearer?"));
+    assert_eq!(result["find_calls"], json!(0));
+    assert_eq!(result["create_calls"], json!(0));
 }

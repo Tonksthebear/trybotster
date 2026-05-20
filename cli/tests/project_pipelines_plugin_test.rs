@@ -1056,6 +1056,7 @@ fn catalog_plugin_project_pipelines_routes_pr_review_to_live_merge_steward() {
             assert(posted.message.type == "task")
             assert(posted.message.payload.source_event == "pr_review_submitted")
             assert(posted.message.payload.review_state == "changes_requested")
+            assert(posted.message.payload.instructions:match("👀"))
             assert(posted.message.payload.instructions:match("Please fix the failing path%."))
             assert(posted.message.payload.instructions:match("You are an orchestrator, not the implementer"))
             assert(posted.message.payload.instructions:match("Do not implement PR feedback yourself"))
@@ -1066,6 +1067,7 @@ fn catalog_plugin_project_pipelines_routes_pr_review_to_live_merge_steward() {
             assert(posted.message.payload.instructions:match("notify_session"))
             assert(notified.session_uuid == "sess-merge")
             assert(notified.notification.title == "PR changes requested")
+            assert(notified.notification.body:match("👀"))
             assert(notified.notification.action.name == "project_pipelines_current_context")
             assert(events[1].kind == "ticket.pr_review_submitted")
             assert(events[2].kind == "ticket.pr_review_steward_prompted")
@@ -1075,6 +1077,246 @@ fn catalog_plugin_project_pipelines_routes_pr_review_to_live_merge_steward() {
         ))
         .eval()
         .expect("PR review changes should route to the live merge steward");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_routes_pr_comment_to_live_merge_steward() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+    botster::lua::primitives::json::register(&lua).expect("register json");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local events = {{}}
+            local posted = nil
+            local notified = nil
+
+            package.loaded["lib.agent"] = {{
+              get = function(session_uuid)
+                if session_uuid == "sess-merge" then
+                  return {{ info = function() return {{ session_uuid = session_uuid }} end }}
+                end
+                return nil
+              end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  post = function(_, session_uuid, message)
+                    posted = {{ session_uuid = session_uuid, message = message }}
+                  end,
+                  notify = function(_, session_uuid, notification)
+                    notified = {{ session_uuid = session_uuid, notification = notification }}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() end,
+            }}
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              find_pr_link = function(attrs)
+                assert(attrs.provider == "github")
+                assert(attrs.repo == "owner/repo")
+                assert(attrs.pr_number == 42)
+                return {{
+                  id = "pr-1",
+                  provider = "github",
+                  repo = "owner/repo",
+                  pr_number = 42,
+                  pr_url = "https://github.com/owner/repo/pull/42",
+                  ticket_id = "ticket-1",
+                  run_id = "run-1",
+                  status = "open",
+                }}
+              end,
+              get_ticket = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{ id = "ticket-1", title = "Ship review loop", status = "open", target_id = "target-1" }}
+              end,
+              get_run = function(run_id)
+                assert(run_id == "run-1")
+                return {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipeline-1", status = "done", target_id = "target-1", current_step_id = false, current_run_step_id = false }}
+              end,
+              latest_ticket_run = function() error("linked run should be used") end,
+              ticket_events = function(ticket_id, kind)
+                assert(ticket_id == "ticket-1")
+                if kind == "ticket.merge_agent_linked" then
+                  return {{ {{ payload = "{{\"session_uuid\":\"sess-merge\"}}" }} }}
+                end
+                return {{}}
+              end,
+              pipeline_steps = function()
+                error("PR comment steward path must not inspect implementation steps")
+              end,
+              create_run_step_visit = function()
+                error("PR comment steward path must not create an implementation visit")
+              end,
+              update_run = function()
+                error("PR comment steward path must not reactivate the run directly")
+              end,
+              append_event = function(kind, event)
+                events[#events + 1] = {{ kind = kind, event = event }}
+              end,
+            }}
+
+            local integration = require("project_pipelines.github_integration")
+            local response = integration.handle_pr_comment({{
+              provider = "github",
+              repo = "owner/repo",
+              pr_number = 42,
+              pr_url = "https://github.com/owner/repo/pull/42",
+              comment_id = 456,
+              comment_url = "https://github.com/owner/repo/pull/42#issuecomment-456",
+              comment_author = "reviewer",
+              comment_body = "Can this be clearer?",
+              action = "created",
+              created_at = "2026-05-20T12:00:00Z",
+            }})
+
+            assert(response.ok == true)
+            assert(response.status == "steward_prompted")
+            assert(response.pr_steward.session_uuid == "sess-merge")
+            assert(posted.session_uuid == "sess-merge")
+            assert(posted.message.type == "task")
+            assert(posted.message.payload.source_event == "pr_comment")
+            assert(posted.message.payload.comment_id == 456)
+            assert(posted.message.payload.instructions:match("👀"))
+            assert(posted.message.payload.instructions:match("Can this be clearer%?"))
+            assert(posted.message.payload.instructions:match("answer on that PR thread"))
+            assert(notified.session_uuid == "sess-merge")
+            assert(notified.notification.body:match("👀"))
+            assert(notified.notification.action.name == "project_pipelines_current_context")
+            assert(events[1].kind == "ticket.pr_comment")
+            assert(events[2].kind == "ticket.pr_comment_steward_prompted")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("PR comments should route to the live merge steward");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_records_pr_comment_without_merge_steward() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local events = {{}}
+            local posted = nil
+            local notified = nil
+
+            package.loaded["lib.agent"] = {{
+              get = function() return nil end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  post = function(_, session_uuid, message)
+                    posted = {{ session_uuid = session_uuid, message = message }}
+                  end,
+                  notify = function(_, session_uuid, notification)
+                    notified = {{ session_uuid = session_uuid, notification = notification }}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() error("PR comment without steward must not transition phase") end,
+            }}
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              find_pr_link = function(attrs)
+                assert(attrs.provider == "github")
+                assert(attrs.repo == "owner/repo")
+                assert(attrs.pr_number == 42)
+                return {{
+                  id = "pr-1",
+                  provider = "github",
+                  repo = "owner/repo",
+                  pr_number = 42,
+                  pr_url = "https://github.com/owner/repo/pull/42",
+                  ticket_id = "ticket-1",
+                  run_id = "run-1",
+                  status = "open",
+                }}
+              end,
+              get_ticket = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{ id = "ticket-1", title = "Ship review loop", status = "open", target_id = "target-1" }}
+              end,
+              get_run = function(run_id)
+                assert(run_id == "run-1")
+                return {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipeline-1", status = "done", target_id = "target-1", current_step_id = false, current_run_step_id = false }}
+              end,
+              latest_ticket_run = function() error("linked run should be used") end,
+              ticket_events = function(ticket_id, kind)
+                assert(ticket_id == "ticket-1")
+                assert(kind == "ticket.merge_agent_linked" or kind == "ticket.merge_requested")
+                return {{}}
+              end,
+              pipeline_steps = function()
+                error("PR comment without steward must not inspect implementation steps")
+              end,
+              create_run_step_visit = function()
+                error("PR comment without steward must not create an implementation visit")
+              end,
+              update_run = function()
+                error("PR comment without steward must not mutate the run")
+              end,
+              latest_step_session = function()
+                error("PR comment without steward must not look up implementation sessions")
+              end,
+              append_event = function(kind, event)
+                events[#events + 1] = {{ kind = kind, event = event }}
+              end,
+            }}
+
+            local integration = require("project_pipelines.github_integration")
+            local response = integration.handle_pr_comment({{
+              provider = "github",
+              repo = "owner/repo",
+              pr_number = 42,
+              comment_id = 456,
+              comment_body = "Can this be clearer?",
+              action = "created",
+            }})
+
+            assert(response.ok == true)
+            assert(response.status == "recorded")
+            assert(response.reason == "no_steward")
+            assert(posted == nil)
+            assert(notified == nil)
+            assert(#events == 1)
+            assert(events[1].kind == "ticket.pr_comment")
+            assert(events[1].event.payload.comment_id == 456)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("PR comments without a steward should be recorded only");
 
     assert_eq!(result, "ok");
 }
@@ -1208,6 +1450,7 @@ fn catalog_plugin_project_pipelines_falls_back_to_existing_implementer_when_no_m
             assert(response.status == "reactivated")
             assert(response.agent.reused == true)
             assert(posted.session_uuid == "sess-impl")
+            assert(posted.message.payload.instructions:match("👀"))
             assert(posted.message.payload.instructions:match("Please fix the failing path%."))
             assert(notified.notification.title == "PR changes requested")
             assert(#visits == 1)
