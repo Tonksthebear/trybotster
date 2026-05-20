@@ -96,4 +96,24 @@ function M.handle_pr_review_submitted(event)
     return result
 end
 
+function M.handle_pr_comment(event)
+    event = event or {}
+    if util.is_blank(event.repo) or util.is_blank(event.pr_number) then
+        return { ok = false, reason = "missing_repo_or_pr_number" }
+    end
+
+    local link = repo.find_pr_link{
+        provider = normalize_provider(event.provider),
+        repo = event.repo,
+        pr_number = event.pr_number,
+    }
+    if not link then
+        return { ok = false, reason = "pr_not_linked" }
+    end
+
+    local result = engine.handle_pr_comment(link, event)
+    result.pr_link = link
+    return result
+end
+
 return M
