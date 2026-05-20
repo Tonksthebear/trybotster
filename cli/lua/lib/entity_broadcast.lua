@@ -35,9 +35,10 @@
 --     (Session, Hub, plugins…) re-registers in its own `_after_reload`,
 --     and re-registration overwrites the function references that would
 --     otherwise dangle if their owning module reloaded independently.
---   * `broadcaster` is similarly transient — `connections.lua` re-installs
---     it from its `_after_reload` so the function reference always points
---     at the live transport layer.
+--   * `broadcaster` is similarly transient — `connections.lua` installs it
+--     at load time, and this module asks the already-loaded connection layer
+--     to reinstall it after an `entity_broadcast.lua` reload so entity deltas
+--     keep flowing even when only this module changed.
 
 local state = require("hub.state")
 
@@ -72,8 +73,10 @@ local BUILTIN_ENTITY_TYPES = {
 --   query = function?,
 --   filter = function?,
 --   owner_plugin = string?,
+--   default = bool?,
 -- }
 local registry = {}
+local replay_registry = state.get("entity_broadcast.replay_registry", {})
 
 -- entity_type -> integer (monotonic per hub process)
 local seq_by_type = state.get("entity_broadcast.seq_by_type", {})
@@ -352,12 +355,17 @@ function M.register(entity_type, opts)
         query = opts.query,
         filter = opts.filter,
         owner_plugin = owner_plugin,
+        default = opts.default ~= false,
     }
+    if owner_plugin then
+        replay_registry[entity_type] = registry[entity_type]
+    end
 end
 
 --- Drop a registration. Used by plugin teardown and by tests.
 function M.unregister(entity_type)
     registry[entity_type] = nil
+    replay_registry[entity_type] = nil
 end
 
 --- Drop all entity types owned by a plugin. Used by plugin unload/hot reload.
@@ -367,6 +375,7 @@ function M.unregister_plugin(owner_plugin)
     for entity_type, entry in pairs(registry) do
         if entry.owner_plugin == owner_plugin then
             registry[entity_type] = nil
+            replay_registry[entity_type] = nil
             removed = removed + 1
         end
     end
@@ -496,6 +505,7 @@ local function registered_type_names(opts)
     opts = opts or {}
     local scope = opts.scope or "all"
     local owner_plugin = opts.owner_plugin
+    local include_non_default = opts.include_non_default == true
     local requested = nil
     if type(opts.types) == "table" then
         requested = {}
@@ -510,6 +520,7 @@ local function registered_type_names(opts)
         if (requested == nil or requested[name])
             and (scope ~= "core" or BUILTIN_ENTITY_TYPES[name])
             and (owner_plugin == nil or entry.owner_plugin == owner_plugin)
+            and (requested ~= nil or include_non_default or entry.default ~= false)
         then
             names[#names + 1] = name
         end
@@ -954,9 +965,31 @@ function M.schedule_snapshots_to(client, sub_id, opts)
     local index = 1
     local request_index = 1
     local sent = 0
+    local job_key = tostring(sub_id or "__nil__")
+    client.__entity_snapshot_jobs = client.__entity_snapshot_jobs or {}
+    client.__entity_snapshot_job_seq = client.__entity_snapshot_job_seq or {}
+    local job_id = (client.__entity_snapshot_job_seq[job_key] or 0) + 1
+    client.__entity_snapshot_job_seq[job_key] = job_id
+    client.__entity_snapshot_jobs[job_key] = job_id
+
+    local function job_is_current()
+        return client.__entity_snapshot_jobs
+            and client.__entity_snapshot_jobs[job_key] == job_id
+    end
+
+    local function clear_current_job()
+        if client.__entity_snapshot_jobs and client.__entity_snapshot_jobs[job_key] == job_id then
+            client.__entity_snapshot_jobs[job_key] = nil
+        end
+    end
 
     local function step()
+        if not job_is_current() then
+            log_snapshot_batch(sent, sub_id, batch_started, " canceled_stale")
+            return
+        end
         if not subscription_is_active(client, sub_id) then
+            clear_current_job()
             log_snapshot_batch(sent, sub_id, batch_started, " canceled")
             return
         end
@@ -967,6 +1000,7 @@ function M.schedule_snapshots_to(client, sub_id, opts)
             local type_sent, ok = send_snapshot_type(client, sub_id, entity_type, context, plugin_contexts)
             sent = sent + type_sent
             if ok == false then
+                clear_current_job()
                 log_snapshot_batch(sent, sub_id, batch_started, " canceled")
                 return
             end
@@ -980,6 +1014,7 @@ function M.schedule_snapshots_to(client, sub_id, opts)
             local request_sent, ok = send_query_request(client, sub_id, request, context, plugin_contexts)
             sent = sent + request_sent
             if ok == false then
+                clear_current_job()
                 log_snapshot_batch(sent, sub_id, batch_started, " canceled")
                 return
             end
@@ -988,11 +1023,27 @@ function M.schedule_snapshots_to(client, sub_id, opts)
         end
 
         log_snapshot_batch(sent, sub_id, batch_started, " scheduled")
+        clear_current_job()
         return
     end
 
     timer.after(0, step)
     return 0
+end
+
+--- Clear the active scheduled snapshot marker for a subscription.
+---
+--- Client unsubscribe/replace paths call this so long-lived browser peers do
+--- not keep stale snapshot jobs alive after the subscription contract ends.
+--- Keep the monotonic sequence counter: a queued tick from the old job may
+--- still run later, and reusing its job id for a new subscription would make
+--- that stale tick look current.
+function M.clear_scheduled_snapshots(client, sub_id)
+    if not client then return end
+    local job_key = tostring(sub_id or "__nil__")
+    if type(client.__entity_snapshot_jobs) == "table" then
+        client.__entity_snapshot_jobs[job_key] = nil
+    end
 end
 
 -- -------------------------------------------------------------------------
@@ -1008,7 +1059,7 @@ function M.snapshot_seq(entity_type)
 end
 
 function M.registered_types()
-    return registered_type_names()
+    return registered_type_names({ include_non_default = true })
 end
 
 -- -------------------------------------------------------------------------
@@ -1021,6 +1072,58 @@ end
 
 function M._after_reload()
     log.info("entity_broadcast.lua reloaded")
+    local ok, core_entities = pcall(require, "hub.core_entities")
+    if ok and type(core_entities) == "table" and type(core_entities.register) == "function" then
+        local registered, err = pcall(core_entities.register)
+        if not registered then
+            log.warn(string.format(
+                "entity_broadcast.lua failed to re-register built-in entities: %s",
+                tostring(err)))
+        end
+    else
+        log.warn(string.format(
+            "entity_broadcast.lua could not load built-in entity providers: %s",
+            tostring(core_entities)))
+    end
+    local replayed = 0
+    for entity_type, entry in pairs(replay_registry) do
+        if type(entry) == "table" and type(entry.owner_plugin) == "string" then
+            local registered, err = pcall(M.register, entity_type, {
+                id_field = entry.id_field,
+                all = entry.all,
+                query = entry.query,
+                filter = entry.filter,
+                owner_plugin = entry.owner_plugin,
+                default = entry.default,
+            })
+            if registered then
+                replayed = replayed + 1
+            else
+                log.warn(string.format(
+                    "entity_broadcast.lua failed to replay plugin entity %s: %s",
+                    tostring(entity_type),
+                    tostring(err)))
+            end
+        end
+    end
+    if replayed > 0 then
+        log.info(string.format(
+            "entity_broadcast.lua replayed %d plugin entity provider(s)",
+            replayed))
+    end
+    local ok_connections, connections = pcall(require, "handlers.connections")
+    if ok_connections and type(connections) == "table" and type(connections.install_entity_broadcaster) == "function" then
+        local installed, err = pcall(connections.install_entity_broadcaster, M)
+        if not installed then
+            log.warn(string.format(
+                "entity_broadcast.lua failed to reinstall broadcaster: %s",
+                tostring(err)))
+        end
+    else
+        log.warn(string.format(
+            "entity_broadcast.lua could not reinstall broadcaster: %s",
+            tostring(connections)))
+    end
 end
 
 --- Wipe registry, broadcaster, and seq counters. Test-only — production
@@ -1028,6 +1131,7 @@ end
 --- trigger this path on a live hub.
 function M._reset_for_tests()
     for k in pairs(registry) do registry[k] = nil end
+    for k in pairs(replay_registry) do replay_registry[k] = nil end
     for k in pairs(seq_by_type) do seq_by_type[k] = nil end
     state.set("entity_broadcast.seq_by_type", seq_by_type)
     state.set("entity_broadcast.seq_epoch", 0)

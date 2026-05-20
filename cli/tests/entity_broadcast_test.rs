@@ -140,13 +140,104 @@ fn registered_types_returns_sorted_names() {
     let register: Function = eb.get("register").unwrap();
     let opts: Table = lua.create_table().unwrap();
     opts.set("id_field", "workspace_id").unwrap();
+    opts.set("default", false).unwrap();
     let all: Function = lua.create_function(|lua, ()| lua.create_table()).unwrap();
     opts.set("all", all).unwrap();
     register.call::<()>(("workspace", opts)).unwrap();
 
     let registered_types: Function = eb.get("registered_types").unwrap();
     let names: Vec<String> = registered_types.call(()).unwrap();
-    assert_eq!(names, vec!["session".to_string(), "workspace".to_string()]);
+    assert_eq!(
+        names,
+        vec!["session".to_string(), "workspace".to_string()],
+        "introspection should include non-default registered types"
+    );
+}
+
+#[test]
+fn after_reload_restores_builtin_entity_providers() {
+    let (_lua, eb) = new_eb_lua();
+
+    let after_reload: Function = eb.get("_after_reload").unwrap();
+    after_reload.call::<()>(()).unwrap();
+
+    let is_registered: Function = eb.get("is_registered").unwrap();
+    for entity_type in [
+        "connection_code",
+        "hub",
+        "session",
+        "session_action",
+        "spawn_target",
+        "template",
+        "workspace",
+        "worktree",
+    ] {
+        let registered: bool = is_registered.call((entity_type,)).unwrap();
+        assert!(
+            registered,
+            "{entity_type} should be registered after reload"
+        );
+    }
+}
+
+#[test]
+fn after_reload_replays_plugin_entity_providers() {
+    let (lua, eb) = new_eb_lua();
+
+    let register: Function = eb.get("register").unwrap();
+    let opts: Table = lua.create_table().unwrap();
+    opts.set("id_field", "id").unwrap();
+    opts.set("owner_plugin", "kanban").unwrap();
+    let all: Function = lua.create_function(|lua, ()| lua.create_table()).unwrap();
+    opts.set("all", all).unwrap();
+    register.call::<()>(("kanban.board", opts)).unwrap();
+
+    let after_reload: Function = eb.get("_after_reload").unwrap();
+    after_reload.call::<()>(()).unwrap();
+
+    let is_registered: Function = eb.get("is_registered").unwrap();
+    let registered: bool = is_registered.call(("kanban.board",)).unwrap();
+    assert!(
+        registered,
+        "plugin entity provider should be replayed after reload"
+    );
+}
+
+#[test]
+fn after_reload_reinstalls_connection_broadcaster() {
+    let (lua, eb) = new_eb_lua();
+    register_session_type(&lua, &eb);
+    lua.globals().set("EB", eb.clone()).unwrap();
+
+    let result: bool = lua
+        .load(
+            r#"
+            local frames = {}
+            package.loaded["handlers.connections"] = {
+              install_entity_broadcaster = function(eb)
+                eb.set_broadcaster(function(frame)
+                  frames[#frames + 1] = frame
+                end)
+              end,
+            }
+
+            EB._after_reload()
+            EB.patch("session", "sess-a", { title = "new title" })
+
+            return #frames == 1
+              and frames[1].type == "entity_patch"
+              and frames[1].entity_type == "session"
+              and frames[1].id == "sess-a"
+              and frames[1].patch.title == "new title"
+        "#,
+        )
+        .eval()
+        .expect("after reload broadcaster reinstall script should evaluate");
+
+    assert!(
+        result,
+        "entity_broadcast reload should restore the connection broadcaster so title/session deltas keep flowing"
+    );
 }
 
 #[test]
@@ -471,6 +562,56 @@ fn send_snapshots_to_emits_one_snapshot_per_registered_type() {
 }
 
 #[test]
+fn send_snapshots_to_skips_non_default_types_unless_requested() {
+    let (lua, eb) = new_eb_lua();
+    lua.globals().set("EB", eb).unwrap();
+
+    let result: bool = lua
+        .load(
+            r#"
+            EB.register("session", {
+              id_field = "session_uuid",
+              all = function() return { { session_uuid = "sess-1" } } end,
+            })
+            EB.register("workspace", {
+              id_field = "workspace_id",
+              default = false,
+              all = function() return { { workspace_id = "ws-1" } } end,
+            })
+
+            local captured = {}
+            local client = {
+              send = function(_, frame)
+                captured[#captured + 1] = frame
+              end,
+            }
+
+            EB.send_snapshots_to(client, "sub-1")
+            local default_ok = #captured == 1 and captured[1].entity_type == "session"
+
+            captured = {}
+            EB.send_snapshots_to(client, "sub-1", { types = { "workspace" } })
+            local explicit_ok = #captured == 1 and captured[1].entity_type == "workspace"
+
+            captured = {}
+            EB.send_snapshots_to(client, "sub-1", { include_non_default = true })
+            local include_ok = #captured == 2
+              and captured[1].entity_type == "session"
+              and captured[2].entity_type == "workspace"
+
+            return default_ok and explicit_ok and include_ok
+        "#,
+        )
+        .eval()
+        .expect("default snapshot filtering script should evaluate");
+
+    assert!(
+        result,
+        "non-default entity types should be excluded from broad snapshots but available by explicit request"
+    );
+}
+
+#[test]
 fn schedule_snapshots_to_defers_work_and_cancels_unsubscribed_clients() {
     let (lua, eb) = new_eb_lua();
     lua.globals().set("EB", eb).unwrap();
@@ -532,6 +673,139 @@ fn schedule_snapshots_to_defers_work_and_cancels_unsubscribed_clients() {
     assert!(
         result,
         "scheduled snapshots should leave the command turn, step by type, and stop after unsubscribe"
+    );
+}
+
+#[test]
+fn schedule_snapshots_to_cancels_stale_jobs_for_same_subscription() {
+    let (lua, eb) = new_eb_lua();
+    lua.globals().set("EB", eb).unwrap();
+
+    let result: bool = lua
+        .load(
+            r#"
+            local queue = {}
+            timer = {
+              after = function(_delay, fn)
+                queue[#queue + 1] = fn
+                return "timer-" .. tostring(#queue)
+              end,
+            }
+
+            local calls = {}
+            EB.register("session", {
+              id_field = "session_uuid",
+              all = function()
+                calls[#calls + 1] = "session"
+                return { { session_uuid = "sess-1" } }
+              end,
+            })
+            EB.register("workspace", {
+              id_field = "workspace_id",
+              all = function()
+                calls[#calls + 1] = "workspace"
+                return { { workspace_id = "ws-1" } }
+              end,
+            })
+
+            local captured = {}
+            local client = {
+              subscriptions = { ["sub-1"] = { channel = "hub" } },
+              send = function(_, frame)
+                captured[#captured + 1] = frame
+              end,
+            }
+
+            EB.schedule_snapshots_to(client, "sub-1", {
+              types = { "session", "workspace" },
+            })
+            EB.schedule_snapshots_to(client, "sub-1", {
+              types = { "workspace" },
+            })
+
+            local two_jobs_queued = #queue == 2 and #captured == 0 and #calls == 0
+            queue[2]()
+            local current_ran = #captured == 1
+              and captured[1].entity_type == "workspace"
+              and #calls == 1
+              and calls[1] == "workspace"
+
+            EB.schedule_snapshots_to(client, "sub-1", {
+              types = { "session" },
+            })
+            queue[1]()
+            local stale_still_canceled_after_new_job = #captured == 1 and #calls == 1
+            queue[3]()
+            local superseded_completion_canceled = #captured == 1 and #calls == 1
+            queue[4]()
+            local next_job_ran = #captured == 2
+              and captured[2].entity_type == "session"
+              and #calls == 2
+              and calls[2] == "session"
+
+            return two_jobs_queued
+              and current_ran
+              and stale_still_canceled_after_new_job
+              and superseded_completion_canceled
+              and next_job_ran
+        "#,
+        )
+        .eval()
+        .expect("stale scheduled snapshot script should evaluate");
+
+    assert!(
+        result,
+        "new hydration requests for the same subscription should cancel older scheduled jobs before they run"
+    );
+}
+
+#[test]
+fn clear_scheduled_snapshots_drops_active_job_without_reusing_ids() {
+    let (lua, eb) = new_eb_lua();
+    lua.globals().set("EB", eb).unwrap();
+
+    let result: bool = lua
+        .load(
+            r#"
+            local queue = {}
+            timer = {
+              after = function(_delay, fn)
+                queue[#queue + 1] = fn
+                return "timer-" .. tostring(#queue)
+              end,
+            }
+
+            EB.register("session", {
+              id_field = "session_uuid",
+              all = function() return { { session_uuid = "sess-1" } } end,
+            })
+
+            local client = {
+              subscriptions = { ["sub-1"] = { channel = "hub" } },
+              send = function() end,
+            }
+
+            EB.schedule_snapshots_to(client, "sub-1", { types = { "session" } })
+            local populated = client.__entity_snapshot_jobs["sub-1"] ~= nil
+              and client.__entity_snapshot_job_seq["sub-1"] ~= nil
+
+            EB.clear_scheduled_snapshots(client, "sub-1")
+            local cleared = client.__entity_snapshot_jobs["sub-1"] == nil
+              and client.__entity_snapshot_job_seq["sub-1"] == 1
+
+            EB.schedule_snapshots_to(client, "sub-1", { types = { "session" } })
+            local advanced = client.__entity_snapshot_job_seq["sub-1"] == 2
+              and client.__entity_snapshot_jobs["sub-1"] == 2
+
+            return populated and cleared and advanced
+        "#,
+        )
+        .eval()
+        .expect("clear scheduled snapshot script should evaluate");
+
+    assert!(
+        result,
+        "subscription teardown should cancel the active snapshot job without reusing queued job ids"
     );
 }
 

@@ -209,6 +209,9 @@ function Client:handle_subscribe(msg)
             existing_terminal_subscription:stop()
             self.terminal_subscriptions[sub_id] = nil
         end
+        pcall(function()
+            require("lib.entity_broadcast").clear_scheduled_snapshots(self, sub_id)
+        end)
         if existing.channel == "terminal" and existing.session_uuid then
             terminal_clients.unregister(existing.session_uuid, self.peer_id)
         end
@@ -464,6 +467,9 @@ function Client:handle_unsubscribe(msg)
         channel = sub.channel,
         sub_id = sub_id,
     })
+    pcall(function()
+        require("lib.entity_broadcast").clear_scheduled_snapshots(self, sub_id)
+    end)
 
     -- Wire protocol: tree_snapshot dedup is GLOBAL on (surface, subpath),
     -- not per-subscription, so unsubscribe leaves the dedup state alone.

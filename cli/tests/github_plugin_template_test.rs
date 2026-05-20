@@ -738,6 +738,7 @@ fn catalog_plugin_project_pipelines_entity_publish_snapshots_and_deltas_use_plug
                   entity_type = entity_type,
                   id_field = opts.id_field,
                   owner_plugin = opts.owner_plugin,
+                  default = opts.default,
                 }
               end,
             }
@@ -830,8 +831,8 @@ fn catalog_plugin_project_pipelines_entity_publish_snapshots_and_deltas_use_plug
     let frames = result["frames"].as_array().unwrap();
     assert_eq!(
         frames.len(),
-        20,
-        "18 snapshots + upsert + remove; non-string id upsert should be dropped"
+        6,
+        "4 default snapshots + upsert + remove; detail/history snapshots are targeted-only by default"
     );
     assert!(
         frames
@@ -846,8 +847,8 @@ fn catalog_plugin_project_pipelines_entity_publish_snapshots_and_deltas_use_plug
         .collect();
     assert_eq!(
         snapshots.len(),
-        18,
-        "publish_snapshots should publish every registered entity family"
+        4,
+        "publish_snapshots should publish only default working-set entity families"
     );
     assert!(snapshots.iter().all(|frame| {
         frame["entity_type"]
@@ -866,52 +867,53 @@ fn catalog_plugin_project_pipelines_entity_publish_snapshots_and_deltas_use_plug
         json!("project-1")
     );
 
-    let run_step_snapshot = snapshots
-        .iter()
-        .find(|frame| frame["entity_type"] == json!("project-pipelines.run_step"))
-        .expect("run step snapshot");
-    assert_eq!(run_step_snapshot["items"][0]["name"], json!("Implement"));
-    assert_eq!(
-        run_step_snapshot["items"][0]["ticket_id"],
-        json!("ticket-1")
-    );
+    for detail_type in [
+        "project-pipelines.run",
+        "project-pipelines.run_step",
+        "project-pipelines.gate_result",
+        "project-pipelines.review",
+        "project-pipelines.finding",
+        "project-pipelines.artifact",
+        "project-pipelines.pr_link",
+        "project-pipelines.event",
+        "project-pipelines.project_target",
+        "project-pipelines.ticket_dependency",
+        "project-pipelines.pipeline_step",
+        "project-pipelines.pipeline_gate",
+        "project-pipelines.checklist",
+        "project-pipelines.checklist_item",
+    ] {
+        assert!(
+            snapshots
+                .iter()
+                .all(|frame| frame["entity_type"] != json!(detail_type)),
+            "{detail_type} should be targeted/detail-only in default publishes"
+        );
+        assert!(
+            result["registrations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(
+                    |registration| registration["entity_type"] == json!(detail_type)
+                        && registration["default"] == json!(false)
+                ),
+            "{detail_type} should register default=false"
+        );
+    }
 
-    let gate_result_snapshot = snapshots
-        .iter()
-        .find(|frame| frame["entity_type"] == json!("project-pipelines.gate_result"))
-        .expect("gate result snapshot");
+    assert_eq!(frames[4]["type"], json!("entity_upsert"));
     assert_eq!(
-        gate_result_snapshot["items"][0]["evidence"]["summary"],
-        json!("ok")
-    );
-
-    let artifact_snapshot = snapshots
-        .iter()
-        .find(|frame| frame["entity_type"] == json!("project-pipelines.artifact"))
-        .expect("artifact snapshot");
-    assert_eq!(artifact_snapshot["items"][0]["payload"]["a"], json!(1));
-
-    let event_snapshot = snapshots
-        .iter()
-        .find(|frame| frame["entity_type"] == json!("project-pipelines.event"))
-        .expect("event snapshot");
-    assert_eq!(
-        event_snapshot["items"][0]["payload"]["gate_id"],
-        json!("gate-1")
-    );
-
-    assert_eq!(frames[18]["type"], json!("entity_upsert"));
-    assert_eq!(
-        frames[18]["entity_type"],
+        frames[4]["entity_type"],
         json!("project-pipelines.run_step")
     );
-    assert_eq!(frames[18]["entity"]["id"], json!("run-step-1"));
-    assert_eq!(frames[19]["type"], json!("entity_remove"));
+    assert_eq!(frames[4]["entity"]["id"], json!("run-step-1"));
+    assert_eq!(frames[5]["type"], json!("entity_remove"));
     assert_eq!(
-        frames[19]["entity_type"],
+        frames[5]["entity_type"],
         json!("project-pipelines.run_step")
     );
-    assert_eq!(frames[19]["id"], json!("run-step-1"));
+    assert_eq!(frames[5]["id"], json!("run-step-1"));
 }
 
 #[test]

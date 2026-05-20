@@ -1075,6 +1075,7 @@ local ENTITY = {
         one = project_entity,
     },
     [M.types.project_target] = {
+        default = false,
         all = function()
             local out = {}
             for _, target in ipairs(rows([[SELECT pt.*
@@ -1091,6 +1092,7 @@ local ENTITY = {
         one = project_target_entity,
     },
     [M.types.ticket_dependency] = {
+        default = false,
         all = function()
             local out = {}
             for _, dependency in ipairs(rows([[SELECT td.*, dep.title AS depends_on_title, dep.status AS depends_on_status
@@ -1113,10 +1115,12 @@ local ENTITY = {
         one = pipeline_entity,
     },
     [M.types.pipeline_step] = {
+        default = false,
         all = function() return rows("SELECT * FROM pipeline_steps ORDER BY pipeline_id ASC, position ASC, created_at ASC, id ASC") end,
         one = copy,
     },
     [M.types.pipeline_gate] = {
+        default = false,
         all = function()
             local out = {}
             for _, gate in ipairs(rows("SELECT * FROM pipeline_gates ORDER BY step_id ASC, created_at ASC, id ASC")) do
@@ -1127,18 +1131,21 @@ local ENTITY = {
         one = pipeline_gate_entity,
     },
     [M.types.run] = {
+        default = false,
         all = function()
             return run_entities(rows("SELECT * FROM runs ORDER BY updated_at DESC, created_at DESC, id DESC"))
         end,
         one = run_entity,
     },
     [M.types.run_step] = {
+        default = false,
         all = function()
             return run_step_entities(rows("SELECT * FROM run_steps ORDER BY run_id ASC, COALESCE(sequence, 0) ASC, created_at ASC, id ASC"))
         end,
         one = run_step_entity,
     },
     [M.types.gate_result] = {
+        default = false,
         all = function()
             local out = {}
             for _, result in ipairs(rows("SELECT * FROM gate_results ORDER BY created_at DESC, id DESC")) do
@@ -1149,10 +1156,12 @@ local ENTITY = {
         one = gate_result_entity,
     },
     [M.types.review] = {
+        default = false,
         all = function() return rows("SELECT * FROM reviews ORDER BY created_at DESC, id DESC") end,
         one = copy,
     },
     [M.types.finding] = {
+        default = false,
         all = function()
             local out = {}
             for _, finding in ipairs(rows("SELECT * FROM review_findings ORDER BY created_at DESC, id DESC")) do
@@ -1163,6 +1172,7 @@ local ENTITY = {
         one = finding_entity,
     },
     [M.types.artifact] = {
+        default = false,
         all = function()
             local out = {}
             for _, artifact in ipairs(rows("SELECT * FROM artifacts ORDER BY created_at DESC, id DESC")) do
@@ -1189,12 +1199,14 @@ local ENTITY = {
         one = question_entity,
     },
     [M.types.checklist] = {
+        default = false,
         all = function()
             return rows("SELECT * FROM checklists ORDER BY updated_at DESC, created_at DESC, id DESC")
         end,
         one = copy,
     },
     [M.types.checklist_item] = {
+        default = false,
         all = function()
             local out = {}
             for _, item in ipairs(rows("SELECT * FROM checklist_items ORDER BY checklist_id ASC, position ASC, created_at ASC, id ASC")) do
@@ -1205,6 +1217,7 @@ local ENTITY = {
         one = checklist_item_entity,
     },
     [M.types.pr_link] = {
+        default = false,
         all = function()
             local out = {}
             for _, link in ipairs(rows("SELECT * FROM pr_links ORDER BY updated_at DESC, created_at DESC, id DESC")) do
@@ -1215,6 +1228,7 @@ local ENTITY = {
         one = pr_link_entity,
     },
     [M.types.event] = {
+        default = false,
         all = function()
             local out = {}
             for _, event in ipairs(rows("SELECT * FROM events ORDER BY created_at DESC, id DESC LIMIT 200")) do
@@ -1429,6 +1443,7 @@ function M.register()
             all = spec.all,
             query = DETAIL[entity_type],
             filter = VISIBLE[entity_type],
+            default = spec.default ~= false,
         })
     end
 end
@@ -1442,9 +1457,12 @@ function M.snapshot(entity_type)
     Hub.get():entity_snapshot(entity_type, spec.all(), opts())
 end
 
-function M.publish_snapshots()
+function M.publish_snapshots(include_detail)
     for _, entity_type in pairs(M.types) do
-        M.snapshot(entity_type)
+        local spec = ENTITY[entity_type]
+        if include_detail == true or (spec and spec.default ~= false) then
+            M.snapshot(entity_type)
+        end
     end
 end
 

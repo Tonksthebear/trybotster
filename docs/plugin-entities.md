@@ -167,6 +167,22 @@ explicit client baseline request. Use `entity_upsert` when a mutator creates or
 replaces one record. Use `entity_patch` for sparse top-level field changes.
 Use `entity_remove` when clients should drop one record.
 
+Broad baseline requests include only default entity families. Register large,
+historical, or detail-only families with `default = false` and expose them
+through `query(request, context)` instead:
+
+```lua
+EB.register("project-pipelines.run_step", {
+  id_field = "id",
+  default = false,
+  all = function(context) return run_step_rows(context) end,
+  query = function(request, context) return run_step_rows_for_request(request, context) end,
+})
+```
+
+Explicit client requests for that entity type still work. The flag only keeps
+unrequested detail families out of broad hub/browser hydration.
+
 Browser surfaces request plugin data by inspecting the received UI tree for
 `$bind` and `bind_list` sources. A surface that binds an unfiltered
 `/project-pipelines.ticket` list pulls a full `project-pipelines.ticket`
@@ -364,6 +380,8 @@ renderer-specific pending flags.
 - Keep entity type names singular, namespaced, and owned by the registering
   plugin; keep published records flat and renderer-ready.
 - Register every entity family before publishing snapshots or deltas.
+- Mark large/detail/history families `default = false` so broad baselines stay
+  bounded; hydrate them through explicit type or scoped `query()` requests.
 - Keep `all()` callbacks array-shaped and resilient; bad records are skipped.
 - Add `query(request, context)` providers for concrete id bindings and filtered
   `bind_list` scopes; return the same read-model shape as `all()`.
