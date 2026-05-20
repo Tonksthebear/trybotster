@@ -175,6 +175,21 @@ local function recover_session_from_process_identity(socket_info, recovered, see
         return
     end
 
+    local target = nil
+    if type(identity.target_id) == "string" and identity.target_id ~= "" and spawn_targets and spawn_targets.get then
+        local ok_target, found = pcall(spawn_targets.get, identity.target_id)
+        if ok_target then target = found end
+    end
+
+    if type(target) ~= "table" or target.enabled == false then
+        log.info(string.format(
+            "[session_recovery] skipping process identity for non-admitted target session=%s target=%s",
+            tostring(session_uuid),
+            tostring(identity.target_id)
+        ))
+        return
+    end
+
     local ok, handle = pcall(
         hub.connect_session, session_uuid, socket_info.socket_path
     )

@@ -246,6 +246,180 @@ describe('<UiTree>', () => {
     ])
   })
 
+  it('keeps entity hydration dedupe across surface remounts on the same hub connection', async () => {
+    const boundTree = {
+      type: 'list',
+      children: [{
+        $kind: 'bind_list',
+        source: '/project-pipelines.ticket',
+        item_template: {
+          type: 'text',
+          props: { text: { $bind: '@/title' } },
+        },
+      }],
+    }
+
+    const first = render(<UiTree hubId="hub-1" targetSurface="pipelines" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'pipelines',
+        tree: boundTree,
+      })
+    })
+    expect(fakeTransport.requestEntitySnapshots).toHaveBeenCalledWith([
+      'project-pipelines.ticket',
+    ], [])
+
+    first.unmount()
+    fakeTransport.requestEntitySnapshots.mockClear()
+
+    render(<UiTree hubId="hub-1" targetSurface="pipelines" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'pipelines',
+        tree: boundTree,
+      })
+    })
+
+    expect(fakeTransport.requestEntitySnapshots).not.toHaveBeenCalled()
+  })
+
+  it('does not repeat targeted hydration when navigating back to a hydrated detail scope', async () => {
+    function routeTree(runId) {
+      return {
+        type: 'stack',
+        children: [{
+          $kind: 'bind_list',
+          source: '/project-pipelines.run_step',
+          where: { run_id: runId },
+          item_template: { type: 'text', props: { text: { $bind: '@/name' } } },
+        }],
+      }
+    }
+
+    const view = render(<UiTree hubId="hub-1" targetSurface="pipelines" subpath="/runs/run-1" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'pipelines',
+        subpath: '/runs/run-1',
+        tree: routeTree('run-1'),
+      })
+    })
+    expect(fakeTransport.requestEntitySnapshots).toHaveBeenLastCalledWith([], [
+      { entity_type: 'project-pipelines.run_step', where: { run_id: 'run-1' } },
+    ])
+
+    fakeTransport.requestEntitySnapshots.mockClear()
+    view.rerender(<UiTree hubId="hub-1" targetSurface="pipelines" subpath="/runs/run-2" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'pipelines',
+        subpath: '/runs/run-2',
+        tree: routeTree('run-2'),
+      })
+    })
+    expect(fakeTransport.requestEntitySnapshots).toHaveBeenLastCalledWith([], [
+      { entity_type: 'project-pipelines.run_step', where: { run_id: 'run-2' } },
+    ])
+
+    fakeTransport.requestEntitySnapshots.mockClear()
+    view.rerender(<UiTree hubId="hub-1" targetSurface="pipelines" subpath="/runs/run-1" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'pipelines',
+        subpath: '/runs/run-1',
+        tree: routeTree('run-1'),
+      })
+    })
+    expect(fakeTransport.requestEntitySnapshots).not.toHaveBeenCalled()
+  })
+
+  it('rehydrates bound entities after reconnect', async () => {
+    const boundTree = {
+      type: 'list',
+      children: [{
+        $kind: 'bind_list',
+        source: '/project-pipelines.ticket',
+        item_template: {
+          type: 'text',
+          props: { text: { $bind: '@/title' } },
+        },
+      }],
+    }
+
+    render(<UiTree hubId="hub-1" targetSurface="pipelines" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'pipelines',
+        tree: boundTree,
+      })
+    })
+    fakeTransport.requestEntitySnapshots.mockClear()
+
+    await act(async () => {
+      fakeTransport.emit('connected')
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'pipelines',
+        tree: boundTree,
+      })
+    })
+
+    expect(fakeTransport.requestEntitySnapshots).toHaveBeenCalledWith([
+      'project-pipelines.ticket',
+    ], [])
+  })
+
+  it('rehydrates bound entities when the hub transport is replaced for the same hub id', async () => {
+    const boundTree = {
+      type: 'list',
+      children: [{
+        $kind: 'bind_list',
+        source: '/project-pipelines.ticket',
+        item_template: {
+          type: 'text',
+          props: { text: { $bind: '@/title' } },
+        },
+      }],
+    }
+
+    const first = render(<UiTree hubId="hub-1" targetSurface="pipelines" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'pipelines',
+        tree: boundTree,
+      })
+    })
+    expect(fakeTransport.requestEntitySnapshots).toHaveBeenCalledWith([
+      'project-pipelines.ticket',
+    ], [])
+
+    first.unmount()
+    const oldTransport = fakeTransport
+    fakeTransport = new FakeTransport()
+
+    render(<UiTree hubId="hub-1" targetSurface="pipelines" />)
+    await act(async () => {
+      fakeTransport.emit('message', {
+        type: 'ui_tree_snapshot',
+        target_surface: 'pipelines',
+        tree: boundTree,
+      })
+    })
+
+    expect(oldTransport.requestEntitySnapshots).toHaveBeenCalledTimes(1)
+    expect(fakeTransport.requestEntitySnapshots).toHaveBeenCalledWith([
+      'project-pipelines.ticket',
+    ], [])
+  })
+
   it('requests a default snapshot when navigating from scoped detail bindings to overview bindings', async () => {
     const view = render(<UiTree hubId="hub-1" targetSurface="pipelines" subpath="/runs/run-1" />)
     await act(async () => {

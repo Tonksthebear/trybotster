@@ -175,15 +175,37 @@ local function unique_nonblank(values)
     return out
 end
 
+local function ids_from(items, key)
+    local out = {}
+    for _, item in ipairs(items or {}) do
+        out[#out + 1] = item and item[key or "id"]
+    end
+    return unique_nonblank(out)
+end
+
 local function rows_by_id(table_name, fields, ids)
     ids = unique_nonblank(ids)
     if #ids == 0 then
         return {}
     end
+    -- table_name and fields are trusted provider constants; ids are the only caller-supplied values.
     return index_by_id(rows(
         "SELECT " .. fields .. " FROM " .. table_name .. " WHERE id IN (" .. placeholders(#ids) .. ")",
         ids
     ))
+end
+
+local function rows_for_ids(table_name, fields, id_field, ids, order_by)
+    ids = unique_nonblank(ids)
+    if #ids == 0 then
+        return {}
+    end
+    -- table_name, fields, id_field, and order_by are trusted provider constants; ids are parameterized.
+    local sql = "SELECT " .. fields .. " FROM " .. table_name .. " WHERE " .. id_field .. " IN (" .. placeholders(#ids) .. ")"
+    if not util.is_blank(order_by) then
+        sql = sql .. " ORDER BY " .. order_by
+    end
+    return rows(sql, ids)
 end
 
 local function grouped_by(items, key)
@@ -252,13 +274,15 @@ local function ticket_dependency_levels(tickets, dependencies)
     return memo, deps_by_ticket
 end
 
-local function latest_merge_events_by_ticket()
+local function latest_merge_events_by_ticket(ticket_ids)
     local out = {}
+    ticket_ids = unique_nonblank(ticket_ids)
+    if #ticket_ids == 0 then return out end
     for _, event in ipairs(rows([[SELECT * FROM events
-                                  WHERE ticket_id IS NOT NULL
+                                  WHERE ticket_id IN (]] .. placeholders(#ticket_ids) .. [[)
                                     AND kind IN ('ticket.merge_requested',
                                                  'ticket.merge_agent_linked')
-                                  ORDER BY created_at DESC, id DESC]])) do
+                                  ORDER BY created_at DESC, id DESC]], ticket_ids)) do
         if event.ticket_id and not out[event.ticket_id] then
             out[event.ticket_id] = event
         end
@@ -266,11 +290,14 @@ local function latest_merge_events_by_ticket()
     return out
 end
 
-local function merge_artifacts_by_run()
+local function merge_artifacts_by_run(run_ids)
     local out = {}
+    run_ids = unique_nonblank(run_ids)
+    if #run_ids == 0 then return out end
     for _, artifact in ipairs(rows([[SELECT * FROM artifacts
                                      WHERE kind = 'merge'
-                                     ORDER BY created_at DESC, id DESC]])) do
+                                       AND run_id IN (]] .. placeholders(#run_ids) .. [[)
+                                     ORDER BY created_at DESC, id DESC]], run_ids)) do
         if artifact.run_id and not out[artifact.run_id] then
             out[artifact.run_id] = artifact
         end
@@ -278,9 +305,15 @@ local function merge_artifacts_by_run()
     return out
 end
 
-local function latest_pr_links_by(field)
+local function latest_pr_links_by(field, values)
     local out = {}
-    for _, link in ipairs(rows("SELECT * FROM pr_links ORDER BY updated_at DESC, created_at DESC, id DESC")) do
+    values = unique_nonblank(values)
+    if #values == 0 then return out end
+    -- field is a trusted provider constant; values are parameterized.
+    for _, link in ipairs(rows(
+        "SELECT * FROM pr_links WHERE " .. field .. " IN (" .. placeholders(#values) .. ") ORDER BY updated_at DESC, created_at DESC, id DESC",
+        values
+    )) do
         local key = link[field]
         if key and not out[key] then
             out[key] = link
@@ -289,12 +322,28 @@ local function latest_pr_links_by(field)
     return out
 end
 
-local function latest_pr_links_by_fields()
+local function latest_pr_links_by_fields(ticket_ids, run_ids)
     local out = {
         run_id = {},
         ticket_id = {},
     }
-    for _, link in ipairs(rows("SELECT * FROM pr_links ORDER BY updated_at DESC, created_at DESC, id DESC")) do
+    ticket_ids = unique_nonblank(ticket_ids)
+    run_ids = unique_nonblank(run_ids)
+    local clauses = {}
+    local params = {}
+    if #ticket_ids > 0 then
+        clauses[#clauses + 1] = "ticket_id IN (" .. placeholders(#ticket_ids) .. ")"
+        for _, id in ipairs(ticket_ids) do params[#params + 1] = id end
+    end
+    if #run_ids > 0 then
+        clauses[#clauses + 1] = "run_id IN (" .. placeholders(#run_ids) .. ")"
+        for _, id in ipairs(run_ids) do params[#params + 1] = id end
+    end
+    if #clauses == 0 then return out end
+    for _, link in ipairs(rows(
+        "SELECT * FROM pr_links WHERE " .. table.concat(clauses, " OR ") .. " ORDER BY updated_at DESC, created_at DESC, id DESC",
+        params
+    )) do
         if link.run_id and not out.run_id[link.run_id] then
             out.run_id[link.run_id] = link
         end
@@ -545,24 +594,45 @@ local function build_ticket_notification_counts(tickets, repo, view)
 end
 
 local function ticket_entities(tickets, context)
+    local ticket_ids = ids_from(tickets, "id")
+    if #ticket_ids == 0 then
+        return {}
+    end
     local repo = with_repo()
     local view = with_view()
-    local runs_by_ticket = cached(context, "project_pipelines.runs_by_ticket", function()
-        return grouped_by(rows("SELECT * FROM runs ORDER BY ticket_id ASC, created_at DESC, id DESC"), "ticket_id")
+    local runs_by_ticket = cached(context, cache_key_for_ids("project_pipelines.runs_by_ticket", ticket_ids), function()
+        return grouped_by(rows_for_ids("runs", "*", "ticket_id", ticket_ids, "ticket_id ASC, created_at DESC, id DESC"), "ticket_id")
     end)
-    local steps_by_id = cached(context, "project_pipelines.steps_by_id", function()
-        return index_by_id(rows("SELECT * FROM pipeline_steps"))
+    local run_ids = {}
+    local step_ids = {}
+    for _, ticket_runs in pairs(runs_by_ticket) do
+        for _, run in ipairs(ticket_runs or {}) do
+            run_ids[#run_ids + 1] = run.id
+            step_ids[#step_ids + 1] = run.current_step_id
+        end
+    end
+    run_ids = unique_nonblank(run_ids)
+    step_ids = unique_nonblank(step_ids)
+    local steps_by_id = cached(context, cache_key_for_ids("project_pipelines.steps_by_id", step_ids), function()
+        return rows_by_id("pipeline_steps", "*", step_ids)
     end)
-    local dependencies = cached(context, "project_pipelines.ticket_dependencies_with_titles", function()
+    local dependencies = cached(context, cache_key_for_ids("project_pipelines.ticket_dependencies_with_titles", ticket_ids), function()
         return rows([[SELECT td.*, t.title AS depends_on_title, t.status AS depends_on_status
                       FROM ticket_dependencies td
                       LEFT JOIN tickets t ON t.id = td.depends_on_ticket_id
-                      ORDER BY td.created_at ASC, td.id ASC]])
+                      WHERE td.ticket_id IN (]] .. placeholders(#ticket_ids) .. [[)
+                      ORDER BY td.created_at ASC, td.id ASC]], ticket_ids)
     end)
     local dependency_levels, dependencies_by_ticket = ticket_dependency_levels(tickets, dependencies)
-    local merge_events = cached(context, "project_pipelines.latest_merge_events_by_ticket", latest_merge_events_by_ticket)
-    local merge_artifacts = cached(context, "project_pipelines.merge_artifacts_by_run", merge_artifacts_by_run)
-    local pr_links = cached(context, "project_pipelines.latest_pr_links", latest_pr_links_by_fields)
+    local merge_events = cached(context, cache_key_for_ids("project_pipelines.latest_merge_events_by_ticket", ticket_ids), function()
+        return latest_merge_events_by_ticket(ticket_ids)
+    end)
+    local merge_artifacts = cached(context, cache_key_for_ids("project_pipelines.merge_artifacts_by_run", run_ids), function()
+        return merge_artifacts_by_run(run_ids)
+    end)
+    local pr_links = cached(context, cache_key_for_ids("project_pipelines.latest_pr_links", ticket_ids) .. cache_key_for_ids(":runs", run_ids), function()
+        return latest_pr_links_by_fields(ticket_ids, run_ids)
+    end)
     local notification_counts = cached(context, "project_pipelines.ticket_notification_counts", function()
         return build_ticket_notification_counts(tickets, repo, view)
     end)
@@ -595,7 +665,7 @@ local function ticket_entity(ticket)
     local repo = with_repo()
     local view = with_view()
     local runs = repo and repo.ticket_runs(ticket.id) or {}
-    local steps_by_id = index_by_id(rows("SELECT * FROM pipeline_steps"))
+    local steps_by_id = rows_by_id("pipeline_steps", "*", ids_from(runs, "current_step_id"))
     local dependencies = rows([[SELECT td.*, t.title AS depends_on_title, t.status AS depends_on_status
                                 FROM ticket_dependencies td
                                 LEFT JOIN tickets t ON t.id = td.depends_on_ticket_id
@@ -629,9 +699,9 @@ local function ticket_entity(ticket)
         dependencies = dependencies,
         dependency_level = dependency_levels[ticket.id] or 0,
         merge_event = merge_event,
-        merge_artifacts_by_run = merge_artifacts_by_run(),
-        pr_links_by_run = latest_pr_links_by("run_id"),
-        pr_links_by_ticket = latest_pr_links_by("ticket_id"),
+        merge_artifacts_by_run = merge_artifacts_by_run(ids_from(runs, "id")),
+        pr_links_by_run = latest_pr_links_by("run_id", ids_from(runs, "id")),
+        pr_links_by_ticket = latest_pr_links_by("ticket_id", { ticket.id }),
         notifications = notifications,
     })
 end
@@ -855,11 +925,13 @@ local function run_step_entity(run_step)
 end
 
 local function run_step_entities(run_steps, context)
-    local steps_by_id = cached(context, "project_pipelines.run_step_entities.steps_by_id", function()
-        return index_by_id(rows("SELECT * FROM pipeline_steps"))
+    local step_ids = ids_from(run_steps, "step_id")
+    local run_ids = ids_from(run_steps, "run_id")
+    local steps_by_id = cached(context, cache_key_for_ids("project_pipelines.run_step_entities.steps_by_id", step_ids), function()
+        return rows_by_id("pipeline_steps", "*", step_ids)
     end)
-    local runs_by_id = cached(context, "project_pipelines.run_step_entities.runs_by_id", function()
-        return index_by_id(rows("SELECT id, ticket_id, pipeline_id FROM runs"))
+    local runs_by_id = cached(context, cache_key_for_ids("project_pipelines.run_step_entities.runs_by_id", run_ids), function()
+        return rows_by_id("runs", "id, ticket_id, pipeline_id", run_ids)
     end)
     local out = {}
     for _, run_step in ipairs(run_steps or {}) do
@@ -1175,6 +1247,10 @@ end
 local function run_detail(request, context)
     local id = query_value(request, "id")
     if util.is_blank(id) then
+        local status = query_value(request, "status")
+        if not util.is_blank(status) then
+            return run_entities(rows("SELECT * FROM runs WHERE status = ? ORDER BY updated_at DESC, created_at DESC, id DESC", status), context)
+        end
         return run_entities(rows("SELECT * FROM runs ORDER BY updated_at DESC, created_at DESC, id DESC"), context)
     end
     return run_entities(rows("SELECT * FROM runs WHERE id = ? LIMIT 1", id), context)
@@ -1191,7 +1267,43 @@ end
 local function ticket_detail(request, context)
     local id = query_value(request, "id")
     if util.is_blank(id) then
-        return ticket_entities(visible_ticket_rows(), context)
+        local where = type(request) == "table" and type(request.where) == "table" and request.where or {}
+        local clauses = { VISIBLE_TICKET_WHERE }
+        local params = {}
+        if not util.is_blank(where.status) then
+            clauses[#clauses + 1] = "COALESCE(t.status, 'open') = ?"
+            params[#params + 1] = where.status
+        end
+        if where.standalone == true then
+            clauses[#clauses + 1] = "(t.project_id IS NULL OR t.project_id = '')"
+        elseif where.standalone == false then
+            clauses[#clauses + 1] = "(t.project_id IS NOT NULL AND t.project_id != '')"
+        end
+        if not util.is_blank(where.project_id) then
+            clauses[#clauses + 1] = "t.project_id = ?"
+            params[#params + 1] = where.project_id
+        end
+        if not util.is_blank(where.latest_run_status) then
+            clauses[#clauses + 1] = [[EXISTS (
+                SELECT 1
+                FROM runs latest
+                WHERE latest.ticket_id = t.id
+                  AND latest.status = ?
+                  AND latest.id = (
+                    SELECT r2.id
+                    FROM runs r2
+                    WHERE r2.ticket_id = t.id
+                    ORDER BY r2.created_at DESC, r2.id DESC
+                    LIMIT 1
+                  )
+            )]]
+            params[#params + 1] = where.latest_run_status
+        end
+        return ticket_entities(rows([[SELECT t.*
+                                      FROM tickets t
+                                      LEFT JOIN projects p ON p.id = t.project_id
+                                      WHERE ]] .. table.concat(clauses, " AND ") .. [[
+                                      ORDER BY t.updated_at DESC, t.created_at DESC]], params), context)
     end
     return ticket_entities(rows("SELECT * FROM tickets WHERE id = ? LIMIT 1", id), context)
 end
@@ -1199,8 +1311,15 @@ end
 local function project_detail(request, context)
     local id = query_value(request, "id")
     if util.is_blank(id) then
+        local status = query_value(request, "status")
         local out = {}
-        for _, project in ipairs(visible_project_rows()) do
+        local projects = not util.is_blank(status)
+            and rows([[SELECT *
+                       FROM projects
+                       WHERE COALESCE(status, 'open') = ?
+                       ORDER BY updated_at DESC, created_at DESC]], status)
+            or visible_project_rows()
+        for _, project in ipairs(projects) do
             out[#out + 1] = project_entity(project)
         end
         return out

@@ -27,7 +27,12 @@ fn create_lua_vm(data_dir: &std::path::Path, repo_root: &std::path::Path) -> Lua
         r#"
         _G.hooks = require("hub.hooks")
         _G.events = {{
-          on = function() return "test-subscription" end,
+          on = function(event, callback)
+            if event == "sessions_discovered" then
+              _G.session_recovery_callback = callback
+            end
+            return "test-subscription"
+          end,
           off = function() return true end,
         }}
         _G.config = {{
@@ -45,6 +50,13 @@ fn create_lua_vm(data_dir: &std::path::Path, repo_root: &std::path::Path) -> Lua
           end,
           register_session = function() return 1 end,
           unregister_session = function() return true end,
+          connect_session = function()
+            _G.test_connect_session_count = (_G.test_connect_session_count or 0) + 1
+            return {{
+              dimensions = function() return 24, 80 end,
+              kill = function() end,
+            }}
+          end,
           update_manifest_workspaces = function() return true end,
           server_id = function() return "hub-test" end,
           hub_id = function() return "hub-test" end,
@@ -100,6 +112,7 @@ fn create_lua_vm(data_dir: &std::path::Path, repo_root: &std::path::Path) -> Lua
                 created_at = "2026-05-18T00:00:00Z",
               }}
             end,
+            scan_recoverable_sessions = function() return {{}} end,
             write_workspace = function()
               _G.test_write_counts.workspace = _G.test_write_counts.workspace + 1
               return true
@@ -219,6 +232,54 @@ fn manifest_recovered_sessions_are_canonical_and_sync_manifests() {
     assert!(
         canonical,
         "manifest recovery should be canonical and writable"
+    );
+}
+
+#[test]
+fn process_identity_recovery_skips_non_admitted_spawn_targets() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().join("data");
+    let repo_root = dir.path().join("repo");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&repo_root).unwrap();
+
+    let lua = create_lua_vm(&data_dir, &repo_root);
+
+    let skipped: bool = lua
+        .load(
+            r#"
+            _G.spawn_targets.get = function() return nil end
+            _G.test_connect_session_count = 0
+
+            require("handlers.session_recovery")
+            assert(_G.session_recovery_callback ~= nil, "session recovery callback registered")
+
+            _G.session_recovery_callback({
+              sockets = {
+                {
+                  session_uuid = "sess-other-hub",
+                  socket_path = "/tmp/botster/sessions/sess-other-hub.sock",
+                  recovery_identity = {
+                    schema_version = 1,
+                    session_uuid = "sess-other-hub",
+                    session_type = "agent",
+                    session_name = "codex",
+                    target_id = "unadmitted-target",
+                    target_path = "/unadmitted/repo",
+                  },
+                },
+              },
+            })
+
+            return _G.test_connect_session_count == 0
+        "#,
+        )
+        .eval()
+        .expect("process identity admission guard should evaluate");
+
+    assert!(
+        skipped,
+        "session recovery should not connect to sockets whose target is not admitted"
     );
 }
 

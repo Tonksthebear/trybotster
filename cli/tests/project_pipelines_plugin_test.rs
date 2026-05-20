@@ -2189,13 +2189,18 @@ fn catalog_plugin_project_pipelines_registers_targeted_overview_hydration() {
                   {{ id = "ticket-standalone", title = "Standalone", status = "open", project_id = "", target_id = "target-1", created_at = 2 }},
                 }}
               end
+              if compact == "SELECT * FROM runs WHERE status = ? ORDER BY updated_at DESC, created_at DESC, id DESC" then
+                return {{
+                  {{ id = "run-active", ticket_id = "ticket-standalone", pipeline_id = "pipeline-1", status = "active" }},
+                }}
+              end
               if compact == "SELECT * FROM runs ORDER BY updated_at DESC, created_at DESC, id DESC" then
                 return {{
                   {{ id = "run-active", ticket_id = "ticket-standalone", pipeline_id = "pipeline-1", status = "active" }},
                   {{ id = "run-done", ticket_id = "ticket-merge", pipeline_id = "pipeline-1", status = "done" }},
                 }}
               end
-              if compact == "SELECT * FROM runs ORDER BY ticket_id ASC, created_at DESC, id DESC" then
+              if compact:find("SELECT %* FROM runs WHERE ticket_id IN") then
                 return {{
                   {{ id = "run-done", ticket_id = "ticket-merge", pipeline_id = "pipeline-1", status = "done" }},
                   {{ id = "run-active", ticket_id = "ticket-standalone", pipeline_id = "pipeline-1", status = "active" }},
@@ -2212,6 +2217,9 @@ fn catalog_plugin_project_pipelines_registers_targeted_overview_hydration() {
               end
               if compact:find("SELECT id, name FROM pipelines WHERE id IN") then
                 return {{ {{ id = "pipeline-1", name = "Pipeline" }} }}
+              end
+              if compact == "SELECT * FROM projects WHERE COALESCE(status, 'open') = ? ORDER BY updated_at DESC, created_at DESC" then
+                return {{ {{ id = "project-1", name = "Project", status = "open" }} }}
               end
               if compact == "SELECT * FROM projects WHERE COALESCE(status, 'open') != 'closed' ORDER BY updated_at DESC, created_at DESC" then
                 return {{ {{ id = "project-1", name = "Project", status = "open" }} }}

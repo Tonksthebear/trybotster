@@ -154,6 +154,39 @@ module Hubs
       auth&.destroy
     end
 
+    test "approved token registration reuses the fingerprint-created hub" do
+      user = users(:primary_user)
+      fingerprint = "aa:bb:cc:dd"
+      auth = HubAuthorization.create!(device_name: "fresh-cli", fingerprint: fingerprint)
+      auth.approve!(user)
+
+      get code_path(auth.device_code), as: :json
+      assert_response :success
+
+      json = JSON.parse(response.body)
+      hub = user.hubs.find_by!(fingerprint: fingerprint)
+      assert_equal "fresh-cli", hub.name
+
+      assert_no_difference "Hub.count" do
+        post hubs_path,
+          params: {
+            identifier: "device-#{fingerprint.delete(":")}",
+            fingerprint: fingerprint
+          },
+          headers: { "Authorization" => "Bearer #{json.fetch("access_token")}" },
+          as: :json
+      end
+
+      assert_response :success
+      registration = JSON.parse(response.body)
+      assert_equal hub.id, registration.fetch("id")
+      assert_equal "device-#{fingerprint.delete(":")}", registration.fetch("identifier")
+      assert_equal "device-#{fingerprint.delete(":")}", hub.reload.identifier
+    ensure
+      user&.hubs&.where(fingerprint: fingerprint)&.destroy_all
+      auth&.destroy
+    end
+
     test "polling an already-consumed approved authorization does not create duplicate hubs" do
       user = users(:primary_user)
       auth = HubAuthorization.create!(device_name: "once-only")
