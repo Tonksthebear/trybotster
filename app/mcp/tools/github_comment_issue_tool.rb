@@ -32,8 +32,9 @@ class GithubCommentIssueTool < ApplicationMCPTool
     agent_info = botster_session_attribution
     render(text: "Adding comment to #{repo}##{issue_number} as [bot] (#{agent_info})...")
 
+    normalized_body = normalize_github_markdown_body(body)
     # Add attribution footer to comment body
-    enhanced_body = body + attribution_footer
+    enhanced_body = normalized_body + attribution_footer
 
     # Create comment using installation token (bot attribution)
     comment = client.add_comment(repo, issue_number.to_i, enhanced_body)
@@ -47,8 +48,8 @@ class GithubCommentIssueTool < ApplicationMCPTool
       "",
       "Preview:",
       "---",
-      body.lines.first(5).join,
-      (body.lines.count > 5 ? "... (truncated)" : ""),
+      normalized_body.lines.first(5).join,
+      (normalized_body.lines.count > 5 ? "... (truncated)" : ""),
       "---",
       "",
       "View full comment at: #{comment[:html_url]}"
