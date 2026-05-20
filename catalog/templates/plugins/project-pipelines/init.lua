@@ -73,6 +73,16 @@ if events and events.on then
             log.warn("[project-pipelines] pr_review_submitted handler failed: " .. tostring(err))
         end
     end)
+
+    if _G.__project_pipelines_pr_comment_sub and events.off then
+        pcall(events.off, _G.__project_pipelines_pr_comment_sub)
+    end
+    _G.__project_pipelines_pr_comment_sub = events.on("pr_comment", function(data)
+        local ok, err = pcall(github_integration.handle_pr_comment, data)
+        if not ok then
+            log.warn("[project-pipelines] pr_comment handler failed: " .. tostring(err))
+        end
+    end)
 end
 
 if hooks and hooks.on then
