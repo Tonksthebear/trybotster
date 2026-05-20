@@ -61,12 +61,17 @@ class GithubCreatePullRequestReviewTool < ApplicationMCPTool
     agent_info = botster_session_attribution
 
     review_options = { event: event }
-    review_options[:body] = body.to_s + attribution_footer if body.present?
+    normalized_body = normalize_github_markdown_body(body) if body.present?
+    review_options[:body] = normalized_body + attribution_footer if body.present?
 
     parsed = parsed_comments
     if parsed.present?
       review_options[:comments] = parsed.map do |c|
-        { path: c["path"] || c[:path], line: (c["line"] || c[:line]).to_i, body: c["body"] || c[:body] }
+        {
+          path: c["path"] || c[:path],
+          line: (c["line"] || c[:line]).to_i,
+          body: normalize_github_markdown_body(c["body"] || c[:body])
+        }
       end
     end
 
@@ -94,7 +99,7 @@ class GithubCreatePullRequestReviewTool < ApplicationMCPTool
     if body.present?
       output << ""
       output << "📝 Review summary:"
-      output << body
+      output << normalized_body
     end
 
     response_text = output.join("\n")
