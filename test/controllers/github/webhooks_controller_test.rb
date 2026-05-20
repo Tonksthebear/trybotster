@@ -240,7 +240,7 @@ module Github
       body, signature = sign_webhook_payload(payload)
 
       with_stubbed_github do
-        assert_difference "Integrations::Github::Message.count", 1 do
+        assert_difference "Integrations::Github::Message.count", 2 do
           post "/github/webhooks",
             params: body,
             headers: {
@@ -251,9 +251,62 @@ module Github
         end
       end
 
-      message = Integrations::Github::Message.last
+      message = Integrations::Github::Message.where(event_type: "github_mention").last
       assert_equal 100, message.issue_number
       assert_equal true, message.payload["is_pr"]
+    end
+
+    test "issue_comment on PR without mention creates PR comment lifecycle message" do
+      payload = {
+        action: "created",
+        issue: {
+          number: 100,
+          title: "Test PR",
+          body: "PR body without issue link",
+          html_url: "https://github.com/test/repo/pull/100",
+          pull_request: { url: "https://api.github.com/repos/test/repo/pulls/100" }
+        },
+        comment: {
+          id: 888,
+          url: "https://api.github.com/repos/test/repo/issues/comments/888",
+          html_url: "https://github.com/test/repo/pull/100#issuecomment-888",
+          body: "Can this be clearer?",
+          created_at: "2026-05-20T12:00:00Z",
+          updated_at: "2026-05-20T12:00:00Z",
+          user: { login: "reviewer" }
+        },
+        repository: {
+          full_name: "test/repo"
+        },
+        installation: {
+          id: 12345
+        }
+      }
+
+      body, signature = sign_webhook_payload(payload)
+
+      assert_difference "Integrations::Github::Message.count", 1 do
+        post "/github/webhooks",
+          params: body,
+          headers: {
+            "Content-Type" => "application/json",
+            "X-GitHub-Event" => "issue_comment",
+            "X-Hub-Signature-256" => signature
+          }
+      end
+
+      message = Integrations::Github::Message.last
+      assert_equal "pull_request_comment", message.event_type
+      assert_equal "test/repo", message.repo
+      assert_equal 100, message.issue_number
+      assert_equal "created", message.payload["action"]
+      assert_equal 100, message.payload["pr_number"]
+      assert_equal "https://github.com/test/repo/pull/100", message.payload["pr_url"]
+      assert_equal 888, message.payload["comment_id"]
+      assert_equal "https://github.com/test/repo/pull/100#issuecomment-888", message.payload["comment_html_url"]
+      assert_equal "Can this be clearer?", message.payload["comment_body"]
+      assert_equal "reviewer", message.payload["comment_author"]
+      assert_equal "2026-05-20T12:00:00Z", message.payload["created_at"]
     end
 
     test "issue_comment on PR with linked issue routes to issue" do
@@ -285,7 +338,7 @@ module Github
         }) do
           body, signature = sign_webhook_payload(payload)
 
-          assert_difference "Integrations::Github::Message.count", 1 do
+          assert_difference "Integrations::Github::Message.count", 2 do
             post "/github/webhooks",
               params: body,
               headers: {
@@ -295,7 +348,7 @@ module Github
               }
           end
 
-          message = Integrations::Github::Message.last
+          message = Integrations::Github::Message.where(event_type: "github_mention").last
           assert_equal 50, message.issue_number, "Should route to linked issue #50"
           assert_equal false, message.payload["is_pr"], "Should be marked as issue, not PR"
 
