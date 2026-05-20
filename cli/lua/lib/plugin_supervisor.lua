@@ -14,6 +14,7 @@ local cleanup_modules = {
     { module = "lib.session_actions", fn = "unregister_by_plugin" },
     { module = "lib.notifications", fn = "unregister_by_plugin" },
     { module = "lib.surfaces", fn = "unregister_by_plugin" },
+    { module = "lib.dashboard", fn = "unregister_by_plugin" },
     { module = "lib.plugin_assets", fn = "unregister_by_plugin" },
     { module = "lib.mcp", fn = "unregister_by_plugin" },
     { module = "lib.entity_broadcast", fn = "unregister_by_plugin" },

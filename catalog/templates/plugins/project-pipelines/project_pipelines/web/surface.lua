@@ -6,6 +6,7 @@
 -- @version 1.1.0
 
 local surfaces = require("lib.surfaces")
+local dashboard = require("lib.dashboard")
 local actions = require("project_pipelines.web.actions")
 local screen_home = require("project_pipelines.web.screens.home")
 local screen_new = require("project_pipelines.web.screens.new")
@@ -153,6 +154,66 @@ local function render_sidebar()
     return ui.stack{ direction = "vertical", gap = "3", children = children }
 end
 
+local function dashboard_run_template()
+    return ui.list_item{
+        id = ui.bind("@/id"),
+        action = ui.action("botster.nav.open", { path = ui.bind("@/path") }),
+        title = {
+            ui.badge{ text = "running", tone = "accent" },
+            ui.text{ text = ui.bind("@/ticket_title"), size = "sm", weight = "semibold" },
+        },
+        subtitle = {
+            ui.text{ text = ui.bind("@/pipeline_name"), size = "xs", tone = "muted" },
+            ui.text{ text = ui.bind("@/current_step_name"), size = "xs", tone = "muted" },
+        },
+        end_ = {
+            ui.bind_if("@/has_current_agent", ui.button{
+                label = "Agent",
+                icon = "command-line",
+                variant = "solid",
+                tone = "accent",
+                action = ui.action("botster.nav.open", { path = ui.bind("@/current_agent_path") }),
+            }),
+            ui.button{
+                label = "Run",
+                icon = "play-circle",
+                variant = "ghost",
+                action = ui.action("botster.nav.open", { path = ui.bind("@/path") }),
+            },
+        },
+    }
+end
+
+local function register_dashboard_widgets()
+    dashboard.register_widget("project-pipelines.active-runs", {
+        title = "Active Pipeline Runs",
+        icon = "queue-list",
+        size = "wide",
+        order = 30,
+        source = "plugin:project-pipelines",
+        children = {
+            ui.list{ children = {
+                ui.bind_list{
+                    source = "/project-pipelines.run",
+                    where = { status = "active" },
+                    item_template = dashboard_run_template(),
+                    empty_template = ui.empty_state{
+                        title = "No running pipelines",
+                        description = "Active ticket pipeline runs will appear here.",
+                        icon = "play-circle",
+                    },
+                },
+            } },
+            ui.button{
+                label = "Open Pipelines",
+                icon = "queue-list",
+                variant = "ghost",
+                action = ui.action("botster.nav.open", { path = "/pipelines" }),
+            },
+        },
+    })
+end
+
 function M.register()
     surfaces.register(SURFACE, {
         label = "Pipelines",
@@ -182,6 +243,7 @@ function M.register()
     })
 
     actions.register()
+    register_dashboard_widgets()
 end
 
 return M

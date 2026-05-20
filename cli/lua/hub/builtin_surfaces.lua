@@ -11,6 +11,7 @@
 -- Lua-authored tree identical to Phase 2 output.
 
 local surfaces = require("lib.surfaces")
+local dashboard = require("lib.dashboard")
 
 -- Shallow-copy `base` and set `surface` to the density the embedded
 -- `workspace_surface` layout expects. `web.layout:workspace_surface` branches
@@ -68,6 +69,18 @@ surfaces.register("workspace_panel", {
     render = workspace_renderer("panel"),
     order = 0,
     source = "builtin",
+})
+
+dashboard.register_widget("botster.sessions", {
+    title = "Sessions",
+    icon = "command-line",
+    size = "full",
+    order = 0,
+    source = "builtin",
+    body = ui.session_list{
+        density = "panel",
+        grouping = "workspace",
+    },
 })
 
 return true
