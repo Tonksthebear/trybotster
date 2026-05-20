@@ -23,7 +23,6 @@ local Agent = require("lib.agent")
 local EntityModel = require("lib.entity_model")
 local Session = require("lib.session")
 local terminal_clients = require("lib.terminal_clients")
-local EB = require("lib.entity_broadcast")
 local surfaces = require("lib.surfaces")
 local notifications = require("lib.notifications")
 
@@ -188,7 +187,7 @@ local function install_entity_broadcaster(eb)
     eb.set_broadcaster(broadcast_frame_to_hub)
 end
 
-install_entity_broadcaster(EB)
+install_entity_broadcaster()
 
 --- Broadcast `ui_tree_snapshot` frames for every hub-channel subscriber.
 ---
@@ -279,15 +278,22 @@ local function schedule_route_registry_broadcast(opts)
         -- fresh baselines for the reloaded owner so already-open surfaces do
         -- not wait for another user action to re-request snapshots.
         for owner_plugin in pairs(owner_plugins) do
+            local entity_broadcast = require("lib.entity_broadcast")
             for _, client in pairs(clients) do
                 for sub_id, sub in pairs(client.subscriptions or {}) do
                     if sub.channel == "hub" then
                         local ok, err = pcall(
-                            EB.schedule_snapshots_to,
-                            client,
-                            sub_id,
-                            { owner_plugin = owner_plugin }
-                        )
+                            function()
+                                -- lib.entity_broadcast can hot-reload without
+                                -- reloading this connection handler. Use the
+                                -- function-scoped live module so plugin
+                                -- reload refreshes do not hit a stale registry.
+                                entity_broadcast.schedule_snapshots_to(
+                                    client,
+                                    sub_id,
+                                    { owner_plugin = owner_plugin }
+                                )
+                            end)
                         if not ok then
                             log.warn(string.format(
                                 "plugin_reloaded snapshot refresh failed for owner_plugin=%s sub=%s: %s",

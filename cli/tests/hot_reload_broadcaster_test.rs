@@ -1,5 +1,4 @@
-//! Wire protocol — regression test for the hot-reload broadcaster gap
-//! (blocker B6).
+//! Wire protocol — regression tests for entity broadcast hot-reload gaps.
 //!
 //! Before the fix, `connections.lua::_before_reload` called
 //! `EB.set_broadcaster(nil)` before the new module's top-level call
@@ -11,6 +10,11 @@
 //! `_before_reload` runs (simulated), the broadcaster is still
 //! functional, so a subsequent EB.patch still delivers. Covers the
 //! mutator contract even if the test cannot spin up the full hub.
+//!
+//! The later plugin-reload test covers the reverse direction: connections.lua
+//! must resolve the live `lib.entity_broadcast` module when it asks for
+//! plugin-owned entity refreshes, otherwise an entity_broadcast.lua reload can
+//! leave the route/tree refresh path talking to a stale registry.
 
 #![expect(
     clippy::unwrap_used,
@@ -167,7 +171,7 @@ fn connections_before_reload_leaves_broadcaster_intact() {
 }
 
 #[test]
-fn plugin_reloaded_invalidates_tree_cache_before_rebroadcast() {
+fn plugin_reloaded_uses_live_entity_broadcast_after_tree_rebroadcast() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
     let dir = lua_src_dir();
@@ -232,17 +236,28 @@ fn plugin_reloaded_invalidates_tree_cache_before_rebroadcast() {
           get_focused_sessions = function(...) return {{}} end,
           is_any_focused = function(...) return false end,
         }}
-        package.loaded["lib.entity_broadcast"] = {{
+        eb_v1_snapshot_attempts = 0
+        eb_v2_snapshot_attempts = 0
+        eb_v2_snapshot_count = 0
+        local eb_v1 = {{
           set_broadcaster = function(...) end,
-          send_snapshots_to = function(_client, sub_id, opts)
-            snapshot_attempts = snapshot_attempts + 1
+          schedule_snapshots_to = function(...)
+            eb_v1_snapshot_attempts = eb_v1_snapshot_attempts + 1
+            error("stale entity_broadcast upvalue used for plugin reload refresh")
+          end,
+        }}
+        local eb_v2 = {{
+          set_broadcaster = function(...) end,
+          schedule_snapshots_to = function(_client, sub_id, opts)
+            eb_v2_snapshot_attempts = eb_v2_snapshot_attempts + 1
             if sub_id == "hub_bad" then error("snapshot source failed") end
             assert(sub_id == "hub_good")
             assert(tree_count == 2, "entity snapshots should follow tree rebroadcast")
             assert(opts.owner_plugin == "demo")
-            snapshot_count = snapshot_count + 1
+            eb_v2_snapshot_count = eb_v2_snapshot_count + 1
           end,
         }}
+        package.loaded["lib.entity_broadcast"] = eb_v1
         package.loaded["lib.surfaces"] = {{
           build_route_registry_payload = function()
             return {{ type = "ui_route_registry", routes = {{}} }}
@@ -295,15 +310,24 @@ fn plugin_reloaded_invalidates_tree_cache_before_rebroadcast() {
           disconnect = function(...) end,
         }})
 
+        package.loaded["lib.entity_broadcast"] = eb_v2
         assert(type(callbacks.plugin_reloaded) == "function", "connections should observe plugin_reloaded")
         callbacks.plugin_reloaded({{ key = "demo" }})
 
-        return invalidate_count, route_count, tree_count, snapshot_attempts, snapshot_count
+        return invalidate_count, route_count, tree_count, eb_v1_snapshot_attempts, eb_v2_snapshot_attempts, eb_v2_snapshot_count
         "#,
         dir = dir.display()
     );
 
-    let (invalidate_count, route_count, tree_count, snapshot_attempts, snapshot_count): (
+    let (
+        invalidate_count,
+        route_count,
+        tree_count,
+        eb_v1_snapshot_attempts,
+        eb_v2_snapshot_attempts,
+        eb_v2_snapshot_count,
+    ): (
+        i64,
         i64,
         i64,
         i64,
@@ -317,6 +341,7 @@ fn plugin_reloaded_invalidates_tree_cache_before_rebroadcast() {
     assert_eq!(invalidate_count, 1);
     assert_eq!(route_count, 2);
     assert_eq!(tree_count, 2);
-    assert_eq!(snapshot_attempts, 2);
-    assert_eq!(snapshot_count, 1);
+    assert_eq!(eb_v1_snapshot_attempts, 0);
+    assert_eq!(eb_v2_snapshot_attempts, 2);
+    assert_eq!(eb_v2_snapshot_count, 1);
 }
