@@ -28,17 +28,25 @@ function M.workspace_surface(state)
     local is_sidebar = density == "sidebar"
 
     local children = {}
-    children[#children + 1] = ui.session_list{
-        density = density,
-        grouping = "workspace",
-    }
     if is_sidebar then
+        children[#children + 1] = ui.session_list{
+            density = density,
+            grouping = "workspace",
+        }
         children[#children + 1] = ui.surface_nav{
             section = "workspace",
             density = density,
         }
-    end
-    if not is_sidebar then
+    else
+        local dashboard = require("lib.dashboard")
+        if dashboard.has_widgets() then
+            children[#children + 1] = dashboard.render{ density = density }
+        else
+            children[#children + 1] = ui.session_list{
+                density = density,
+                grouping = "workspace",
+            }
+        end
         children[#children + 1] = ui.new_session_button{
             action = ui.action("botster.session.create.request"),
         }

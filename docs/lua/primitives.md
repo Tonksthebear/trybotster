@@ -120,6 +120,43 @@ metadata = {
 }
 ```
 
+## Dashboard Widgets
+
+Plugins can contribute to the default Hub dashboard through `lib.dashboard`.
+Widgets are stable UiNode descriptors, not per-render plugin callbacks, so they
+can use shared primitives and entity bindings without putting plugin work on the
+dashboard hot path.
+
+```lua
+local dashboard = require("lib.dashboard")
+
+dashboard.register_widget("vault.pending-captures", {
+  title = "Pending Captures",
+  icon = "inbox", -- descriptor metadata; host support may vary
+  size = "wide", -- small, medium, wide, full; reserved for host placement
+  order = 40,
+  children = {
+    ui.list{ children = {
+      ui.bind_list{
+        source = "/vault.capture",
+        where = { status = "pending" },
+        item_template = ui.list_item{
+          id = ui.bind("@/id"),
+          title = { ui.text{ text = ui.bind("@/title") } },
+        },
+      },
+    } },
+  },
+})
+```
+
+The dashboard registry is plugin-owned: reload cleanup removes widgets whose
+`owner_plugin` matches the plugin being reloaded. Widget bodies should bind to
+plugin entities instead of querying plugin storage during dashboard render.
+Widgets registered outside plugin load, such as from a timer or callback, should
+pass `owner_plugin` explicitly when ownership cannot be inferred from the plugin
+worker context.
+
 Surface UI can render those sessions and mount the core terminal viewer without
 leaving the plugin route:
 

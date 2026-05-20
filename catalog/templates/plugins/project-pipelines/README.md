@@ -20,7 +20,7 @@ The plugin is intentionally split across modules:
 - `project_pipelines/entities.lua` owns plugin entity read models and publishes dynamic state to clients.
 - `project_pipelines/engine.lua` owns run advancement, gates, agent creation, and command gates.
 - `project_pipelines/mcp.lua` exposes the agent-facing API.
-- `project_pipelines/web/surface.lua` registers routes and sidebar navigation.
+- `project_pipelines/web/surface.lua` registers routes, sidebar navigation, and the Hub dashboard widget.
 - `project_pipelines/web/screens/home.lua` renders the overview.
 - `project_pipelines/web/screens/pipelines.lua` renders the pipeline index and edit form.
 - `project_pipelines/web/screens/run.lua` renders run details.
@@ -211,6 +211,10 @@ this by inspecting the opened surface tree for `ui.bind` / `ui.bind_list`
 sources. Unfiltered lists request whole-family snapshots, direct record binds
 request id upserts/removes, and filtered `bind_list{ where = { ... } }`
 sections request scoped snapshots that replace only matching rows.
+
+The Hub dashboard widget uses the same path: it is a `lib.dashboard`
+registration whose body binds to `/project-pipelines.run` instead of querying
+plugin storage during dashboard render.
 
 The contract module describes the published read-model shape, not the plugin.db
 table schema. Persistence models may have different names, decoded JSON fields,

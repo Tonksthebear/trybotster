@@ -72,6 +72,7 @@ _G.action = safe_require("lib.action")
 -- surfaces global lets plugin authors call `surfaces.register(name, opts)`
 -- without boilerplate. `hub.builtin_surfaces` registers workspace_sidebar /
 -- workspace_panel so the workspace isn't special-cased anywhere else.
+_G.dashboard = safe_require("lib.dashboard")
 _G.surfaces = safe_require("lib.surfaces")
 safe_require("hub.builtin_surfaces")
 

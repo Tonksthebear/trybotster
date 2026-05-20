@@ -709,3 +709,11 @@ generic `ui_action_result` frames for submitters. Project Pipelines is the
 reference plugin for this model. New plugin UI should extend that path, not add
 plugin-specific browser stores, renderer-specific pending state, or duplicate
 client renderers.
+
+The default Hub dashboard follows the same rule. Plugins register dashboard
+widgets as inert UiNode descriptors through `lib.dashboard`; the browser hydrates
+any referenced entity families by inspecting `ui.bind` / `ui.bind_list` in the
+received tree. Plugins do not get a dashboard-specific React renderer or a
+per-render Lua callback. Widget `size`, `icon`, and `description` fields are
+host-owned descriptor metadata; `size` is reserved for dashboard placement once
+the host grows a grid/layout primitive.

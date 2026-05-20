@@ -524,6 +524,174 @@ fn workspace_panel_layout_keeps_pairing_out_of_main_surface() {
         tree_contains_type(&parsed, "new_session_button"),
         "workspace panel should still render the new-session affordance: {parsed}"
     );
+    assert_eq!(
+        parsed
+            .pointer("/children/0/children/0/props/title")
+            .and_then(|v| v.as_str()),
+        Some("Sessions"),
+        "default workspace sessions should render through the dashboard widget shell"
+    );
+}
+
+#[test]
+fn workspace_panel_renders_plugin_registered_dashboard_widgets() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    lua.load(
+        r#"
+        require("hub.builtin_surfaces")
+        _G._loading_plugin_key = "project-pipelines"
+        local dashboard = require("lib.dashboard")
+        dashboard.register_widget("project-pipelines.active-runs", {
+            title = "Active Pipeline Runs",
+            order = 30,
+            children = {
+                ui.list{ children = {
+                    ui.bind_list{
+                        source = "/project-pipelines.run",
+                        where = { status = "active" },
+                        item_template = ui.list_item{
+                            id = ui.bind("@/id"),
+                            title = {
+                                ui.text{ text = ui.bind("@/ticket_title") },
+                            },
+                        },
+                    },
+                } },
+            },
+        })
+        _G._loading_plugin_key = nil
+        "#,
+    )
+    .exec()
+    .expect("register dashboard widget");
+
+    let json: String = lua
+        .load(r#"return web_layout.render("workspace_panel", { surface = "panel" })"#)
+        .eval()
+        .expect("render workspace panel");
+
+    let parsed: serde_json::Value = serde_json::from_str(&json).expect("parse JSON");
+    assert_eq!(
+        parsed
+            .pointer("/children/0/children/1/id")
+            .and_then(|v| v.as_str()),
+        Some("dashboard-widget-project-pipelines.active-runs")
+    );
+    assert_eq!(
+        parsed
+            .pointer("/children/0/children/1/props/title")
+            .and_then(|v| v.as_str()),
+        Some("Active Pipeline Runs")
+    );
+    assert_eq!(
+        parsed
+            .pointer("/children/0/children/1/children/0/children/0/children/0/$kind")
+            .and_then(|v| v.as_str()),
+        Some("bind_list"),
+        "plugin widget bindings must survive dashboard rendering: {parsed}"
+    );
+    assert_eq!(
+        parsed
+            .pointer("/children/0/children/1/children/0/children/0/children/0/source")
+            .and_then(|v| v.as_str()),
+        Some("/project-pipelines.run")
+    );
+}
+
+#[test]
+fn dashboard_unregister_by_plugin_removes_owned_widgets_only() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let (before, removed, after): (i64, i64, i64) = lua
+        .load(
+            r#"
+            local dashboard = require("lib.dashboard")
+            dashboard._reset_for_tests()
+            dashboard.register_widget("core.sessions", {
+                title = "Sessions",
+                owner_plugin = false,
+                body = ui.text{ text = "sessions" },
+            })
+            _G._loading_plugin_key = "demo-plugin"
+            dashboard.register_widget("demo.widget", {
+                title = "Demo",
+                body = ui.text{ text = "demo" },
+            })
+            _G._loading_plugin_key = nil
+            _G._plugin_worker_key = "demo-plugin"
+            dashboard.register_widget("demo.worker-widget", {
+                title = "Worker Demo",
+                body = ui.text{ text = "worker" },
+            })
+            _G._plugin_worker_key = nil
+            local before = #dashboard.list()
+            local removed = dashboard.unregister_by_plugin("demo-plugin")
+            local after = #dashboard.list()
+            return before, removed, after
+            "#,
+        )
+        .eval()
+        .expect("dashboard cleanup");
+
+    assert_eq!(before, 3);
+    assert_eq!(removed, 2);
+    assert_eq!(after, 1);
+}
+
+#[test]
+fn dashboard_unregister_widget_removes_one_widget() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let (removed, count): (bool, i64) = lua
+        .load(
+            r#"
+            local dashboard = require("lib.dashboard")
+            dashboard._reset_for_tests()
+            dashboard.register_widget("demo.one", {
+                title = "One",
+                body = ui.text{ text = "one" },
+            })
+            dashboard.register_widget("demo.two", {
+                title = "Two",
+                body = ui.text{ text = "two" },
+            })
+            return dashboard.unregister_widget("demo.one"), #dashboard.list()
+            "#,
+        )
+        .eval()
+        .expect("dashboard unregister widget");
+
+    assert!(removed);
+    assert_eq!(count, 1);
+}
+
+#[test]
+fn dashboard_rejects_invalid_widget_size() {
+    let _lock = lock_env();
+    let lua = new_test_lua();
+
+    let failed: bool = lua
+        .load(
+            r#"
+            local dashboard = require("lib.dashboard")
+            dashboard._reset_for_tests()
+            return pcall(function()
+                dashboard.register_widget("demo.bad", {
+                    title = "Bad",
+                    size = "giant",
+                    body = ui.text{ text = "bad" },
+                })
+            end) == false
+            "#,
+        )
+        .eval()
+        .expect("dashboard invalid size");
+
+    assert!(failed);
 }
 
 #[test]
