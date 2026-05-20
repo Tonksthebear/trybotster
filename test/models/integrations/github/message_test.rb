@@ -178,6 +178,16 @@ class Integrations::Github::MessageTest < ActiveSupport::TestCase
     assert_includes message.errors[:event_type], "invalid_type is not a valid event type"
   end
 
+  test "allows pull_request_comment event type" do
+    message = Integrations::Github::Message.new(
+      event_type: "pull_request_comment",
+      repo: "test/repo",
+      payload: { repo: "test/repo", pr_number: 1, comment_id: 123 }
+    )
+
+    assert message.valid?
+  end
+
   test "validates repo presence" do
     message = Integrations::Github::Message.new(
       event_type: "github_mention",
