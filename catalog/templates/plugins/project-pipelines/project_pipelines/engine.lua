@@ -14,6 +14,14 @@ local Agent = require("lib.agent")
 
 local OWNER = "project-pipelines"
 local SURFACE = "pipelines"
+local GITHUB_FORWARD_MARKER = "👀"
+
+local function github_forwarded(text)
+    if util.is_blank(text) then
+        return GITHUB_FORWARD_MARKER
+    end
+    return GITHUB_FORWARD_MARKER .. " " .. tostring(text)
+end
 
 local function lua_pattern_escape(value)
     return tostring(value):gsub("([^%w])", "%%%1")
@@ -325,7 +333,7 @@ local function spawn_step_agent(run, step, opts)
         "If you are reviewing, check correctness, regressions, architecture fit, missing tests, documentation gaps, overcomplication, hidden assumptions, dead code, deprecated code paths, and unwired implementation. Do not accept pre-existing failures as a blanket excuse; require exact evidence that a failure is unrelated or send the work back. Call project_pipelines_submit_review with findings or approval.",
     }, "\n\n")
     if not util.is_blank(opts.extra_prompt) then
-        role_prompt = role_prompt .. "\n\n" .. tostring(opts.extra_prompt)
+        role_prompt = role_prompt .. "\n\n" .. github_forwarded(opts.extra_prompt)
     end
 
     if existing and existing.agent_session_uuid and Agent.get(existing.agent_session_uuid) then
@@ -1045,7 +1053,7 @@ end
 local function pr_review_extra_prompt(ticket, link, event)
     local state = tostring(event.state or "commented")
     local lines = {
-        "A GitHub PR review was submitted for this ticket's linked PR.",
+        github_forwarded("A GitHub PR review was submitted for this ticket's linked PR."),
         "Review state: " .. state,
         "PR: " .. tostring(event.pr_url or link.pr_url or (tostring(link.repo) .. "#" .. tostring(link.pr_number))),
     }
@@ -1069,7 +1077,7 @@ end
 local function pr_steward_review_prompt(ticket, link, event)
     local state = tostring(event.state or "commented")
     local lines = {
-        "A GitHub PR review was submitted for a PR you steward for this Project Pipelines ticket.",
+        github_forwarded("A GitHub PR review was submitted for a PR you steward for this Project Pipelines ticket."),
         "Ticket: " .. tostring(ticket and (ticket.title or ticket.id) or link.ticket_id),
         "Review state: " .. state,
         "PR: " .. tostring(event.pr_url or link.pr_url or (tostring(link.repo) .. "#" .. tostring(link.pr_number))),
@@ -1087,6 +1095,28 @@ local function pr_steward_review_prompt(ticket, link, event)
     lines[#lines + 1] = "You are an orchestrator, not the implementer. Do not implement PR feedback yourself, and do not answer architecture/product questions from your own judgment alone when an existing ticket agent has relevant context."
     lines[#lines + 1] = "If the feedback is informational, answer on the PR using the GitHub MCP tools after checking the appropriate ticket context. If the human asked or said something through the PR, ask clarifying follow-up questions and provide answers on that PR thread instead of switching to project_pipelines_ask_human. If it needs code changes, delegate to the existing implementer with Botster MCP messaging tools such as list_hubs, post_message, and notify_session, and route the pipeline back to implementation when needed. If it is architectural/product reasoning, delegate to the existing planner or other context-owning ticket agent and synthesize their answer back to the PR. Use Project Pipelines human questions only for non-PR-originated decisions or when a durable pipeline-level waiver/decision record is required in addition to the PR reply."
     lines[#lines + 1] = "Do not create a new PR or new ticket run for ordinary PR review revisions. Keep the existing linked PR as the delivery envelope."
+    return table.concat(lines, "\n\n")
+end
+
+local function pr_steward_comment_prompt(ticket, link, event)
+    local action = tostring(event.action or "created")
+    local lines = {
+        github_forwarded("A GitHub PR conversation comment was " .. action .. " on a PR you steward for this Project Pipelines ticket."),
+        "Ticket: " .. tostring(ticket and (ticket.title or ticket.id) or link.ticket_id),
+        "PR: " .. tostring(event.pr_url or link.pr_url or (tostring(link.repo) .. "#" .. tostring(link.pr_number))),
+    }
+    if not util.is_blank(event.comment_url) then
+        lines[#lines + 1] = "Comment: " .. tostring(event.comment_url)
+    end
+    if not util.is_blank(event.comment_author) then
+        lines[#lines + 1] = "Author: " .. tostring(event.comment_author)
+    end
+    if not util.is_blank(event.comment_body) then
+        lines[#lines + 1] = "Comment body:\n" .. tostring(event.comment_body)
+    end
+    lines[#lines + 1] = "You are the PR steward. Triage this through project_pipelines_current_context and project_pipelines_get_ticket before acting."
+    lines[#lines + 1] = "If the human asked or said something through the PR, answer on that PR thread using the GitHub MCP tools after checking the appropriate ticket context. If it needs code changes, delegate to the existing implementer with Botster MCP messaging tools such as list_hubs, post_message, and notify_session, and route the pipeline back to implementation when needed."
+    lines[#lines + 1] = "Do not create a new PR or new ticket run for ordinary PR conversation comments. Keep the existing linked PR as the delivery envelope."
     return table.concat(lines, "\n\n")
 end
 
@@ -1130,7 +1160,7 @@ local function notify_merge_agent_of_pr_review(ticket, run, link, event)
         Hub.get():notify(session_uuid, {
             source = OWNER,
             title = state == "changes_requested" and "PR changes requested" or (state == "approved" and "PR approved" or "PR review submitted"),
-            body = "GitHub PR review feedback is ready for PR steward triage on ticket " .. tostring(ticket.title or ticket.id) .. ".",
+            body = github_forwarded("GitHub PR review feedback is ready for PR steward triage on ticket " .. tostring(ticket.title or ticket.id) .. "."),
             action = {
                 kind = "mcp_tool",
                 name = "project_pipelines_current_context",
@@ -1145,6 +1175,56 @@ local function notify_merge_agent_of_pr_review(ticket, run, link, event)
             pr_link_id = link.id,
             session_uuid = session_uuid,
             review_state = state,
+            delivered = ok,
+            error = ok and nil or tostring(err),
+        },
+    })
+    if ok then
+        return { session_uuid = session_uuid, prompted = true }
+    end
+    return nil
+end
+
+local function notify_merge_agent_of_pr_comment(ticket, run, link, event)
+    local session_uuid = live_merge_agent(ticket.id)
+    if util.is_blank(session_uuid) then
+        return nil
+    end
+    local instructions = pr_steward_comment_prompt(ticket, link, event)
+    local ok, err = pcall(function()
+        Hub.get():post(session_uuid, {
+            type = "task",
+            from_agent_id = OWNER,
+            from_label = "Project Pipelines",
+            payload = {
+                run_id = run.id,
+                ticket_id = ticket.id,
+                pr_link_id = link.id,
+                source_event = "pr_comment",
+                comment_id = event.comment_id,
+                comment_action = event.action,
+                instructions = instructions,
+            },
+        })
+        Hub.get():notify(session_uuid, {
+            source = OWNER,
+            title = "PR comment " .. tostring(event.action or "created"),
+            body = github_forwarded("GitHub PR conversation comment is ready for PR steward triage on ticket " .. tostring(ticket.title or ticket.id) .. "."),
+            action = {
+                kind = "mcp_tool",
+                name = "project_pipelines_current_context",
+                params = { run_id = run.id },
+            },
+        })
+    end)
+    repo.append_event("ticket.pr_comment_steward_prompted", {
+        run_id = run.id,
+        ticket_id = ticket.id,
+        payload = {
+            pr_link_id = link.id,
+            session_uuid = session_uuid,
+            comment_id = event.comment_id,
+            comment_action = event.action,
             delivered = ok,
             error = ok and nil or tostring(err),
         },
@@ -1250,6 +1330,46 @@ function M.handle_pr_review_submitted(link, event)
 
     refresh_surfaces()
     return { ok = true, status = "reactivated", ticket = ticket, run = repo.get_run(run.id), step = step, run_step = repo.get_run_step_visit(visit.id), agent = agent }
+end
+
+function M.handle_pr_comment(link, event)
+    link = link or {}
+    event = event or {}
+    local ticket = repo.get_ticket(link.ticket_id)
+    local run = link.run_id and repo.get_run(link.run_id) or nil
+    if not run and ticket then
+        run = repo.latest_ticket_run(ticket.id)
+    end
+    if not ticket or not run then
+        return { ok = false, reason = "missing_ticket_or_run" }
+    end
+
+    repo.append_event("ticket.pr_comment", {
+        run_id = run.id,
+        ticket_id = ticket.id,
+        payload = {
+            pr_link_id = link.id,
+            provider = link.provider,
+            repo = link.repo,
+            pr_number = link.pr_number,
+            pr_url = event.pr_url or link.pr_url,
+            comment_id = event.comment_id,
+            comment_url = event.comment_url,
+            comment_author = event.comment_author,
+            comment_body = event.comment_body,
+            action = event.action,
+            created_at = event.created_at,
+            updated_at = event.updated_at,
+        },
+    })
+
+    local steward = notify_merge_agent_of_pr_comment(ticket, run, link, event)
+    refresh_surfaces()
+    if steward then
+        return { ok = true, status = "steward_prompted", ticket = ticket, run = run, pr_steward = steward }
+    end
+
+    return { ok = true, status = "recorded", reason = "no_steward", ticket = ticket, run = run }
 end
 
 function M.start_run(params)
