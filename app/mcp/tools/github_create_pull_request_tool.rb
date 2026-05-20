@@ -30,7 +30,7 @@ class GithubCreatePullRequestTool < ApplicationMCPTool
     render(text: "Creating pull request in #{repo} as [bot] (#{agent_info})...")
 
     # Add attribution footer to PR body
-    enhanced_body = body.to_s + attribution_footer
+    enhanced_body = normalize_github_markdown_body(body) + attribution_footer
 
     # Create PR using installation token (bot attribution)
     pr = client.create_pull_request(repo, base, head, title, enhanced_body, draft: draft || false)
