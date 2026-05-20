@@ -221,6 +221,25 @@ class GithubCreateIssueToolTest < ActiveSupport::TestCase
     end
   end
 
+  test "normalizes escaped newlines in issue body before creating issue" do
+    tool = GithubCreateIssueTool.new(repo: "owner/repo", title: "New issue", body: "Intro\\n\\n- item")
+    setup_tool_mocks(tool)
+
+    captured_body = nil
+    issue_data = @created_issue
+    client = Object.new
+    client.define_singleton_method(:create_issue) do |_repo, _title, body, **_kwargs|
+      captured_body = body
+      resource = OpenStruct.new(issue_data)
+      resource.define_singleton_method(:to_h) { issue_data }
+      resource
+    end
+
+    with_installation_client(client) { tool.perform }
+
+    assert_equal "Intro\n\n- item\n\n_via test_", captured_body
+  end
+
   test "returns error when app not installed" do
     tool = GithubCreateIssueTool.new(repo: "owner/repo", title: "New issue", body: "Description")
     setup_tool_mocks(tool)
@@ -261,6 +280,45 @@ class GithubCommentIssueToolTest < ActiveSupport::TestCase
       tool.perform
       assert_nil tool.instance_variable_get(:@error)
     end
+  end
+
+  test "normalizes escaped newlines in comment body before adding comment" do
+    tool = GithubCommentIssueTool.new(repo: "owner/repo", issue_number: 123, body: "Intro\\n\\n- item")
+    setup_tool_mocks(tool)
+
+    captured_body = nil
+    comment_data = @comment
+    client = Object.new
+    client.define_singleton_method(:add_comment) do |_repo, _issue_number, body|
+      captured_body = body
+      resource = OpenStruct.new(comment_data)
+      resource.define_singleton_method(:to_h) { comment_data }
+      resource
+    end
+
+    with_installation_client(client) { tool.perform }
+
+    assert_equal "Intro\n\n- item\n\n_via test_", captured_body
+  end
+
+  test "preserves escaped newline examples in already multiline comment body" do
+    body = "Intro\n\n```ruby\nputs \"Use \\n here\"\n```"
+    tool = GithubCommentIssueTool.new(repo: "owner/repo", issue_number: 123, body: body)
+    setup_tool_mocks(tool)
+
+    captured_body = nil
+    comment_data = @comment
+    client = Object.new
+    client.define_singleton_method(:add_comment) do |_repo, _issue_number, submitted_body|
+      captured_body = submitted_body
+      resource = OpenStruct.new(comment_data)
+      resource.define_singleton_method(:to_h) { comment_data }
+      resource
+    end
+
+    with_installation_client(client) { tool.perform }
+
+    assert_equal "#{body}\n\n_via test_", captured_body
   end
 
   test "returns error when app not installed" do
@@ -406,6 +464,25 @@ class GithubUpdateIssueToolTest < ActiveSupport::TestCase
     end
   end
 
+  test "normalizes escaped newlines in issue update body" do
+    tool = GithubUpdateIssueTool.new(repo: "owner/repo", issue_number: 123, body: "Intro\\n\\n- item")
+    setup_tool_mocks(tool)
+
+    captured_options = nil
+    issue_data = @updated_issue
+    client = Object.new
+    client.define_singleton_method(:update_issue) do |_repo, _issue_number, options|
+      captured_options = options
+      resource = OpenStruct.new(issue_data)
+      resource.define_singleton_method(:to_h) { issue_data }
+      resource
+    end
+
+    with_installation_client(client) { tool.perform }
+
+    assert_equal "Intro\n\n- item", captured_options[:body]
+  end
+
   test "returns error when app not installed" do
     tool = GithubUpdateIssueTool.new(repo: "owner/repo", issue_number: 123, state: "closed")
     setup_tool_mocks(tool)
@@ -458,6 +535,31 @@ class GithubCreatePullRequestToolTest < ActiveSupport::TestCase
       tool.perform
       assert_nil tool.instance_variable_get(:@error)
     end
+  end
+
+  test "normalizes escaped newlines in pull request body before creating pull request" do
+    tool = GithubCreatePullRequestTool.new(
+      repo: "owner/repo",
+      title: "New feature",
+      head: "feature-branch",
+      base: "main",
+      body: "Intro\\n\\n- item"
+    )
+    setup_tool_mocks(tool)
+
+    captured_body = nil
+    pr_data = @created_pr
+    client = Object.new
+    client.define_singleton_method(:create_pull_request) do |_repo, _base, _head, _title, body, **_kwargs|
+      captured_body = body
+      resource = OpenStruct.new(pr_data)
+      resource.define_singleton_method(:to_h) { pr_data }
+      resource
+    end
+
+    with_installation_client(client) { tool.perform }
+
+    assert_equal "Intro\n\n- item\n\n_via test_", captured_body
   end
 
   test "returns error when app not installed" do
@@ -756,6 +858,34 @@ class GithubCreatePullRequestReviewToolTest < ActiveSupport::TestCase
     end
   end
 
+  test "normalizes escaped newlines in review body and inline comments" do
+    tool = GithubCreatePullRequestReviewTool.new(
+      repo: "owner/repo",
+      pr_number: 49,
+      event: "COMMENT",
+      body: "Summary\\n\\n- item",
+      comments: [
+        { "path" => "app/models/user.rb", "line" => 15, "body" => "Inline\\n\\n- note" }
+      ]
+    )
+    setup_tool_mocks(tool)
+
+    captured_options = nil
+    review_data = @review_data
+    client = Object.new
+    client.define_singleton_method(:create_pull_request_review) do |_repo, _pr_number, **options|
+      captured_options = options
+      resource = OpenStruct.new(review_data)
+      resource.define_singleton_method(:to_h) { review_data }
+      resource
+    end
+
+    with_installation_client(client) { tool.perform }
+
+    assert_equal "Summary\n\n- item\n\n_via test_", captured_options[:body]
+    assert_equal "Inline\n\n- note", captured_options[:comments].first[:body]
+  end
+
   test "returns error when app not installed" do
     tool = GithubCreatePullRequestReviewTool.new(
       repo: "owner/repo", pr_number: 49, event: "APPROVE"
@@ -884,5 +1014,95 @@ class GithubCreatePullRequestReviewToolTest < ActiveSupport::TestCase
     with_installation_client(mock_client) { tool2.perform }
 
     assert_equal 1, api_call_count, "Retry should not call the GitHub API again"
+  end
+end
+
+class GithubMarkPullRequestReadyForReviewToolTest < ActiveSupport::TestCase
+  include MCPToolTestHelper
+
+  test "marks draft pull request ready for review with graphql mutation" do
+    tool = GithubMarkPullRequestReadyForReviewTool.new(repo: "owner/repo", pr_number: 49)
+    setup_tool_mocks(tool)
+
+    captured_path = nil
+    captured_payload = nil
+    client = Object.new
+    client.define_singleton_method(:pull_request) do |_repo, _pr_number|
+      { number: 49, draft: true, node_id: "PR_kwDOExample", html_url: "https://github.com/owner/repo/pull/49" }.with_indifferent_access
+    end
+    client.define_singleton_method(:post) do |path, payload|
+      captured_path = path
+      captured_payload = JSON.parse(payload)
+      {
+        data: {
+          markPullRequestReadyForReview: {
+            pullRequest: { number: 49, isDraft: false, url: "https://github.com/owner/repo/pull/49" }
+          }
+        }
+      }.with_indifferent_access
+    end
+
+    with_installation_client(client) { tool.perform }
+
+    assert_nil tool.instance_variable_get(:@error)
+    assert_equal "/graphql", captured_path
+    assert_includes captured_payload["query"], "markPullRequestReadyForReview"
+    assert_equal "PR_kwDOExample", captured_payload.dig("variables", "id")
+    rendered = tool.instance_variable_get(:@rendered)
+    assert rendered[:text]&.include?("ready for review")
+  end
+
+  test "does not call graphql when pull request is already ready for review" do
+    tool = GithubMarkPullRequestReadyForReviewTool.new(repo: "owner/repo", pr_number: 49)
+    setup_tool_mocks(tool)
+
+    post_called = false
+    client = Object.new
+    client.define_singleton_method(:pull_request) do |_repo, _pr_number|
+      { number: 49, draft: false, node_id: "PR_kwDOExample" }.with_indifferent_access
+    end
+    client.define_singleton_method(:post) do |*_args|
+      post_called = true
+      raise "GraphQL should not be called"
+    end
+
+    with_installation_client(client) { tool.perform }
+
+    assert_not post_called
+    assert_nil tool.instance_variable_get(:@error)
+    rendered = tool.instance_variable_get(:@rendered)
+    assert rendered[:text]&.include?("already ready")
+  end
+
+  test "returns error when app not installed" do
+    tool = GithubMarkPullRequestReadyForReviewTool.new(repo: "owner/repo", pr_number: 49)
+    setup_tool_mocks(tool)
+
+    with_no_installation do
+      tool.perform
+      error = tool.instance_variable_get(:@error)
+      assert error&.include?("not installed")
+    end
+  end
+
+  test "returns error when github does not provide node id" do
+    tool = GithubMarkPullRequestReadyForReviewTool.new(repo: "owner/repo", pr_number: 49)
+    setup_tool_mocks(tool)
+
+    client = Object.new
+    client.define_singleton_method(:pull_request) do |_repo, _pr_number|
+      { number: 49, draft: true }.with_indifferent_access
+    end
+
+    with_installation_client(client) { tool.perform }
+
+    error = tool.instance_variable_get(:@error)
+    assert error&.include?("node id")
+  end
+
+  test "validates pr_number is positive" do
+    tool = GithubMarkPullRequestReadyForReviewTool.new(repo: "owner/repo", pr_number: 0)
+    assert_not tool.valid?
+    assert tool.errors[:pr_number].any?
   end
 end
