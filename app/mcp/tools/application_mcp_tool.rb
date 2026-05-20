@@ -139,4 +139,12 @@ class ApplicationMCPTool < ActionMCP::Tool
 
     hash[key] || hash[key.to_sym]
   end
+
+  def normalize_github_markdown_body(value)
+    text = value.to_s
+    return text unless text.include?("\\n") || text.include?("\\r\\n")
+    return text if text.include?("\n") || text.include?("\r")
+
+    text.gsub("\\r\\n", "\n").gsub("\\n", "\n")
+  end
 end

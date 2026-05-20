@@ -33,7 +33,7 @@ class GithubUpdateIssueTool < ApplicationMCPTool
     update_options = {}
     update_options[:state] = state if state.present?
     update_options[:title] = title if title.present?
-    update_options[:body] = body if body.present?
+    update_options[:body] = normalize_github_markdown_body(body) if body.present?
     update_options[:labels] = labels.split(",").map(&:strip) if labels.present?
     update_options[:assignees] = assignees.split(",").map(&:strip) if assignees.present?
 
