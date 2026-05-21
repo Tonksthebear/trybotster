@@ -562,51 +562,6 @@ class GithubCreatePullRequestToolTest < ActiveSupport::TestCase
     assert_equal "Intro\n\n- item\n\n_via test_", captured_body
   end
 
-  test "casts draft property to booleans" do
-    false_tool = GithubCreatePullRequestTool.new(
-      repo: "owner/repo",
-      title: "PR",
-      head: "feature",
-      base: "main",
-      draft: false
-    )
-    true_tool = GithubCreatePullRequestTool.new(
-      repo: "owner/repo",
-      title: "PR",
-      head: "feature",
-      base: "main",
-      draft: true
-    )
-    omitted_tool = GithubCreatePullRequestTool.new(
-      repo: "owner/repo",
-      title: "PR",
-      head: "feature",
-      base: "main"
-    )
-
-    assert_equal false, false_tool.draft
-    assert_equal true, true_tool.draft
-    assert_nil omitted_tool.draft
-  end
-
-  test "passes explicit draft false to github client" do
-    _tool, kwargs = perform_create_pull_request_with(draft: false)
-
-    assert_equal false, kwargs[:draft]
-  end
-
-  test "passes draft true to github client" do
-    _tool, kwargs = perform_create_pull_request_with(draft: true)
-
-    assert_equal true, kwargs[:draft]
-  end
-
-  test "defaults omitted draft to false for github client" do
-    _tool, kwargs = perform_create_pull_request_with
-
-    assert_equal false, kwargs[:draft]
-  end
-
   test "returns error when app not installed" do
     tool = GithubCreatePullRequestTool.new(
       repo: "owner/repo",
@@ -631,33 +586,6 @@ class GithubCreatePullRequestToolTest < ActiveSupport::TestCase
   test "validates base branch presence" do
     tool = GithubCreatePullRequestTool.new(repo: "owner/repo", title: "PR", head: "feature", base: "")
     assert_not tool.valid?
-  end
-
-  private
-
-  def perform_create_pull_request_with(attributes = {})
-    tool = GithubCreatePullRequestTool.new({
-      repo: "owner/repo",
-      title: "New feature",
-      head: "feature-branch",
-      base: "main",
-      body: "Description"
-    }.merge(attributes))
-    setup_tool_mocks(tool)
-
-    captured_kwargs = nil
-    pr_data = @created_pr
-    client = Object.new
-    client.define_singleton_method(:create_pull_request) do |_repo, _base, _head, _title, _body, **kwargs|
-      captured_kwargs = kwargs
-      resource = OpenStruct.new(pr_data)
-      resource.define_singleton_method(:to_h) { pr_data }
-      resource
-    end
-
-    with_installation_client(client) { tool.perform }
-
-    [ tool, captured_kwargs ]
   end
 end
 

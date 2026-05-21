@@ -541,7 +541,20 @@ function M.call_tool(name, params, context, callback)
             return nil, err
         end
 
-        local params = { name = name, arguments = params or {} }
+        local arguments = params or {}
+        if type(proxy.transform_arguments) == "function" then
+            local ok, transformed = pcall(proxy.transform_arguments, name, arguments, context or {})
+            if not ok then
+                local err = "Proxy argument transform failed for tool " .. name .. ": " .. tostring(transformed)
+                if callback then callback(nil, err) return end
+                return nil, err
+            end
+            if type(transformed) == "table" then
+                arguments = transformed
+            end
+        end
+
+        local params = { name = name, arguments = arguments }
         local botster_meta = build_botster_meta(context)
         if botster_meta then params._meta = { botster = botster_meta } end
 
@@ -672,6 +685,7 @@ end
 -- @param opts table|nil {
 --   token = "bearer-token",        -- Authorization header for the remote server
 --   on_auth_error = function()      -- Called when a tool call returns 401; use to refresh the token
+--   transform_arguments = function(name, arguments, context) return arguments end
 -- }
 function M.proxy(url, opts)
     if type(url) ~= "string" or url == "" then
@@ -797,6 +811,7 @@ function M.proxy(url, opts)
         -- Update proxy registry (preserve on_auth_error across refreshes if not re-supplied).
         local prev_proxy = proxies[proxy_id]
         local prev_on_auth_error = prev_proxy and prev_proxy.on_auth_error
+        local prev_transform_arguments = prev_proxy and prev_proxy.transform_arguments
         proxies[proxy_id] = {
             url           = url,
             token         = token,
@@ -804,6 +819,7 @@ function M.proxy(url, opts)
             source        = registered_source,
             tool_names    = tool_names,
             on_auth_error = on_auth_error or prev_on_auth_error,
+            transform_arguments = opts.transform_arguments or prev_transform_arguments,
             owner_plugin  = owner_plugin or (prev_proxy and prev_proxy.owner_plugin),
             handler_id    = (owner_plugin or (prev_proxy and prev_proxy.owner_plugin))
                 and mcp_handler_id("proxy_auth_error", proxy_id)
