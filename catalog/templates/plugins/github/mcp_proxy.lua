@@ -102,6 +102,23 @@ local function on_mcp_auth_error()
     end)
 end
 
+local function normalize_tool_arguments(tool_name, arguments)
+    if tool_name ~= "github_create_pull_request" or type(arguments) ~= "table" then
+        return arguments
+    end
+
+    local normalized = {}
+    for key, value in pairs(arguments) do
+        normalized[key] = value
+    end
+
+    if normalized.draft == false then
+        normalized.draft = nil
+    end
+
+    return normalized
+end
+
 setup_mcp_proxy = function()
     local mcp_url = secrets.get("github", "mcp_url")
     local mcp_token = secrets.get("github", "mcp_token")
@@ -109,7 +126,11 @@ setup_mcp_proxy = function()
         log.debug("GitHub plugin: no MCP URL/token cached, skipping proxy setup")
         return
     end
-    mcp.proxy(mcp_url, { token = mcp_token, on_auth_error = on_mcp_auth_error })
+    mcp.proxy(mcp_url, {
+        token = mcp_token,
+        on_auth_error = on_mcp_auth_error,
+        transform_arguments = normalize_tool_arguments,
+    })
 end
 
 function M.start()

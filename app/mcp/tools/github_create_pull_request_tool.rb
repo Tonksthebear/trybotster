@@ -10,7 +10,6 @@ class GithubCreatePullRequestTool < ApplicationMCPTool
   property :head, type: "string", description: "The name of the branch where your changes are (e.g., 'feature-branch')", required: true
   property :base, type: "string", description: "The name of the branch you want to merge into (e.g., 'main')", required: true
   property :draft, type: "boolean", description: "Create as draft PR (default: false)", required: false
-  attribute :draft, :boolean
 
   validates :repo, format: { with: /\A[\w\-\.]+\/[\w\-\.]+\z/, message: "must be in 'owner/repo' format" }
   validates :title, presence: true, length: { minimum: 1, maximum: 256 }

@@ -287,6 +287,94 @@ fn catalog_plugin_github_template_normalizes_spawn_target_repos() {
 }
 
 #[test]
+fn catalog_plugin_github_mcp_proxy_normalizes_create_pull_request_draft_false() {
+    let plugin_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates/plugins/github");
+    let proxy_path = plugin_root.join("mcp_proxy.lua");
+
+    let lua = create_lua_vm();
+    let result_lua: Value = lua
+        .load(format!(
+            r#"
+            package.preload["hub.state"] = function()
+              return {{ get = function() return {{}} end }}
+            end
+            secrets = {{
+              get = function(scope, key)
+                if scope == "github" and key == "mcp_url" then return "https://example.test/mcp" end
+                if scope == "github" and key == "mcp_token" then return "token" end
+                return nil
+              end,
+              set = function() end,
+            }}
+            hub = {{ api_token = function() return nil end }}
+            config = {{ server_url = function() return "https://trybotster.test" end }}
+            http = {{ post = function() return nil, "unused" end }}
+            log = {{
+              debug = function() end,
+              info = function() end,
+              warn = function() end,
+            }}
+            timer = {{ every = function() return "timer" end, cancel = function() end }}
+            mcp = {{
+              proxy = function(url, opts)
+                _G.__github_mcp_proxy = {{ url = url, opts = opts }}
+              end,
+            }}
+
+            local proxy = assert(loadfile({proxy_path}))()
+            proxy.start()
+            local transform = _G.__github_mcp_proxy.opts.transform_arguments
+
+            local explicit_false = transform("github_create_pull_request", {{
+              title = "PR",
+              draft = false,
+            }})
+            local explicit_true = transform("github_create_pull_request", {{
+              title = "PR",
+              draft = true,
+            }})
+            local omitted = transform("github_create_pull_request", {{
+              title = "PR",
+            }})
+            local other_tool = transform("github_create_issue", {{
+              title = "Issue",
+              draft = false,
+            }})
+
+            return {{
+              proxy_url = _G.__github_mcp_proxy.url,
+              false_draft_removed = explicit_false.draft == nil,
+              false_title_preserved = explicit_false.title == "PR",
+              true_draft_preserved = explicit_true.draft == true,
+              omitted_still_omitted = omitted.draft == nil,
+              other_tool_unchanged = other_tool.draft == false,
+            }}
+            "#,
+            proxy_path = serde_json::to_string(&proxy_path.to_string_lossy()).unwrap(),
+        ))
+        .eval()
+        .expect("GitHub MCP proxy should normalize draft false at plugin boundary");
+    let result: JsonValue = lua
+        .from_value(result_lua)
+        .expect("GitHub MCP proxy result should convert to JSON");
+
+    assert_eq!(
+        result,
+        json!({
+            "proxy_url": "https://example.test/mcp",
+            "false_draft_removed": true,
+            "false_title_preserved": true,
+            "true_draft_preserved": true,
+            "omitted_still_omitted": true,
+            "other_tool_unchanged": true,
+        })
+    );
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_template_catalog_entry_is_a_multi_file_plugin() {
     let catalog_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1244,7 +1332,10 @@ fn catalog_plugin_github_event_routing_emits_pr_comment_and_does_not_spawn_agent
     assert_eq!(result["emitted"][0]["name"], json!("pr_comment"));
     assert_eq!(result["emitted"][0]["event"]["repo"], json!("owner/repo"));
     assert_eq!(result["emitted"][0]["event"]["pr_number"], json!(42));
-    assert_eq!(result["emitted"][0]["event"]["comment_body"], json!("Can this be clearer?"));
+    assert_eq!(
+        result["emitted"][0]["event"]["comment_body"],
+        json!("Can this be clearer?")
+    );
     assert_eq!(result["find_calls"], json!(0));
     assert_eq!(result["create_calls"], json!(0));
 }
