@@ -11,7 +11,7 @@
 -- let it drift and leaked a raw path into agent-facing context, where agents
 -- mistook it for their working directory. target_id is the sole stored handle.
 local db = plugin.db{
-    version = 9,
+    version = 10,
     migrations = {
         -- v9: drop the denormalized target_path columns. target_path is now
         -- fully derived from target_id at point of use. Guarded so it is a
@@ -34,6 +34,26 @@ local db = plugin.db{
             drop_target_path("tickets")
             drop_target_path("project_targets")
             drop_target_path("runs")
+        end,
+        -- v10: add pipeline lifecycle metadata. These columns are nullable so
+        -- existing definitions and fresh installs stay compatible while
+        -- archived definitions remain directly addressable by id.
+        [10] = function(migration_db)
+            local function add_column_if_missing(tbl, name, definition)
+                local info = migration_db:eval(string.format("PRAGMA table_info(%s)", tbl))
+                if type(info) == "table" then
+                    for _, col in ipairs(info) do
+                        if col.name == name then
+                            return
+                        end
+                    end
+                end
+                migration_db:eval(string.format("ALTER TABLE %s ADD COLUMN %s %s", tbl, name, definition))
+            end
+            add_column_if_missing("pipelines", "version_label", "text")
+            add_column_if_missing("pipelines", "archived_at", "integer")
+            add_column_if_missing("pipelines", "replacement_pipeline_id", "text")
+            add_column_if_missing("pipelines", "supersedes_pipeline_id", "text")
         end,
     },
     models = {
@@ -72,6 +92,10 @@ local db = plugin.db{
             name = { "text", required = true },
             description = { "text" },
             merge_policy = { "text" },
+            version_label = { "text" },
+            archived_at = { "integer" },
+            replacement_pipeline_id = { "text" },
+            supersedes_pipeline_id = { "text" },
             created_at = { "integer", required = true },
             updated_at = { "integer", required = true },
         },

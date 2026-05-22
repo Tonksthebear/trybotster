@@ -25,6 +25,7 @@ local function pipeline_card_template()
             },
         },
         ui.text{ text = ui.bind("@/description"), size = "xs", tone = "muted" },
+        ui.bind_if("@/version_label", view.badge(ui.bind("@/version_label"), "accent")),
         ui.text{ text = ui.bind("@/step_summary"), size = "xs", tone = "muted" },
     } } }
 end
@@ -35,9 +36,19 @@ function M.index(_view_state, ctx)
             title = "Pipeline Definitions",
             back_id = "pipeline-index-back",
             back_path = ctx.path("/"),
+            actions = {
+                ui.button{
+                    id = "pipeline-index-archived",
+                    label = "Archived",
+                    icon = "archive-box",
+                    variant = "ghost",
+                    action = ui.action("botster.nav.open", { path = ctx.path("/pipelines/archived") }),
+                },
+            },
         },
         ui.bind_list{
             source = "/project-pipelines.pipeline",
+            where = { active = true },
             item_template = pipeline_card_template(),
             empty_template = view.empty(
                 "No pipelines yet",
@@ -48,6 +59,26 @@ function M.index(_view_state, ctx)
     }
 
     return ui.stack{ direction = "vertical", gap = "4", children = children }
+end
+
+function M.archived(_view_state, ctx)
+    return ui.stack{ direction = "vertical", gap = "4", children = {
+        view.page_header{
+            title = "Archived Pipeline Definitions",
+            back_id = "pipeline-archived-back",
+            back_path = ctx.path("/pipelines"),
+        },
+        ui.bind_list{
+            source = "/project-pipelines.pipeline",
+            where = { archived = true },
+            item_template = pipeline_card_template(),
+            empty_template = view.empty(
+                "No archived pipelines",
+                "Retired pipeline definitions will appear here after they are archived.",
+                "archive-box"
+            ),
+        },
+    } }
 end
 
 local function feedback_error(state, id, field)
@@ -120,6 +151,58 @@ local function edit_pipeline_fields(pipeline, state)
     local merge_policy_error = feedback_error(state, pipeline.id, "merge_policy")
     if merge_policy_error then
         table.insert(children, ui.text{ text = merge_policy_error, size = "xs", tone = "danger" })
+    end
+    table.insert(children, ui.text_input{
+        id = "pipeline-" .. pipeline.id .. "-version-label",
+        label = "Version",
+        placeholder = pipeline.version_label or "",
+        on_change = view.field_action("project_pipelines.update_pipeline_field", {
+            pipeline_id = pipeline.id,
+            field = "version_label",
+        }),
+    })
+    local version_error = feedback_error(state, pipeline.id, "version_label")
+    if version_error then
+        table.insert(children, ui.text{ text = version_error, size = "xs", tone = "danger" })
+    end
+    table.insert(children, ui.text_input{
+        id = "pipeline-" .. pipeline.id .. "-replacement-pipeline",
+        label = "Replacement pipeline ID",
+        placeholder = pipeline.replacement_pipeline_id or "",
+        on_change = view.field_action("project_pipelines.update_pipeline_field", {
+            pipeline_id = pipeline.id,
+            field = "replacement_pipeline_id",
+        }),
+    })
+    local replacement_error = feedback_error(state, pipeline.id, "replacement_pipeline_id")
+    if replacement_error then
+        table.insert(children, ui.text{ text = replacement_error, size = "xs", tone = "danger" })
+    end
+    table.insert(children, ui.text_input{
+        id = "pipeline-" .. pipeline.id .. "-supersedes-pipeline",
+        label = "Supersedes pipeline ID",
+        placeholder = pipeline.supersedes_pipeline_id or "",
+        on_change = view.field_action("project_pipelines.update_pipeline_field", {
+            pipeline_id = pipeline.id,
+            field = "supersedes_pipeline_id",
+        }),
+    })
+    local supersedes_error = feedback_error(state, pipeline.id, "supersedes_pipeline_id")
+    if supersedes_error then
+        table.insert(children, ui.text{ text = supersedes_error, size = "xs", tone = "danger" })
+    end
+    table.insert(children, ui.checkbox{
+        id = "pipeline-" .. pipeline.id .. "-archived",
+        label = "Archived",
+        selected = pipeline.archived_at ~= nil and tostring(pipeline.archived_at) ~= "",
+        on_change = view.field_action("project_pipelines.update_pipeline_field", {
+            pipeline_id = pipeline.id,
+            field = "archived",
+        }),
+    })
+    local archived_error = feedback_error(state, pipeline.id, "archived")
+    if archived_error then
+        table.insert(children, ui.text{ text = archived_error, size = "xs", tone = "danger" })
     end
     return view.panel{
         ui.stack{ direction = "vertical", gap = "3", children = children },
@@ -253,15 +336,23 @@ function M.edit(view_state, ctx)
 
     local state = actions.feedback(ctx)
     local steps = repo.pipeline_steps(pipeline.id)
+    local meta = {
+        view.badge(pipeline.id, "muted"),
+        view.badge(tostring(#steps) .. " steps", "muted"),
+    }
+    if pipeline.version_label and pipeline.version_label ~= "" then
+        table.insert(meta, view.badge(pipeline.version_label, "accent"))
+    end
+    if pipeline.archived_at then
+        table.insert(meta, view.badge("archived", "muted"))
+    end
+
     local children = {
         view.page_header{
             title = "Edit Pipeline",
             back_id = "pipeline-" .. pipeline.id .. "-back",
             back_path = ctx.path("/pipelines"),
-            meta = {
-                view.badge(pipeline.id, "muted"),
-                view.badge(tostring(#steps) .. " steps", "muted"),
-            },
+            meta = meta,
         },
         edit_pipeline_fields(pipeline, state),
         ui.text{ text = "Steps", size = "md", weight = "semibold" },

@@ -15,7 +15,15 @@ local drafts = {}
 local feedback = {}
 
 local ALLOWED_FIELDS = {
-    pipeline = { name = true, description = true, merge_policy = true },
+    pipeline = {
+        name = true,
+        description = true,
+        merge_policy = true,
+        version_label = true,
+        archived = true,
+        replacement_pipeline_id = true,
+        supersedes_pipeline_id = true,
+    },
     step = {
         name = true,
         prompt = true,
@@ -172,7 +180,11 @@ function M.register()
     action.on("project_pipelines.update_pipeline_field", "project_pipelines.update_pipeline_field", function(envelope, ctx)
         local payload = value_payload(envelope)
         if payload.pipeline_id and allowed("pipeline", payload.field) then
-            local ok, err = pcall(repo.update_pipeline, payload.pipeline_id, { [payload.field] = payload.value or "" })
+            local value = payload.value
+            if value == nil then
+                value = ""
+            end
+            local ok, err = pcall(repo.update_pipeline, payload.pipeline_id, { [payload.field] = value })
             set_field_error(ctx, payload.pipeline_id, payload.field, ok and nil or err)
             refresh(ctx)
         elseif payload.field then
