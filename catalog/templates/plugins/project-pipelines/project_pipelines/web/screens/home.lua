@@ -261,6 +261,7 @@ function M.render(_view_state, ctx)
             ui.list{ children = {
                 ui.bind_list{
                     source = "/project-pipelines.pipeline",
+                    where = { active = true },
                     item_template = pipeline_template(),
                     empty_template = view.empty(
                         "No pipelines yet",
