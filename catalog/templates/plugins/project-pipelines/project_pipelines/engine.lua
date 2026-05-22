@@ -1403,6 +1403,12 @@ function M.start_run(params)
     if not pipeline then
         error("pipeline not found: " .. tostring(pipeline_id))
     end
+    local pipeline_archived = repo.pipeline_is_archived
+        and repo.pipeline_is_archived(pipeline)
+        or (pipeline.archived_at ~= nil and tostring(pipeline.archived_at) ~= "")
+    if pipeline_archived then
+        error("archived pipeline definitions are unavailable for new runs: " .. tostring(pipeline_id))
+    end
     if #repo.pipeline_steps(pipeline_id) == 0 then
         error("pipeline has no steps: " .. tostring(pipeline_id))
     end

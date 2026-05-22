@@ -781,6 +781,12 @@ local function pipeline_entity(pipeline)
     local entity = copy(pipeline)
     local steps = rows("SELECT * FROM pipeline_steps WHERE pipeline_id = ? ORDER BY position ASC, created_at ASC, id ASC", pipeline.id)
     local step_count = #steps
+    entity.archived = pipeline.archived_at ~= nil and tostring(pipeline.archived_at) ~= ""
+    entity.active = not entity.archived
+    entity.version_label = pipeline.version_label or ""
+    entity.replacement_pipeline_id = pipeline.replacement_pipeline_id or ""
+    entity.supersedes_pipeline_id = pipeline.supersedes_pipeline_id or ""
+    entity.lifecycle_label = entity.archived and "archived" or "active"
     entity.step_count = step_count
     entity.step_count_label = string.format("%d step%s", step_count, step_count == 1 and "" or "s")
     entity.step_summary = pipeline_step_summary(steps)
@@ -802,6 +808,12 @@ local function pipeline_entities(pipelines)
     for _, pipeline in ipairs(pipelines or {}) do
         local entity = copy(pipeline)
         local step_count = counts[pipeline.id] or 0
+        entity.archived = pipeline.archived_at ~= nil and tostring(pipeline.archived_at) ~= ""
+        entity.active = not entity.archived
+        entity.version_label = pipeline.version_label or ""
+        entity.replacement_pipeline_id = pipeline.replacement_pipeline_id or ""
+        entity.supersedes_pipeline_id = pipeline.supersedes_pipeline_id or ""
+        entity.lifecycle_label = entity.archived and "archived" or "active"
         entity.step_count = step_count
         entity.step_count_label = string.format("%d step%s", step_count, step_count == 1 and "" or "s")
         entity.step_summary = pipeline_step_summary(steps_by_pipeline[pipeline.id])
@@ -1351,6 +1363,21 @@ local function project_targets_for_detail(request, context)
     return out
 end
 
+local function pipeline_detail(request, context)
+    local id = query_value(request, "id")
+    if util.is_blank(id) then
+        local where = type(request) == "table" and type(request.where) == "table" and request.where or {}
+        if where.active == true then
+            return pipeline_entities(rows("SELECT * FROM pipelines WHERE archived_at IS NULL ORDER BY created_at ASC, id ASC"))
+        end
+        if where.archived == true then
+            return pipeline_entities(rows("SELECT * FROM pipelines WHERE archived_at IS NOT NULL ORDER BY created_at ASC, id ASC"))
+        end
+        return pipeline_entities(rows("SELECT * FROM pipelines ORDER BY created_at ASC, id ASC"))
+    end
+    return query_by_id("pipelines", request, pipeline_entity, context)
+end
+
 local function tickets_for_project_detail(request, context)
     local project_id = query_value(request, "project_id")
     if util.is_blank(project_id) then return {} end
@@ -1410,6 +1437,7 @@ local DETAIL = {
     [M.types.ticket] = ticket_detail,
     [M.types.project] = project_detail,
     [M.types.project_target] = project_targets_for_detail,
+    [M.types.pipeline] = pipeline_detail,
     [M.types.ticket_dependency] = dependencies_for_ticket_detail,
     [M.types.question] = questions_for_ticket_detail,
     [M.types.run] = run_detail,

@@ -111,9 +111,25 @@ gates must declare a command. Every gate includes a prompt because unmet gates
 surface that prompt back to agents; for `review_clear` gates, use the prompt to
 explain that blocker/high review findings must be resolved or waived.
 
+Pipelines have first-class lifecycle metadata. `version_label` is display
+metadata, `archived_at` retires a definition without deleting it, and
+`replacement_pipeline_id` / `supersedes_pipeline_id` link old and new
+definitions. Do not encode lifecycle state in manual title prefixes.
+
+Normal selection paths hide archived definitions: `project_pipelines_list_pipelines`
+without `include_archived`, ticket start controls, the home pipeline list, the
+pipeline index, and the engine's default pipeline fallback all use active
+definitions only. `project_pipelines_list_pipelines{ include_archived = true }`
+returns active and archived definitions. `project_pipelines_get_pipeline`
+requires `include_archived = true` for an archived pipeline id. The Pipelines UI
+keeps its default index active-only and exposes archived definitions from the
+explicit archived definitions view.
+
 Runs keep durable references to pipeline, step, and gate IDs. The current UI and
 MCP context render live definition names/prompts for those IDs rather than a
-full historical snapshot of the definition text.
+full historical snapshot of the definition text. Direct historical lookup paths
+inside the repo remain unfiltered so run detail pages and current context can
+still render archived pipeline names and steps.
 
 Review loops are first-class. A step can define:
 
