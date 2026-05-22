@@ -391,10 +391,15 @@ function M.register()
     end)
 
     tool("project_pipelines_list_pipelines", {
-        description = "List available project pipelines with ordered steps and gate prompts.",
-        input_schema = { type = "object", properties = {} },
-    }, function()
-        local pipelines = repo.list_pipelines()
+        description = "List available project pipelines with ordered steps and gate prompts. Archived pipelines are hidden unless include_archived is true.",
+        input_schema = {
+            type = "object",
+            properties = {
+                include_archived = { type = "boolean" },
+            },
+        },
+    }, function(params)
+        local pipelines = params.include_archived == true and repo.list_all_pipelines() or repo.list_pipelines()
         for _, pipeline in ipairs(pipelines) do
             local definition = repo.get_pipeline_definition(pipeline.id)
             pipeline.steps = definition and definition.steps or {}
@@ -403,16 +408,21 @@ function M.register()
     end)
 
     tool("project_pipelines_get_pipeline", {
-        description = "Get one project pipeline definition with ordered steps and gates.",
+        description = "Get one project pipeline definition with ordered steps and gates. Archived pipelines require include_archived=true.",
         input_schema = {
             type = "object",
             properties = {
                 pipeline_id = { type = "string" },
+                include_archived = { type = "boolean" },
             },
             required = { "pipeline_id" },
         },
     }, function(params)
-        return ok(repo.get_pipeline_definition(params.pipeline_id))
+        local definition = repo.get_pipeline_definition(params.pipeline_id)
+        if definition and repo.pipeline_is_archived(definition) and params.include_archived ~= true then
+            return ok(nil)
+        end
+        return ok(definition)
     end)
 
     tool("project_pipelines_create_pipeline", {
@@ -424,6 +434,9 @@ function M.register()
                 name = { type = "string" },
                 description = { type = "string" },
                 merge_policy = { type = "string", enum = { "direct", "pr" } },
+                version_label = { type = "string" },
+                replacement_pipeline_id = { type = "string" },
+                supersedes_pipeline_id = { type = "string" },
                 steps = { type = "array", items = step_schema },
             },
             required = { "id", "name", "steps" },
@@ -433,7 +446,7 @@ function M.register()
     end)
 
     tool("project_pipelines_update_pipeline", {
-        description = "Update a pipeline definition's name, description, or merge policy.",
+        description = "Update a pipeline definition's metadata, archive state, replacement links, name, description, or merge policy.",
         input_schema = {
             type = "object",
             properties = {
@@ -441,14 +454,26 @@ function M.register()
                 name = { type = "string" },
                 description = { type = "string" },
                 merge_policy = { type = "string", enum = { "direct", "pr" } },
+                version_label = { type = "string" },
+                archived = { type = "boolean" },
+                replacement_pipeline_id = { type = "string" },
+                supersedes_pipeline_id = { type = "string" },
             },
             required = { "pipeline_id" },
         },
     }, function(params)
         local fields = {}
-        if params.name ~= nil then fields.name = params.name end
-        if params.description ~= nil then fields.description = params.description end
-        if params.merge_policy ~= nil then fields.merge_policy = params.merge_policy end
+        for _, field in ipairs({
+            "name",
+            "description",
+            "merge_policy",
+            "version_label",
+            "archived",
+            "replacement_pipeline_id",
+            "supersedes_pipeline_id",
+        }) do
+            if params[field] ~= nil then fields[field] = params[field] end
+        end
         return sync_ok(repo.update_pipeline(params.pipeline_id, fields))
     end)
 
