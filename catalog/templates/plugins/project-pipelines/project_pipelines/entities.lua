@@ -507,7 +507,6 @@ local function build_ticket_notification_counts(tickets, repo, view)
     local uuid_by_ticket = {}
     local seen_by_ticket = {}
     local all_uuids = {}
-    local removed_by_ticket = {}
 
     local function add(ticket_id, uuid)
         if not ticket_id or not uuid or uuid == "" then
@@ -528,35 +527,12 @@ local function build_ticket_notification_counts(tickets, repo, view)
     end
 
     for _, row in ipairs(rows([[SELECT r.ticket_id, rs.agent_session_uuid
-                                FROM run_steps rs
-                                JOIN runs r ON r.id = rs.run_id
-                                WHERE rs.agent_session_uuid IS NOT NULL
+                                FROM runs r
+                                JOIN run_steps rs ON rs.id = r.current_run_step_id
+                                WHERE r.status IN ('active', 'blocked')
+                                  AND rs.agent_session_uuid IS NOT NULL
                                   AND rs.agent_session_uuid != '']])) do
         add(row.ticket_id, row.agent_session_uuid)
-    end
-
-    for _, event in ipairs(rows([[SELECT ticket_id, payload
-                                  FROM events
-                                  WHERE ticket_id IS NOT NULL
-                                    AND kind = 'ticket.manual_session_removed']])) do
-        local payload = decode(event.payload, {})
-        if not util.is_blank(event.ticket_id) and not util.is_blank(payload.session_uuid) then
-            removed_by_ticket[event.ticket_id] = removed_by_ticket[event.ticket_id] or {}
-            removed_by_ticket[event.ticket_id][payload.session_uuid] = true
-        end
-    end
-
-    for _, event in ipairs(rows([[SELECT ticket_id, kind, payload
-                                  FROM events
-                                  WHERE ticket_id IS NOT NULL
-                                    AND kind IN ('ticket.merge_requested',
-                                                 'ticket.merge_agent_linked',
-                                                 'ticket.manual_session_linked',
-                                                 'question.agent_linked')]])) do
-        local payload = decode(event.payload, {})
-        if not (removed_by_ticket[event.ticket_id] and removed_by_ticket[event.ticket_id][payload.session_uuid]) then
-            add(event.ticket_id, payload.session_uuid)
-        end
     end
 
     local Agent = nil
@@ -770,6 +746,13 @@ local function decorate_run_entity(entity, opts)
     entity.project_path = project and ("/pipelines/projects/" .. tostring(project.id)) or nil
     entity.current_agent_session_uuid = current_agent_session_uuid
     entity.has_current_agent = not util.is_blank(current_agent_session_uuid)
+    entity.current_agent_has_notification = entity.has_current_agent
+        and view
+        and view.session_has_notification
+        and view.session_has_notification(current_agent_session_uuid) == true
+        or false
+    entity.current_agent_button_label = entity.current_agent_has_notification and "Current agent needs attention" or "Current agent"
+    entity.current_agent_button_tone = entity.current_agent_has_notification and "danger" or "accent"
     entity.current_agent_button_id = "run-" .. tostring(entity.id or "") .. "-current-agent"
     entity.current_agent_path = entity.has_current_agent
         and ("/pipelines/tickets/" .. tostring(entity.ticket_id) .. "/sessions/" .. tostring(current_agent_session_uuid))
@@ -910,6 +893,14 @@ local function decorate_run_step_entity(entity, opts)
     entity.detail = detail
     entity.prompt_text = entity.prompt or ""
     entity.has_terminal = not util.is_blank(entity.agent_session_uuid) and not util.is_blank(entity.ticket_id)
+    local view = with_view()
+    entity.has_current_notification = entity.has_terminal
+        and run
+        and run.current_run_step_id == entity.id
+        and view
+        and view.session_has_notification
+        and view.session_has_notification(entity.agent_session_uuid) == true
+        or false
     entity.terminal_button_id = "run-" .. tostring(entity.run_id or "") .. "-terminal-" .. tostring(entity.id or "")
     if entity.has_terminal then
         entity.terminal_path = "/pipelines/tickets/" .. tostring(entity.ticket_id) .. "/sessions/" .. tostring(entity.agent_session_uuid)
@@ -995,6 +986,86 @@ local function question_entities(questions, context)
         entity.blocking_tone = question.blocking == 1 and "danger" or "accent"
         out[#out + 1] = entity
     end
+    return out
+end
+
+local function attention_question_entity(question, ticket)
+    return {
+        id = "question:" .. tostring(question.id),
+        kind = "question",
+        title = ticket and ticket.title or question.ticket_id,
+        subtitle = question.question or "Question needs an answer.",
+        badge_label = question.blocking == 1 and "blocking question" or "question",
+        badge_tone = question.blocking == 1 and "danger" or "accent",
+        path = "/pipelines/tickets/" .. tostring(question.ticket_id or ""),
+        sort_key = string.format("1:%012d:%s", tonumber(question.updated_at or question.created_at or 0) or 0, tostring(question.id or "")),
+    }
+end
+
+local function attention_agent_entity(row, view)
+    local step_name = row.step_name or row.step_id or "Current agent"
+    return {
+        id = "agent:" .. tostring(row.run_step_id),
+        kind = "agent",
+        title = row.ticket_title or row.ticket_id,
+        subtitle = tostring(step_name) .. " needs attention.",
+        badge_label = "agent notification",
+        badge_tone = "danger",
+        path = "/pipelines/tickets/" .. tostring(row.ticket_id or "") .. "/sessions/" .. tostring(row.agent_session_uuid or ""),
+        session_uuid = row.agent_session_uuid,
+        run_id = row.run_id,
+        run_step_id = row.run_step_id,
+        ticket_id = row.ticket_id,
+        has_notification = view
+            and view.session_has_notification
+            and view.session_has_notification(row.agent_session_uuid) == true
+            or false,
+        sort_key = string.format("0:%012d:%s", tonumber(row.run_updated_at or row.run_created_at or 0) or 0, tostring(row.run_step_id or "")),
+    }
+end
+
+local function attention_items(_context)
+    local view = with_view()
+    local out = {}
+
+    for _, row in ipairs(rows([[SELECT q.*, t.title AS ticket_title
+                                FROM questions q
+                                JOIN tickets t ON t.id = q.ticket_id
+                                LEFT JOIN projects p ON p.id = t.project_id
+                                WHERE q.status = 'open'
+                                  AND ]] .. VISIBLE_TICKET_WHERE .. [[
+                                ORDER BY q.updated_at DESC, q.created_at DESC, q.id DESC]])) do
+        out[#out + 1] = attention_question_entity(row, { title = row.ticket_title })
+    end
+
+    for _, row in ipairs(rows([[SELECT r.id AS run_id,
+                                       r.ticket_id,
+                                       r.current_run_step_id AS run_step_id,
+                                       r.created_at AS run_created_at,
+                                       r.updated_at AS run_updated_at,
+                                       rs.agent_session_uuid,
+                                       ps.id AS step_id,
+                                       ps.name AS step_name,
+                                       t.title AS ticket_title
+                                FROM runs r
+                                JOIN run_steps rs ON rs.id = r.current_run_step_id
+                                JOIN tickets t ON t.id = r.ticket_id
+                                LEFT JOIN projects p ON p.id = t.project_id
+                                LEFT JOIN pipeline_steps ps ON ps.id = rs.step_id
+                                WHERE r.status IN ('active', 'blocked')
+                                  AND rs.agent_session_uuid IS NOT NULL
+                                  AND rs.agent_session_uuid != ''
+                                  AND ]] .. VISIBLE_TICKET_WHERE .. [[
+                                ORDER BY r.updated_at DESC, r.created_at DESC, r.id DESC]])) do
+        local entity = attention_agent_entity(row, view)
+        if entity.has_notification then
+            out[#out + 1] = entity
+        end
+    end
+
+    table.sort(out, function(a, b)
+        return tostring(a.sort_key or "") > tostring(b.sort_key or "")
+    end)
     return out
 end
 
@@ -1197,6 +1268,11 @@ local ENTITY = {
             return out
         end,
         one = question_entity,
+    },
+    [M.types.attention_item] = {
+        default = false,
+        all = attention_items,
+        one = copy,
     },
     [M.types.checklist] = {
         default = false,
@@ -1412,6 +1488,7 @@ local DETAIL = {
     [M.types.project_target] = project_targets_for_detail,
     [M.types.ticket_dependency] = dependencies_for_ticket_detail,
     [M.types.question] = questions_for_ticket_detail,
+    [M.types.attention_item] = attention_items,
     [M.types.run] = run_detail,
     [M.types.run_step] = run_steps_for_detail,
     [M.types.review] = function(request, _context) return query_by_run_id("reviews", request, copy) end,

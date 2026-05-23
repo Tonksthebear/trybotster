@@ -77,10 +77,10 @@ local function running_run_template()
                 action = ui.action("botster.nav.open", { path = ui.bind("@/path") }),
             },
             ui.bind_if("@/has_current_agent", ui.button{
-                label = "Agent",
+                label = ui.bind("@/current_agent_button_label"),
                 icon = "command-line",
                 variant = "solid",
-                tone = "accent",
+                tone = ui.bind("@/current_agent_button_tone"),
                 action = ui.action("botster.nav.open", { path = ui.bind("@/current_agent_path") }),
             }),
         },
@@ -143,6 +143,22 @@ local function question_template()
     }
 end
 
+local function attention_template()
+    return ui.list_item{
+        id = ui.bind("@/id"),
+        action = ui.action("botster.nav.open", { path = ui.bind("@/path") }),
+        title = {
+            ui.text{ text = ui.bind("@/title"), size = "sm", weight = "semibold" },
+        },
+        subtitle = {
+            ui.text{ text = ui.bind("@/subtitle"), size = "xs", tone = "muted" },
+        },
+        end_ = {
+            ui.badge{ text = ui.bind("@/badge_label"), tone = ui.bind("@/badge_tone") },
+        },
+    }
+end
+
 local function pipeline_template()
     return ui.list_item{
         id = ui.bind("@/id"),
@@ -187,6 +203,19 @@ function M.render(_view_state, ctx)
                 },
             },
         },
+        view.panel{ view.section("Needs Attention", {
+            ui.list{ children = {
+                ui.bind_list{
+                    source = "/project-pipelines.attention_item",
+                    item_template = attention_template(),
+                    empty_template = view.empty(
+                        "Nothing needs attention",
+                        "Questions and agent notifications will appear here.",
+                        "bell"
+                    ),
+                },
+            } },
+        }) },
         view.panel{ view.section("Questions To Answer", {
             ui.list{ children = {
                 ui.bind_list{

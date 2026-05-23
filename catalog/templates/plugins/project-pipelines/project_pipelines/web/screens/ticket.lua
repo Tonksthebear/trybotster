@@ -22,6 +22,23 @@ local function actor_label(session_uuid, fallback)
     return session_uuid
 end
 
+local function current_agent_session_uuid(run, overview)
+    if not run or util.is_blank(run.current_run_step_id) then
+        return nil
+    end
+    local current = nil
+    if overview and overview.run_steps then
+        for _, step in ipairs(overview.run_steps) do
+            if step.id == run.current_run_step_id then
+                current = step
+                break
+            end
+        end
+    end
+    current = current or repo.get_run_step_visit(run.current_run_step_id)
+    return current and current.agent_session_uuid or nil
+end
+
 local function pipeline_start_controls(ticket, ctx, overview)
     local children = {}
     local open_run = overview and overview.open_run or repo.open_ticket_run(ticket.id)
@@ -123,6 +140,7 @@ local function session_rows(ticket_id, ctx, overview)
     local children = {}
     local seen = {}
     local removed_manual_sessions = {}
+    local current_uuid = current_agent_session_uuid(overview and overview.open_run, overview)
 
     for _, event in ipairs(overview and overview.events or repo.ticket_events(ticket_id, nil, 100)) do
         if event.kind == "ticket.manual_session_removed" then
@@ -139,7 +157,7 @@ local function session_rows(ticket_id, ctx, overview)
             seen[uuid] = true
             local info = view.session_info(uuid)
             local alive = info ~= nil
-            local notified = view.session_has_notification(uuid)
+            local notified = uuid == current_uuid and view.session_has_notification(uuid)
             local header = {
                 ui.text{ text = label, size = "sm", weight = "semibold" },
                 view.badge(alive and "running" or "closed", alive and "accent" or "muted"),
@@ -218,33 +236,21 @@ local function session_rows(ticket_id, ctx, overview)
 end
 
 local function active_session_button(run, ctx, overview)
-    if not run or not run.current_run_step_id then
+    local session_uuid = current_agent_session_uuid(run, overview)
+    if util.is_blank(session_uuid) then
         return nil
     end
-    local current = nil
-    if overview and overview.run_steps then
-        for _, step in ipairs(overview.run_steps) do
-            if step.id == run.current_run_step_id then
-                current = step
-                break
-            end
-        end
-    end
-    current = current or repo.get_run_step_visit(run.current_run_step_id)
-    if not current or not current.agent_session_uuid or current.agent_session_uuid == "" then
-        return nil
-    end
-    if not view.session_info(current.agent_session_uuid) then
+    if not view.session_info(session_uuid) then
         return nil
     end
     return ui.button{
-        id = "ticket-" .. run.ticket_id .. "-current-terminal-" .. current.agent_session_uuid,
+        id = "ticket-" .. run.ticket_id .. "-current-terminal-" .. session_uuid,
         label = "Open current terminal",
         icon = "command-line",
         variant = "solid",
         tone = "accent",
         action = ui.action("botster.nav.open", {
-            path = ctx.path("/tickets/" .. run.ticket_id .. "/sessions/" .. current.agent_session_uuid),
+            path = ctx.path("/tickets/" .. run.ticket_id .. "/sessions/" .. session_uuid),
         }),
     }
 end
@@ -290,7 +296,7 @@ local function handoff_rows(run, ctx, overview)
             view.row(header),
         }
         if step.agent_session_uuid and step.agent_session_uuid ~= "" then
-            local notified = view.session_has_notification(step.agent_session_uuid)
+            local notified = step.id == run.current_run_step_id and view.session_has_notification(step.agent_session_uuid)
             if notified then
                 table.insert(step_children, view.badge("notification", "danger"))
             end
@@ -756,7 +762,7 @@ function M.render(view_state, ctx)
         view.badge(ui.bind(ticket_path .. "/target_label"), "accent"),
         view.badge(ui.bind(ticket_path .. "/latest_run_badge"), ui.bind(ticket_path .. "/latest_run_tone")),
     }
-    local notification = view.notification_badge(view.notification_count_for_uuids(overview.session_uuids))
+    local notification = view.notification_badge(view.notification_count_for_uuids(overview.current_agent_session_uuids))
     if notification then
         table.insert(meta, notification)
     end

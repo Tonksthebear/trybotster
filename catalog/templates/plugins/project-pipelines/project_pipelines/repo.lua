@@ -1749,6 +1749,42 @@ function M.ticket_session_uuids_by_ticket(ticket_ids)
     return by_ticket, all_uuids
 end
 
+function M.current_ticket_agent_session_uuids(ticket_id)
+    if util.is_blank(ticket_id) then
+        return {}
+    end
+    local run = M.open_ticket_run(ticket_id)
+    if not run or util.is_blank(run.current_run_step_id) then
+        return {}
+    end
+    local run_step = M.get_run_step_visit(run.current_run_step_id)
+    if not run_step or util.is_blank(run_step.agent_session_uuid) then
+        return {}
+    end
+    return { run_step.agent_session_uuid }
+end
+
+function M.current_ticket_agent_session_uuids_by_ticket(ticket_ids)
+    local ticket_filter, params = id_filter("r.ticket_id", ticket_ids)
+    local by_ticket = {}
+    local all_uuids = {}
+
+    for _, row in ipairs(rows([[SELECT r.ticket_id, rs.agent_session_uuid
+                                FROM runs r
+                                JOIN run_steps rs ON rs.id = r.current_run_step_id
+                                WHERE r.status IN ('active', 'blocked')
+                                  AND rs.agent_session_uuid IS NOT NULL
+                                  AND rs.agent_session_uuid != '']] .. ticket_filter, params)) do
+        if not util.is_blank(row.ticket_id) and not util.is_blank(row.agent_session_uuid) then
+            by_ticket[row.ticket_id] = by_ticket[row.ticket_id] or {}
+            table.insert(by_ticket[row.ticket_id], row.agent_session_uuid)
+            all_uuids[row.agent_session_uuid] = true
+        end
+    end
+
+    return by_ticket, all_uuids
+end
+
 function M.ticket_session_links_for_uuids(session_uuids)
     if type(session_uuids) ~= "table" or #session_uuids == 0 then
         return {}
@@ -1865,6 +1901,7 @@ function M.ticket_detail_overview(ticket_id)
     local events = M.ticket_events(ticket_id, nil, 100)
     local events_by_kind = group_by(events, "kind")
     local session_uuids_by_ticket = M.ticket_session_uuids_by_ticket({ ticket_id })
+    local current_agent_session_uuids_by_ticket = M.current_ticket_agent_session_uuids_by_ticket({ ticket_id })
 
     return {
         runs = runs,
@@ -1886,6 +1923,7 @@ function M.ticket_detail_overview(ticket_id)
         merge_events = events_by_kind["ticket.merge_requested"] or {},
         failed_merge_events = events_by_kind["ticket.merge_request_failed"] or {},
         session_uuids = session_uuids_by_ticket[ticket_id] or {},
+        current_agent_session_uuids = current_agent_session_uuids_by_ticket[ticket_id] or {},
     }
 end
 

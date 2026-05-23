@@ -168,10 +168,10 @@ local function dashboard_run_template()
         },
         end_ = {
             ui.bind_if("@/has_current_agent", ui.button{
-                label = "Agent",
+                label = ui.bind("@/current_agent_button_label"),
                 icon = "command-line",
                 variant = "solid",
-                tone = "accent",
+                tone = ui.bind("@/current_agent_button_tone"),
                 action = ui.action("botster.nav.open", { path = ui.bind("@/current_agent_path") }),
             }),
             ui.button{
@@ -184,7 +184,50 @@ local function dashboard_run_template()
     }
 end
 
+local function dashboard_attention_template()
+    return ui.list_item{
+        id = ui.bind("@/id"),
+        action = ui.action("botster.nav.open", { path = ui.bind("@/path") }),
+        title = {
+            ui.text{ text = ui.bind("@/title"), size = "sm", weight = "semibold" },
+        },
+        subtitle = {
+            ui.text{ text = ui.bind("@/subtitle"), size = "xs", tone = "muted" },
+        },
+        end_ = {
+            ui.badge{ text = ui.bind("@/badge_label"), tone = ui.bind("@/badge_tone") },
+        },
+    }
+end
+
 local function register_dashboard_widgets()
+    dashboard.register_widget("project-pipelines.needs-attention", {
+        title = "Pipeline Needs Attention",
+        icon = "bell",
+        size = "wide",
+        order = 25,
+        source = "plugin:project-pipelines",
+        children = {
+            ui.list{ children = {
+                ui.bind_list{
+                    source = "/project-pipelines.attention_item",
+                    item_template = dashboard_attention_template(),
+                    empty_template = ui.empty_state{
+                        title = "Nothing needs attention",
+                        description = "Questions and agent notifications will appear here.",
+                        icon = "bell",
+                    },
+                },
+            } },
+            ui.button{
+                label = "Open Pipelines",
+                icon = "queue-list",
+                variant = "ghost",
+                action = ui.action("botster.nav.open", { path = "/pipelines" }),
+            },
+        },
+    })
+
     dashboard.register_widget("project-pipelines.active-runs", {
         title = "Active Pipeline Runs",
         icon = "queue-list",

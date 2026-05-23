@@ -347,7 +347,10 @@ function M.ticket_notification_count(ticket_id, repo)
     if not repo or not ticket_id then
         return 0
     end
-    for _, uuid in ipairs(repo.ticket_session_uuids(ticket_id)) do
+    local session_uuids = repo.current_ticket_agent_session_uuids
+        and repo.current_ticket_agent_session_uuids(ticket_id)
+        or repo.ticket_session_uuids(ticket_id)
+    for _, uuid in ipairs(session_uuids) do
         if uuid and uuid ~= "" and not seen[uuid] then
             seen[uuid] = true
             if M.session_has_notification(uuid) then
@@ -359,10 +362,14 @@ function M.ticket_notification_count(ticket_id, repo)
 end
 
 function M.ticket_notification_counts(repo, ticket_ids)
-    if not repo or not repo.ticket_session_uuids_by_ticket then
+    if not repo then
         return {}
     end
-    local uuids_by_ticket, all_uuids = repo.ticket_session_uuids_by_ticket(ticket_ids)
+    local list = repo.current_ticket_agent_session_uuids_by_ticket or repo.ticket_session_uuids_by_ticket
+    if not list then
+        return {}
+    end
+    local uuids_by_ticket, all_uuids = list(ticket_ids)
     local notified = {}
     for uuid in pairs(all_uuids or {}) do
         notified[uuid] = M.session_has_notification(uuid) == true

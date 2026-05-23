@@ -530,6 +530,40 @@ local function registered_type_names(opts)
     return names
 end
 
+local function sorted_scope_pairs(scope)
+    local pairs_out = {}
+    if type(scope) ~= "table" then return pairs_out end
+    for key, value in pairs(scope) do
+        pairs_out[#pairs_out + 1] = tostring(key) .. "=" .. tostring(value)
+    end
+    table.sort(pairs_out)
+    return pairs_out
+end
+
+local function snapshot_job_key(sub_id, names, requests)
+    local parts = { tostring(sub_id or "__nil__") }
+    parts[#parts + 1] = "types"
+    for _, name in ipairs(names or {}) do
+        parts[#parts + 1] = tostring(name)
+    end
+    parts[#parts + 1] = "requests"
+    for _, request in ipairs(requests or {}) do
+        parts[#parts + 1] = tostring(request.entity_type or "")
+        if request.id then
+            parts[#parts + 1] = "id=" .. tostring(request.id)
+        end
+        local scope_pairs = sorted_scope_pairs(request.where)
+        for _, pair in ipairs(scope_pairs) do
+            parts[#parts + 1] = "where:" .. pair
+        end
+    end
+    return table.concat(parts, "\31")
+end
+
+local function snapshot_job_key_prefix(sub_id)
+    return tostring(sub_id or "__nil__") .. "\31"
+end
+
 local function requested_entity_queries(opts)
     opts = opts or {}
     local out = {}
@@ -965,7 +999,7 @@ function M.schedule_snapshots_to(client, sub_id, opts)
     local index = 1
     local request_index = 1
     local sent = 0
-    local job_key = tostring(sub_id or "__nil__")
+    local job_key = snapshot_job_key(sub_id, names, requests)
     client.__entity_snapshot_jobs = client.__entity_snapshot_jobs or {}
     client.__entity_snapshot_job_seq = client.__entity_snapshot_job_seq or {}
     local job_id = (client.__entity_snapshot_job_seq[job_key] or 0) + 1
@@ -977,14 +1011,24 @@ function M.schedule_snapshots_to(client, sub_id, opts)
             and client.__entity_snapshot_jobs[job_key] == job_id
     end
 
+    local function clear_current_job_sequence()
+        if client.__entity_snapshot_job_seq and client.__entity_snapshot_job_seq[job_key] == job_id then
+            client.__entity_snapshot_job_seq[job_key] = nil
+        end
+    end
+
     local function clear_current_job()
         if client.__entity_snapshot_jobs and client.__entity_snapshot_jobs[job_key] == job_id then
             client.__entity_snapshot_jobs[job_key] = nil
         end
+        clear_current_job_sequence()
     end
 
     local function step()
         if not job_is_current() then
+            if not client.__entity_snapshot_jobs or client.__entity_snapshot_jobs[job_key] == nil then
+                clear_current_job_sequence()
+            end
             log_snapshot_batch(sent, sub_id, batch_started, " canceled_stale")
             return
         end
@@ -1031,18 +1075,21 @@ function M.schedule_snapshots_to(client, sub_id, opts)
     return 0
 end
 
---- Clear the active scheduled snapshot marker for a subscription.
+--- Clear the active scheduled snapshot markers for a subscription.
 ---
 --- Client unsubscribe/replace paths call this so long-lived browser peers do
 --- not keep stale snapshot jobs alive after the subscription contract ends.
---- Keep the monotonic sequence counter: a queued tick from the old job may
---- still run later, and reusing its job id for a new subscription would make
---- that stale tick look current.
+--- Sequence counters are left in place until their queued ticks drain so a new
+--- job cannot reuse the stale job id and make an old tick look current.
 function M.clear_scheduled_snapshots(client, sub_id)
     if not client then return end
-    local job_key = tostring(sub_id or "__nil__")
     if type(client.__entity_snapshot_jobs) == "table" then
-        client.__entity_snapshot_jobs[job_key] = nil
+        local prefix = snapshot_job_key_prefix(sub_id)
+        for key in pairs(client.__entity_snapshot_jobs) do
+            if key:sub(1, #prefix) == prefix then
+                client.__entity_snapshot_jobs[key] = nil
+            end
+        end
     end
 end
 
