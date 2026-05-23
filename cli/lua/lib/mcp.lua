@@ -503,7 +503,7 @@ end
 -- @param name string Tool name
 -- @param params table Arguments from the MCP client
 -- @param context table|nil Caller context (caller_cwd, etc.)
--- @param callback function|nil function(content, err) — if provided, result is delivered here
+-- @param callback function|nil function(content, err, is_error) — if provided, result is delivered here
 -- @return result, error_string (only meaningful for local tools without a callback)
 function M.call_tool(name, params, context, callback)
     local tool = tools[name]
@@ -609,12 +609,7 @@ function M.call_tool(name, params, context, callback)
             local content = result.content or {}
             local is_error = result.isError == true
 
-            if is_error then
-                local err_text = (content[1] and content[1].text) or "Remote tool error"
-                if callback then callback(nil, err_text) end
-            else
-                if callback then callback(content, nil) end
-            end
+            if callback then callback(content, nil, is_error) end
         end)
 
         return  -- async; result arrives via callback
