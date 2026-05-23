@@ -134,3 +134,177 @@ fn proxied_tool_call_forwards_botster_context_in_meta() {
         "proxied MCP tools/call should include _meta.botster context"
     );
 }
+
+#[test]
+fn proxied_tool_call_applies_generic_argument_transform() {
+    let lua = create_lua_vm();
+
+    let ok: bool = lua
+        .load(
+            r#"
+            _G.http = {
+              request = function(req, callback)
+                local decoded = json.decode(req.body)
+
+                if decoded.method == "initialize" then
+                  callback({
+                    status = 200,
+                    headers = { ["Mcp-Session-Id"] = "remote-session" },
+                    body = json.encode({ jsonrpc = "2.0", id = decoded.id, result = {} }),
+                  }, nil)
+                elseif decoded.method == "tools/list" then
+                  callback({
+                    status = 200,
+                    headers = {},
+                    body = json.encode({
+                      jsonrpc = "2.0",
+                      id = decoded.id,
+                      result = {
+                        tools = {
+                          {
+                            name = "remote_tool",
+                            description = "Remote tool",
+                            inputSchema = { type = "object", properties = {} },
+                          },
+                        },
+                      },
+                    }),
+                  }, nil)
+                elseif decoded.method == "tools/call" then
+                  _G.forwarded_call = decoded
+                  callback({
+                    status = 200,
+                    headers = {},
+                    body = json.encode({
+                      jsonrpc = "2.0",
+                      id = decoded.id,
+                      result = {
+                        content = { { type = "text", text = "ok" } },
+                        isError = false,
+                      },
+                    }),
+                  }, nil)
+                else
+                  error("unexpected method: " .. tostring(decoded.method))
+                end
+              end,
+            }
+
+            local mcp = require("lib.mcp")
+            mcp.proxy("https://example.test/mcp", {
+              transform_arguments = function(name, arguments)
+                if name == "remote_tool" and arguments.flag == false then
+                  local out = {}
+                  for key, value in pairs(arguments) do
+                    out[key] = value
+                  end
+                  out.flag = nil
+                  return out
+                end
+                return arguments
+              end,
+            })
+            mcp.call_tool("remote_tool", { value = 1, flag = false }, {}, function(content, err)
+              _G.callback_err = err
+              _G.callback_text = content and content[1] and content[1].text
+            end)
+
+            local arguments = _G.forwarded_call.params.arguments
+            return _G.callback_err == nil
+              and _G.callback_text == "ok"
+              and arguments.value == 1
+              and arguments.flag == nil
+            "#,
+        )
+        .eval()
+        .expect("proxied tool call should apply argument transform");
+
+    assert!(
+        ok,
+        "proxied MCP tools/call should apply generic argument transform before forwarding"
+    );
+}
+
+#[test]
+fn proxied_tool_call_preserves_remote_error_content_blocks() {
+    let lua = create_lua_vm();
+
+    let ok: bool = lua
+        .load(
+            r#"
+            _G.http = {
+              request = function(req, callback)
+                local decoded = json.decode(req.body)
+
+                if decoded.method == "initialize" then
+                  callback({
+                    status = 200,
+                    headers = { ["Mcp-Session-Id"] = "remote-session" },
+                    body = json.encode({ jsonrpc = "2.0", id = decoded.id, result = {} }),
+                  }, nil)
+                elseif decoded.method == "tools/list" then
+                  callback({
+                    status = 200,
+                    headers = {},
+                    body = json.encode({
+                      jsonrpc = "2.0",
+                      id = decoded.id,
+                      result = {
+                        tools = {
+                          {
+                            name = "github_mark_pull_request_ready_for_review",
+                            description = "Mark PR ready",
+                            inputSchema = { type = "object", properties = {} },
+                          },
+                        },
+                      },
+                    }),
+                  }, nil)
+                elseif decoded.method == "tools/call" then
+                  callback({
+                    status = 200,
+                    headers = {},
+                    body = json.encode({
+                      jsonrpc = "2.0",
+                      id = decoded.id,
+                      result = {
+                        content = {
+                          { type = "text", text = "Marking owner/repo#84 ready for review..." },
+                          { type = "text", text = "GitHub did not confirm that owner/repo#84 is ready for review." },
+                        },
+                        isError = true,
+                      },
+                    }),
+                  }, nil)
+                else
+                  error("unexpected method: " .. tostring(decoded.method))
+                end
+              end,
+            }
+
+            local mcp = require("lib.mcp")
+            mcp.proxy("https://example.test/mcp")
+            mcp.call_tool("github_mark_pull_request_ready_for_review", {
+              repo = "owner/repo",
+              pr_number = 84,
+            }, {}, function(content, err, is_error)
+              _G.callback_err = err
+              _G.callback_is_error = is_error
+              _G.callback_first_text = content and content[1] and content[1].text
+              _G.callback_second_text = content and content[2] and content[2].text
+            end)
+
+            return _G.callback_err == nil
+              and _G.callback_is_error == true
+              and _G.callback_first_text == "Marking owner/repo#84 ready for review..."
+              and _G.callback_second_text == "GitHub did not confirm that owner/repo#84 is ready for review."
+            "#,
+        )
+        .eval()
+        .expect("proxied tool call should preserve remote isError content");
+
+    assert!(
+        ok,
+        "proxied MCP tools/call should preserve every remote isError content block"
+    );
+}

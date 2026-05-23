@@ -1056,6 +1056,7 @@ fn catalog_plugin_project_pipelines_routes_pr_review_to_live_merge_steward() {
             assert(posted.message.type == "task")
             assert(posted.message.payload.source_event == "pr_review_submitted")
             assert(posted.message.payload.review_state == "changes_requested")
+            assert(posted.message.payload.instructions:match("👀"))
             assert(posted.message.payload.instructions:match("Please fix the failing path%."))
             assert(posted.message.payload.instructions:match("You are an orchestrator, not the implementer"))
             assert(posted.message.payload.instructions:match("Do not implement PR feedback yourself"))
@@ -1066,6 +1067,7 @@ fn catalog_plugin_project_pipelines_routes_pr_review_to_live_merge_steward() {
             assert(posted.message.payload.instructions:match("notify_session"))
             assert(notified.session_uuid == "sess-merge")
             assert(notified.notification.title == "PR changes requested")
+            assert(notified.notification.body:match("👀"))
             assert(notified.notification.action.name == "project_pipelines_current_context")
             assert(events[1].kind == "ticket.pr_review_submitted")
             assert(events[2].kind == "ticket.pr_review_steward_prompted")
@@ -1075,6 +1077,246 @@ fn catalog_plugin_project_pipelines_routes_pr_review_to_live_merge_steward() {
         ))
         .eval()
         .expect("PR review changes should route to the live merge steward");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_routes_pr_comment_to_live_merge_steward() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+    botster::lua::primitives::json::register(&lua).expect("register json");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local events = {{}}
+            local posted = nil
+            local notified = nil
+
+            package.loaded["lib.agent"] = {{
+              get = function(session_uuid)
+                if session_uuid == "sess-merge" then
+                  return {{ info = function() return {{ session_uuid = session_uuid }} end }}
+                end
+                return nil
+              end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  post = function(_, session_uuid, message)
+                    posted = {{ session_uuid = session_uuid, message = message }}
+                  end,
+                  notify = function(_, session_uuid, notification)
+                    notified = {{ session_uuid = session_uuid, notification = notification }}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() end,
+            }}
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              find_pr_link = function(attrs)
+                assert(attrs.provider == "github")
+                assert(attrs.repo == "owner/repo")
+                assert(attrs.pr_number == 42)
+                return {{
+                  id = "pr-1",
+                  provider = "github",
+                  repo = "owner/repo",
+                  pr_number = 42,
+                  pr_url = "https://github.com/owner/repo/pull/42",
+                  ticket_id = "ticket-1",
+                  run_id = "run-1",
+                  status = "open",
+                }}
+              end,
+              get_ticket = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{ id = "ticket-1", title = "Ship review loop", status = "open", target_id = "target-1" }}
+              end,
+              get_run = function(run_id)
+                assert(run_id == "run-1")
+                return {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipeline-1", status = "done", target_id = "target-1", current_step_id = false, current_run_step_id = false }}
+              end,
+              latest_ticket_run = function() error("linked run should be used") end,
+              ticket_events = function(ticket_id, kind)
+                assert(ticket_id == "ticket-1")
+                if kind == "ticket.merge_agent_linked" then
+                  return {{ {{ payload = "{{\"session_uuid\":\"sess-merge\"}}" }} }}
+                end
+                return {{}}
+              end,
+              pipeline_steps = function()
+                error("PR comment steward path must not inspect implementation steps")
+              end,
+              create_run_step_visit = function()
+                error("PR comment steward path must not create an implementation visit")
+              end,
+              update_run = function()
+                error("PR comment steward path must not reactivate the run directly")
+              end,
+              append_event = function(kind, event)
+                events[#events + 1] = {{ kind = kind, event = event }}
+              end,
+            }}
+
+            local integration = require("project_pipelines.github_integration")
+            local response = integration.handle_pr_comment({{
+              provider = "github",
+              repo = "owner/repo",
+              pr_number = 42,
+              pr_url = "https://github.com/owner/repo/pull/42",
+              comment_id = 456,
+              comment_url = "https://github.com/owner/repo/pull/42#issuecomment-456",
+              comment_author = "reviewer",
+              comment_body = "Can this be clearer?",
+              action = "created",
+              created_at = "2026-05-20T12:00:00Z",
+            }})
+
+            assert(response.ok == true)
+            assert(response.status == "steward_prompted")
+            assert(response.pr_steward.session_uuid == "sess-merge")
+            assert(posted.session_uuid == "sess-merge")
+            assert(posted.message.type == "task")
+            assert(posted.message.payload.source_event == "pr_comment")
+            assert(posted.message.payload.comment_id == 456)
+            assert(posted.message.payload.instructions:match("👀"))
+            assert(posted.message.payload.instructions:match("Can this be clearer%?"))
+            assert(posted.message.payload.instructions:match("answer on that PR thread"))
+            assert(notified.session_uuid == "sess-merge")
+            assert(notified.notification.body:match("👀"))
+            assert(notified.notification.action.name == "project_pipelines_current_context")
+            assert(events[1].kind == "ticket.pr_comment")
+            assert(events[2].kind == "ticket.pr_comment_steward_prompted")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("PR comments should route to the live merge steward");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_records_pr_comment_without_merge_steward() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local events = {{}}
+            local posted = nil
+            local notified = nil
+
+            package.loaded["lib.agent"] = {{
+              get = function() return nil end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  post = function(_, session_uuid, message)
+                    posted = {{ session_uuid = session_uuid, message = message }}
+                  end,
+                  notify = function(_, session_uuid, notification)
+                    notified = {{ session_uuid = session_uuid, notification = notification }}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() error("PR comment without steward must not transition phase") end,
+            }}
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              find_pr_link = function(attrs)
+                assert(attrs.provider == "github")
+                assert(attrs.repo == "owner/repo")
+                assert(attrs.pr_number == 42)
+                return {{
+                  id = "pr-1",
+                  provider = "github",
+                  repo = "owner/repo",
+                  pr_number = 42,
+                  pr_url = "https://github.com/owner/repo/pull/42",
+                  ticket_id = "ticket-1",
+                  run_id = "run-1",
+                  status = "open",
+                }}
+              end,
+              get_ticket = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{ id = "ticket-1", title = "Ship review loop", status = "open", target_id = "target-1" }}
+              end,
+              get_run = function(run_id)
+                assert(run_id == "run-1")
+                return {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipeline-1", status = "done", target_id = "target-1", current_step_id = false, current_run_step_id = false }}
+              end,
+              latest_ticket_run = function() error("linked run should be used") end,
+              ticket_events = function(ticket_id, kind)
+                assert(ticket_id == "ticket-1")
+                assert(kind == "ticket.merge_agent_linked" or kind == "ticket.merge_requested")
+                return {{}}
+              end,
+              pipeline_steps = function()
+                error("PR comment without steward must not inspect implementation steps")
+              end,
+              create_run_step_visit = function()
+                error("PR comment without steward must not create an implementation visit")
+              end,
+              update_run = function()
+                error("PR comment without steward must not mutate the run")
+              end,
+              latest_step_session = function()
+                error("PR comment without steward must not look up implementation sessions")
+              end,
+              append_event = function(kind, event)
+                events[#events + 1] = {{ kind = kind, event = event }}
+              end,
+            }}
+
+            local integration = require("project_pipelines.github_integration")
+            local response = integration.handle_pr_comment({{
+              provider = "github",
+              repo = "owner/repo",
+              pr_number = 42,
+              comment_id = 456,
+              comment_body = "Can this be clearer?",
+              action = "created",
+            }})
+
+            assert(response.ok == true)
+            assert(response.status == "recorded")
+            assert(response.reason == "no_steward")
+            assert(posted == nil)
+            assert(notified == nil)
+            assert(#events == 1)
+            assert(events[1].kind == "ticket.pr_comment")
+            assert(events[1].event.payload.comment_id == 456)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("PR comments without a steward should be recorded only");
 
     assert_eq!(result, "ok");
 }
@@ -1208,6 +1450,7 @@ fn catalog_plugin_project_pipelines_falls_back_to_existing_implementer_when_no_m
             assert(response.status == "reactivated")
             assert(response.agent.reused == true)
             assert(posted.session_uuid == "sess-impl")
+            assert(posted.message.payload.instructions:match("👀"))
             assert(posted.message.payload.instructions:match("Please fix the failing path%."))
             assert(notified.notification.title == "PR changes requested")
             assert(#visits == 1)
@@ -3451,6 +3694,510 @@ fn catalog_plugin_project_pipelines_retry_step_agent_requeues_current_visit() {
         ))
         .eval()
         .expect("project pipelines should retry blocked agent steps by reusing the current visit");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_pipeline_edit_meta_keeps_archived_badge_without_version() {
+    let lua = Lua::new();
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            ui = {{
+              action = function(name, payload) return {{ name = name, payload = payload }} end,
+              badge = function(props) return {{ type = "badge", text = props.text, tone = props.tone }} end,
+              bind = function(path) return {{ bind = path }} end,
+              bind_if = function(path, node) return {{ bind_if = path, node = node }} end,
+              button = function(props) return {{ type = "button", props = props }} end,
+              checkbox = function(props) return {{ type = "checkbox", props = props }} end,
+              panel = function(props) return {{ type = "panel", props = props }} end,
+              select = function(props) return {{ type = "select", props = props }} end,
+              stack = function(props) return {{ type = "stack", props = props }} end,
+              text = function(props) return {{ type = "text", props = props }} end,
+              text_input = function(props) return {{ type = "text_input", props = props }} end,
+              textarea = function(props) return {{ type = "textarea", props = props }} end,
+            }}
+
+            package.loaded["project_pipelines.web.ui"] = {{
+              action_row = function(children) return {{ type = "action_row", children = children }} end,
+              agent_options = function() return {{}} end,
+              badge = function(text, tone) return {{ type = "badge", text = tostring(text), tone = tone }} end,
+              empty = function(title) return {{ type = "empty", title = title }} end,
+              field_action = function(name, payload) return {{ name = name, payload = payload }} end,
+              page_header = function(props) return {{ type = "page_header", props = props }} end,
+              panel = function(child) return {{ type = "panel", child = child }} end,
+              row = function(children) return {{ type = "row", children = children }} end,
+            }}
+            package.loaded["project_pipelines.web.actions"] = {{
+              feedback = function() return {{}} end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              get_pipeline = function(id)
+                return {{ id = id, name = "Old pipeline", archived_at = 123, version_label = "" }}
+              end,
+              pipeline_steps = function(id)
+                return {{ {{ id = "step-1", pipeline_id = id, name = "Implement", kind = "agent", position = 1 }} }}
+              end,
+              step_gates = function() return {{}} end,
+            }}
+
+            local screen = require("project_pipelines.web.screens.pipelines")
+            local tree = screen.edit({{ params = {{ pipeline_id = "old" }} }}, {{ path = function(path) return path end }})
+            local header = tree.props.children[1]
+            local meta = header.props.meta
+            assert(#meta == 3, "archived badge must not be truncated by a nil version meta entry")
+            assert(meta[1].text == "old")
+            assert(meta[2].text == "1 steps")
+            assert(meta[3].text == "archived")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("archived pipeline edit header should preserve meta badges");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_pipeline_entity_queries_filter_active_and_archived() {
+    let lua = Lua::new();
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local registered = {{}}
+            package.loaded["lib.entity_broadcast"] = {{
+              register = function(entity_type, opts)
+                registered[entity_type] = opts
+              end,
+            }}
+            package.loaded["project_pipelines.web.ui"] = {{
+              status_tone = function() return "muted" end,
+              status_label = function(status) return tostring(status or "") end,
+              status_state = function() return "neutral" end,
+              ticket_notification_count = function() return 0 end,
+            }}
+
+            local function normalize(sql)
+              return (sql:gsub("%s+", " "))
+            end
+            local db = {{}}
+            function db:eval(sql, param)
+              local compact = normalize(sql)
+              if compact == "SELECT * FROM pipelines WHERE archived_at IS NULL ORDER BY created_at ASC, id ASC" then
+                return {{ {{ id = "active", name = "Active", created_at = 1 }} }}
+              end
+              if compact == "SELECT * FROM pipelines WHERE archived_at IS NOT NULL ORDER BY created_at ASC, id ASC" then
+                return {{ {{ id = "archived", name = "Archived", archived_at = 123, version_label = "v1", created_at = 0 }} }}
+              end
+              if compact == "SELECT * FROM pipelines WHERE id = ? LIMIT 1" then
+                assert(param == "archived")
+                return {{ {{ id = "archived", name = "Archived", archived_at = 123, version_label = "v1" }} }}
+              end
+              if compact:find("FROM pipeline_steps") then
+                return {{}}
+              end
+              return {{}}
+            end
+            package.loaded["project_pipelines.db"] = db
+
+            local entities = require("project_pipelines.entities")
+            entities.register()
+            local active = registered[entities.types.pipeline].query({{ where = {{ active = true }} }})
+            local archived = registered[entities.types.pipeline].query({{ where = {{ archived = true }} }})
+            local direct = registered[entities.types.pipeline].query({{ id = "archived" }})
+
+            assert(#active == 1 and active[1].id == "active" and active[1].active == true)
+            assert(#archived == 1 and archived[1].id == "archived" and archived[1].archived == true)
+            assert(#direct == 1 and direct[1].id == "archived" and direct[1].archived == true)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("pipeline entity queries should expose active, archived, and direct archived hydration");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_repo_filters_default_lists_but_preserves_ticket_history_names()
+{
+    let lua = Lua::new();
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local function normalize(sql)
+              return (sql:gsub("%s+", " "))
+            end
+            local db = {{}}
+            function db:eval(sql, param)
+              local compact = normalize(sql)
+              if compact == "SELECT * FROM pipelines WHERE archived_at IS NULL ORDER BY created_at ASC" then
+                return {{ {{ id = "active", name = "Active", created_at = 2 }} }}
+              end
+              if compact == "SELECT * FROM pipelines ORDER BY created_at ASC" then
+                return {{
+                  {{ id = "archived", name = "Archived", archived_at = 123, created_at = 1 }},
+                  {{ id = "active", name = "Active", created_at = 2 }},
+                }}
+              end
+              if compact == "SELECT * FROM pipelines WHERE archived_at IS NULL ORDER BY created_at ASC LIMIT 1" then
+                return {{ {{ id = "active", name = "Active", created_at = 2 }} }}
+              end
+              if compact == "SELECT * FROM runs WHERE ticket_id = ? ORDER BY created_at DESC" then
+                assert(param == "ticket-1")
+                return {{ {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "archived", status = "active", created_at = 10 }} }}
+              end
+              if compact:find("SELECT %* FROM pipelines WHERE id IN") then
+                return {{ {{ id = "archived", name = "Archived", archived_at = 123 }} }}
+              end
+              if compact == "SELECT * FROM pipeline_steps" then
+                return {{}}
+              end
+              if compact:find("FROM run_steps") then
+                return {{}}
+              end
+              if compact:find("FROM events") then
+                return {{}}
+              end
+              if compact:find("FROM questions") then
+                return {{}}
+              end
+              if compact:find("FROM ticket_dependencies") then
+                return {{}}
+              end
+              if compact:find("FROM tickets") then
+                return {{}}
+              end
+              return {{}}
+            end
+            package.loaded["project_pipelines.db"] = db
+
+            local repo = require("project_pipelines.repo")
+            local active = repo.list_pipelines()
+            local all = repo.list_all_pipelines()
+            local default = repo.get_default_pipeline()
+            local overview = repo.ticket_detail_overview("ticket-1")
+
+            assert(#active == 1 and active[1].id == "active")
+            assert(#all == 2 and all[1].id == "archived")
+            assert(default.id == "active")
+            assert(#overview.pipelines == 1 and overview.pipelines[1].id == "active")
+            assert(overview.pipelines_by_id.archived and overview.pipelines_by_id.archived.name == "Archived")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("repo should filter normal lists while preserving archived names for ticket history");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_db_v10_migration_adds_nullable_pipeline_columns() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local spec = nil
+            plugin = {{
+              db = function(opts)
+                spec = opts
+                return {{ eval = function() end }}
+              end,
+            }}
+            log = {{ warn = function() end }}
+
+            require("project_pipelines.db")
+            assert(spec.version == 10)
+            for _, column in ipairs({{ "version_label", "archived_at", "replacement_pipeline_id", "supersedes_pipeline_id" }}) do
+              assert(spec.models.pipelines[column] ~= nil, "fresh model missing " .. column)
+            end
+
+            local alters = {{}}
+            local migration_db = {{}}
+            function migration_db:eval(sql)
+              if sql == "PRAGMA table_info(pipelines)" then
+                return {{
+                  {{ name = "id" }},
+                  {{ name = "name" }},
+                  {{ name = "description" }},
+                  {{ name = "merge_policy" }},
+                  {{ name = "created_at" }},
+                  {{ name = "updated_at" }},
+                }}
+              end
+              alters[#alters + 1] = sql
+            end
+            spec.migrations[10](migration_db)
+            assert(#alters == 4)
+            assert(alters[1]:find("ADD COLUMN version_label text", 1, true))
+            assert(alters[2]:find("ADD COLUMN archived_at integer", 1, true))
+            assert(alters[3]:find("ADD COLUMN replacement_pipeline_id text", 1, true))
+            assert(alters[4]:find("ADD COLUMN supersedes_pipeline_id text", 1, true))
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("project pipelines v10 migration should add nullable pipeline columns");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_repo_validates_replacement_links() {
+    let lua = Lua::new();
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local pipelines = {{
+              old = {{ id = "old", name = "Old", merge_policy = "direct" }},
+              new = {{ id = "new", name = "New", merge_policy = "direct" }},
+            }}
+            json = {{
+              encode = function() return "{{}}" end,
+              decode = function() return {{}} end,
+            }}
+            local updates = {{}}
+            local db = {{
+              pipelines = {{
+                where = function(_self, query)
+                  return pipelines[query.id]
+                end,
+                update = function(_self, spec)
+                  updates[#updates + 1] = spec
+                  for key, value in pairs(spec.set or {{}}) do
+                    pipelines[spec.where.id][key] = value
+                  end
+                end,
+              }},
+              events = {{
+                insert = function() end,
+              }},
+            }}
+            function db:eval(sql, param)
+              if sql:find("UPDATE pipelines SET replacement_pipeline_id = NULL") then
+                pipelines[param].replacement_pipeline_id = nil
+              elseif sql:find("UPDATE pipelines SET supersedes_pipeline_id = NULL") then
+                pipelines[param].supersedes_pipeline_id = nil
+              elseif sql:find("UPDATE pipelines SET archived_at = NULL") then
+                pipelines[param].archived_at = nil
+              end
+              return {{}}
+            end
+            package.loaded["project_pipelines.db"] = db
+
+            local repo = require("project_pipelines.repo")
+            local ok_self, err_self = pcall(repo.update_pipeline, "old", {{ replacement_pipeline_id = "old" }})
+            assert(ok_self == false and tostring(err_self):find("cannot reference the same pipeline", 1, true))
+            local ok_missing, err_missing = pcall(repo.update_pipeline, "old", {{ replacement_pipeline_id = "missing" }})
+            assert(ok_missing == false and tostring(err_missing):find("not found: missing", 1, true))
+            local updated = repo.update_pipeline("old", {{ replacement_pipeline_id = "new", supersedes_pipeline_id = "" }})
+            assert(updated.replacement_pipeline_id == "new")
+            assert(#updates >= 1)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("repo should validate pipeline replacement links");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_archive_schema_and_allowlists_are_wired() {
+    let root = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let db = std::fs::read_to_string(root.join("project_pipelines/db.lua"))
+        .expect("read project pipelines db");
+    let repo = std::fs::read_to_string(root.join("project_pipelines/repo.lua"))
+        .expect("read project pipelines repo");
+    let actions = std::fs::read_to_string(root.join("project_pipelines/web/actions.lua"))
+        .expect("read project pipelines actions");
+    let entity_contract =
+        std::fs::read_to_string(root.join("project_pipelines/entity_contract.lua"))
+            .expect("read project pipelines entity contract");
+
+    assert!(db.contains("version = 10"));
+    for column in [
+        "version_label",
+        "archived_at",
+        "replacement_pipeline_id",
+        "supersedes_pipeline_id",
+    ] {
+        assert!(
+            db.contains(&format!("\"{column}\""))
+                && db.contains(&format!("{column} = {{ \"text\""))
+                || column == "archived_at" && db.contains("archived_at = { \"integer\""),
+            "db model and migration should include {column}"
+        );
+        assert!(
+            repo.contains(&format!("{column} = true")),
+            "repo update allow-list missing {column}"
+        );
+        assert!(
+            actions.contains(&format!("{column} = true")) || column == "archived_at",
+            "web action allow-list missing {column}"
+        );
+        assert!(
+            entity_contract.contains(column),
+            "entity contract missing {column}"
+        );
+    }
+    assert!(
+        actions.contains("archived = true"),
+        "web action allow-list missing archived toggle"
+    );
+    assert!(repo.contains("function M.list_all_pipelines()"));
+    assert!(repo.contains("WHERE archived_at IS NULL ORDER BY created_at ASC"));
+    assert!(
+        repo.contains("referenced_pipeline_ids"),
+        "ticket overview should preserve historical pipeline names"
+    );
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_mcp_archive_contract_is_explicit() {
+    let lua = Lua::new();
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local handlers = {{}}
+            mcp = {{
+              tool = function(name, _spec, handler)
+                handlers[name] = handler
+              end,
+              prompt = function() end,
+            }}
+            log = {{ warn = function() end, info = function() end }}
+            package.loaded["lib.config_resolver"] = {{ list_agents = function() return {{}} end }}
+            package.loaded["project_pipelines.engine"] = {{ start_run = function() end }}
+            package.loaded["project_pipelines.repo"] = {{
+              prune_legacy_seed_data = function() end,
+              list_pipelines = function()
+                return {{ {{ id = "active", name = "Active" }} }}
+              end,
+              list_all_pipelines = function()
+                return {{
+                  {{ id = "active", name = "Active" }},
+                  {{ id = "archived", name = "Archived", archived_at = 123 }},
+                }}
+              end,
+              get_pipeline_definition = function(id)
+                if id == "archived" then
+                  return {{ id = "archived", name = "Archived", archived_at = 123, steps = {{}} }}
+                end
+                return {{ id = id, name = "Active", steps = {{}} }}
+              end,
+              pipeline_is_archived = function(pipeline)
+                return pipeline and pipeline.archived_at ~= nil
+              end,
+              update_pipeline = function(_id, fields)
+                assert(fields.archived == true)
+                assert(fields.version_label == "v2")
+                assert(fields.replacement_pipeline_id == "active")
+                return fields
+              end,
+            }}
+
+            require("project_pipelines.mcp").register()
+            local default_list = handlers.project_pipelines_list_pipelines({{}})
+            assert(#default_list.result == 1 and default_list.result[1].id == "active")
+            local all_list = handlers.project_pipelines_list_pipelines({{ include_archived = true }})
+            assert(#all_list.result == 2 and all_list.result[2].id == "archived")
+            local hidden = handlers.project_pipelines_get_pipeline({{ pipeline_id = "archived" }})
+            assert(hidden.ok == true and hidden.result == nil)
+            local explicit = handlers.project_pipelines_get_pipeline({{ pipeline_id = "archived", include_archived = true }})
+            assert(explicit.result.id == "archived")
+            handlers.project_pipelines_update_pipeline({{
+              pipeline_id = "archived",
+              archived = true,
+              version_label = "v2",
+              replacement_pipeline_id = "active",
+            }})
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("project pipelines MCP archive contract should be explicit");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_start_run_rejects_archived_pipelines() {
+    let lua = Lua::new();
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
+            package.loaded["project_pipelines.notification_policy"] = {{}}
+            package.loaded["lib.hub"] = {{ get = function() return {{}} end }}
+            package.loaded["lib.agent"] = {{}}
+            package.loaded["project_pipelines.repo"] = {{
+              prune_legacy_seed_data = function() end,
+              get_default_pipeline = function()
+                return {{ id = "active", name = "Active" }}
+              end,
+              get_ticket = function(id)
+                return {{ id = id, target_id = "target-1", title = "Ticket" }}
+              end,
+              open_ticket_run = function() return nil end,
+              blocking_ticket_dependencies = function() return {{}} end,
+              get_pipeline = function(id)
+                if id == "archived" then
+                  return {{ id = "archived", archived_at = 123 }}
+                end
+                return {{ id = id }}
+              end,
+              pipeline_is_archived = function(pipeline)
+                return pipeline and pipeline.archived_at ~= nil
+              end,
+              pipeline_steps = function(_id) return {{}} end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            local ok_archived, err_archived = pcall(engine.start_run, {{ ticket_id = "ticket-1", pipeline_id = "archived" }})
+            assert(ok_archived == false)
+            assert(tostring(err_archived):find("archived pipeline definitions are unavailable", 1, true))
+
+            local ok_default, err_default = pcall(engine.start_run, {{ ticket_id = "ticket-1" }})
+            assert(ok_default == false)
+            assert(tostring(err_default):find("pipeline has no steps: active", 1, true))
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("project pipelines start_run should reject archived pipelines");
 
     assert_eq!(result, "ok");
 }

@@ -222,6 +222,50 @@ Results:
 Project Pipelines remains the reference plugin for entity-backed dynamic state
 and generic action lifecycle feedback.
 
+## 2026-05-21 Pipeline Versioning And Archive Support
+
+Implementation scope:
+
+- Added nullable pipeline lifecycle metadata: `version_label`, `archived_at`,
+  `replacement_pipeline_id`, and `supersedes_pipeline_id`.
+- Active/default selection paths omit archived definitions while direct repo
+  lookups still resolve historical runs by pipeline id.
+- MCP list/get expose explicit `include_archived` behavior; update accepts
+  archive, version, and replacement metadata.
+- Home and pipeline index lists filter `/project-pipelines.pipeline` rows by
+  active state while direct edit/detail paths can still hydrate archived rows.
+- The explicit archived pipeline view at `/pipelines/archived`
+  exposes retired definitions without changing default active-only lists.
+
+Verification commands:
+
+```bash
+cd cli && ./test.sh --unit -- project_pipelines
+cd cli && ./test.sh --integration -- project_pipelines
+rg -n "title.*prefix|prefix.*title" catalog/templates/plugins/project-pipelines/project_pipelines
+rg -n "archived_at|version_label|replacement_pipeline_id|supersedes_pipeline_id|/pipelines/archived" catalog/templates/plugins/project-pipelines/project_pipelines
+```
+
+Expected proof:
+
+- Integration coverage should prove schema/allow-list wiring, MCP
+  `include_archived` behavior, `engine.start_run` rejecting explicit archived
+  pipelines, repo default/list filtering, ticket history name preservation,
+  entity active/archived queries, archived UI meta rendering, v10 migration, and
+  replacement-link validation.
+- Static inspection should find archive/version metadata fields and no
+  title-prefix lifecycle logic in Project Pipelines Lua files.
+
+Results:
+
+- `cd cli && ./test.sh --unit -- project_pipelines` passed, but matched zero
+  library tests because Project Pipelines coverage is in integration tests.
+- `cd cli && ./test.sh --integration -- project_pipelines` passed. The filtered
+  run included 42 Project Pipelines plugin tests plus related catalog checks.
+- The title-prefix scan returned no Project Pipelines Lua matches.
+- The metadata field scan found the schema, repo, MCP, entity contract, web UI,
+  explicit archived route, and engine archive/version wiring.
+
 ## 2026-05-01 Dependency And Merge Polish
 
 Manual verification was run against the live `~/.botster-dev/plugins/project-pipelines` plugin after reloading the plugin and layout.
