@@ -274,6 +274,7 @@ function M.register()
             { path = "/tickets/:ticket_id", render = screen_ticket.render },
             { path = "/tickets/:ticket_id/sessions/:session_uuid", layout = "fullscreen", render = screen_ticket.session },
             { path = "/pipelines", render = screen_pipelines.index },
+            { path = "/pipelines/archived", render = screen_pipelines.archived },
             { path = "/pipelines/:pipeline_id/edit", render = screen_pipelines.edit },
             { path = "/runs/:run_id", render = screen_run.render },
             { path = "/sessions/:session_uuid", layout = "fullscreen", render = render_session },

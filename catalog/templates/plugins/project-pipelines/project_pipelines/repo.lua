@@ -47,6 +47,11 @@ local PIPELINE_UPDATE_FIELDS = {
     name = true,
     description = true,
     merge_policy = true,
+    version_label = true,
+    archived = true,
+    archived_at = true,
+    replacement_pipeline_id = true,
+    supersedes_pipeline_id = true,
 }
 
 local STEP_UPDATE_FIELDS = {
@@ -1219,11 +1224,19 @@ function M.remove_project_target(project_target_id)
 end
 
 function M.list_pipelines()
+    return rows("SELECT * FROM pipelines WHERE archived_at IS NULL ORDER BY created_at ASC")
+end
+
+function M.list_all_pipelines()
     return rows("SELECT * FROM pipelines ORDER BY created_at ASC")
 end
 
 function M.get_pipeline(pipeline_id)
     return db.pipelines:where{ id = pipeline_id }
+end
+
+function M.pipeline_is_archived(pipeline)
+    return pipeline and pipeline.archived_at ~= nil and tostring(pipeline.archived_at) ~= ""
 end
 
 function M.get_pipeline_definition(pipeline_id)
@@ -1242,7 +1255,7 @@ function M.get_pipeline_definition(pipeline_id)
 end
 
 function M.get_default_pipeline()
-    return first("SELECT * FROM pipelines ORDER BY created_at ASC LIMIT 1")
+    return first("SELECT * FROM pipelines WHERE archived_at IS NULL ORDER BY created_at ASC LIMIT 1")
 end
 
 function M.pipeline_steps(pipeline_id)
@@ -1262,11 +1275,37 @@ function M.update_pipeline(pipeline_id, attrs)
     if not has_fields(set) then
         return pipeline
     end
+    local now = util.now()
     if set.merge_policy ~= nil then
         set.merge_policy = normalize_merge_policy(set.merge_policy)
     end
-    set.updated_at = util.now()
+    local clear_columns = {}
+    if set.archived ~= nil then
+        if set.archived == true or set.archived == 1 or set.archived == "1" or set.archived == "true" then
+            set.archived_at = pipeline.archived_at or now
+        else
+            set.archived_at = nil
+            clear_columns[#clear_columns + 1] = "archived_at"
+        end
+        set.archived = nil
+    end
+    for _, field in ipairs({ "replacement_pipeline_id", "supersedes_pipeline_id" }) do
+        if set[field] ~= nil then
+            if util.is_blank(set[field]) then
+                set[field] = nil
+                clear_columns[#clear_columns + 1] = field
+            elseif set[field] == pipeline_id then
+                error(field .. " cannot reference the same pipeline")
+            elseif not M.get_pipeline(set[field]) then
+                error(field .. " not found: " .. tostring(set[field]))
+            end
+        end
+    end
+    set.updated_at = now
     db.pipelines:update{ where = { id = pipeline_id }, set = set }
+    for _, column in ipairs(clear_columns) do
+        db:eval("UPDATE pipelines SET " .. column .. " = NULL WHERE id = ?", pipeline_id)
+    end
     publish_entity("pipeline", M.get_pipeline(pipeline_id))
     M.append_event("pipeline.updated", {
         payload = { pipeline_id = pipeline_id, fields = set },
@@ -1341,12 +1380,25 @@ function M.create_pipeline(attrs)
         name = attrs.name,
         description = attrs.description or "",
         merge_policy = normalize_merge_policy(attrs.merge_policy),
+        version_label = attrs.version_label,
+        archived_at = attrs.archived_at,
+        replacement_pipeline_id = attrs.replacement_pipeline_id,
+        supersedes_pipeline_id = attrs.supersedes_pipeline_id,
         created_at = now,
         updated_at = now,
     }
     with_transaction(function()
         if M.get_pipeline(pipeline.id) then
             error("pipeline already exists: " .. tostring(pipeline.id))
+        end
+        for _, field in ipairs({ "replacement_pipeline_id", "supersedes_pipeline_id" }) do
+            if not util.is_blank(pipeline[field]) then
+                if pipeline[field] == pipeline.id then
+                    error(field .. " cannot reference the same pipeline")
+                elseif not M.get_pipeline(pipeline[field]) then
+                    error(field .. " not found: " .. tostring(pipeline[field]))
+                end
+            end
         end
         db.pipelines:insert(pipeline)
         local step_ids = {}
@@ -1874,6 +1926,21 @@ function M.ticket_detail_overview(ticket_id)
 
     local pipelines = M.list_pipelines()
     local pipelines_by_id = index_by_id(pipelines)
+    local referenced_pipeline_ids = {}
+    for pipeline_id, _ in pairs(pipeline_ids) do
+        if not pipelines_by_id[pipeline_id] then
+            referenced_pipeline_ids[#referenced_pipeline_ids + 1] = pipeline_id
+        end
+    end
+    if #referenced_pipeline_ids > 0 then
+        local referenced = rows(
+            "SELECT * FROM pipelines WHERE id IN (" .. placeholders(#referenced_pipeline_ids) .. ")",
+            referenced_pipeline_ids
+        )
+        for _, pipeline in ipairs(referenced) do
+            pipelines_by_id[pipeline.id] = pipeline
+        end
+    end
     local steps_by_id = index_by_id(rows("SELECT * FROM pipeline_steps"))
 
     local run_steps = {}
