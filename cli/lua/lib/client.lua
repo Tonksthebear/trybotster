@@ -594,7 +594,7 @@ function Client:handle_mcp_data(sub_id, command)
 
         local context = sub and sub.caller_context or {}
 
-        mcp.call_tool(tool_name, params, context, function(result, err)
+        mcp.call_tool(tool_name, params, context, function(result, err, remote_is_error)
             if err then
                 self:send({
                     subscriptionId = sub_id,
@@ -608,7 +608,7 @@ function Client:handle_mcp_data(sub_id, command)
                     subscriptionId = sub_id,
                     type = "tool_result",
                     call_id = call_id,
-                    is_error = false,
+                    is_error = remote_is_error == true,
                     content = result,
                 })
             end
