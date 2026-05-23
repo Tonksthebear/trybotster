@@ -47,6 +47,7 @@ local function step_nodes(run_id)
                     },
                     ui.text{ text = ui.bind("@/detail"), size = "xs", tone = "muted" },
                     ui.text{ text = ui.bind("@/prompt_text"), size = "xs", tone = "muted" },
+                    ui.bind_if("@/has_current_notification", view.badge("needs attention", "danger")),
                     ui.bind_if("@/has_terminal", ui.button{
                         id = ui.bind("@/terminal_button_id"),
                         label = "Open terminal",
@@ -161,10 +162,10 @@ function M.render(view_state, ctx)
         }),
         ui.bind_if(run_path .. "/has_current_agent", ui.button{
             id = ui.bind(run_path .. "/current_agent_button_id"),
-            label = "Current agent",
+            label = ui.bind(run_path .. "/current_agent_button_label"),
             icon = "command-line",
             variant = "solid",
-            tone = "accent",
+            tone = ui.bind(run_path .. "/current_agent_button_tone"),
             action = ui.action("botster.nav.open", { path = ui.bind(run_path .. "/current_agent_path") }),
         }),
     }

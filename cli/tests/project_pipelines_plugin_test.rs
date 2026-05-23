@@ -1333,19 +1333,24 @@ fn catalog_plugin_project_pipelines_home_bind_lists_use_entity_empty_templates()
         "catalog/templates/plugins/project-pipelines/project_pipelines/web/screens/home.lua",
     ))
     .expect("read project pipelines home screen");
+    let surface = std::fs::read_to_string(project_root_dir().join(
+        "catalog/templates/plugins/project-pipelines/project_pipelines/web/surface.lua",
+    ))
+    .expect("read project pipelines surface");
 
     assert_eq!(
         home.matches("ui.bind_list").count(),
-        6,
-        "home should keep the six entity-backed bind_list sections"
+        7,
+        "home should keep the seven entity-backed bind_list sections"
     );
     assert_eq!(
         home.matches("empty_template = view.empty").count(),
-        6,
+        7,
         "each home bind_list should provide an empty_template"
     );
 
     for source in [
+        "/project-pipelines.attention_item",
         "/project-pipelines.question",
         "/project-pipelines.run",
         "/project-pipelines.ticket",
@@ -1372,12 +1377,165 @@ fn catalog_plugin_project_pipelines_home_bind_lists_use_entity_empty_templates()
         r#"path = ui.bind("@/path")"#,
         r#"ui.bind_if("@/has_current_agent""#,
         r#"path = ui.bind("@/current_agent_path")"#,
+        r#"source = "/project-pipelines.attention_item""#,
+        r#"Questions and agent notifications will appear here."#,
     ] {
         assert!(
             home.contains(snippet),
             "Running Pipelines rows should expose entity-backed action snippet: {snippet}"
         );
     }
+
+    for snippet in [
+        r#"project-pipelines.needs-attention"#,
+        r#"source = "/project-pipelines.attention_item""#,
+        r#"Questions and agent notifications will appear here."#,
+    ] {
+        assert!(
+            surface.contains(snippet),
+            "dashboard should expose the Needs Attention widget snippet: {snippet}"
+        );
+    }
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_notification_counts_only_use_current_agents() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            package.loaded["lib.config_resolver"] = {{
+              list_agents = function() return {{}} end,
+              list_accessories = function() return {{}} end,
+            }}
+            package.loaded["lib.agent"] = {{
+              get = function(session_uuid)
+                return {{
+                  info = function()
+                    return {{ session_uuid = session_uuid, notification = session_uuid == "sess-current" }}
+                  end,
+                }}
+              end,
+            }}
+
+            local current_lookup = 0
+            local legacy_lookup = 0
+            local repo = {{
+              current_ticket_agent_session_uuids = function(ticket_id)
+                current_lookup = current_lookup + 1
+                assert(ticket_id == "ticket-1")
+                return {{ "sess-current" }}
+              end,
+              ticket_session_uuids = function()
+                legacy_lookup = legacy_lookup + 1
+                return {{ "sess-current", "sess-stale" }}
+              end,
+              current_ticket_agent_session_uuids_by_ticket = function(ticket_ids)
+                current_lookup = current_lookup + 1
+                assert(ticket_ids[1] == "ticket-1")
+                return {{
+                  ["ticket-1"] = {{ "sess-current" }},
+                }}, {{ ["sess-current"] = true }}
+              end,
+              ticket_session_uuids_by_ticket = function()
+                legacy_lookup = legacy_lookup + 1
+                return {{
+                  ["ticket-1"] = {{ "sess-current", "sess-stale" }},
+                }}, {{ ["sess-current"] = true, ["sess-stale"] = true }}
+              end,
+            }}
+
+            local view = require("project_pipelines.web.ui")
+            assert(view.ticket_notification_count("ticket-1", repo) == 1)
+            local counts = view.ticket_notification_counts(repo, {{ "ticket-1" }})
+            assert(counts["ticket-1"] == 1)
+            assert(current_lookup == 2)
+            assert(legacy_lookup == 0)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines notification counts should use current assigned agents");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_attention_items_include_questions_and_notified_current_agents() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local frames = {{}}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  entity_snapshot = function(_self, entity_type, items, opts)
+                    frames[entity_type] = {{ items = items, owner_plugin = opts.owner_plugin }}
+                  end,
+                }}
+              end,
+            }}
+
+            package.loaded["project_pipelines.web.ui"] = {{
+              session_has_notification = function(session_uuid)
+                return session_uuid == "sess-current"
+              end,
+            }}
+
+            local db = {{}}
+            function db:eval(sql, _params)
+              local compact = (sql:gsub("%s+", " "))
+              if compact:find("FROM questions q JOIN tickets t") then
+                return {{
+                  {{ id = "question-1", ticket_id = "ticket-1", ticket_title = "Question ticket", question = "Need a decision?", status = "open", blocking = 1, updated_at = 20 }},
+                }}
+              end
+              if compact:find("FROM runs r JOIN run_steps rs") then
+                return {{
+                  {{ run_id = "run-1", ticket_id = "ticket-1", run_step_id = "run-step-current", agent_session_uuid = "sess-current", step_name = "Implement", ticket_title = "Notified ticket", run_updated_at = 30 }},
+                  {{ run_id = "run-2", ticket_id = "ticket-2", run_step_id = "run-step-quiet", agent_session_uuid = "sess-quiet", step_name = "Review", ticket_title = "Quiet ticket", run_updated_at = 40 }},
+                }}
+              end
+              return {{}}
+            end
+            package.loaded["project_pipelines.db"] = db
+
+            local entities = require("project_pipelines.entities")
+            entities.snapshot(entities.types.attention_item)
+
+            local frame = frames[entities.types.attention_item]
+            assert(frame.owner_plugin == "project-pipelines")
+            assert(#frame.items == 2)
+
+            local seen = {{}}
+            for _, item in ipairs(frame.items) do
+              seen[item.id] = item
+            end
+            assert(seen["question:question-1"])
+            assert(seen["question:question-1"].badge_label == "blocking question")
+            assert(seen["agent:run-step-current"])
+            assert(seen["agent:run-step-current"].path == "/pipelines/tickets/ticket-1/sessions/sess-current")
+            assert(not seen["agent:run-step-quiet"])
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("Project Pipelines attention items should include open questions and notified current agents");
+
+    assert_eq!(result, "ok");
 }
 
 #[test]
@@ -2400,6 +2558,9 @@ fn catalog_plugin_project_pipelines_run_entities_decorate_relationship_and_agent
               status_tone = function(status)
                 return status == "blocked" and "danger" or "muted"
               end,
+              session_has_notification = function(session_uuid)
+                return session_uuid == "sess-agent"
+              end,
             }}
             package.loaded["project_pipelines.db"] = {{
               eval = function(_self, sql, param)
@@ -2462,6 +2623,9 @@ fn catalog_plugin_project_pipelines_run_entities_decorate_relationship_and_agent
             assert(decorated.project_path == "/pipelines/projects/project-1")
             assert(decorated.current_agent_session_uuid == "sess-agent")
             assert(decorated.has_current_agent == true)
+            assert(decorated.current_agent_has_notification == true)
+            assert(decorated.current_agent_button_label == "Current agent needs attention")
+            assert(decorated.current_agent_button_tone == "danger")
             assert(decorated.current_agent_path == "/pipelines/tickets/ticket-1/sessions/sess-agent")
 
             entities.upsert(entities.types.run, {{
@@ -2478,6 +2642,9 @@ fn catalog_plugin_project_pipelines_run_entities_decorate_relationship_and_agent
             assert(fallback.has_ticket == false)
             assert(fallback.has_project == false)
             assert(fallback.has_current_agent == false)
+            assert(fallback.current_agent_has_notification == false)
+            assert(fallback.current_agent_button_label == "Current agent")
+            assert(fallback.current_agent_button_tone == "accent")
             assert(fallback.current_agent_path == nil)
             assert(fallback.status_tone == "danger")
             return "ok"

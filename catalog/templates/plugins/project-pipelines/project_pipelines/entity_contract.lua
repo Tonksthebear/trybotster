@@ -24,6 +24,7 @@ M.types = {
     finding = M.owner .. ".finding",
     artifact = M.owner .. ".artifact",
     question = M.owner .. ".question",
+    attention_item = M.owner .. ".attention_item",
     checklist = M.owner .. ".checklist",
     checklist_item = M.owner .. ".checklist_item",
     pr_link = M.owner .. ".pr_link",
@@ -31,6 +32,18 @@ M.types = {
 }
 
 M.home_screen = {
+    {
+        name = "needs_attention",
+        source = "/" .. M.types.attention_item,
+        fields = {
+            "badge_label",
+            "badge_tone",
+            "id",
+            "path",
+            "subtitle",
+            "title",
+        },
+    },
     {
         name = "questions_to_answer",
         source = "/" .. M.types.question,
@@ -51,6 +64,8 @@ M.home_screen = {
         where_fields = { "status" },
         fields = {
             "current_step_name",
+            "current_agent_button_label",
+            "current_agent_button_tone",
             "current_agent_path",
             "has_current_agent",
             "has_project",
@@ -238,6 +253,8 @@ M.screens = {
             where_fields = { "id" },
             fields = {
                 "current_agent_button_id",
+                "current_agent_button_label",
+                "current_agent_button_tone",
                 "current_agent_path",
                 "current_agent_session_uuid",
                 "detail_label",
@@ -265,6 +282,7 @@ M.screens = {
             where_fields = { "run_id" },
             fields = {
                 "detail",
+                "has_current_notification",
                 "has_terminal",
                 "name",
                 "prompt_text",

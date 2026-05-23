@@ -677,7 +677,7 @@ fn schedule_snapshots_to_defers_work_and_cancels_unsubscribed_clients() {
 }
 
 #[test]
-fn schedule_snapshots_to_cancels_stale_jobs_for_same_subscription() {
+fn schedule_snapshots_to_keeps_distinct_batches_for_same_subscription() {
     let (lua, eb) = new_eb_lua();
     lua.globals().set("EB", eb).unwrap();
 
@@ -725,29 +725,30 @@ fn schedule_snapshots_to_cancels_stale_jobs_for_same_subscription() {
 
             local two_jobs_queued = #queue == 2 and #captured == 0 and #calls == 0
             queue[2]()
-            local current_ran = #captured == 1
+            local second_batch_ran = #captured == 1
               and captured[1].entity_type == "workspace"
               and #calls == 1
               and calls[1] == "workspace"
 
-            EB.schedule_snapshots_to(client, "sub-1", {
-              types = { "session" },
-            })
             queue[1]()
-            local stale_still_canceled_after_new_job = #captured == 1 and #calls == 1
-            queue[3]()
-            local superseded_completion_canceled = #captured == 1 and #calls == 1
-            queue[4]()
-            local next_job_ran = #captured == 2
+            local first_batch_started = #captured == 2
               and captured[2].entity_type == "session"
               and #calls == 2
               and calls[2] == "session"
 
+            queue[3]()
+            local second_batch_completed = #captured == 2 and #calls == 2
+            queue[4]()
+            local first_batch_finished = #captured == 3
+              and captured[3].entity_type == "workspace"
+              and #calls == 3
+              and calls[3] == "workspace"
+
             return two_jobs_queued
-              and current_ran
-              and stale_still_canceled_after_new_job
-              and superseded_completion_canceled
-              and next_job_ran
+              and second_batch_ran
+              and first_batch_started
+              and second_batch_completed
+              and first_batch_finished
         "#,
         )
         .eval()
@@ -755,7 +756,63 @@ fn schedule_snapshots_to_cancels_stale_jobs_for_same_subscription() {
 
     assert!(
         result,
-        "new hydration requests for the same subscription should cancel older scheduled jobs before they run"
+        "different hydration batches for the same subscription should not cancel each other"
+    );
+}
+
+#[test]
+fn schedule_snapshots_to_cancels_stale_duplicate_jobs_for_same_subscription() {
+    let (lua, eb) = new_eb_lua();
+    lua.globals().set("EB", eb).unwrap();
+
+    let result: bool = lua
+        .load(
+            r#"
+            local queue = {}
+            timer = {
+              after = function(_delay, fn)
+                queue[#queue + 1] = fn
+                return "timer-" .. tostring(#queue)
+              end,
+            }
+
+            local calls = 0
+            EB.register("session", {
+              id_field = "session_uuid",
+              all = function()
+                calls = calls + 1
+                return { { session_uuid = "sess-1" } }
+              end,
+            })
+
+            local captured = {}
+            local client = {
+              subscriptions = { ["sub-1"] = { channel = "hub" } },
+              send = function(_, frame)
+                captured[#captured + 1] = frame
+              end,
+            }
+
+            EB.schedule_snapshots_to(client, "sub-1", { types = { "session" } })
+            EB.schedule_snapshots_to(client, "sub-1", { types = { "session" } })
+
+            local duplicate_jobs_queued = #queue == 2 and #captured == 0 and calls == 0
+            queue[1]()
+            local first_canceled = #captured == 0 and calls == 0
+            queue[2]()
+            local second_ran = #captured == 1
+              and captured[1].entity_type == "session"
+              and calls == 1
+
+            return duplicate_jobs_queued and first_canceled and second_ran
+        "#,
+        )
+        .eval()
+        .expect("duplicate scheduled snapshot script should evaluate");
+
+    assert!(
+        result,
+        "duplicate hydration requests should cancel stale copies for the same subscription"
     );
 }
 
@@ -785,19 +842,41 @@ fn clear_scheduled_snapshots_drops_active_job_without_reusing_ids() {
               send = function() end,
             }
 
+            local function job_count()
+              local count = 0
+              for _ in pairs(client.__entity_snapshot_jobs or {}) do
+                count = count + 1
+              end
+              return count
+            end
+            local function seq_value()
+              for _, value in pairs(client.__entity_snapshot_job_seq or {}) do
+                return value
+              end
+              return nil
+            end
+
             EB.schedule_snapshots_to(client, "sub-1", { types = { "session" } })
-            local populated = client.__entity_snapshot_jobs["sub-1"] ~= nil
-              and client.__entity_snapshot_job_seq["sub-1"] ~= nil
+            local populated = job_count() == 1 and seq_value() == 1
 
             EB.clear_scheduled_snapshots(client, "sub-1")
-            local cleared = client.__entity_snapshot_jobs["sub-1"] == nil
-              and client.__entity_snapshot_job_seq["sub-1"] == 1
+            local cleared = job_count() == 0 and seq_value() == 1
 
             EB.schedule_snapshots_to(client, "sub-1", { types = { "session" } })
-            local advanced = client.__entity_snapshot_job_seq["sub-1"] == 2
-              and client.__entity_snapshot_jobs["sub-1"] == 2
+            local advanced = job_count() == 1 and seq_value() == 2
+            queue[1]()
+            local stale_tick_pruned = job_count() == 1 and seq_value() == 2
+            queue[2]()
+            local active_tick_preserved = job_count() == 1 and seq_value() == 2
+            queue[3]()
+            local completed_pruned = job_count() == 0 and seq_value() == nil
 
-            return populated and cleared and advanced
+            return populated
+              and cleared
+              and advanced
+              and stale_tick_pruned
+              and active_tick_preserved
+              and completed_pruned
         "#,
         )
         .eval()
@@ -806,6 +885,72 @@ fn clear_scheduled_snapshots_drops_active_job_without_reusing_ids() {
     assert!(
         result,
         "subscription teardown should cancel the active snapshot job without reusing queued job ids"
+    );
+}
+
+#[test]
+fn clear_scheduled_snapshots_clears_only_matching_subscription_batches() {
+    let (lua, eb) = new_eb_lua();
+    lua.globals().set("EB", eb).unwrap();
+
+    let result: bool = lua
+        .load(
+            r#"
+            local queue = {}
+            timer = {
+              after = function(_delay, fn)
+                queue[#queue + 1] = fn
+                return "timer-" .. tostring(#queue)
+              end,
+            }
+
+            EB.register("session", {
+              id_field = "session_uuid",
+              all = function() return { { session_uuid = "sess-1" } } end,
+            })
+            EB.register("workspace", {
+              id_field = "workspace_id",
+              all = function() return { { workspace_id = "ws-1" } } end,
+            })
+
+            local client = {
+              subscriptions = {
+                ["sub-1"] = { channel = "hub" },
+                ["sub-10"] = { channel = "hub" },
+              },
+              send = function() end,
+            }
+
+            local function job_count()
+              local count = 0
+              for _ in pairs(client.__entity_snapshot_jobs or {}) do
+                count = count + 1
+              end
+              return count
+            end
+
+            EB.schedule_snapshots_to(client, "sub-1", { types = { "session" } })
+            EB.schedule_snapshots_to(client, "sub-1", { types = { "workspace" } })
+            EB.schedule_snapshots_to(client, "sub-10", { types = { "session" } })
+            local populated = job_count() == 3
+
+            EB.clear_scheduled_snapshots(client, "sub-1")
+            local cleared_matching = job_count() == 1
+
+            for _, fn in ipairs(queue) do
+              fn()
+            end
+            local different_subscription_survived = job_count() == 0
+
+            return populated and cleared_matching and different_subscription_survived
+        "#,
+        )
+        .eval()
+        .expect("clear scheduled snapshot multi-batch script should evaluate");
+
+    assert!(
+        result,
+        "subscription teardown should clear all matching batches without touching prefixed subscription ids"
     );
 }
 
