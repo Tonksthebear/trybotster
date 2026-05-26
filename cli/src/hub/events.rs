@@ -479,8 +479,12 @@ impl HubEvent {
     pub(crate) fn is_high_priority(&self) -> bool {
         match self {
             Self::LuaPtyRequest(request) => Self::is_terminal_control_request(request),
-            Self::AcChannelMessage { .. }
-            | Self::LuaActionCableRequest(_)
+            // AcChannelMessage is not high-priority (cold-turkey boundary change).
+            // Synchronous plugin Lua handlers must not starve terminal control
+            // and mode frames (e.g. ModeChanged carrying mouse_mode) required for
+            // reattach fidelity of nested TUIs. See worker-actor-contracts.md and
+            // the AC cross-VM conversion.
+            Self::LuaActionCableRequest(_)
             | Self::WebRtcOfferNegotiated(_)
             | Self::WebRtcOutgoingSignal(_)
             | Self::DcOpened { .. }
