@@ -260,6 +260,12 @@ _event_sub = events.on("sessions_discovered", function(data)
     if data_dir then
         local ws = require("lib.workspace_store")
         local active_workspaces = {}
+        local wanted_by_uuid = {}
+        for _, socket_info in ipairs(sockets) do
+            if socket_info.session_uuid and socket_info.session_uuid ~= "" then
+                wanted_by_uuid[socket_info.session_uuid] = true
+            end
+        end
 
         -- Read active workspace IDs from the hub manifest
         local hub_id = hub.hub_id and hub.hub_id() or nil
@@ -303,14 +309,32 @@ _event_sub = events.on("sessions_discovered", function(data)
                 "[session_recovery] Scanned %d active workspace(s), found %d session manifest(s)",
                 #active_workspaces, manifest_count
             ))
-        else
-            -- No workspaces in hub manifest — scan recoverable sessions
-            local wanted_by_uuid = {}
-            for _, socket_info in ipairs(sockets) do
-                if socket_info.session_uuid and socket_info.session_uuid ~= "" then
-                    wanted_by_uuid[socket_info.session_uuid] = true
+
+            local missing_by_uuid = {}
+            local missing_count = 0
+            for session_uuid, _ in pairs(wanted_by_uuid) do
+                if not manifest_by_uuid[session_uuid] then
+                    missing_by_uuid[session_uuid] = true
+                    missing_count = missing_count + 1
                 end
             end
+            if missing_count > 0 then
+                local records = ws.scan_recoverable_sessions(data_dir, missing_by_uuid)
+                local fallback_count = 0
+                for _, record in ipairs(records) do
+                    if not manifest_by_uuid[record.session_uuid] then
+                        manifest_by_uuid[record.session_uuid] = record
+                        manifest_count = manifest_count + 1
+                        fallback_count = fallback_count + 1
+                    end
+                end
+                log.info(string.format(
+                    "[session_recovery] Fallback scanned workspace store for %d missing socket(s), found %d session manifest(s)",
+                    missing_count, fallback_count
+                ))
+            end
+        else
+            -- No workspaces in hub manifest — scan recoverable sessions
             local records = ws.scan_recoverable_sessions(data_dir, wanted_by_uuid)
             for _, record in ipairs(records) do
                 manifest_by_uuid[record.session_uuid] = record
