@@ -112,6 +112,10 @@ fn create_lua_vm(data_dir: &std::path::Path, repo_root: &std::path::Path) -> Lua
                 created_at = "2026-05-18T00:00:00Z",
               }}
             end,
+            workspace_dir = function(data_dir, workspace_id)
+              return data_dir .. "/workspaces/" .. workspace_id
+            end,
+            read_session = function() return nil end,
             scan_recoverable_sessions = function() return {{}} end,
             write_workspace = function()
               _G.test_write_counts.workspace = _G.test_write_counts.workspace + 1
@@ -232,6 +236,117 @@ fn manifest_recovered_sessions_are_canonical_and_sync_manifests() {
     assert!(
         canonical,
         "manifest recovery should be canonical and writable"
+    );
+}
+
+#[test]
+fn recovery_falls_back_to_workspace_scan_when_hub_manifest_misses_live_socket_workspace() {
+    let dir = TempDir::new().unwrap();
+    let data_dir = dir.path().join("data");
+    let repo_root = dir.path().join("repo");
+    let worktree_path = dir.path().join("worktree");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    std::fs::create_dir_all(&repo_root).unwrap();
+    std::fs::create_dir_all(&worktree_path).unwrap();
+    std::fs::write(worktree_path.join(".git"), "gitdir: /tmp/example").unwrap();
+    std::fs::write(
+        data_dir.join("hub-manifest.json"),
+        r#"{"workspaces":["ws-stale-only"]}"#,
+    )
+    .unwrap();
+
+    let lua = create_lua_vm(&data_dir, &repo_root);
+
+    let recovered: bool = lua
+        .load(format!(
+            r#"
+            _G.test_connect_session_count = 0
+            _G.test_fallback_wanted = nil
+            package.loaded["lib.workspace_store"] = nil
+            package.preload["lib.workspace_store"] = function()
+              return {{
+                init_dir = function() return true end,
+                workspace_dir = function(data_dir, workspace_id)
+                  return data_dir .. "/workspaces/" .. workspace_id
+                end,
+                read_workspace = function()
+                  return {{
+                    id = "ws-live",
+                    name = "Live Workspace",
+                    status = "active",
+                    metadata = {{}},
+                    created_at = "2026-05-18T00:00:00Z",
+                  }}
+                end,
+                read_session = function() return nil end,
+                scan_recoverable_sessions = function(data_dir, wanted_by_uuid)
+                  _G.test_fallback_wanted = wanted_by_uuid and wanted_by_uuid["sess-live"] == true
+                  return {{
+                    {{
+                      session_uuid = "sess-live",
+                      workspace_id = "ws-live",
+                      data_dir = data_dir,
+                      manifest = {{
+                        session_uuid = "sess-live",
+                        session_type = "agent",
+                        session_name = "codex",
+                        repo = "owner/repo",
+                        target_id = "target-1",
+                        target_path = "{repo_root}",
+                        target_repo = "owner/repo",
+                        branch_name = "feature",
+                        worktree_path = "{worktree_path}",
+                        workspace_id = "ws-live",
+                        workspace_name = "Live Workspace",
+                        status = "active",
+                      }},
+                    }},
+                  }}
+                end,
+                write_workspace = function()
+                  _G.test_write_counts.workspace = _G.test_write_counts.workspace + 1
+                  return true
+                end,
+                write_session = function()
+                  _G.test_write_counts.session = _G.test_write_counts.session + 1
+                  return true
+                end,
+                refresh_workspace_status = function() return true end,
+                append_event = function() return true end,
+              }}
+            end
+
+            require("handlers.session_recovery")
+            assert(_G.session_recovery_callback ~= nil, "session recovery callback registered")
+
+            _G.session_recovery_callback({{
+              sockets = {{
+                {{
+                  session_uuid = "sess-live",
+                  socket_path = "/tmp/botster/sessions/sess-live.sock",
+                  rows = 24,
+                  cols = 80,
+                }},
+              }},
+            }})
+
+            local Session = require("lib.session")
+            local session = Session.get("sess-live")
+            local info = session and session:info() or {{}}
+            return _G.test_fallback_wanted == true
+              and _G.test_connect_session_count == 1
+              and info.recovery_source == "manifest"
+              and info.canonical == true
+        "#,
+            repo_root = repo_root.to_str().unwrap(),
+            worktree_path = worktree_path.to_str().unwrap(),
+        ))
+        .eval()
+        .expect("stale hub manifest fallback recovery should evaluate");
+
+    assert!(
+        recovered,
+        "live socket UUIDs missing from the hub manifest workspace list should still recover from manifests"
     );
 }
 
