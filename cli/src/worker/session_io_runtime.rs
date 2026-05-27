@@ -637,6 +637,12 @@ impl SessionIoRuntime {
                         return;
                     }
                 }
+
+                // Replay mode (if captured) before any reconnect/attach state.
+                if self.try_replay_initial_attach_mode(&delivery).is_err() {
+                    return;
+                }
+
                 if self
                     .try_send_initial_attach_control(
                         &delivery,
@@ -737,10 +743,10 @@ impl SessionIoRuntime {
             }
         }
 
-        // Per reviewer guidance for Item 3 (TUI reattach): emit full ModeChanged
-        // (from delivery.mode) after Scrollback/subscribed but before any
-        // TerminalAttach(Attached) so the client has mouse/focus/etc state at
-        // the attach barrier.
+        // Mode replay for non-empty path.
+        // For mode=None we keep the exact original if-let shape (no extra
+        // helper call) so that existing backpressure tests for the mode=None
+        // case continue to see the same phase failure points.
         if let Some(mode) = &delivery.mode {
             if self
                 .try_send_initial_attach_control(
@@ -803,6 +809,28 @@ impl SessionIoRuntime {
                 );
                 Err(())
             }
+        }
+    }
+
+    /// Replays the captured initial mode state (if any) before emitting the final
+    /// attach/reconnect state. This ensures clients receive full mouse_mode,
+    /// focus, etc. as part of the attach barrier on both non-empty and empty
+    /// snapshot paths (per reviewer requirement for TUI Raw reattach).
+    fn try_replay_initial_attach_mode(
+        &self,
+        delivery: &TerminalInitialSnapshotDelivery,
+    ) -> Result<(), ()> {
+        if let Some(mode) = &delivery.mode {
+            self.try_send_initial_attach_control(
+                delivery,
+                TerminalAttachDeliveryPhase::ModeReplay,
+                crate::worker::client::ClientControlFrame::ModeChanged {
+                    session_uuid: self.session_uuid.clone(),
+                    mode: mode.clone(),
+                },
+            )
+        } else {
+            Ok(())
         }
     }
 

@@ -228,8 +228,6 @@ pub fn mode_changed_from_flags(flags: ModeFlags) -> ModeChanged {
     }
 }
 
-// Rust guideline compliant (M-CANONICAL-DOCS + strong types per 03-documentation + 07-universal) 2026-05
-
 /// OSC notification payload.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NotificationPayload {
