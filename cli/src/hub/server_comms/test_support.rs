@@ -318,6 +318,19 @@ pub(super) fn deliver_terminal_initial_snapshot(
             .expect("deliver subscription confirmation to client worker");
     }
 
+    // Mirror production ordering for tests: mode (if present) before final attach.
+    if let Some(mode) = &delivery.mode {
+        delivery
+            .worker
+            .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::ModeChanged {
+                    session_uuid: delivery.session_uuid.clone(),
+                    mode: mode.clone(),
+                },
+            ))
+            .expect("deliver mode replay in test initial snapshot");
+    }
+
     delivery
         .worker
         .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
