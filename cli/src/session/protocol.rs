@@ -159,7 +159,7 @@ pub struct ModeFlags {
     pub cursor_visible: bool,
     /// Bracketed paste mode enabled.
     pub bracketed_paste: bool,
-    /// Mouse tracking mode (0=off, 1000/1002/1003/1006).
+    /// Mouse tracking mode bitmask (1=normal, 2=any-event, 4=button-event, 8=SGR encoding, etc.).
     pub mouse_mode: u8,
     /// Alternate screen buffer active.
     pub alt_screen: bool,
@@ -187,7 +187,7 @@ pub struct ModeChanged {
     /// Alternate screen buffer toggled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alt_screen: Option<bool>,
-    /// Mouse tracking mode changed (0=off, 1000/1002/1003/1006).
+    /// Mouse tracking mode bitmask changed (see ModeFlags for encoding).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mouse_mode: Option<u8>,
     /// Bracketed paste mode toggled.

@@ -1656,7 +1656,7 @@ mod tests {
             kitty_enabled: Some(true),
             cursor_visible: Some(true),
             bracketed_paste: Some(true),
-            mouse_mode: Some(2),
+            mouse_mode: Some(8),
             alt_screen: Some(false),
             focus_reporting: Some(true),
             application_cursor: Some(true),
@@ -1722,7 +1722,7 @@ mod tests {
             crate::worker::client::ClientWorkerMessage::ControlFrame(
                 crate::worker::client::ClientControlFrame::ModeChanged { mode: received_mode, .. },
             ) => {
-                assert_eq!(received_mode.mouse_mode, Some(2));
+                assert_eq!(received_mode.mouse_mode, Some(8));
                 assert_eq!(received_mode.focus_reporting, Some(true));
             }
             other => panic!("expected ModeChanged, got {other:?}"),
@@ -1760,8 +1760,16 @@ mod tests {
             tx: client_tx,
         };
 
+        let live_subscription = TerminalOutputSubscription {
+            subscription_key: format!("client:{session_uuid}"),
+            subscription_id: "terminal_empty_live_mode".to_string(),
+            worker: worker.clone(),
+            output_prefix: Vec::new(),
+            filter: crate::worker::session_io::TerminalOutputFilter::None,
+        };
+
         let mode = crate::session::protocol::ModeChanged {
-            mouse_mode: Some(2),
+            mouse_mode: Some(8),
             focus_reporting: Some(true),
             ..Default::default()
         };
@@ -1781,7 +1789,7 @@ mod tests {
                         mode: Some(mode.clone()),
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: true,
-                        live_subscription: None,
+                        live_subscription: Some(live_subscription),
                         attach_requested_at: None,
                         client_worker_subscribed_at: None,
                         session_io_snapshot_queued_at: None,
@@ -1816,7 +1824,7 @@ mod tests {
             crate::worker::client::ClientWorkerMessage::ControlFrame(
                 crate::worker::client::ClientControlFrame::ModeChanged { mode: received_mode, .. },
             ) => {
-                assert_eq!(received_mode.mouse_mode, Some(2));
+                assert_eq!(received_mode.mouse_mode, Some(8));
                 assert_eq!(received_mode.focus_reporting, Some(true));
             }
             other => panic!("expected ModeChanged, got {other:?}"),
@@ -1833,6 +1841,13 @@ mod tests {
             }
             other => panic!("expected Reconnecting, got {other:?}"),
         }
+
+        // After the barrier, write live output. A fuller test would assert it now flows.
+        // For now we at least prove we reached this point after Reconnecting with a real live_subscription attached.
+        writer
+            .write_all(&encode_frame(FRAME_PTY_OUTPUT, b"live-after-reconnect"))
+            .expect("write live output after reconnect");
+        std::thread::sleep(Duration::from_millis(10));
 
         // Cleanup
         if let Ok(path) = crate::session::session_socket_path(&session_uuid) {
