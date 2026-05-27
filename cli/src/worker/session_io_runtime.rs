@@ -1842,12 +1842,20 @@ mod tests {
             other => panic!("expected Reconnecting, got {other:?}"),
         }
 
-        // After the barrier, write live output. A fuller test would assert it now flows.
-        // For now we at least prove we reached this point after Reconnecting with a real live_subscription attached.
+        // After the barrier, live output must now flow (activation happens after Reconnecting + mode replay).
         writer
             .write_all(&encode_frame(FRAME_PTY_OUTPUT, b"live-after-reconnect"))
             .expect("write live output after reconnect");
         std::thread::sleep(Duration::from_millis(10));
+
+        match block_on_with_timeout(async {
+            client_rx.recv().await
+        }) {
+            Some(crate::worker::client::ClientWorkerMessage::TerminalBytes { data, .. }) => {
+                assert_eq!(data, b"live-after-reconnect");
+            }
+            other => panic!("expected TerminalBytes after barrier, got {other:?}"),
+        }
 
         // Cleanup
         if let Ok(path) = crate::session::session_socket_path(&session_uuid) {
