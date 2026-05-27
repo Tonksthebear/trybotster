@@ -109,12 +109,38 @@ impl Hub {
                         "subscriptionId": req.subscription_id.clone(),
                     })),
                 ));
+
+                // Item 3: reattach mode replay (on top of Item 2 producer)
+                // On reused-subscription reattach, emit current mode state (full sparse
+                // ModeChanged from live ModeFlags) *before* "attached" so the client
+                // receives mode state as part of the attach barrier.
+                if let Some(flags) = pty_handle.get_mode_flags() {
+                    // Convert live ModeFlags into full sparse ModeChanged for reattach replay.
+                    // Every current field is Some(...) so the client receives complete state.
+                    let mode = crate::session::protocol::ModeChanged {
+                        kitty_enabled: Some(flags.kitty_enabled),
+                        cursor_visible: Some(flags.cursor_visible),
+                        bracketed_paste: Some(flags.bracketed_paste),
+                        mouse_mode: Some(flags.mouse_mode),
+                        alt_screen: Some(flags.alt_screen),
+                        focus_reporting: Some(flags.focus_reporting),
+                        application_cursor: Some(flags.application_cursor),
+                    };
+                    let _ = worker.try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                        crate::worker::client::ClientControlFrame::ModeChanged {
+                            session_uuid: req.session_uuid.clone(),
+                            mode,
+                        },
+                    ));
+                }
+
                 Self::send_worker_terminal_attach_state(
                     &worker,
                     &req.subscription_id,
                     &req.session_uuid,
                     "attached",
                 );
+
                 log::debug!(
                     "[WebRTC] Reused active terminal subscription for {} resize={}x{}",
                     subscription_key,
