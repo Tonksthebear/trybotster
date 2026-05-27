@@ -1104,10 +1104,11 @@ mod tests {
             "ID should start with 'http_', got: {id}"
         );
 
-        // Pending should have 1 entry, in_flight should be 1
+        // The invalid URL may fail before this assertion runs, so only assert
+        // the synchronous registration contract here.
         let entries = registry.lock().unwrap();
         assert_eq!(entries.pending_count(), 1);
-        assert_eq!(entries.in_flight_count(), 1);
+        assert!(entries.pending.contains_key(&id));
     }
 
     #[test]
