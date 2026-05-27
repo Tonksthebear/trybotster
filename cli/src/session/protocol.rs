@@ -201,6 +201,35 @@ pub struct ModeChanged {
     pub application_cursor: Option<bool>,
 }
 
+/// Converts live ModeFlags into a full sparse ModeChanged for attach/reattach replay.
+///
+/// Every field is Some(...) so clients receive the complete current terminal
+/// mode state as part of the initial snapshot barrier or reuse fast path.
+/// This helper is shared by the TUI Raw snapshot path and browser reused-sub
+/// path to guarantee identical fields and prevent divergence.
+///
+/// # Examples
+///
+/// ```ignore
+/// let mode = mode_changed_from_flags(flags);
+/// let _ = worker.try_send(ClientWorkerMessage::ControlFrame(
+///     ClientControlFrame::ModeChanged { session_uuid, mode },
+/// ));
+/// ```
+pub fn mode_changed_from_flags(flags: ModeFlags) -> ModeChanged {
+    ModeChanged {
+        kitty_enabled: Some(flags.kitty_enabled),
+        cursor_visible: Some(flags.cursor_visible),
+        bracketed_paste: Some(flags.bracketed_paste),
+        mouse_mode: Some(flags.mouse_mode),
+        alt_screen: Some(flags.alt_screen),
+        focus_reporting: Some(flags.focus_reporting),
+        application_cursor: Some(flags.application_cursor),
+    }
+}
+
+// Rust guideline compliant (M-CANONICAL-DOCS + strong types per 03-documentation + 07-universal) 2026-05
+
 /// OSC notification payload.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NotificationPayload {
