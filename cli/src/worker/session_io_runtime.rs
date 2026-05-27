@@ -898,12 +898,14 @@ impl SessionIoRuntime {
     }
 
     fn flush_metadata(&mut self) {
-        for event in self.coalescer.take_metadata(
+        let (events, mode_delta) = self.coalescer.take_metadata(
             &self.session_uuid,
             &self.kitty_enabled,
             &self.cursor_visible,
-        ) {
-            match &event {
+        );
+
+        for event in &events {
+            match event {
                 PtyEvent::KittyChanged(enabled) => {
                     self.deliver_terminal_control(
                         crate::worker::client::ClientControlFrame::KittyChanged {
@@ -922,7 +924,20 @@ impl SessionIoRuntime {
                 }
                 _ => {}
             }
-            let _ = self.event_tx.send(event);
+            let _ = self.event_tx.send(event.clone());
+        }
+
+        // Item 2 producer (cold-turkey mode boundary):
+        // Consume the mode delta once (from take_metadata) and emit the full
+        // typed ClientControlFrame::ModeChanged for any clients that want the
+        // complete terminal mode state (mouse_mode, etc.).
+        if let Some(mode) = mode_delta {
+            self.deliver_terminal_control(
+                crate::worker::client::ClientControlFrame::ModeChanged {
+                    session_uuid: self.session_uuid.clone(),
+                    mode,
+                },
+            );
         }
     }
 
@@ -1106,9 +1121,10 @@ impl SessionIoCoalescer {
         _session_uuid: &str,
         kitty_enabled: &AtomicBool,
         cursor_visible: &AtomicBool,
-    ) -> Vec<PtyEvent> {
+    ) -> (Vec<PtyEvent>, Option<ModeChanged>) {
         let mut events = Vec::new();
-        if let Some(mode) = self.mode.take() {
+        let mode_delta = self.mode.take();
+        if let Some(mode) = &mode_delta {
             if let Some(kitty) = mode.kitty_enabled {
                 let old = kitty_enabled.load(Ordering::Relaxed);
                 if kitty != old {
@@ -1134,7 +1150,7 @@ impl SessionIoCoalescer {
         if !self.has_metadata() {
             self.metadata_started_at = None;
         }
-        events
+        (events, mode_delta)
     }
 
     fn ensure_metadata_started(&mut self) {
@@ -2397,5 +2413,37 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("response frame");
         assert_eq!(frame.frame_type, FRAME_GET_SCREEN);
+    }
+
+    #[test]
+    fn coalescer_returns_mouse_mode_delta_without_legacy_mouse_pty_event() {
+        // This narrow test directly protects the bug fixed in Item 2:
+        // a mouse_mode-only delta must be returned by take_metadata (for the
+        // typed ModeChanged path) while producing no mouse-specific legacy PtyEvent
+        // in this producer slice.
+        let mut coalescer = SessionIoCoalescer::default();
+        let dummy_kitty = Arc::new(AtomicBool::new(false));
+        let dummy_cursor = Arc::new(AtomicBool::new(true));
+
+        let mut delta = ModeChanged::default();
+        delta.mouse_mode = Some(8); // example SGR-only value
+
+        coalescer.merge_mode(delta);
+
+        let (events, mode_delta) =
+            coalescer.take_metadata("sess-test", &dummy_kitty, &dummy_cursor);
+
+        // For a mouse_mode-only delta in this producer slice, we intentionally
+        // produce no legacy PtyEvent — the value lives only in the returned
+        // sparse ModeChanged delta for the typed path.
+        assert!(
+            events.is_empty(),
+            "expected no PtyEvents for mouse_mode-only delta in Item 2 producer slice, got: {:?}",
+            events
+        );
+
+        // The full sparse delta must be returned with mouse_mode intact
+        let returned = mode_delta.expect("mode delta must be returned for typed path");
+        assert_eq!(returned.mouse_mode, Some(8));
     }
 }
