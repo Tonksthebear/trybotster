@@ -165,6 +165,9 @@ impl Hub {
                 TerminalAttachDeliveryPhase::AttachState => {
                     "terminal_attach.delivery_failed.phase.attach_state"
                 }
+                TerminalAttachDeliveryPhase::ModeReplay => {
+                    "terminal_attach.delivery_failed.phase.mode_replay"
+                }
             },
             1,
         );

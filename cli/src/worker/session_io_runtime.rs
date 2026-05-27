@@ -737,6 +737,26 @@ impl SessionIoRuntime {
             }
         }
 
+        // Per reviewer guidance for Item 3 (TUI reattach): emit full ModeChanged
+        // (from delivery.mode) after Scrollback/subscribed but before any
+        // TerminalAttach(Attached) so the client has mouse/focus/etc state at
+        // the attach barrier.
+        if let Some(mode) = &delivery.mode {
+            if self
+                .try_send_initial_attach_control(
+                    &delivery,
+                    TerminalAttachDeliveryPhase::ModeReplay,
+                    crate::worker::client::ClientControlFrame::ModeChanged {
+                        session_uuid: self.session_uuid.clone(),
+                        mode: mode.clone(),
+                    },
+                )
+                .is_err()
+            {
+                return;
+            }
+        }
+
         if self
             .try_send_initial_attach_control(
                 &delivery,
@@ -1358,6 +1378,7 @@ mod tests {
                         rows: 24,
                         cols: 80,
                         kitty_enabled: false,
+                        mode: None,
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: false,
                         live_subscription: None,
@@ -1430,6 +1451,7 @@ mod tests {
                         rows: 24,
                         cols: 80,
                         kitty_enabled: false,
+                        mode: None,
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: true,
                         live_subscription: None,
@@ -1526,6 +1548,7 @@ mod tests {
                         rows: 24,
                         cols: 80,
                         kitty_enabled: false,
+                        mode: None,
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: true,
                         live_subscription: Some(live_subscription),
@@ -1617,6 +1640,7 @@ mod tests {
                         rows: 24,
                         cols: 80,
                         kitty_enabled: false,
+                        mode: None,
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: false,
                         live_subscription: Some(live_subscription),
@@ -1723,6 +1747,7 @@ mod tests {
                         rows: 24,
                         cols: 80,
                         kitty_enabled: false,
+                        mode: None,
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: true,
                         live_subscription: None,
@@ -1820,6 +1845,7 @@ mod tests {
                         rows: 24,
                         cols: 80,
                         kitty_enabled: false,
+                        mode: None,
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: true,
                         live_subscription: Some(live_subscription),

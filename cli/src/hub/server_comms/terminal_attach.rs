@@ -115,17 +115,9 @@ impl Hub {
                 // ModeChanged from live ModeFlags) *before* "attached" so the client
                 // receives mode state as part of the attach barrier.
                 if let Some(flags) = pty_handle.get_mode_flags() {
-                    // Convert live ModeFlags into full sparse ModeChanged for reattach replay.
-                    // Every current field is Some(...) so the client receives complete state.
-                    let mode = crate::session::protocol::ModeChanged {
-                        kitty_enabled: Some(flags.kitty_enabled),
-                        cursor_visible: Some(flags.cursor_visible),
-                        bracketed_paste: Some(flags.bracketed_paste),
-                        mouse_mode: Some(flags.mouse_mode),
-                        alt_screen: Some(flags.alt_screen),
-                        focus_reporting: Some(flags.focus_reporting),
-                        application_cursor: Some(flags.application_cursor),
-                    };
+                    // Use the shared helper so the browser reused-sub path and the
+                    // TUI Raw initial snapshot path cannot drift on which fields are replayed.
+                    let mode = crate::session::protocol::mode_changed_from_flags(flags);
                     let _ = worker.try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
                         crate::worker::client::ClientControlFrame::ModeChanged {
                             session_uuid: req.session_uuid.clone(),
