@@ -794,7 +794,7 @@ where
                 .panel_pool
                 .panels
                 .get(&uuid)
-                .map(|panel| panel.mouse_tracking())
+                .map(|panel| panel.sgr_mouse_passthrough_enabled())
                 .unwrap_or(false)
             {
                 let data = Self::sgr_mouse_bytes_with_local_coords(
@@ -897,7 +897,7 @@ where
                 .panel_pool
                 .panels
                 .get(&widget_id)
-                .map(|panel| panel.mouse_tracking())
+                .map(|panel| panel.sgr_mouse_passthrough_enabled())
                 .unwrap_or(false)
             {
                 let data = Self::sgr_mouse_bytes_with_local_coords(raw_bytes, local_x, local_y);
@@ -4616,6 +4616,12 @@ mod tests {
             .get("sess-0")
             .expect("panel")
             .mouse_tracking());
+        assert!(!runner
+            .panel_pool
+            .panels()
+            .get("sess-0")
+            .expect("panel")
+            .sgr_mouse_passthrough_enabled());
     }
 
     #[test]
@@ -4628,7 +4634,7 @@ mod tests {
             serde_json::json!({
                 "type": "mode_changed",
                 "session_uuid": "sess-0",
-                "mode": { "mouse_mode": 8 }
+                "mode": { "mouse_mode": 12 }
             }),
             None,
         );
@@ -4662,7 +4668,7 @@ mod tests {
             serde_json::json!({
                 "type": "mode_changed",
                 "session_uuid": "sess-0",
-                "mode": { "mouse_mode": 8 }
+                "mode": { "mouse_mode": 12 }
             }),
             None,
         );
@@ -4686,6 +4692,41 @@ mod tests {
         let input = input_rx.try_recv().expect("mouse input forwarded");
         assert_eq!(input.session_uuid, "sess-0");
         assert_eq!(input.data, b"\x1b[<0;5;2M");
+    }
+
+    #[test]
+    fn sgr_encoding_only_mouse_mode_does_not_passthrough_to_child_pty() {
+        let (mut runner, mut input_rx) = create_test_runner_with_session_input();
+        runner.mode = "terminal".to_string();
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
+        runner.panel_pool.resolve_panel("sess-0").on_scrollback(b"");
+        runner.dispatch_hub_event(
+            serde_json::json!({
+                "type": "mode_changed",
+                "session_uuid": "sess-0",
+                "mode": { "mouse_mode": 8 }
+            }),
+            None,
+        );
+        runner.last_widget_areas.insert(
+            "sess-0".to_string(),
+            crate::clients::tui::render::WidgetArea {
+                rect: ratatui::layout::Rect::new(5, 3, 70, 20),
+                widget_type: "terminal".to_string(),
+            },
+        );
+
+        runner.route_mouse_scroll(
+            crate::clients::tui::raw_input::ScrollDirection::Up,
+            b"\x1b[<64;10;5M",
+            9,
+            4,
+        );
+
+        assert!(
+            input_rx.try_recv().is_err(),
+            "SGR encoding without a tracking bit must not forward mouse input"
+        );
     }
 
     #[test]

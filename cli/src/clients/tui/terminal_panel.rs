@@ -120,6 +120,17 @@ impl TerminalPanel {
             != 0
     }
 
+    /// Whether SGR mouse input can be passed through to the child PTY.
+    pub fn sgr_mouse_passthrough_enabled(&self) -> bool {
+        let mouse_mode = self
+            .mode
+            .mouse_mode
+            .unwrap_or_else(|| self.parser.mouse_mode());
+        const SGR_ENCODING: u8 = 8;
+        const TRACKING_MODES: u8 = 1 | 2 | 4;
+        mouse_mode & SGR_ENCODING != 0 && mouse_mode & TRACKING_MODES != 0
+    }
+
     /// Whether the cursor should be hidden.
     pub fn cursor_hidden(&self) -> bool {
         self.mode
