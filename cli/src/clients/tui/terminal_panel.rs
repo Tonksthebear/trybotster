@@ -34,6 +34,7 @@ pub struct TerminalPanel {
     color_cache: ColorCache,
     state: PanelState,
     dims: (u16, u16),
+    mode: crate::session::protocol::ModeChanged,
     /// Consecutive mouse scroll events in the current tick (for acceleration).
     scroll_accel: u32,
 }
@@ -64,6 +65,7 @@ impl TerminalPanel {
             color_cache,
             state: PanelState::Idle,
             dims: (rows, cols),
+            mode: crate::session::protocol::ModeChanged::default(),
             scroll_accel: 0,
         }
     }
@@ -91,22 +93,39 @@ impl TerminalPanel {
 
     /// Whether focus reporting mode is active.
     pub fn focus_reporting(&self) -> bool {
-        self.parser.focus_reporting()
+        self.mode
+            .focus_reporting
+            .unwrap_or_else(|| self.parser.focus_reporting())
     }
 
     /// Whether DECCKM (application cursor keys) mode is active.
     pub fn application_cursor(&self) -> bool {
-        self.parser.application_cursor()
+        self.mode
+            .application_cursor
+            .unwrap_or_else(|| self.parser.application_cursor())
     }
 
     /// Whether bracketed paste mode is active.
     pub fn bracketed_paste(&self) -> bool {
-        self.parser.bracketed_paste()
+        self.mode
+            .bracketed_paste
+            .unwrap_or_else(|| self.parser.bracketed_paste())
+    }
+
+    /// Whether mouse tracking is active.
+    pub fn mouse_tracking(&self) -> bool {
+        self.mode
+            .mouse_mode
+            .unwrap_or_else(|| self.parser.mouse_mode())
+            != 0
     }
 
     /// Whether the cursor should be hidden.
     pub fn cursor_hidden(&self) -> bool {
-        self.parser.cursor_hidden()
+        self.mode
+            .cursor_visible
+            .map(|visible| !visible)
+            .unwrap_or_else(|| self.parser.cursor_hidden())
     }
 
     /// Current cursor style from the render state.
@@ -201,6 +220,7 @@ impl TerminalPanel {
 
         // Replace the parser entirely so the old scrollback buffer is discarded.
         self.parser = TerminalParser::new(rows, cols, TUI_SCROLLBACK);
+        self.mode = crate::session::protocol::ModeChanged::default();
 
         if !data.is_empty() {
             // Single-call import: one opaque blob restores the whole terminal.
@@ -228,6 +248,32 @@ impl TerminalPanel {
             return;
         }
         self.parser.process(data);
+        self.update_render_state();
+    }
+
+    /// Apply an out-of-band terminal mode delta from the data plane.
+    pub fn apply_mode_changed(&mut self, mode: crate::session::protocol::ModeChanged) {
+        if mode.kitty_enabled.is_some() {
+            self.mode.kitty_enabled = mode.kitty_enabled;
+        }
+        if mode.cursor_visible.is_some() {
+            self.mode.cursor_visible = mode.cursor_visible;
+        }
+        if mode.alt_screen.is_some() {
+            self.mode.alt_screen = mode.alt_screen;
+        }
+        if mode.mouse_mode.is_some() {
+            self.mode.mouse_mode = mode.mouse_mode;
+        }
+        if mode.bracketed_paste.is_some() {
+            self.mode.bracketed_paste = mode.bracketed_paste;
+        }
+        if mode.focus_reporting.is_some() {
+            self.mode.focus_reporting = mode.focus_reporting;
+        }
+        if mode.application_cursor.is_some() {
+            self.mode.application_cursor = mode.application_cursor;
+        }
         self.update_render_state();
     }
 

@@ -55,6 +55,8 @@ pub enum InputEvent {
     MouseScroll {
         /// Scroll direction (up or down).
         direction: ScrollDirection,
+        /// Original raw bytes from stdin for PTY passthrough.
+        raw_bytes: Vec<u8>,
         /// Screen column (0-indexed).
         x: u16,
         /// Screen row (0-indexed).
@@ -66,6 +68,8 @@ pub enum InputEvent {
         button: MouseButton,
         /// Press, release, or drag.
         event_type: MouseEventType,
+        /// Original raw bytes from stdin for PTY passthrough.
+        raw_bytes: Vec<u8>,
         /// Screen column (0-indexed).
         x: u16,
         /// Screen row (0-indexed).
@@ -552,6 +556,7 @@ impl RawInputReader {
             _ => String::new(), // Unknown CSI — will pass through
         };
 
+        let raw = self.pending[..seq_len].to_vec();
         self.pending.drain(..seq_len);
         Some(InputEvent::Key {
             descriptor,
@@ -584,6 +589,7 @@ impl RawInputReader {
             });
         }
 
+        let raw = self.pending[..seq_len].to_vec();
         self.pending.drain(..seq_len);
 
         let cb = parts[0].parse::<u16>().unwrap_or(0);
@@ -599,6 +605,7 @@ impl RawInputReader {
                 } else {
                     ScrollDirection::Down
                 },
+                raw_bytes: raw,
                 x,
                 y,
             });
@@ -626,6 +633,7 @@ impl RawInputReader {
         Some(InputEvent::Mouse {
             button,
             event_type,
+            raw_bytes: raw,
             x,
             y,
         })
@@ -1169,9 +1177,11 @@ mod tests {
             events[0],
             InputEvent::MouseScroll {
                 direction: ScrollDirection::Up,
+                ref raw_bytes,
                 x: 9,
                 y: 4,
-            }
+                ..
+            } if raw_bytes == b"\x1b[<64;10;5M"
         ));
     }
 
@@ -1185,6 +1195,7 @@ mod tests {
                 direction: ScrollDirection::Down,
                 x: 9,
                 y: 4,
+                ..
             }
         ));
     }
@@ -1202,9 +1213,11 @@ mod tests {
             InputEvent::Mouse {
                 button: MouseButton::Left,
                 event_type: MouseEventType::Press,
+                ref raw_bytes,
                 x: 14,
                 y: 9,
-            }
+                ..
+            } if raw_bytes == b"\x1b[<0;15;10M"
         ));
     }
 
@@ -1221,6 +1234,7 @@ mod tests {
                 event_type: MouseEventType::Release,
                 x: 14,
                 y: 9,
+                ..
             }
         ));
     }
@@ -1238,6 +1252,7 @@ mod tests {
                 event_type: MouseEventType::Drag,
                 x: 19,
                 y: 7,
+                ..
             }
         ));
     }
@@ -1255,6 +1270,7 @@ mod tests {
                 event_type: MouseEventType::Press,
                 x: 4,
                 y: 2,
+                ..
             }
         ));
     }
@@ -1272,6 +1288,7 @@ mod tests {
                 event_type: MouseEventType::Press,
                 x: 39,
                 y: 11,
+                ..
             }
         ));
     }
