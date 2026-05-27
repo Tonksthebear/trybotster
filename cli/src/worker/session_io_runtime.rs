@@ -1722,8 +1722,7 @@ mod tests {
             crate::worker::client::ClientWorkerMessage::ControlFrame(
                 crate::worker::client::ClientControlFrame::ModeChanged { mode: received_mode, .. },
             ) => {
-                assert_eq!(received_mode.mouse_mode, Some(8));
-                assert_eq!(received_mode.focus_reporting, Some(true));
+                assert_eq!(received_mode, mode);
             }
             other => panic!("expected ModeChanged, got {other:?}"),
         }
@@ -1824,8 +1823,7 @@ mod tests {
             crate::worker::client::ClientWorkerMessage::ControlFrame(
                 crate::worker::client::ClientControlFrame::ModeChanged { mode: received_mode, .. },
             ) => {
-                assert_eq!(received_mode.mouse_mode, Some(8));
-                assert_eq!(received_mode.focus_reporting, Some(true));
+                assert_eq!(received_mode, mode);
             }
             other => panic!("expected ModeChanged, got {other:?}"),
         }
