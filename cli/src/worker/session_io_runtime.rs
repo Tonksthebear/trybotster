@@ -1595,18 +1595,8 @@ mod tests {
             .write_all(&encode_frame(FRAME_SNAPSHOT, b"initial-partial-snapshot"))
             .expect("write snapshot frame");
 
-        match block_on_with_timeout(async {
-            client_rx
-                .recv()
-                .await
-                .expect("client worker initial snapshot")
-        }) {
-            crate::worker::client::ClientWorkerMessage::ControlFrame(
-                crate::worker::client::ClientControlFrame::Scrollback { data, .. },
-            ) => assert_eq!(data, b"initial-partial-snapshot"),
-            other => panic!("expected Scrollback control frame, got {other:?}"),
-        }
-
+        // Assert the delivery failure first (while the 1-slot client queue is still occupied by the undrained Scrollback).
+        // This makes the SubscribeAck phase assertion deterministic for the mode=None case.
         match recv_hub_event(&mut hub_rx) {
             HubEvent::SessionIo(SessionIoEvent::TerminalAttachDeliveryFailed {
                 request_id,
@@ -1619,6 +1609,19 @@ mod tests {
                 assert_eq!(reason, TerminalAttachDeliveryFailureReason::QueueFull);
             }
             other => panic!("expected TerminalAttachDeliveryFailed, got {other:?}"),
+        }
+
+        // Now drain the Scrollback that was already in the queue.
+        match block_on_with_timeout(async {
+            client_rx
+                .recv()
+                .await
+                .expect("client worker initial snapshot")
+        }) {
+            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::Scrollback { data, .. },
+            ) => assert_eq!(data, b"initial-partial-snapshot"),
+            other => panic!("expected Scrollback control frame, got {other:?}"),
         }
         assert!(matches!(
             recv_hub_event(&mut hub_rx),
@@ -1653,7 +1656,7 @@ mod tests {
             kitty_enabled: Some(true),
             cursor_visible: Some(true),
             bracketed_paste: Some(true),
-            mouse_mode: Some(1002),
+            mouse_mode: Some(2),
             alt_screen: Some(false),
             focus_reporting: Some(true),
             application_cursor: Some(true),
@@ -1719,7 +1722,7 @@ mod tests {
             crate::worker::client::ClientWorkerMessage::ControlFrame(
                 crate::worker::client::ClientControlFrame::ModeChanged { mode: received_mode, .. },
             ) => {
-                assert_eq!(received_mode.mouse_mode, Some(1002));
+                assert_eq!(received_mode.mouse_mode, Some(2));
                 assert_eq!(received_mode.focus_reporting, Some(true));
             }
             other => panic!("expected ModeChanged, got {other:?}"),
@@ -1758,7 +1761,7 @@ mod tests {
         };
 
         let mode = crate::session::protocol::ModeChanged {
-            mouse_mode: Some(1002),
+            mouse_mode: Some(2),
             focus_reporting: Some(true),
             ..Default::default()
         };
@@ -1813,7 +1816,7 @@ mod tests {
             crate::worker::client::ClientWorkerMessage::ControlFrame(
                 crate::worker::client::ClientControlFrame::ModeChanged { mode: received_mode, .. },
             ) => {
-                assert_eq!(received_mode.mouse_mode, Some(1002));
+                assert_eq!(received_mode.mouse_mode, Some(2));
                 assert_eq!(received_mode.focus_reporting, Some(true));
             }
             other => panic!("expected ModeChanged, got {other:?}"),
