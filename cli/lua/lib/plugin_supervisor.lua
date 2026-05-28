@@ -18,6 +18,7 @@ local cleanup_modules = {
     { module = "lib.plugin_assets", fn = "unregister_by_plugin" },
     { module = "lib.mcp", fn = "unregister_by_plugin" },
     { module = "lib.entity_broadcast", fn = "unregister_by_plugin" },
+    { module = "lib.stable_urls", fn = "unregister_by_plugin" },
 }
 
 local DEFAULT_TIMEOUT_MS = 5000

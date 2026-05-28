@@ -1086,6 +1086,20 @@ fn invoke_in_worker(
             .set_name("plugin_worker_invoke_mcp_proxy_auth_error")
             .eval()
             .map_err(|e| e.to_string())?,
+        "stable_urls_api" => lua
+            .load(
+                r#"
+                local stable_urls = require("lib.stable_urls")
+                local ok, result = __hook_timed_pcall(function()
+                    return stable_urls._invoke_registered(__handler_id, __payload.params, __payload.context)
+                end, __handler_timeout_ms)
+                if not ok then error(result) end
+                return result
+                "#,
+            )
+            .set_name("plugin_worker_invoke_stable_urls_api")
+            .eval()
+            .map_err(|e| e.to_string())?,
         _ => return Err(format!("unsupported plugin handler kind: {kind}")),
     };
 

@@ -257,6 +257,16 @@ function Hub._handle_worker_parent_request(payload)
         return { result = { ok = true } }
     end
 
+    if kind == "stable_urls_call" then
+        local ok, result = pcall(function()
+            return require("lib.stable_urls").call(payload.operation, payload.params or {}, payload.context or {})
+        end)
+        if not ok then
+            return { error = tostring(result) }
+        end
+        return { result = result }
+    end
+
     if kind == "send_message" then
         return { result = local_hub:send_message(payload.agent_id, payload.text, payload.session) }
     end
