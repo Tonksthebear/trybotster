@@ -185,17 +185,27 @@ describe('WebRtcPtyTransport', () => {
 
   it('imports a reconnect snapshot before replaying mouse mode changes into Restty', async () => {
     const conn = fakeTerminalConnection()
+    conn.hasSubscription.mockReturnValue(true)
+    mocks.get.mockReturnValue(conn)
     const delivered = []
+    let snapshotStartCallback
+    let modeChangedCallback
+    let binarySnapshotCallback
+    let snapshotCompleteCallback
+    conn.onSnapshotStart.mockImplementation((callback) => {
+      snapshotStartCallback = callback
+      return vi.fn()
+    })
     conn.onModeChanged.mockImplementation((callback) => {
-      callback({
-        type: 'mode_changed',
-        session_uuid: 'session-1',
-        mode: { mouse_mode: 12, bracketed_paste: true, focus_reporting: true },
-      })
+      modeChangedCallback = callback
       return vi.fn()
     })
     conn.onBinarySnapshot.mockImplementation((callback) => {
-      callback(new Uint8Array([1, 2, 3]))
+      binarySnapshotCallback = callback
+      return vi.fn()
+    })
+    conn.onSnapshotComplete.mockImplementation((callback) => {
+      snapshotCompleteCallback = callback
       return vi.fn()
     })
     mocks.acquire.mockResolvedValue(conn)
@@ -213,12 +223,68 @@ describe('WebRtcPtyTransport', () => {
       },
     })
 
+    modeChangedCallback({
+      type: 'mode_changed',
+      session_uuid: 'session-1',
+      mode: { mouse_mode: 12, bracketed_paste: true, focus_reporting: true },
+    })
+    expect(delivered).toEqual([])
+
+    snapshotStartCallback()
+    expect(delivered).toEqual([])
+
+    binarySnapshotCallback(new Uint8Array([1, 2, 3]))
+    expect(delivered).toEqual([['snapshot']])
+
+    snapshotCompleteCallback()
     expect(delivered).toEqual([
       ['snapshot'],
       [
         'data',
         '\x1b[?1000l\x1b[?1003l\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1004h',
       ],
+    ])
+  })
+
+  it('flushes pending reconnect mode changes before live output when no snapshot arrives', async () => {
+    const conn = fakeTerminalConnection()
+    conn.hasSubscription.mockReturnValue(true)
+    mocks.get.mockReturnValue(conn)
+    const delivered = []
+    let modeChangedCallback
+    let outputCallback
+    conn.onModeChanged.mockImplementation((callback) => {
+      modeChangedCallback = callback
+      return vi.fn()
+    })
+    conn.onOutput.mockImplementation((callback) => {
+      outputCallback = callback
+      return vi.fn()
+    })
+    mocks.acquire.mockResolvedValue(conn)
+    const transport = new WebRtcPtyTransport({
+      hubId: 'hub-1',
+      sessionUuid: 'session-1',
+    })
+
+    await transport.connect({
+      rows: 24,
+      cols: 80,
+      callbacks: {
+        onData: (data) => delivered.push(data),
+      },
+    })
+
+    modeChangedCallback({
+      type: 'mode_changed',
+      session_uuid: 'session-1',
+      mode: { mouse_mode: 8 },
+    })
+    outputCallback(new Uint8Array([9, 8, 7]))
+
+    expect(delivered).toEqual([
+      '\x1b[?1000l\x1b[?1003l\x1b[?1002l\x1b[?1006h',
+      new Uint8Array([9, 8, 7]),
     ])
   })
 })

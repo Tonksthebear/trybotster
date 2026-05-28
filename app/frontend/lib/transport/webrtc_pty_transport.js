@@ -59,6 +59,8 @@ export class WebRtcPtyTransport {
   #onDisconnect = null;
   #onBinarySnapshot = null;
   #onFocusReportingChanged = null;
+  // ModeChanged is a full mode snapshot, so a newer replay supersedes older buffered state.
+  #pendingModeSequences = "";
   #desiredSize = null; // { cols, rows }
   #resizeTimer = null;
   #destroyed = false;
@@ -121,6 +123,7 @@ export class WebRtcPtyTransport {
   disconnect() {
     this.#clearResizeTimer();
     this.#awaitingReconnectSnapshot = false;
+    this.#pendingModeSequences = "";
     this.#unsubscribers.forEach((unsub) => unsub());
     this.#unsubscribers = [];
     this.#callbacks = null;
@@ -185,6 +188,7 @@ export class WebRtcPtyTransport {
     this.#connectGeneration++;
     this.disconnect();
     this.#desiredSize = null;
+    this.#pendingModeSequences = "";
     this.#onReconnect = null;
     this.#onConnect = null;
     this.#onDisconnect = null;
@@ -211,6 +215,7 @@ export class WebRtcPtyTransport {
     this.#unsubscribers.push(
       this.#terminalConn.onSnapshotComplete(() => {
         this.#awaitingReconnectSnapshot = false;
+        this.#flushPendingModeSequences();
       }),
     );
 
@@ -226,7 +231,12 @@ export class WebRtcPtyTransport {
     this.#unsubscribers.push(
       this.#terminalConn.onModeChanged((message) => {
         const sequences = modeChangedToTerminalSequences(message?.mode);
-        if (sequences) this.#callbacks?.onData?.(sequences);
+        if (!sequences) return;
+        if (this.#awaitingReconnectSnapshot) {
+          this.#pendingModeSequences = sequences;
+          return;
+        }
+        this.#callbacks?.onData?.(sequences);
       }),
     );
 
@@ -242,6 +252,8 @@ export class WebRtcPtyTransport {
 
     this.#unsubscribers.push(
       this.#terminalConn.onOutput((data) => {
+        this.#flushPendingModeSequences();
+        this.#awaitingReconnectSnapshot = false;
         this.#callbacks?.onData?.(data);
       }),
     );
@@ -283,6 +295,13 @@ export class WebRtcPtyTransport {
       cols: options.cols,
       rows: options.rows,
     };
+  }
+
+  #flushPendingModeSequences() {
+    if (!this.#pendingModeSequences) return;
+    const sequences = this.#pendingModeSequences;
+    this.#pendingModeSequences = "";
+    this.#callbacks?.onData?.(sequences);
   }
 
   #clearResizeTimer() {
