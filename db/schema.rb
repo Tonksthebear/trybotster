@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_04_10_000000) do
+ActiveRecord::Schema[8.1].define(version: 2026_05_27_211440) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -167,6 +167,47 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_000000) do
     t.index ["user_id"], name: "index_hubs_on_user_id"
   end
 
+  create_table "hubs_cloudflare_tunnels", force: :cascade do |t|
+    t.string "cloudflare_tunnel_id", null: false
+    t.string "cloudflare_tunnel_name", null: false
+    t.datetime "created_at", null: false
+    t.bigint "hub_id", null: false
+    t.text "last_error"
+    t.datetime "last_synced_at"
+    t.string "status", default: "pending", null: false
+    t.datetime "token_delivered_at"
+    t.datetime "token_expires_at"
+    t.string "token_secret"
+    t.integer "token_version", default: 0, null: false
+    t.string "tunnel_secret"
+    t.datetime "updated_at", null: false
+    t.index ["cloudflare_tunnel_id"], name: "index_hubs_cloudflare_tunnels_on_cloudflare_tunnel_id", unique: true
+    t.index ["cloudflare_tunnel_name"], name: "index_hubs_cloudflare_tunnels_on_cloudflare_tunnel_name"
+    t.index ["hub_id"], name: "index_hubs_cloudflare_tunnels_on_hub_id", unique: true
+    t.index ["status"], name: "index_hubs_cloudflare_tunnels_on_status"
+  end
+
+  create_table "hubs_stable_webhook_hostnames", force: :cascade do |t|
+    t.datetime "created_at", null: false
+    t.string "dns_record_id"
+    t.string "hostname", null: false
+    t.bigint "hub_id", null: false
+    t.bigint "hubs_cloudflare_tunnel_id", null: false
+    t.text "last_error"
+    t.string "local_service_url", null: false
+    t.string "owner_key"
+    t.string "owner_plugin"
+    t.string "public_url", null: false
+    t.string "purpose"
+    t.string "status", default: "pending", null: false
+    t.datetime "updated_at", null: false
+    t.index ["hostname"], name: "index_hubs_stable_webhook_hostnames_on_hostname", unique: true
+    t.index ["hub_id", "owner_plugin", "owner_key"], name: "idx_hubs_stable_hostnames_on_owner"
+    t.index ["hub_id"], name: "index_hubs_stable_webhook_hostnames_on_hub_id"
+    t.index ["hubs_cloudflare_tunnel_id"], name: "idx_hubs_stable_hostnames_on_tunnel_id"
+    t.index ["status"], name: "index_hubs_stable_webhook_hostnames_on_status"
+  end
+
   create_table "idempotency_keys", force: :cascade do |t|
     t.datetime "completed_at"
     t.datetime "created_at", null: false
@@ -234,6 +275,9 @@ ActiveRecord::Schema[8.1].define(version: 2026_04_10_000000) do
   add_foreign_key "hub_commands", "hubs"
   add_foreign_key "hub_tokens", "hubs"
   add_foreign_key "hubs", "users"
+  add_foreign_key "hubs_cloudflare_tunnels", "hubs"
+  add_foreign_key "hubs_stable_webhook_hostnames", "hubs"
+  add_foreign_key "hubs_stable_webhook_hostnames", "hubs_cloudflare_tunnels"
   add_foreign_key "integrations_github_mcp_tokens", "hubs"
   add_foreign_key "users", "teams"
 end
