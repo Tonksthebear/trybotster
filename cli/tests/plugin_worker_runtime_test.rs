@@ -1245,6 +1245,82 @@ fn plugin_owned_event_handler_runs_in_plugin_worker_vm() {
 }
 
 #[test]
+fn plugin_worker_can_enqueue_parent_event_without_blocking_callback() {
+    // SAFETY: This integration filter runs this test in isolation and the
+    // worker VM must resolve the repository Lua modules instead of user config.
+    unsafe {
+        std::env::set_var(
+            "BOTSTER_LUA_PATH",
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua"),
+        )
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let target_dir = tmp.path().join("target-plugin");
+    let emitter_dir = tmp.path().join("emitter-plugin");
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::create_dir_all(&emitter_dir).unwrap();
+
+    let target_init = target_dir.join("init.lua");
+    fs::write(
+        &target_init,
+        r#"
+        events.on("worker_parent_target", function(payload)
+            return true
+        end)
+
+        return {}
+        "#,
+    )
+    .unwrap();
+
+    let emitter_init = emitter_dir.join("init.lua");
+    fs::write(
+        &emitter_init,
+        r#"
+        events.on("worker_parent_emit", function()
+            assert(rawget(_G, "_plugin_worker_key") == "emitter-plugin")
+            assert(plugin_worker_parent_hub.enqueue({
+                type = "emit_event",
+                event = "worker_parent_target",
+                data = { value = "ok" },
+            }))
+        end)
+
+        return {}
+        "#,
+    )
+    .unwrap();
+
+    let runtime = LuaRuntime::new().unwrap();
+    runtime
+        .lua()
+        .load(format!(
+            r#"
+            local loader = require("hub.loader")
+            local ok, err = loader.load_plugin({target_init}, "target-plugin", {{ source = "device" }})
+            assert(ok, tostring(err))
+            assert(events.has("worker_parent_target"), "target event should be registered in parent hub")
+            local target_count = events.emit("worker_parent_target", {{ value = "ok" }})
+            assert(target_count == 1, "target event direct emit count: " .. tostring(target_count))
+            ok, err = loader.load_plugin({emitter_init}, "emitter-plugin", {{ source = "device" }})
+            assert(ok, tostring(err))
+            assert(events.has("worker_parent_emit"), "emitter event should be registered in parent hub")
+            target_count = events.emit("worker_parent_target", {{ value = "ok" }})
+            assert(target_count == 1, "target event direct emit after emitter count: " .. tostring(target_count))
+
+            local count = events.emit("worker_parent_emit", {{}})
+            assert(count == 1, tostring(count))
+            return true
+            "#,
+            target_init = serde_json::to_string(&target_init.to_string_lossy()).unwrap(),
+            emitter_init = serde_json::to_string(&emitter_init.to_string_lossy()).unwrap(),
+        ))
+        .eval::<bool>()
+        .unwrap();
+}
+
+#[test]
 fn plugin_owned_watch_callback_runs_in_plugin_worker_vm() {
     // SAFETY: This integration filter runs this test in isolation and the
     // worker VM must resolve the repository Lua modules instead of user config.

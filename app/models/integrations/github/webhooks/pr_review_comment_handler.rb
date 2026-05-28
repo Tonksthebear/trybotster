@@ -5,7 +5,10 @@ module Integrations
     module Webhooks
       class PrReviewCommentHandler < BaseHandler
         def call
-          return unless processable?
+          return unless processable_comment?
+
+          create_review_comment_lifecycle_message
+          return unless mention_processable?
 
           Rails.logger.info "Processing @trybotster mention in PR #{repo_full_name}##{pr_number}"
 
@@ -29,14 +32,41 @@ module Integrations
 
         private
 
-        def processable?
+        def processable_comment?
           return false unless %w[created edited].include?(action)
           return false if comment_body.blank?
           return false if bot_author?(comment_author)
+
+          true
+        end
+
+        def mention_processable?
           return false unless mentioned_trybotster?(comment_body)
           return false unless collaborator?(comment_author)
 
           true
+        end
+
+        def create_review_comment_lifecycle_message
+          create_pull_request_comment_lifecycle_message(
+            repo: repo_full_name,
+            pr_number: pr_number,
+            payload: {
+              action: action,
+              repo: repo_full_name,
+              pr_number: pr_number,
+              pr_url: pr_url,
+              comment_id: comment_id,
+              comment_url: comment_url,
+              comment_html_url: comment_html_url,
+              comment_body: comment_body,
+              comment_author: comment_author,
+              created_at: comment_created_at,
+              updated_at: comment_updated_at,
+              source_type: "pr_review_comment",
+              installation_id: installation_id
+            }
+          )
         end
 
         def resolve_target
@@ -69,6 +99,22 @@ module Integrations
 
         def comment_id
           payload.dig("comment", "id")
+        end
+
+        def comment_url
+          payload.dig("comment", "url")
+        end
+
+        def comment_html_url
+          payload.dig("comment", "html_url")
+        end
+
+        def comment_created_at
+          payload.dig("comment", "created_at")
+        end
+
+        def comment_updated_at
+          payload.dig("comment", "updated_at")
         end
 
         def pr_number

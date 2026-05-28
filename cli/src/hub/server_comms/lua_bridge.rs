@@ -246,10 +246,23 @@ impl Hub {
                 channel_id,
                 channel_name,
                 params,
-                owner_plugin: _owner,
-                handler_id: _hid,
+                owner_plugin,
+                handler_id,
             } => {
                 if let Some(conn) = self.lua_ac_connections.get(&connection_id) {
+                    if owner_plugin.is_some() {
+                        if let Ok(mut registry) = self.lua.ac_callback_registry().lock() {
+                            registry.insert(
+                                channel_id.clone(),
+                                crate::lua::primitives::action_cable::AcCallbackEntry {
+                                    callback_key: None,
+                                    owner_plugin: owner_plugin.clone(),
+                                    handler_id: handler_id.clone(),
+                                },
+                            );
+                        }
+                    }
+
                     // Build the ActionCable identifier JSON with channel name and params
                     let mut identifier = serde_json::json!({ "channel": channel_name });
                     if let serde_json::Value::Object(map) = params {
@@ -336,8 +349,15 @@ impl Hub {
                             }
                             // Owned entries: explicitly unregister the handler in the
                             // worker VM so the handlers table does not leak (V9).
-                            if let (Some(owner), Some(hid)) = (&entry.owner_plugin, &entry.handler_id) {
-                                if let Ok(invoke) = self.lua.lua_ref().globals().get::<mlua::Function>("__plugin_worker_invoke") {
+                            if let (Some(owner), Some(hid)) =
+                                (&entry.owner_plugin, &entry.handler_id)
+                            {
+                                if let Ok(invoke) = self
+                                    .lua
+                                    .lua_ref()
+                                    .globals()
+                                    .get::<mlua::Function>("__plugin_worker_invoke")
+                                {
                                     if let Err(e) = invoke.call::<mlua::Value>((
                                         owner.clone(),
                                         "ac_unregister".to_string(),
@@ -384,8 +404,15 @@ impl Hub {
                             }
                             // Owned entries: explicitly unregister the handler in the
                             // worker VM so the handlers table does not leak (V9).
-                            if let (Some(owner), Some(hid)) = (&entry.owner_plugin, &entry.handler_id) {
-                                if let Ok(invoke) = self.lua.lua_ref().globals().get::<mlua::Function>("__plugin_worker_invoke") {
+                            if let (Some(owner), Some(hid)) =
+                                (&entry.owner_plugin, &entry.handler_id)
+                            {
+                                if let Ok(invoke) = self
+                                    .lua
+                                    .lua_ref()
+                                    .globals()
+                                    .get::<mlua::Function>("__plugin_worker_invoke")
+                                {
                                     if let Err(e) = invoke.call::<mlua::Value>((
                                         owner.clone(),
                                         "ac_unregister".to_string(),

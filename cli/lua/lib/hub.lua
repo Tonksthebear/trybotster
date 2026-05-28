@@ -231,6 +231,24 @@ function Hub._handle_worker_parent_request(payload)
         return { error = string.format("unsupported worker parent hub command: %s", tostring((payload.command or {}).type)) }
     end
 
+    if kind == "emit_event" then
+        local event_name = payload.event
+        if type(event_name) ~= "string" or event_name == "" then
+            return { error = "worker parent hub emit_event requires event" }
+        end
+
+        local events_table = rawget(_G, "events")
+        if type(events_table) ~= "table" or type(events_table.emit) ~= "function" then
+            return { error = "worker parent hub emit_event unavailable: events.emit missing" }
+        end
+
+        local ok, delivered = pcall(events_table.emit, event_name, payload.data)
+        if not ok then
+            return { error = tostring(delivered) }
+        end
+        return { result = { delivered = tonumber(delivered) or 0 } }
+    end
+
     if kind == "get_agent_list" then
         return { result = Agent.all_info(payload.opts or {}) }
     end
