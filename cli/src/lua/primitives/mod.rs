@@ -42,6 +42,7 @@ pub mod hub;
 pub mod hub_client;
 pub mod hub_discovery;
 pub mod json;
+pub mod local_webhooks;
 pub mod log;
 pub mod plugin_worker;
 pub mod pty;
@@ -95,6 +96,7 @@ pub use hub_client::{
     new_hub_client_pending_requests, HubClientCallbackRegistry, HubClientFrameSenders,
     HubClientPendingRequests, HubClientRequest, LuaHubClientConn,
 };
+pub(crate) use local_webhooks::{new_local_webhook_registry, LocalWebhookRegistry};
 pub(crate) use plugin_worker::{new_plugin_worker_registry, PluginWorkerRegistry};
 pub use pty::{
     BrowserTerminalSubscriptionRequest, PtyRequest, PtySessionHandle, RefreshSnapshotRequest,
@@ -130,6 +132,11 @@ pub fn register_all(lua: &Lua) -> Result<()> {
     hook_timeout::register(lua)?;
     crate::ui_contract::lua::register(lua)?;
     web_layout::register(lua)?;
+    Ok(())
+}
+
+pub(crate) fn register_local_webhooks(lua: &Lua, registry: LocalWebhookRegistry) -> Result<()> {
+    local_webhooks::register(lua, registry)?;
     Ok(())
 }
 
