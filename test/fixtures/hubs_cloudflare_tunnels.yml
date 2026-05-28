@@ -1,0 +1,10 @@
+active:
+  hub: active_hub
+  cloudflare_tunnel_id: "cf-tunnel-active"
+  cloudflare_tunnel_name: "botster-hub-<%= ActiveRecord::FixtureSet.identify(:active_hub) %>"
+  tunnel_secret: "encrypted-by-fixture"
+  token_secret: "encrypted-by-fixture"
+  token_version: 1
+  token_delivered_at: <%= 1.hour.ago %>
+  status: "active"
+  last_synced_at: <%= 1.hour.ago %>
