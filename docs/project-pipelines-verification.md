@@ -1,5 +1,32 @@
 # Project Pipelines Verification
 
+## 2026-05-28 Stable Webhook URL Contract Verification
+
+Scope:
+
+- Scaffold-only contract for stable webhook URLs and local webhook ingress.
+- Rails broker API, Cloudflare lifecycle, hub token delivery, stable URL
+  claims, `local_webhooks`, request/response shape, body limits, timeouts,
+  reconciliation, rotation, revocation, and one-owner claim rule.
+- Boundary decomposition across Rails, Rust/Lua primitives, Cloudflare
+  stable-url plugin, and consumer/provider plugins.
+
+Verification intent:
+
+- No production runtime path changed in this ticket. Runtime proof belongs to
+  future implementation slices named in
+  `docs/specs/stable-webhook-url-contracts.md`.
+- The contract itself records the scaffold-only status so readers do not infer
+  that Rails routes, `local_webhooks`, or a Cloudflare stable-url plugin already
+  exist.
+
+Expected static checks:
+
+```bash
+rg -n "local_webhooks|stable_urls|HubCloudflareTunnel|StableWebhookHostname|token_version|response_mode|body_limit|rotation|revocation" docs docs/lua catalog/templates/plugins
+rg -n "Cloudflare account credentials|consumer plugins never receive|mlua::Function|127\\.0\\.0\\.1|plugin worker|cloudflare-stable-urls\\.stable_url" docs/specs/stable-webhook-url-contracts.md docs/lua docs/plugin-entities.md
+```
+
 ## 2026-05-04 Workerized Architecture Docs And Static Boundary Checks
 
 Scope:

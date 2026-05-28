@@ -465,6 +465,16 @@ submitters that need generic `ui_action_result` feedback. See
 
 ## Event-Driven Primitives
 
+### `local_webhooks` (planned)
+
+`local_webhooks` is specified in
+[`../specs/stable-webhook-url-contracts.md`](../specs/stable-webhook-url-contracts.md).
+It will expose provider-neutral localhost-only webhook ingress for plugins:
+route registration, bounded body reads, timeout handling, response modes, and
+plugin-worker dispatch. It must not own Cloudflare policy or provider signature
+verification, and it must not store executable Lua callbacks in the hub route
+registry.
+
 ### `webrtc`
 ```lua
 webrtc.on_peer_connected(fn(peer_id))
