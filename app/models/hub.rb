@@ -5,6 +5,8 @@ class Hub < ApplicationRecord
   has_many :hub_commands, dependent: :destroy
   has_one :hub_token, dependent: :destroy
   has_one :mcp_token, class_name: "Integrations::Github::MCPToken", dependent: :destroy
+  has_one :cloudflare_tunnel, class_name: "Hubs::CloudflareTunnel", dependent: :destroy
+  has_many :stable_webhook_hostnames, class_name: "Hubs::StableWebhookHostname", dependent: :destroy
 
   validates :identifier, presence: true, uniqueness: true
   validates :last_seen_at, presence: true

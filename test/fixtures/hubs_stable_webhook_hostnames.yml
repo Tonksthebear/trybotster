@@ -1,0 +1,11 @@
+active:
+  hub: active_hub
+  cloudflare_tunnel: active
+  hostname: "hub-active.example.test"
+  public_url: "https://hub-active.example.test"
+  dns_record_id: "dns-record-active"
+  owner_plugin: "test-plugin"
+  owner_key: "default"
+  purpose: "webhook"
+  local_service_url: "http://localhost:3000"
+  status: "active"

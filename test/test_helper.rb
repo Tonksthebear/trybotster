@@ -86,6 +86,8 @@ module ActiveSupport
 
     # Setup all fixtures in test/fixtures/*.yml for all tests in alphabetical order.
     set_fixture_class "integrations/github/mcp_tokens" => Integrations::Github::MCPToken
+    set_fixture_class "hubs_cloudflare_tunnels" => Hubs::CloudflareTunnel
+    set_fixture_class "hubs_stable_webhook_hostnames" => Hubs::StableWebhookHostname
     fixtures :all
 
     # Add more helper methods to be used by all tests here...
