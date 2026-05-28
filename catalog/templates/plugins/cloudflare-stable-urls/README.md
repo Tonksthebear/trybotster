@@ -29,6 +29,10 @@ Session-facing MCP tools mirror the Lua API:
 - `stable_urls_list`
 - `stable_urls_get`
 
+The shared `lib.stable_urls` facade is for consumer plugins. This provider's
+own MCP handlers intentionally call the plugin repo directly because they
+already execute inside the `cloudflare-stable-urls` worker.
+
 Owner identity is `owner_plugin + owner_key`. `owner_id` is intentionally not a
 public field. This slice only creates `available` and `claimed` transitions;
 `reconciling`, `unhealthy`, and `revoked` are reserved statuses for later
