@@ -23,6 +23,7 @@ function fakeTerminalConnection() {
     onSnapshotStart: vi.fn(() => vi.fn()),
     onSnapshotComplete: vi.fn(() => vi.fn()),
     onBinarySnapshot: vi.fn(() => vi.fn()),
+    onModeChanged: vi.fn(() => vi.fn()),
     on: vi.fn(() => vi.fn()),
     onOutput: vi.fn(() => vi.fn()),
     onConnected: vi.fn((callback) => {
@@ -180,5 +181,44 @@ describe('WebRtcPtyTransport', () => {
     expect(conn.sendResize).not.toHaveBeenCalled()
     expect(conn.requestSnapshot).not.toHaveBeenCalled()
     expect(conn.onOutput).not.toHaveBeenCalled()
+  })
+
+  it('imports a reconnect snapshot before replaying mouse mode changes into Restty', async () => {
+    const conn = fakeTerminalConnection()
+    const delivered = []
+    conn.onModeChanged.mockImplementation((callback) => {
+      callback({
+        type: 'mode_changed',
+        session_uuid: 'session-1',
+        mode: { mouse_mode: 12, bracketed_paste: true, focus_reporting: true },
+      })
+      return vi.fn()
+    })
+    conn.onBinarySnapshot.mockImplementation((callback) => {
+      callback(new Uint8Array([1, 2, 3]))
+      return vi.fn()
+    })
+    mocks.acquire.mockResolvedValue(conn)
+    const transport = new WebRtcPtyTransport({
+      hubId: 'hub-1',
+      sessionUuid: 'session-1',
+    })
+    transport.onBinarySnapshot = () => delivered.push(['snapshot'])
+
+    await transport.connect({
+      rows: 24,
+      cols: 80,
+      callbacks: {
+        onData: (data) => delivered.push(['data', data]),
+      },
+    })
+
+    expect(delivered).toEqual([
+      ['snapshot'],
+      [
+        'data',
+        '\x1b[?1000l\x1b[?1003l\x1b[?1002h\x1b[?1006h\x1b[?2004h\x1b[?1004h',
+      ],
+    ])
   })
 })
