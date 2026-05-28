@@ -111,8 +111,11 @@ claims unavailable until reconciliation restores capacity.
 ## Stable URL Claim Model
 
 The Cloudflare stable-url plugin owns `stable_urls.claim`, `stable_urls.release`,
-and `stable_urls.list` as Lua-facing APIs. A v1 claim owns an entire hostname.
-Only one active owner may claim a URL at a time.
+`stable_urls.list`, and `stable_urls.get` as Lua-facing APIs. Session-facing MCP
+tools expose the same redacted shapes as `stable_urls_claim`,
+`stable_urls_release`, `stable_urls_list`, and `stable_urls_get`, scoped by the
+existing per-session plugin visibility policy. A v1 claim owns an entire
+hostname. Only one active owner may claim a URL at a time.
 
 Claim input:
 
@@ -146,6 +149,10 @@ Claims persist in plugin-owned state so reload and daemon restart can reconcile
 the connector. Release removes the owner, removes or disables the ingress rule,
 publishes an entity update, and keeps enough audit state to explain recent
 claim/release events.
+
+Owner identity is `owner_plugin + owner_key`. `owner_id` is intentionally not a
+public API alias because the owner key is a caller-owned stable string, not a
+database id.
 
 ## Stable URL Entity Contract
 
