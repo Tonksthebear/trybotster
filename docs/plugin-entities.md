@@ -90,6 +90,11 @@ Built-in entity families such as `session`, `workspace`, `spawn_target`,
 `worktree`, `hub`, `connection_code`, `template`, and `session_action` are
 reserved for core.
 
+The planned Cloudflare stable-url plugin publishes
+`cloudflare-stable-urls.stable_url` as the read model for stable webhook URL
+claims. Its public fields and forbidden secret-bearing fields are specified in
+[`specs/stable-webhook-url-contracts.md`](specs/stable-webhook-url-contracts.md#stable-url-entity-contract).
+
 Keep plugin model names and entity names aligned, but do not expose private
 table shape by accident. Use singular entity type names for one record family
 (`project-pipelines.ticket`, not `project-pipelines.tickets`), and keep record

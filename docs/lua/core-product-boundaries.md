@@ -32,6 +32,12 @@ external notification services, or opinionated template catalogs.
 - Agent and accessory definitions for specific tools or brands.
 - Catalog choices for which templates are offered to users.
 
+For stable webhook URLs, this split is explicit in
+[`../specs/stable-webhook-url-contracts.md`](../specs/stable-webhook-url-contracts.md):
+core may provide the provider-neutral `local_webhooks` primitive, the
+Cloudflare stable-url plugin owns connector/claim/reconciliation policy, and
+consumer plugins own provider verification and event semantics.
+
 ## Rails Owns
 
 Rails owns settings bootstrap, authentication, and the browser shell. It must
@@ -39,6 +45,11 @@ not discover, fetch, or parse template catalogs. Browsers consume the hub's
 `template` entity snapshot. Remote sources such as the default GitHub-backed
 trybotster catalog belong behind the hub catalog provider/cache rather than a
 Rails controller.
+
+For stable webhook URLs, Rails additionally owns Cloudflare account
+credentials, named-tunnel desired state, hostname allocation, connector-token
+rotation, and revocation. Rails must not expose Cloudflare tunnel tokens to
+consumer plugins or parse provider webhook payloads.
 
 ## Rule of Thumb
 
