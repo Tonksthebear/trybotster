@@ -17,6 +17,35 @@
  */
 import { HubConnectionManager, TerminalConnection } from "connections";
 
+const MOUSE_MODE_BITS = [
+  [1000, 1],
+  [1003, 2],
+  [1002, 4],
+  [1006, 8],
+];
+
+function privateModeSequence(code, enabled) {
+  return `\x1b[?${code}${enabled ? "h" : "l"}`;
+}
+
+function modeChangedToTerminalSequences(mode) {
+  if (!mode || typeof mode !== "object") return "";
+
+  let output = "";
+  if (Number.isInteger(mode.mouse_mode)) {
+    for (const [code, bit] of MOUSE_MODE_BITS) {
+      output += privateModeSequence(code, (mode.mouse_mode & bit) !== 0);
+    }
+  }
+  if (typeof mode.bracketed_paste === "boolean") {
+    output += privateModeSequence(2004, mode.bracketed_paste);
+  }
+  if (typeof mode.focus_reporting === "boolean") {
+    output += privateModeSequence(1004, mode.focus_reporting);
+  }
+  return output;
+}
+
 export class WebRtcPtyTransport {
   static #RESIZE_DEBOUNCE_MS = 30;
   #hubId;
@@ -195,8 +224,17 @@ export class WebRtcPtyTransport {
     );
 
     this.#unsubscribers.push(
+      this.#terminalConn.onModeChanged((message) => {
+        const sequences = modeChangedToTerminalSequences(message?.mode);
+        if (sequences) this.#callbacks?.onData?.(sequences);
+      }),
+    );
+
+    this.#unsubscribers.push(
       this.#terminalConn.on("message", (message) => {
         if (message?.type === "focus_reporting_changed") {
+          // Coexists with modeChanged -> DEC ?1004h/l replay: this path
+          // resends browser focus state, while the DEC path updates Restty.
           this.#onFocusReportingChanged?.(!!message.enabled);
         }
       }),
