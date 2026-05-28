@@ -813,7 +813,7 @@ module Github
       body, signature = sign_webhook_payload(payload)
 
       with_stubbed_github do
-        assert_difference "Integrations::Github::Message.count", 1 do
+        assert_difference "Integrations::Github::Message.count", 2 do
           post "/github/webhooks",
             params: body,
             headers: {
@@ -824,12 +824,17 @@ module Github
         end
       end
 
-      message = Integrations::Github::Message.last
+      lifecycle = Integrations::Github::Message.where(event_type: "pull_request_comment").last
+      assert_equal 90, lifecycle.issue_number
+      assert_equal "pr_review_comment", lifecycle.payload["source_type"]
+      assert_equal "@trybotster can you fix this?", lifecycle.payload["comment_body"]
+
+      message = Integrations::Github::Message.where(event_type: "github_mention").last
       assert_equal "github_mention", message.event_type
       assert_equal 90, message.issue_number
     end
 
-    test "pr_review_comment without mention does not create message" do
+    test "pr_review_comment without mention creates lifecycle message only" do
       payload = {
         action: "created",
         pull_request: {
@@ -849,7 +854,7 @@ module Github
 
       body, signature = sign_webhook_payload(payload)
 
-      assert_no_difference "Integrations::Github::Message.count" do
+      assert_difference "Integrations::Github::Message.count", 1 do
         post "/github/webhooks",
           params: body,
           headers: {
@@ -860,6 +865,12 @@ module Github
       end
 
       assert_response :success
+
+      message = Integrations::Github::Message.last
+      assert_equal "pull_request_comment", message.event_type
+      assert_equal 91, message.issue_number
+      assert_equal "Looks good to me!", message.payload["comment_body"]
+      assert_equal "pr_review_comment", message.payload["source_type"]
     end
 
     test "pull_request_review submitted creates review lifecycle message" do

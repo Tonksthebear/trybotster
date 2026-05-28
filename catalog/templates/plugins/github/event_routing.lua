@@ -90,6 +90,62 @@ local function pr_payload(message, payload)
     }
 end
 
+local function emit_lifecycle_event(event_name, event)
+    local bridge = rawget(_G, "plugin_worker_parent_hub")
+    if type(bridge) == "table" and type(bridge.enqueue) == "function" then
+        local ok, err = pcall(bridge.enqueue, {
+            type = "emit_event",
+            event = event_name,
+            data = event,
+        })
+        if ok then
+            return true, 1
+        end
+        log.warn(string.format(
+            "GitHub: parent hub failed to enqueue %s event: %s",
+            event_name,
+            tostring(err)
+        ))
+        return false, 0
+    elseif type(bridge) == "table" and type(bridge.request) == "function" then
+        local ok, response_or_err = pcall(bridge.request, {
+            type = "emit_event",
+            event = event_name,
+            data = event,
+        }, 5000)
+        if ok and type(response_or_err) == "table" then
+            if response_or_err.error then
+                log.warn(string.format(
+                    "GitHub: parent hub failed to emit %s event: %s",
+                    event_name,
+                    tostring(response_or_err.error)
+                ))
+                return false, 0
+            end
+            local result = response_or_err.result
+            if type(result) == "table" then
+                return true, tonumber(result.delivered) or 0
+            end
+        elseif not ok then
+            log.warn(string.format(
+                "GitHub: parent hub request failed for %s event: %s",
+                event_name,
+                tostring(response_or_err)
+            ))
+            return false, 0
+        end
+    end
+
+    if events and events.emit then
+        local ok, count_or_err = pcall(events.emit, event_name, event)
+        if ok then
+            return true, tonumber(count_or_err) or 0
+        end
+        log.warn(string.format("GitHub: failed to emit %s event: %s", event_name, tostring(count_or_err)))
+    end
+    return false, 0
+end
+
 local function emit_pr_merged(event_repo, message, payload)
     local event = pr_payload(message, payload)
     if not event then
@@ -99,14 +155,8 @@ local function emit_pr_merged(event_repo, message, payload)
     if not event.repo then
         return true, false
     end
-    if events and events.emit then
-        local ok, err = pcall(events.emit, "pr_merged", event)
-        if ok then
-            return true, true
-        end
-        log.warn("GitHub: failed to emit pr_merged event: " .. tostring(err))
-    end
-    return true, false
+    local ok, count = emit_lifecycle_event("pr_merged", event)
+    return true, ok and count > 0
 end
 
 local function pr_review_payload(message, payload)
@@ -154,14 +204,8 @@ local function emit_pr_review_submitted(event_repo, message, payload)
     if not event.repo then
         return true, false
     end
-    if events and events.emit then
-        local ok, err = pcall(events.emit, "pr_review_submitted", event)
-        if ok then
-            return true, true
-        end
-        log.warn("GitHub: failed to emit pr_review_submitted event: " .. tostring(err))
-    end
-    return true, false
+    local ok, count = emit_lifecycle_event("pr_review_submitted", event)
+    return true, ok and count > 0
 end
 
 local function pr_comment_payload(message, payload)
@@ -206,14 +250,8 @@ local function emit_pr_comment(event_repo, message, payload)
     if not event.repo then
         return true, false
     end
-    if events and events.emit then
-        local ok, err = pcall(events.emit, "pr_comment", event)
-        if ok then
-            return true, true
-        end
-        log.warn("GitHub: failed to emit pr_comment event: " .. tostring(err))
-    end
-    return true, false
+    local ok, count = emit_lifecycle_event("pr_comment", event)
+    return true, ok and count > 0
 end
 
 local function is_pr_lifecycle_message(message, payload)
@@ -229,13 +267,16 @@ end
 local function handle_message(default_repo, message, channel_id)
     local payload = message.payload or {}
     local event_repo = message.repo or default_repo
-    local pr_merged_event = emit_pr_merged(event_repo, message, payload)
-    local pr_review_event = emit_pr_review_submitted(event_repo, message, payload)
-    local pr_comment_event = emit_pr_comment(event_repo, message, payload)
+    local pr_merged_event, pr_merged_delivered = emit_pr_merged(event_repo, message, payload)
+    local pr_review_event, pr_review_delivered = emit_pr_review_submitted(event_repo, message, payload)
+    local pr_comment_event, pr_comment_delivered = emit_pr_comment(event_repo, message, payload)
     local pr_lifecycle_event = pr_merged_event or pr_review_event or pr_comment_event
+    local pr_lifecycle_delivered = pr_merged_delivered or pr_review_delivered or pr_comment_delivered
 
     if pr_lifecycle_event and is_pr_lifecycle_message(message, payload) then
-        action_cable.perform(channel_id, "ack", { id = message.id })
+        if pr_lifecycle_delivered then
+            action_cable.perform(channel_id, "ack", { id = message.id })
+        end
         return
     end
 

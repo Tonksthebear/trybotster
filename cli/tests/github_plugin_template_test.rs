@@ -1247,6 +1247,89 @@ fn catalog_plugin_github_event_routing_emits_pr_review_submitted() {
 }
 
 #[test]
+fn catalog_plugin_github_event_routing_emits_lifecycle_through_parent_hub() {
+    let template_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates/plugins/github/event_routing.lua");
+    let template_path = template_path.to_str().unwrap();
+
+    let lua = create_lua_vm();
+
+    let result: JsonValue = lua
+        .load(format!(
+            r#"
+            local parent_requests = {{}}
+            local local_emits = 0
+            local acked = false
+            local callback = nil
+
+            package.loaded["lib.agent"] = {{ find_by_workspace = function() return {{}} end }}
+            package.loaded["hub.state"] = {{ get = function() return {{}} end }}
+            package.loaded["lib.hub"] = {{ get = function() return {{}} end }}
+            plugin_worker_parent_hub = {{
+              request = function(payload)
+                parent_requests[#parent_requests + 1] = payload
+                return {{ result = {{ delivered = 1 }} }}
+              end,
+              enqueue = function(payload)
+                parent_requests[#parent_requests + 1] = payload
+                return true
+              end,
+            }}
+            events = {{
+              emit = function()
+                local_emits = local_emits + 1
+                return 0
+              end,
+            }}
+            action_cable = {{
+              connect = function() return "conn-1" end,
+              subscribe = function(_, _, _, cb)
+                callback = cb
+                return "chan-1"
+              end,
+              perform = function(_, action, data)
+                if action == "ack" and data.id == 12 then acked = true end
+              end,
+              close = function() end,
+            }}
+
+            local routing = dofile("{template_path}")
+            routing.start("owner/repo")
+            callback({{
+              id = 12,
+              event_type = "pull_request_review",
+              repo = "owner/repo",
+              payload = {{
+                action = "submitted",
+                repo = "owner/repo",
+                pr_number = 42,
+                state = "commented",
+              }},
+            }}, "chan-1")
+
+            return {{ parent_requests = parent_requests, local_emits = local_emits, acked = acked }}
+            "#
+        ))
+        .eval()
+        .and_then(|value: Value| lua.from_value(value))
+        .expect("GitHub lifecycle events should emit through parent hub from plugin workers");
+
+    assert_eq!(result["parent_requests"][0]["type"], json!("emit_event"));
+    assert_eq!(
+        result["parent_requests"][0]["event"],
+        json!("pr_review_submitted")
+    );
+    assert_eq!(
+        result["parent_requests"][0]["data"]["pr_number"],
+        json!(42)
+    );
+    assert_eq!(result["local_emits"], json!(0));
+    assert_eq!(result["acked"], json!(true));
+}
+
+#[test]
 fn catalog_plugin_github_event_routing_emits_pr_comment_and_does_not_spawn_agent() {
     let template_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -1337,5 +1420,79 @@ fn catalog_plugin_github_event_routing_emits_pr_comment_and_does_not_spawn_agent
         json!("Can this be clearer?")
     );
     assert_eq!(result["find_calls"], json!(0));
+    assert_eq!(result["create_calls"], json!(0));
+}
+
+#[test]
+fn catalog_plugin_github_event_routing_does_not_ack_lifecycle_without_consumer() {
+    let template_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates/plugins/github/event_routing.lua");
+    let template_path = template_path.to_str().unwrap();
+
+    let lua = create_lua_vm();
+
+    let result: JsonValue = lua
+        .load(format!(
+            r#"
+            local acked = false
+            local callback = nil
+            local create_calls = 0
+
+            package.loaded["lib.agent"] = {{
+              find_by_workspace = function()
+                error("pending lifecycle events must not fall back to generic agent routing")
+              end,
+            }}
+            package.loaded["hub.state"] = {{ get = function() return {{}} end }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  create_agent = function()
+                    create_calls = create_calls + 1
+                  end,
+                }}
+              end,
+            }}
+            events = {{
+              emit = function()
+                return 0
+              end,
+            }}
+            action_cable = {{
+              connect = function() return "conn-1" end,
+              subscribe = function(_, _, _, cb)
+                callback = cb
+                return "chan-1"
+              end,
+              perform = function(_, action, data)
+                if action == "ack" and data.id == 11 then acked = true end
+              end,
+              close = function() end,
+            }}
+
+            local routing = dofile("{template_path}")
+            routing.start("owner/repo")
+            callback({{
+              id = 11,
+              event_type = "pull_request_review",
+              repo = "owner/repo",
+              payload = {{
+                action = "submitted",
+                repo = "owner/repo",
+                pr_number = 42,
+                state = "changes_requested",
+              }},
+            }}, "chan-1")
+
+            return {{ acked = acked, create_calls = create_calls }}
+            "#
+        ))
+        .eval()
+        .and_then(|value: Value| lua.from_value(value))
+        .expect("GitHub lifecycle events should remain pending until a consumer receives them");
+
+    assert_eq!(result["acked"], json!(false));
     assert_eq!(result["create_calls"], json!(0));
 }
