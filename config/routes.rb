@@ -37,6 +37,10 @@ Rails.application.routes.draw do
       resource :webrtc, only: [ :show ], controller: :webrtc  # GET config
       resource :settings, only: [ :show, :update, :destroy ], controller: :settings
       resource :pairing, only: [ :show ], controller: :pairing
+      resource :cloudflare_tunnel, only: [ :show, :create, :destroy ], controller: :cloudflare_tunnels do
+        patch :rotate
+      end
+      resources :stable_webhook_hostnames, only: [ :create, :destroy ]
     end
   end
 

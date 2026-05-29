@@ -53,6 +53,9 @@ Rails.application.configure do
 
   # Allow reading unencrypted fixture data for encrypted attributes
   config.active_record.encryption.support_unencrypted_data = true
+  config.active_record.encryption.primary_key = "test-primary-key-for-active-record-encryption"
+  config.active_record.encryption.deterministic_key = "test-deterministic-key-for-active-record-encryption"
+  config.active_record.encryption.key_derivation_salt = "test-key-derivation-salt"
 
   # Use test adapter for jobs - runs inline without queue infrastructure
   config.active_job.queue_adapter = :test

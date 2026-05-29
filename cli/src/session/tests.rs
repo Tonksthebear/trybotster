@@ -824,6 +824,30 @@ mod socket_path_tests {
         let session_uuid = unique_session_uuid("tmp-recovery-identity");
         let socket_path = session_socket_path(&session_uuid).unwrap();
         let pid_path = session_pid_path(&session_uuid).unwrap();
+        let dead_pid = 999_999_999_u32;
+        let tmp_path = session_recovery_identity_path(&session_uuid)
+            .unwrap()
+            .with_file_name(format!("{session_uuid}.identity.json.{dead_pid}.tmp"));
+
+        let _ = std::fs::remove_file(&socket_path);
+        let _ = std::fs::remove_file(&pid_path);
+        let _ = std::fs::remove_file(&tmp_path);
+
+        std::fs::write(&tmp_path, "{}").unwrap();
+
+        cleanup_orphaned_session_files();
+
+        assert!(
+            !tmp_path.exists(),
+            "cleanup should remove orphaned temporary sidecar files"
+        );
+    }
+
+    #[test]
+    fn cleanup_orphaned_session_files_preserves_live_writer_identity_tmp_file() {
+        let session_uuid = unique_session_uuid("live-tmp-recovery-identity");
+        let socket_path = session_socket_path(&session_uuid).unwrap();
+        let pid_path = session_pid_path(&session_uuid).unwrap();
         let tmp_path = session_recovery_identity_path(&session_uuid)
             .unwrap()
             .with_file_name(format!(
@@ -840,8 +864,10 @@ mod socket_path_tests {
         cleanup_orphaned_session_files();
 
         assert!(
-            !tmp_path.exists(),
-            "cleanup should remove orphaned temporary sidecar files"
+            tmp_path.exists(),
+            "cleanup should preserve temporary sidecar files from a live writer"
         );
+
+        let _ = std::fs::remove_file(&tmp_path);
     }
 }

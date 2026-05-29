@@ -159,7 +159,7 @@ pub struct ModeFlags {
     pub cursor_visible: bool,
     /// Bracketed paste mode enabled.
     pub bracketed_paste: bool,
-    /// Mouse tracking mode (0=off, 1000/1002/1003/1006).
+    /// Mouse tracking mode bitmask (1=normal, 2=any-event, 4=button-event, 8=SGR encoding, etc.).
     pub mouse_mode: u8,
     /// Alternate screen buffer active.
     pub alt_screen: bool,
@@ -187,7 +187,7 @@ pub struct ModeChanged {
     /// Alternate screen buffer toggled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alt_screen: Option<bool>,
-    /// Mouse tracking mode changed (0=off, 1000/1002/1003/1006).
+    /// Mouse tracking mode bitmask changed (see ModeFlags for encoding).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mouse_mode: Option<u8>,
     /// Bracketed paste mode toggled.
@@ -199,6 +199,33 @@ pub struct ModeChanged {
     /// Application cursor keys mode toggled (DECCKM).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub application_cursor: Option<bool>,
+}
+
+/// Converts live ModeFlags into a full sparse ModeChanged for attach/reattach replay.
+///
+/// Every field is Some(...) so clients receive the complete current terminal
+/// mode state as part of the initial snapshot barrier or reuse fast path.
+/// This helper is shared by the TUI Raw snapshot path and browser reused-sub
+/// path to guarantee identical fields and prevent divergence.
+///
+/// # Examples
+///
+/// ```ignore
+/// let mode = mode_changed_from_flags(flags);
+/// let _ = worker.try_send(ClientWorkerMessage::ControlFrame(
+///     ClientControlFrame::ModeChanged { session_uuid, mode },
+/// ));
+/// ```
+pub fn mode_changed_from_flags(flags: ModeFlags) -> ModeChanged {
+    ModeChanged {
+        kitty_enabled: Some(flags.kitty_enabled),
+        cursor_visible: Some(flags.cursor_visible),
+        bracketed_paste: Some(flags.bracketed_paste),
+        mouse_mode: Some(flags.mouse_mode),
+        alt_screen: Some(flags.alt_screen),
+        focus_reporting: Some(flags.focus_reporting),
+        application_cursor: Some(flags.application_cursor),
+    }
 }
 
 /// OSC notification payload.
