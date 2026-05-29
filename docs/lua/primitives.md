@@ -465,15 +465,69 @@ submitters that need generic `ui_action_result` feedback. See
 
 ## Event-Driven Primitives
 
-### `local_webhooks` (planned)
+### `local_webhooks`
 
 `local_webhooks` is specified in
 [`../specs/stable-webhook-url-contracts.md`](../specs/stable-webhook-url-contracts.md).
-It will expose provider-neutral localhost-only webhook ingress for plugins:
-route registration, bounded body reads, timeout handling, response modes, and
-plugin-worker dispatch. It must not own Cloudflare policy or provider signature
-verification, and it must not store executable Lua callbacks in the hub route
-registry.
+It exposes provider-neutral localhost-only webhook ingress for plugins: route
+registration, bounded body reads, timeout handling, response modes, and
+plugin-worker dispatch. It does not own Cloudflare policy, stable URL claim
+state, provider signature verification, replay handling, or provider-specific
+content-type validation.
+
+```lua
+local route = local_webhooks.register({
+  id = "github.repo-webhook",
+  methods = { "POST", "PUT" },
+  path = "/webhooks/claim/<route_token>",
+  body_limit = 1024 * 1024,
+  timeout_ms = 10000,
+  response_mode = "handler", -- "handler", "ack", or "static"
+}, function(request)
+  return {
+    status = 202,
+    headers = { ["content-type"] = "text/plain" },
+    body = "accepted",
+  }
+end)
+
+local_webhooks.unregister(route.id)
+```
+
+Routes bind to an ephemeral `127.0.0.1` port and return `{ id, route_id, path,
+route_token, port, url }`. Generated route tokens use 128 bits of entropy;
+caller-supplied tokens must be unguessable URL-safe text; the primitive
+validates URL-safe length and rejects collisions, but cannot prove caller
+entropy. v1 accepts only `POST` and `PUT`; the default method set is
+`POST`-only, so pass `methods = { "POST", "PUT" }` when both are desired.
+Other registered methods are rejected and unregistered methods hitting a
+registered path return `405`.
+
+Plugin init code runs once in the hub loader VM and again in the plugin worker
+VM. A plugin-owned `local_webhooks.register` call made during the hub loader
+pass returns only route metadata (`id`, `route_id`, `path`, `route_token`) so
+plugin code can publish stable metadata without binding a listener in the hub.
+The worker-side call owns the actual listener and includes `port` and `url`;
+plugin code that writes connector state should guard on `route.url`.
+In v1, each plugin worker owns its local webhook listener. This keeps handler
+callbacks and registry keys in the worker VM, while preserving the public route
+contract for a future hub-scoped listener multiplexer.
+
+Request tables contain `request_id`, `route_id`, `method`, `path`, `query`,
+`headers`, `body`, `raw_body`, `body_truncated=false`, `remote_addr`, and
+`received_at`. `content-type` is preserved exactly when present and missing or
+unusual content types are passed through. Content-Length and chunked bodies are
+bounded by `body_limit`; unsupported transfer codings return `400`; over-limit
+bodies return `413` before dispatch.
+
+`response_mode="handler"` waits for the plugin worker response until
+`timeout_ms`. `ack` returns `202` after the request is accepted into the worker
+mailbox. `static` returns the configured `response` table without invoking the
+handler. Plugin reload/unload cleanup unregisters owned routes; after
+unregister, the primitive returns `404`. Worker runtime shutdown drops the
+worker-owned registry and stops its listener. Stable URL products that need
+`410` for released claims should register a static tombstone route above this
+primitive.
 
 ### `webrtc`
 ```lua

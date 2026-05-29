@@ -184,6 +184,13 @@ provider webhook secrets.
 127.0.0.1-only listener and dispatches requests to plugin workers through
 bounded mailboxes. It never binds `0.0.0.0`.
 
+Implementation note for v1: listener ownership is scoped to the plugin worker
+runtime that registers the route, so separate plugin workers may expose
+separate ephemeral localhost ports. The route contract is intentionally the
+same shape a future hub-scoped multiplexer would expose (`path`, `route_token`,
+`port`, `url`), while v1 keeps handler callbacks and Lua registry keys inside
+the worker VM that executes them.
+
 API shape:
 
 ```lua
@@ -205,10 +212,12 @@ end)
 local_webhooks.unregister("github.repo-webhook")
 ```
 
-Route tokens must be unguessable. Use at least 128 bits of entropy, reject
-collisions during registration, and never accept a caller-supplied token that
-already exists for another route. The listener should accept `POST` and `PUT`
-only when registered. Other methods return `405`.
+Route tokens must be unguessable. Generated tokens use at least 128 bits of
+entropy; caller-supplied tokens must provide equivalent entropy because the
+primitive can only validate URL-safe length and reject collisions during
+registration. The listener should accept `POST` and `PUT` only when registered.
+The v1 default is `POST` only; callers must pass both methods explicitly when
+both are desired. Other methods return `405`.
 
 Allowed request bodies are bounded byte buffers. The listener must return `413`
 when `body_limit` would be exceeded and must not continue reading unbounded
@@ -275,13 +284,15 @@ Each registered route carries `owner_plugin`, `handler_ref`, and
 `plugin_generation`. The hub registry may store descriptors and handler refs,
 but not `mlua::Function` closures. Execution must happen in the plugin worker.
 
-On plugin reload or unload, `local_webhooks` removes routes for the old
-generation. URL release, token rotation, and Rails-side hostname revocation
-disable the affected route generation before connector changes are applied.
-In-flight requests may finish only if their generation is still current. Stale
+On plugin reload or unload, v1 worker runtime shutdown drops the worker-owned
+registry, unregisters routes for the old generation, and stops its listener.
+URL release, token rotation, and Rails-side hostname revocation disable the
+affected route generation before connector changes are applied. In-flight
+requests may finish only if their generation is still current. Stale
 completions are ignored and cannot write late responses after a route is
-replaced, released, or revoked. New requests for a released claim return `410`;
-new requests for an unknown or Rails-revoked hostname/route return `404`.
+replaced, released, or revoked. New requests for an unknown local route return
+`404`; a stable-url plugin that needs released-claim `410` behavior must keep
+or install an explicit static tombstone route above the primitive.
 
 Token rotation must prefer a drain-and-reload sequence: mint and store the new
 token generation, start or reload the connector, wait for health, then revoke
