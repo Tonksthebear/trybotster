@@ -53,6 +53,7 @@ use mlua::Lua;
 ///
 /// Creates a global `fs` table with methods:
 /// - `fs.write(path, content)` - Write string content to a file (creates parent dirs)
+/// - `fs.write_private(path, content)` - Write string content with 0600 permissions on Unix
 /// - `fs.read(path)` - Read file contents as a UTF-8 string
 /// - `fs.read_bytes(path)` - Read file contents as raw bytes (binary-safe Lua string)
 /// - `fs.append(path, content)` - Append string content to a file (creates if absent)
@@ -101,6 +102,50 @@ pub fn register(lua: &Lua) -> Result<()> {
     fs_table
         .set("write", write_fn)
         .map_err(|e| anyhow!("Failed to set fs.write: {e}"))?;
+
+    // fs.write_private(path, content) -> (true, nil) or (nil, error_string)
+    //
+    // Writes string content to a file and restricts Unix permissions to 0600.
+    // Intended for runtime materialization of secret-bearing files.
+    let write_private_fn = lua
+        .create_function(|_, (path, content): (String, String)| {
+            let file_path = Path::new(&path);
+
+            if let Some(parent) = file_path.parent() {
+                if !parent.exists() {
+                    if let Err(e) = std::fs::create_dir_all(parent) {
+                        return Ok((
+                            None::<bool>,
+                            Some(format!("Failed to create parent directories: {e}")),
+                        ));
+                    }
+                }
+            }
+
+            if let Err(e) = std::fs::write(file_path, content) {
+                return Ok((None::<bool>, Some(format!("Failed to write file: {e}"))));
+            }
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(e) =
+                    std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(0o600))
+                {
+                    return Ok((
+                        None::<bool>,
+                        Some(format!("Failed to set permissions: {e}")),
+                    ));
+                }
+            }
+
+            Ok((Some(true), None::<String>))
+        })
+        .map_err(|e| anyhow!("Failed to create fs.write_private function: {e}"))?;
+
+    fs_table
+        .set("write_private", write_private_fn)
+        .map_err(|e| anyhow!("Failed to set fs.write_private: {e}"))?;
 
     // fs.read(path) -> (content, nil) or (nil, error_string)
     //
@@ -296,7 +341,7 @@ pub fn register(lua: &Lua) -> Result<()> {
 
     // fs.stat(path) -> (table, nil) or (nil, error_string)
     //
-    // Returns { type = "file"|"dir", size = N, exists = true } or { exists = false }.
+    // Returns { type = "file"|"dir", size = N, exists = true, mode = N? } or { exists = false }.
     let stat_fn = lua
         .create_function(|lua, path: String| {
             let p = Path::new(&path);
@@ -311,6 +356,11 @@ pub fn register(lua: &Lua) -> Result<()> {
                     table.set("exists", true)?;
                     table.set("type", if meta.is_dir() { "dir" } else { "file" })?;
                     table.set("size", meta.len())?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        table.set("mode", meta.permissions().mode() & 0o777)?;
+                    }
                     Ok((Some(table), None::<String>))
                 }
                 Err(e) => Ok((None::<mlua::Table>, Some(format!("Failed to stat: {e}")))),
@@ -525,6 +575,9 @@ mod tests {
 
         // Verify all functions exist
         let _: Function = fs_table.get("write").expect("fs.write should exist");
+        let _: Function = fs_table
+            .get("write_private")
+            .expect("fs.write_private should exist");
         let _: Function = fs_table.get("read").expect("fs.read should exist");
         let _: Function = fs_table
             .get("read_bytes")
@@ -702,6 +755,34 @@ mod tests {
         assert_eq!(ok, Some(true));
         assert!(err.is_none());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "nested content");
+    }
+
+    #[test]
+    fn test_write_private_sets_restricted_permissions() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let temp_dir =
+            std::env::temp_dir().join(format!("botster-fs-private-test-{}", std::process::id()));
+        let path = temp_dir.join("secret.txt");
+        let path_str = path.to_string_lossy();
+
+        let ok: bool = lua
+            .load(format!(
+                r#"return fs.write_private("{path_str}", "secret")"#
+            ))
+            .eval()
+            .expect("fs.write_private should be callable");
+        assert!(ok);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[test]
