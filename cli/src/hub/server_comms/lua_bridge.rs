@@ -246,8 +246,23 @@ impl Hub {
                 channel_id,
                 channel_name,
                 params,
+                owner_plugin,
+                handler_id,
             } => {
                 if let Some(conn) = self.lua_ac_connections.get(&connection_id) {
+                    if owner_plugin.is_some() {
+                        if let Ok(mut registry) = self.lua.ac_callback_registry().lock() {
+                            registry.insert(
+                                channel_id.clone(),
+                                crate::lua::primitives::action_cable::AcCallbackEntry {
+                                    callback_key: None,
+                                    owner_plugin: owner_plugin.clone(),
+                                    handler_id: handler_id.clone(),
+                                },
+                            );
+                        }
+                    }
+
                     // Build the ActionCable identifier JSON with channel name and params
                     let mut identifier = serde_json::json!({ "channel": channel_name });
                     if let serde_json::Value::Object(map) = params {
@@ -327,8 +342,34 @@ impl Hub {
                 if self.lua_ac_channels.remove(&channel_id).is_some() {
                     // Clean up the callback registry entry and release the RegistryKey.
                     if let Ok(mut reg) = self.lua.ac_callback_registry().lock() {
-                        if let Some(key) = reg.remove(&channel_id) {
-                            let _ = self.lua.lua_ref().remove_registry_value(key);
+                        if let Some(entry) = reg.remove(&channel_id) {
+                            // Only platform entries have a hub-Lua RegistryKey to release.
+                            if let Some(key) = entry.callback_key {
+                                let _ = self.lua.lua_ref().remove_registry_value(key);
+                            }
+                            // Owned entries: explicitly unregister the handler in the
+                            // worker VM so the handlers table does not leak (V9).
+                            if let (Some(owner), Some(hid)) =
+                                (&entry.owner_plugin, &entry.handler_id)
+                            {
+                                if let Ok(invoke) = self
+                                    .lua
+                                    .lua_ref()
+                                    .globals()
+                                    .get::<mlua::Function>("__plugin_worker_invoke")
+                                {
+                                    if let Err(e) = invoke.call::<mlua::Value>((
+                                        owner.clone(),
+                                        "ac_unregister".to_string(),
+                                        hid.clone(),
+                                        mlua::Value::Nil,
+                                        mlua::Value::Nil,
+                                        250u64,
+                                    )) {
+                                        log::warn!("[ActionCable] Failed to unregister owned handler {hid} in worker {owner}: {e}");
+                                    }
+                                }
+                            }
                         }
                     }
                     log::info!("[ActionCable-Lua] Channel '{}' unsubscribed", channel_id);
@@ -356,8 +397,34 @@ impl Hub {
                 // Clean up callback registry entries for all removed channels.
                 if let Ok(mut reg) = self.lua.ac_callback_registry().lock() {
                     for ch_id in &orphaned {
-                        if let Some(key) = reg.remove(ch_id) {
-                            let _ = self.lua.lua_ref().remove_registry_value(key);
+                        if let Some(entry) = reg.remove(ch_id) {
+                            // Only platform entries have a hub-Lua RegistryKey to release.
+                            if let Some(key) = entry.callback_key {
+                                let _ = self.lua.lua_ref().remove_registry_value(key);
+                            }
+                            // Owned entries: explicitly unregister the handler in the
+                            // worker VM so the handlers table does not leak (V9).
+                            if let (Some(owner), Some(hid)) =
+                                (&entry.owner_plugin, &entry.handler_id)
+                            {
+                                if let Ok(invoke) = self
+                                    .lua
+                                    .lua_ref()
+                                    .globals()
+                                    .get::<mlua::Function>("__plugin_worker_invoke")
+                                {
+                                    if let Err(e) = invoke.call::<mlua::Value>((
+                                        owner.clone(),
+                                        "ac_unregister".to_string(),
+                                        hid.clone(),
+                                        mlua::Value::Nil,
+                                        mlua::Value::Nil,
+                                        250u64,
+                                    )) {
+                                        log::warn!("[ActionCable] Failed to unregister owned handler {hid} in worker {owner}: {e}");
+                                    }
+                                }
+                            }
                         }
                     }
                 }

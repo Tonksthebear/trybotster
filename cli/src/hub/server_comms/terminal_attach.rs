@@ -109,12 +109,30 @@ impl Hub {
                         "subscriptionId": req.subscription_id.clone(),
                     })),
                 ));
+
+                // Item 3: reattach mode replay (on top of Item 2 producer)
+                // On reused-subscription reattach, emit current mode state (full sparse
+                // ModeChanged from live ModeFlags) *before* "attached" so the client
+                // receives mode state as part of the attach barrier.
+                if let Some(flags) = pty_handle.get_mode_flags() {
+                    // Use the shared helper so the browser reused-sub path and the
+                    // TUI Raw initial snapshot path cannot drift on which fields are replayed.
+                    let mode = crate::session::protocol::mode_changed_from_flags(flags);
+                    let _ = worker.try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                        crate::worker::client::ClientControlFrame::ModeChanged {
+                            session_uuid: req.session_uuid.clone(),
+                            mode,
+                        },
+                    ));
+                }
+
                 Self::send_worker_terminal_attach_state(
                     &worker,
                     &req.subscription_id,
                     &req.session_uuid,
                     "attached",
                 );
+
                 log::debug!(
                     "[WebRTC] Reused active terminal subscription for {} resize={}x{}",
                     subscription_key,

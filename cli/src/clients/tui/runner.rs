@@ -642,9 +642,14 @@ where
 
         for event in events {
             match &event {
-                InputEvent::MouseScroll { direction, x, y } if !self.has_overlay => {
+                InputEvent::MouseScroll {
+                    direction,
+                    ref raw_bytes,
+                    x,
+                    y,
+                } if !self.has_overlay => {
                     self.dirty = true;
-                    self.route_mouse_scroll(*direction, *x, *y);
+                    self.route_mouse_scroll(*direction, raw_bytes, *x, *y);
                 }
                 InputEvent::MouseScroll { .. } => {
                     // Overlay active — swallow scroll events.
@@ -652,11 +657,12 @@ where
                 InputEvent::Mouse {
                     button,
                     event_type,
+                    ref raw_bytes,
                     x,
                     y,
                 } if !self.has_overlay => {
                     self.dirty = true;
-                    self.handle_mouse_event(*button, *event_type, *x, *y, layout_lua);
+                    self.handle_mouse_event(*button, *event_type, raw_bytes, *x, *y, layout_lua);
                 }
                 InputEvent::Mouse { .. } => {
                     // Overlay active — swallow mouse events.
@@ -767,18 +773,41 @@ where
     /// Hit-tests `last_widget_areas` to find which widget contains (x, y),
     /// then delegates to that widget's `mouse_scroll()`. If nothing
     /// scrollable is under the cursor, the event is discarded.
-    fn route_mouse_scroll(&mut self, direction: super::raw_input::ScrollDirection, x: u16, y: u16) {
-        let target_uuid = self
+    fn route_mouse_scroll(
+        &mut self,
+        direction: super::raw_input::ScrollDirection,
+        raw_bytes: &[u8],
+        x: u16,
+        y: u16,
+    ) {
+        let target = self
             .last_widget_areas
             .iter()
             .find(|(_, area)| {
                 let r = &area.rect;
                 x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height
             })
-            .map(|(id, _)| id.clone());
+            .map(|(id, area)| (id.clone(), area.rect));
 
-        if let Some(panel) = target_uuid.and_then(|uuid| self.panel_pool.panels.get_mut(&uuid)) {
-            panel.mouse_scroll(direction);
+        if let Some((uuid, rect)) = target {
+            if self
+                .panel_pool
+                .panels
+                .get(&uuid)
+                .map(|panel| panel.sgr_mouse_passthrough_enabled())
+                .unwrap_or(false)
+            {
+                let data = Self::sgr_mouse_bytes_with_local_coords(
+                    raw_bytes,
+                    x.saturating_sub(rect.x),
+                    y.saturating_sub(rect.y),
+                );
+                self.route_session_input(uuid, &data);
+                return;
+            }
+            if let Some(panel) = self.panel_pool.panels.get_mut(&uuid) {
+                panel.mouse_scroll(direction);
+            }
         }
     }
 
@@ -793,6 +822,7 @@ where
         &mut self,
         button: super::raw_input::MouseButton,
         event_type: MouseEventType,
+        raw_bytes: &[u8],
         x: u16,
         y: u16,
         layout_lua: Option<&super::layout_lua::LayoutLua>,
@@ -861,6 +891,20 @@ where
         let Some((widget_id, widget_type, _rect, local_x, local_y)) = target else {
             return;
         };
+
+        if widget_type == "terminal" {
+            if self
+                .panel_pool
+                .panels
+                .get(&widget_id)
+                .map(|panel| panel.sgr_mouse_passthrough_enabled())
+                .unwrap_or(false)
+            {
+                let data = Self::sgr_mouse_bytes_with_local_coords(raw_bytes, local_x, local_y);
+                self.route_session_input(widget_id, &data);
+                return;
+            }
+        }
 
         let event_str = match event_type {
             MouseEventType::Press => "press",
@@ -1009,6 +1053,37 @@ where
             .and_then(|uuid| self.panel_pool.panels().get(uuid))
             .map(|panel| panel.focus_reporting())
             .unwrap_or(false)
+    }
+
+    fn sgr_mouse_bytes_with_local_coords(raw_bytes: &[u8], local_x: u16, local_y: u16) -> Vec<u8> {
+        let Ok(raw) = std::str::from_utf8(raw_bytes) else {
+            return raw_bytes.to_vec();
+        };
+        let Some(body) = raw.strip_prefix("\x1b[<") else {
+            return raw_bytes.to_vec();
+        };
+        let Some(final_byte) = body.as_bytes().last().copied() else {
+            return raw_bytes.to_vec();
+        };
+        if !matches!(final_byte, b'M' | b'm') {
+            return raw_bytes.to_vec();
+        }
+        let params = &body[..body.len().saturating_sub(1)];
+        let mut parts = params.split(';');
+        let Some(button_code) = parts.next() else {
+            return raw_bytes.to_vec();
+        };
+        if parts.next().is_none() || parts.next().is_none() || parts.next().is_some() {
+            return raw_bytes.to_vec();
+        }
+        format!(
+            "\x1b[<{};{};{}{}",
+            button_code,
+            local_x.saturating_add(1),
+            local_y.saturating_add(1),
+            final_byte as char
+        )
+        .into_bytes()
     }
 
     /// Map a Lua key action to a `TuiAction` and handle it.
@@ -1753,6 +1828,32 @@ where
             let msg_uuid = msg.get("session_uuid").and_then(|v| v.as_str());
             if msg_uuid == self.panel_pool.current_session_uuid() {
                 if let Some(enabled) = msg.get("enabled").and_then(|v| v.as_bool()) {
+                    self.terminal_modes.on_kitty_changed(enabled);
+                }
+            }
+            return;
+        }
+
+        if event_type == "mode_changed" {
+            let msg_uuid = msg.get("session_uuid").and_then(|v| v.as_str());
+            let Some(session_uuid) = msg_uuid else {
+                return;
+            };
+            let Some(mode_value) = msg.get("mode") else {
+                return;
+            };
+            let Ok(mode) =
+                serde_json::from_value::<crate::session::protocol::ModeChanged>(mode_value.clone())
+            else {
+                log::warn!("[TUI] malformed mode_changed for session={session_uuid}");
+                return;
+            };
+            let focused = msg_uuid == self.panel_pool.current_session_uuid();
+            let kitty_enabled = mode.kitty_enabled;
+            let panel = self.panel_pool.resolve_panel(session_uuid);
+            panel.apply_mode_changed(mode);
+            if focused {
+                if let Some(enabled) = kitty_enabled {
                     self.terminal_modes.on_kitty_changed(enabled);
                 }
             }
@@ -2526,6 +2627,35 @@ mod tests {
         runner.terminal_modes.on_focus_lost();
 
         (runner, request_rx)
+    }
+
+    fn create_test_runner_with_session_input() -> (
+        TuiRunner<TestBackend>,
+        mpsc::UnboundedReceiver<TuiSessionInput>,
+    ) {
+        let backend = TestBackend::new(80, 24);
+        let terminal = Terminal::new(backend).expect("Failed to create test terminal");
+        let (request_tx, _request_rx) = mpsc::unbounded_channel::<TuiRequest>();
+        let (_output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (session_input_tx, session_input_rx) = mpsc::unbounded_channel::<TuiSessionInput>();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let mut runner = TuiRunner::new_with_color_cache_and_session_input(
+            terminal,
+            request_tx,
+            output_rx,
+            shutdown,
+            (24, 80),
+            None,
+            TuiRunner::<TestBackend>::probe_spawning_terminal_colors(),
+            Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            Some(session_input_tx),
+        );
+        let lua = make_test_layout_with_keybindings();
+        runner.mode = lua.call_initial_mode();
+        runner.terminal_modes.on_focus_lost();
+
+        (runner, session_input_rx)
     }
 
     #[test]
@@ -4462,6 +4592,140 @@ mod tests {
             runner.panel_pool.panels().len(),
             0,
             "bridge reconnect should hard-reset panel state"
+        );
+    }
+
+    #[test]
+    fn mode_changed_updates_panel_mouse_tracking_state() {
+        let (mut runner, _request_rx) = create_test_runner();
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
+        runner.panel_pool.resolve_panel("sess-0").on_scrollback(b"");
+
+        runner.dispatch_hub_event(
+            serde_json::json!({
+                "type": "mode_changed",
+                "session_uuid": "sess-0",
+                "mode": { "mouse_mode": 8 }
+            }),
+            None,
+        );
+
+        assert!(runner
+            .panel_pool
+            .panels()
+            .get("sess-0")
+            .expect("panel")
+            .mouse_tracking());
+        assert!(!runner
+            .panel_pool
+            .panels()
+            .get("sess-0")
+            .expect("panel")
+            .sgr_mouse_passthrough_enabled());
+    }
+
+    #[test]
+    fn mouse_scroll_over_tracking_terminal_forwards_to_child_pty() {
+        let (mut runner, mut input_rx) = create_test_runner_with_session_input();
+        runner.mode = "terminal".to_string();
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
+        runner.panel_pool.resolve_panel("sess-0").on_scrollback(b"");
+        runner.dispatch_hub_event(
+            serde_json::json!({
+                "type": "mode_changed",
+                "session_uuid": "sess-0",
+                "mode": { "mouse_mode": 12 }
+            }),
+            None,
+        );
+        runner.last_widget_areas.insert(
+            "sess-0".to_string(),
+            crate::clients::tui::render::WidgetArea {
+                rect: ratatui::layout::Rect::new(5, 3, 70, 20),
+                widget_type: "terminal".to_string(),
+            },
+        );
+
+        runner.route_mouse_scroll(
+            crate::clients::tui::raw_input::ScrollDirection::Up,
+            b"\x1b[<64;10;5M",
+            9,
+            4,
+        );
+
+        let input = input_rx.try_recv().expect("mouse input forwarded");
+        assert_eq!(input.session_uuid, "sess-0");
+        assert_eq!(input.data, b"\x1b[<64;5;2M");
+    }
+
+    #[test]
+    fn mouse_button_over_tracking_terminal_forwards_to_child_pty() {
+        let (mut runner, mut input_rx) = create_test_runner_with_session_input();
+        runner.mode = "terminal".to_string();
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
+        runner.panel_pool.resolve_panel("sess-0").on_scrollback(b"");
+        runner.dispatch_hub_event(
+            serde_json::json!({
+                "type": "mode_changed",
+                "session_uuid": "sess-0",
+                "mode": { "mouse_mode": 12 }
+            }),
+            None,
+        );
+        runner.last_widget_areas.insert(
+            "sess-0".to_string(),
+            crate::clients::tui::render::WidgetArea {
+                rect: ratatui::layout::Rect::new(5, 3, 70, 20),
+                widget_type: "terminal".to_string(),
+            },
+        );
+
+        runner.handle_mouse_event(
+            crate::clients::tui::raw_input::MouseButton::Left,
+            MouseEventType::Press,
+            b"\x1b[<0;10;5M",
+            9,
+            4,
+            None,
+        );
+
+        let input = input_rx.try_recv().expect("mouse input forwarded");
+        assert_eq!(input.session_uuid, "sess-0");
+        assert_eq!(input.data, b"\x1b[<0;5;2M");
+    }
+
+    #[test]
+    fn sgr_encoding_only_mouse_mode_does_not_passthrough_to_child_pty() {
+        let (mut runner, mut input_rx) = create_test_runner_with_session_input();
+        runner.mode = "terminal".to_string();
+        runner.panel_pool.current_session_uuid = Some("sess-0".to_string());
+        runner.panel_pool.resolve_panel("sess-0").on_scrollback(b"");
+        runner.dispatch_hub_event(
+            serde_json::json!({
+                "type": "mode_changed",
+                "session_uuid": "sess-0",
+                "mode": { "mouse_mode": 8 }
+            }),
+            None,
+        );
+        runner.last_widget_areas.insert(
+            "sess-0".to_string(),
+            crate::clients::tui::render::WidgetArea {
+                rect: ratatui::layout::Rect::new(5, 3, 70, 20),
+                widget_type: "terminal".to_string(),
+            },
+        );
+
+        runner.route_mouse_scroll(
+            crate::clients::tui::raw_input::ScrollDirection::Up,
+            b"\x1b[<64;10;5M",
+            9,
+            4,
+        );
+
+        assert!(
+            input_rx.try_recv().is_err(),
+            "SGR encoding without a tracking bit must not forward mouse input"
         );
     }
 

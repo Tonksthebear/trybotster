@@ -1491,6 +1491,12 @@ fn cleanup_stale_session_files(session_uuid: &str) {
     }
 }
 
+fn session_identity_tmp_pid(file_name: &str) -> Option<u32> {
+    let (_, suffix) = file_name.split_once(".identity.json.")?;
+    let pid = suffix.strip_suffix(".tmp")?;
+    pid.parse::<u32>().ok()
+}
+
 fn remove_socket_path_logged(session_uuid: &str, path: &Path, reason: &str) -> bool {
     remove_file_logged(session_uuid, path, reason)
 }
@@ -1601,7 +1607,10 @@ pub fn cleanup_orphaned_session_files() {
             } else if is_identity_sidecar && !socket_exists {
                 remove_file_logged(session_uuid, &path, "orphan_cleanup_identity_only");
                 removed += 1;
-            } else if is_identity_tmp && !socket_exists {
+            } else if is_identity_tmp
+                && !socket_exists
+                && session_identity_tmp_pid(file_name).is_none_or(|pid| !pid_is_live(pid))
+            {
                 remove_file_logged(session_uuid, &path, "orphan_cleanup_identity_tmp_only");
                 removed += 1;
             }

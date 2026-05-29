@@ -162,6 +162,10 @@ impl Hub {
                         rows: spec.rows,
                         cols: spec.cols,
                         kitty_enabled: spec.pty_handle.kitty_enabled(),
+                        mode: spec
+                            .pty_handle
+                            .get_mode_flags()
+                            .map(crate::session::protocol::mode_changed_from_flags),
                         payload_mode,
                         confirm_subscription: spec.confirm_subscription,
                         live_subscription: Some(live_subscription),

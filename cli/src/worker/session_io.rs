@@ -152,6 +152,14 @@ pub struct TerminalInitialSnapshotDelivery {
     pub cols: u16,
     /// Whether kitty keyboard mode is enabled in the inner PTY.
     pub kitty_enabled: bool,
+    /// Full current mode state captured at attach time for reattach replay.
+    ///
+    /// When present, the initial snapshot delivery path emits a ModeChanged
+    /// control frame (after Scrollback / subscribed, before TerminalAttach)
+    /// so TUI Raw and other clients receive complete mouse_mode, focus, etc.
+    /// as part of the attach barrier. Built via the shared helper from live
+    /// PTY flags to keep behavior identical to the browser reused-sub path.
+    pub mode: Option<crate::session::protocol::ModeChanged>,
     /// Payload preparation expected by the transport adapter.
     pub payload_mode: TerminalSnapshotPayloadMode,
     /// Whether the transport needs a subscription confirmation after the
@@ -205,6 +213,8 @@ pub enum TerminalAttachDeliveryPhase {
     Snapshot,
     /// Optional subscribe acknowledgement frame.
     SubscribeAck,
+    /// Full mode state replay (ModeChanged) before attach/reconnect state.
+    ModeReplay,
     /// Terminal attach state control frame.
     AttachState,
 }

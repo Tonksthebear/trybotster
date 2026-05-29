@@ -637,6 +637,12 @@ impl SessionIoRuntime {
                         return;
                     }
                 }
+
+                // Replay mode (if captured) before any reconnect/attach state.
+                if self.try_replay_initial_attach_mode(&delivery).is_err() {
+                    return;
+                }
+
                 if self
                     .try_send_initial_attach_control(
                         &delivery,
@@ -737,6 +743,26 @@ impl SessionIoRuntime {
             }
         }
 
+        // Mode replay for non-empty path.
+        // For mode=None we keep the exact original if-let shape (no extra
+        // helper call) so that existing backpressure tests for the mode=None
+        // case continue to see the same phase failure points.
+        if let Some(mode) = &delivery.mode {
+            if self
+                .try_send_initial_attach_control(
+                    &delivery,
+                    TerminalAttachDeliveryPhase::ModeReplay,
+                    crate::worker::client::ClientControlFrame::ModeChanged {
+                        session_uuid: self.session_uuid.clone(),
+                        mode: mode.clone(),
+                    },
+                )
+                .is_err()
+            {
+                return;
+            }
+        }
+
         if self
             .try_send_initial_attach_control(
                 &delivery,
@@ -783,6 +809,28 @@ impl SessionIoRuntime {
                 );
                 Err(())
             }
+        }
+    }
+
+    /// Replays the captured initial mode state (if any) before emitting the final
+    /// attach/reconnect state. This ensures clients receive full mouse_mode,
+    /// focus, etc. as part of the attach barrier on both non-empty and empty
+    /// snapshot paths (per reviewer requirement for TUI Raw reattach).
+    fn try_replay_initial_attach_mode(
+        &self,
+        delivery: &TerminalInitialSnapshotDelivery,
+    ) -> Result<(), ()> {
+        if let Some(mode) = &delivery.mode {
+            self.try_send_initial_attach_control(
+                delivery,
+                TerminalAttachDeliveryPhase::ModeReplay,
+                crate::worker::client::ClientControlFrame::ModeChanged {
+                    session_uuid: self.session_uuid.clone(),
+                    mode: mode.clone(),
+                },
+            )
+        } else {
+            Ok(())
         }
     }
 
@@ -898,12 +946,14 @@ impl SessionIoRuntime {
     }
 
     fn flush_metadata(&mut self) {
-        for event in self.coalescer.take_metadata(
+        let (events, mode_delta) = self.coalescer.take_metadata(
             &self.session_uuid,
             &self.kitty_enabled,
             &self.cursor_visible,
-        ) {
-            match &event {
+        );
+
+        for event in &events {
+            match event {
                 PtyEvent::KittyChanged(enabled) => {
                     self.deliver_terminal_control(
                         crate::worker::client::ClientControlFrame::KittyChanged {
@@ -922,7 +972,20 @@ impl SessionIoRuntime {
                 }
                 _ => {}
             }
-            let _ = self.event_tx.send(event);
+            let _ = self.event_tx.send(event.clone());
+        }
+
+        // Item 2 producer (cold-turkey mode boundary):
+        // Consume the mode delta once (from take_metadata) and emit the full
+        // typed ClientControlFrame::ModeChanged for any clients that want the
+        // complete terminal mode state (mouse_mode, etc.).
+        if let Some(mode) = mode_delta {
+            self.deliver_terminal_control(
+                crate::worker::client::ClientControlFrame::ModeChanged {
+                    session_uuid: self.session_uuid.clone(),
+                    mode,
+                },
+            );
         }
     }
 
@@ -1106,9 +1169,10 @@ impl SessionIoCoalescer {
         _session_uuid: &str,
         kitty_enabled: &AtomicBool,
         cursor_visible: &AtomicBool,
-    ) -> Vec<PtyEvent> {
+    ) -> (Vec<PtyEvent>, Option<ModeChanged>) {
         let mut events = Vec::new();
-        if let Some(mode) = self.mode.take() {
+        let mode_delta = self.mode.take();
+        if let Some(mode) = &mode_delta {
             if let Some(kitty) = mode.kitty_enabled {
                 let old = kitty_enabled.load(Ordering::Relaxed);
                 if kitty != old {
@@ -1134,7 +1198,7 @@ impl SessionIoCoalescer {
         if !self.has_metadata() {
             self.metadata_started_at = None;
         }
-        events
+        (events, mode_delta)
     }
 
     fn ensure_metadata_started(&mut self) {
@@ -1342,6 +1406,7 @@ mod tests {
                         rows: 24,
                         cols: 80,
                         kitty_enabled: false,
+                        mode: None,
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: false,
                         live_subscription: None,
@@ -1414,6 +1479,7 @@ mod tests {
                         rows: 24,
                         cols: 80,
                         kitty_enabled: false,
+                        mode: None,
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: true,
                         live_subscription: None,
@@ -1510,6 +1576,7 @@ mod tests {
                         rows: 24,
                         cols: 80,
                         kitty_enabled: false,
+                        mode: None,
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: true,
                         live_subscription: Some(live_subscription),
@@ -1528,18 +1595,8 @@ mod tests {
             .write_all(&encode_frame(FRAME_SNAPSHOT, b"initial-partial-snapshot"))
             .expect("write snapshot frame");
 
-        match block_on_with_timeout(async {
-            client_rx
-                .recv()
-                .await
-                .expect("client worker initial snapshot")
-        }) {
-            crate::worker::client::ClientWorkerMessage::ControlFrame(
-                crate::worker::client::ClientControlFrame::Scrollback { data, .. },
-            ) => assert_eq!(data, b"initial-partial-snapshot"),
-            other => panic!("expected Scrollback control frame, got {other:?}"),
-        }
-
+        // Assert the delivery failure first (while the 1-slot client queue is still occupied by the undrained Scrollback).
+        // This makes the SubscribeAck phase assertion deterministic for the mode=None case.
         match recv_hub_event(&mut hub_rx) {
             HubEvent::SessionIo(SessionIoEvent::TerminalAttachDeliveryFailed {
                 request_id,
@@ -1552,6 +1609,19 @@ mod tests {
                 assert_eq!(reason, TerminalAttachDeliveryFailureReason::QueueFull);
             }
             other => panic!("expected TerminalAttachDeliveryFailed, got {other:?}"),
+        }
+
+        // Now drain the Scrollback that was already in the queue.
+        match block_on_with_timeout(async {
+            client_rx
+                .recv()
+                .await
+                .expect("client worker initial snapshot")
+        }) {
+            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::Scrollback { data, .. },
+            ) => assert_eq!(data, b"initial-partial-snapshot"),
+            other => panic!("expected Scrollback control frame, got {other:?}"),
         }
         assert!(matches!(
             recv_hub_event(&mut hub_rx),
@@ -1568,6 +1638,230 @@ mod tests {
             client_rx.try_recv().is_err(),
             "partial attach must not activate live output delivery"
         );
+    }
+
+    #[test]
+    fn non_empty_initial_snapshot_with_mode_replays_before_attached() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (request_tx, _event_rx, _response_rx, _hub_rx, _alive) =
+            spawn_test_worker_with_requests(reader);
+        let (client_tx, mut client_rx) =
+            tokio_mpsc::channel::<crate::worker::client::ClientWorkerMessage>(8);
+        let worker = crate::worker::client::ClientWorkerHandle {
+            client_id: crate::client::ClientId::Socket("client".to_string()),
+            tx: client_tx,
+        };
+
+        let mode = crate::session::protocol::ModeChanged {
+            kitty_enabled: Some(true),
+            cursor_visible: Some(true),
+            bracketed_paste: Some(true),
+            mouse_mode: Some(8),
+            alt_screen: Some(false),
+            focus_reporting: Some(true),
+            application_cursor: Some(true),
+        };
+
+        block_on_with_timeout(async {
+            request_tx
+                .send(SessionIoRequest::GetInitialSnapshot {
+                    delivery: crate::worker::session_io::TerminalInitialSnapshotDelivery {
+                        request_id: "initial-with-mode".to_string(),
+                        subscription_key: "client:sess-test-io".to_string(),
+                        session_uuid: "sess-test-io".to_string(),
+                        subscription_id: "terminal_with_mode".to_string(),
+                        worker,
+                        rows: 24,
+                        cols: 80,
+                        kitty_enabled: false,
+                        mode: Some(mode.clone()),
+                        payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
+                        confirm_subscription: true,
+                        live_subscription: None,
+                        attach_requested_at: None,
+                        client_worker_subscribed_at: None,
+                        session_io_snapshot_queued_at: None,
+                        session_io_accepted_at: None,
+                    },
+                })
+                .await
+                .expect("request initial snapshot with mode");
+        });
+        std::thread::sleep(Duration::from_millis(10));
+
+        writer
+            .write_all(&encode_frame(FRAME_SNAPSHOT, b"mode-snapshot"))
+            .expect("write snapshot");
+
+        // Expect Scrollback first
+        match block_on_with_timeout(async {
+            client_rx.recv().await.expect("scrollback")
+        }) {
+            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::Scrollback { data, .. },
+            ) => assert_eq!(data, b"mode-snapshot"),
+            other => panic!("expected Scrollback, got {other:?}"),
+        }
+
+        // Then subscribed (confirm_subscription = true)
+        match block_on_with_timeout(async {
+            client_rx.recv().await.expect("subscribed")
+        }) {
+            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::BoundaryJson(value),
+            ) => {
+                assert_eq!(value.get("type").and_then(|v| v.as_str()), Some("subscribed"));
+            }
+            other => panic!("expected subscribed, got {other:?}"),
+        }
+
+        // Then ModeChanged (the key new behavior)
+        match block_on_with_timeout(async {
+            client_rx.recv().await.expect("mode changed")
+        }) {
+            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::ModeChanged { mode: received_mode, .. },
+            ) => {
+                assert_eq!(received_mode, mode);
+            }
+            other => panic!("expected ModeChanged, got {other:?}"),
+        }
+
+        // Then TerminalAttach(Attached)
+        match block_on_with_timeout(async {
+            client_rx.recv().await.expect("attached")
+        }) {
+            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::TerminalAttach { state, .. },
+            ) => {
+                assert_eq!(state, crate::worker::client::TerminalAttachState::Attached);
+            }
+            other => panic!("expected Attached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_live_initial_snapshot_with_mode_replays_before_reconnecting() {
+        let session_uuid = "sess-test-io-mode-empty".to_string();
+        let socket_path =
+            crate::session::session_socket_path(&session_uuid).expect("session socket path");
+        std::fs::write(&socket_path, b"").expect("create live session socket");
+        crate::session::write_session_pid_file(&session_uuid, std::process::id())
+            .expect("write live session pid");
+
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (request_tx, _event_rx, _response_rx, _hub_rx, _alive) =
+            spawn_test_worker_with_session(reader, &session_uuid);
+        let (client_tx, mut client_rx) =
+            tokio_mpsc::channel::<crate::worker::client::ClientWorkerMessage>(8);
+        let worker = crate::worker::client::ClientWorkerHandle {
+            client_id: crate::client::ClientId::Socket("client".to_string()),
+            tx: client_tx,
+        };
+
+        let live_subscription = TerminalOutputSubscription {
+            subscription_key: format!("client:{session_uuid}"),
+            subscription_id: "terminal_empty_live_mode".to_string(),
+            worker: worker.clone(),
+            output_prefix: Vec::new(),
+            filter: crate::worker::session_io::TerminalOutputFilter::None,
+        };
+
+        let mode = crate::session::protocol::ModeChanged {
+            mouse_mode: Some(8),
+            focus_reporting: Some(true),
+            ..Default::default()
+        };
+
+        block_on_with_timeout(async {
+            request_tx
+                .send(SessionIoRequest::GetInitialSnapshot {
+                    delivery: crate::worker::session_io::TerminalInitialSnapshotDelivery {
+                        request_id: "initial-empty-live-mode".to_string(),
+                        subscription_key: format!("client:{session_uuid}"),
+                        session_uuid: session_uuid.clone(),
+                        subscription_id: "terminal_empty_live_mode".to_string(),
+                        worker,
+                        rows: 24,
+                        cols: 80,
+                        kitty_enabled: false,
+                        mode: Some(mode.clone()),
+                        payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
+                        confirm_subscription: true,
+                        live_subscription: Some(live_subscription),
+                        attach_requested_at: None,
+                        client_worker_subscribed_at: None,
+                        session_io_snapshot_queued_at: None,
+                        session_io_accepted_at: None,
+                    },
+                })
+                .await
+                .expect("request empty live with mode");
+        });
+        std::thread::sleep(Duration::from_millis(10));
+
+        writer
+            .write_all(&encode_frame(FRAME_SNAPSHOT, b""))
+            .expect("write empty snapshot");
+
+        // Expect subscribed first (confirm_subscription = true)
+        match block_on_with_timeout(async {
+            client_rx.recv().await.expect("subscribed")
+        }) {
+            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::BoundaryJson(value),
+            ) => {
+                assert_eq!(value.get("type").and_then(|v| v.as_str()), Some("subscribed"));
+            }
+            other => panic!("expected subscribed, got {other:?}"),
+        }
+
+        // Then ModeChanged (the key assertion)
+        match block_on_with_timeout(async {
+            client_rx.recv().await.expect("mode changed")
+        }) {
+            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::ModeChanged { mode: received_mode, .. },
+            ) => {
+                assert_eq!(received_mode, mode);
+            }
+            other => panic!("expected ModeChanged, got {other:?}"),
+        }
+
+        // Then TerminalAttach(Reconnecting)
+        match block_on_with_timeout(async {
+            client_rx.recv().await.expect("reconnecting")
+        }) {
+            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                crate::worker::client::ClientControlFrame::TerminalAttach { state, .. },
+            ) => {
+                assert_eq!(state, crate::worker::client::TerminalAttachState::Reconnecting);
+            }
+            other => panic!("expected Reconnecting, got {other:?}"),
+        }
+
+        // After the barrier, live output must now flow (activation happens after Reconnecting + mode replay).
+        writer
+            .write_all(&encode_frame(FRAME_PTY_OUTPUT, b"live-after-reconnect"))
+            .expect("write live output after reconnect");
+        std::thread::sleep(Duration::from_millis(10));
+
+        match block_on_with_timeout(async {
+            client_rx.recv().await
+        }) {
+            Some(crate::worker::client::ClientWorkerMessage::TerminalBytes { data, .. }) => {
+                assert_eq!(data, b"live-after-reconnect");
+            }
+            other => panic!("expected TerminalBytes after barrier, got {other:?}"),
+        }
+
+        // Cleanup
+        if let Ok(path) = crate::session::session_socket_path(&session_uuid) {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Ok(path) = crate::session::session_pid_path(&session_uuid) {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]
@@ -1601,6 +1895,7 @@ mod tests {
                         rows: 24,
                         cols: 80,
                         kitty_enabled: false,
+                        mode: None,
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: false,
                         live_subscription: Some(live_subscription),
@@ -1707,6 +2002,7 @@ mod tests {
                         rows: 24,
                         cols: 80,
                         kitty_enabled: false,
+                        mode: None,
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: true,
                         live_subscription: None,
@@ -1804,6 +2100,7 @@ mod tests {
                         rows: 24,
                         cols: 80,
                         kitty_enabled: false,
+                        mode: None,
                         payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
                         confirm_subscription: true,
                         live_subscription: Some(live_subscription),
@@ -2397,5 +2694,37 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("response frame");
         assert_eq!(frame.frame_type, FRAME_GET_SCREEN);
+    }
+
+    #[test]
+    fn coalescer_returns_mouse_mode_delta_without_legacy_mouse_pty_event() {
+        // This narrow test directly protects the bug fixed in Item 2:
+        // a mouse_mode-only delta must be returned by take_metadata (for the
+        // typed ModeChanged path) while producing no mouse-specific legacy PtyEvent
+        // in this producer slice.
+        let mut coalescer = SessionIoCoalescer::default();
+        let dummy_kitty = Arc::new(AtomicBool::new(false));
+        let dummy_cursor = Arc::new(AtomicBool::new(true));
+
+        let mut delta = ModeChanged::default();
+        delta.mouse_mode = Some(8); // example SGR-only value
+
+        coalescer.merge_mode(delta);
+
+        let (events, mode_delta) =
+            coalescer.take_metadata("sess-test", &dummy_kitty, &dummy_cursor);
+
+        // For a mouse_mode-only delta in this producer slice, we intentionally
+        // produce no legacy PtyEvent — the value lives only in the returned
+        // sparse ModeChanged delta for the typed path.
+        assert!(
+            events.is_empty(),
+            "expected no PtyEvents for mouse_mode-only delta in Item 2 producer slice, got: {:?}",
+            events
+        );
+
+        // The full sparse delta must be returned with mouse_mode intact
+        let returned = mode_delta.expect("mode delta must be returned for typed path");
+        assert_eq!(returned.mouse_mode, Some(8));
     }
 }
