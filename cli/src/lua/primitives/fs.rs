@@ -120,15 +120,41 @@ pub fn register(lua: &Lua) -> Result<()> {
                         ));
                     }
                 }
-            }
-
-            if let Err(e) = std::fs::write(file_path, content) {
-                return Ok((None::<bool>, Some(format!("Failed to write file: {e}"))));
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(e) =
+                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                    {
+                        return Ok((
+                            None::<bool>,
+                            Some(format!("Failed to set parent permissions: {e}")),
+                        ));
+                    }
+                }
             }
 
             #[cfg(unix)]
             {
+                use std::io::Write;
+                use std::os::unix::fs::OpenOptionsExt;
                 use std::os::unix::fs::PermissionsExt;
+
+                let mut file = match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .mode(0o600)
+                    .open(file_path)
+                {
+                    Ok(file) => file,
+                    Err(e) => {
+                        return Ok((None::<bool>, Some(format!("Failed to write file: {e}"))))
+                    }
+                };
+                if let Err(e) = file.write_all(content.as_bytes()) {
+                    return Ok((None::<bool>, Some(format!("Failed to write file: {e}"))));
+                }
                 if let Err(e) =
                     std::fs::set_permissions(file_path, std::fs::Permissions::from_mode(0o600))
                 {
@@ -136,6 +162,13 @@ pub fn register(lua: &Lua) -> Result<()> {
                         None::<bool>,
                         Some(format!("Failed to set permissions: {e}")),
                     ));
+                }
+            }
+
+            #[cfg(not(unix))]
+            {
+                if let Err(e) = std::fs::write(file_path, content) {
+                    return Ok((None::<bool>, Some(format!("Failed to write file: {e}"))));
                 }
             }
 
