@@ -21,6 +21,7 @@ local RETRY_DELAY_SECS = 5
 
 local M = {}
 local pending_prepares = {}
+local reconcile_in_flight = false
 
 local function now()
     return os.time()
@@ -53,52 +54,9 @@ local function token_path(token_version)
     return data_dir() .. "/runtime/token-" .. sanitize(token_version or "0")
 end
 
-local function config_path()
-    return data_dir() .. "/runtime/config.yml"
-end
-
-local function public_claim_rows()
-    local claims = repo.active_claims()
-    if #claims > 0 then return claims end
-
-    -- Advisory plan decision: local_webhooks is not implemented in this slice.
-    -- A configured placeholder port keeps named-tunnel config generation real
-    -- without inventing local request delivery here.
-    local port = os.getenv("BOTSTER_STABLE_URL_PLACEHOLDER_PORT")
-    if type(port) ~= "string" or port == "" then return {} end
-    local hostname = os.getenv("BOTSTER_STABLE_URL_PLACEHOLDER_HOSTNAME")
-    if type(hostname) ~= "string" or hostname == "" then return {} end
-    return {
-        {
-            id = "placeholder-" .. hostname,
-            hostname = hostname,
-            public_url = "https://" .. hostname,
-            owner_plugin = false,
-            owner_key = false,
-            purpose = "placeholder",
-            local_service_url = "http://127.0.0.1:" .. port,
-            status = "claimed",
-        },
-    }
-end
-
-local function config_contents(tunnel)
-    local lines = {
-        "tunnel: " .. tostring(tunnel.cloudflare_tunnel_id or tunnel.id or ""),
-        "token-file: " .. token_path(tunnel.token_version),
-        "ingress:",
-    }
-    for _, claim in ipairs(public_claim_rows()) do
-        lines[#lines + 1] = "  - hostname: " .. tostring(claim.hostname)
-        lines[#lines + 1] = "    service: " .. tostring(claim.local_service_url)
-    end
-    lines[#lines + 1] = "  - service: http_status:404"
-    return table.concat(lines, "\n") .. "\n"
-end
-
 local function command_args(tunnel)
     local name = tunnel.cloudflare_tunnel_name or tunnel.name or tunnel.cloudflare_tunnel_id or tunnel.id
-    return { "tunnel", "--config", config_path(), "run", "--token-file", token_path(tunnel.token_version), tostring(name) }
+    return { "tunnel", "run", "--token-file", token_path(tunnel.token_version), tostring(name) }
 end
 
 local function publish_connector(status, message, extras)
@@ -147,13 +105,6 @@ local function materialize_runtime_files(tunnel, secret_key)
     if not token then return nil, token_err or "connector token secret missing" end
 
     local ok, err = fs.write_private(token_path(tunnel.token_version), token)
-    if not ok then return nil, err end
-
-    local cfg = config_contents(tunnel)
-    if cfg:find(tunnel.connector_token, 1, true) then
-        return nil, "generated cloudflared config contains connector token"
-    end
-    ok, err = fs.write(config_path(), cfg)
     if not ok then return nil, err end
     return true
 end
@@ -213,8 +164,6 @@ local function spawn_connector(state, tunnel, reason)
     Hub.get():prepare_plugin_command({
         request_id = request_id,
         command = cloudflared_command(),
-        config_path = config_path(),
-        config_contents = config_contents(tunnel),
         context = {
             owner_plugin = PLUGIN_NAME,
             connector_generation = state.connector_generation,
@@ -240,10 +189,20 @@ end
 
 function M.reconcile(reason)
     reason = reason or "reconcile"
+    if reconcile_in_flight then
+        return false
+    end
+
+    reconcile_in_flight = true
+    local function finish_reconcile()
+        reconcile_in_flight = false
+    end
+
     publish_connector("reconciling", "Reconciling Cloudflare stable connector (" .. reason .. ")")
 
     if hub and hub.is_offline and hub.is_offline() then
         publish_connector("unhealthy", "Hub is offline; Cloudflare stable connector is paused")
+        finish_reconcile()
         return false
     end
 
@@ -252,9 +211,11 @@ function M.reconcile(reason)
     local hub_id = hub and hub.hub_id and hub.hub_id()
     if not server_url or not api_token or not hub_id then
         publish_connector("unhealthy", "Missing hub server URL, API token, or hub id")
+        finish_reconcile()
         return false
     end
 
+    local completed = false
     local request_id = http.request({
         method = "POST",
         url = trim_slash(server_url) .. "/hubs/" .. tostring(hub_id) .. "/cloudflare_tunnel",
@@ -266,6 +227,8 @@ function M.reconcile(reason)
         body = "{}",
         timeout_ms = 30000,
     }, function(resp, err)
+        completed = true
+        finish_reconcile()
         if err then
             publish_connector("unhealthy", tostring(err))
             schedule_retry(tostring(err))
@@ -291,7 +254,7 @@ function M.reconcile(reason)
             token_version = tunnel.token_version,
             token_secret_key = secret_key,
             token_path = token_path(tunnel.token_version),
-            config_path = config_path(),
+            config_path = false,
             connector_generation = generation,
             status = "reconciling",
             message = "Broker material received",
@@ -319,6 +282,7 @@ function M.reconcile(reason)
 
         spawn_connector(state, tunnel, reason)
     end)
+    if completed then finish_reconcile() end
     return request_id
 end
 

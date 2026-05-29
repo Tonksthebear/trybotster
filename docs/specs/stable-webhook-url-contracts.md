@@ -13,7 +13,7 @@ separate platform owners plus consumer/provider plugins:
 | Layer | Owns | Does not own |
 |---|---|---|
 | Rails broker | Cloudflare account credentials, named-tunnel desired state, hostname allocation, connector token minting, rotation, revocation, and hub auth | provider webhook parsing, consumer plugin secrets, local handler execution |
-| Cloudflare stable-url hub plugin | per-hub connector lifecycle, token secret pointer, local cloudflared config, URL claim pool, reconciliation, and entity publication | Cloudflare account API token, consumer webhook verification, arbitrary path multiplexing |
+| Cloudflare stable-url hub plugin | per-hub connector lifecycle, token secret pointer, token-file materialization, URL claim pool, reconciliation, and entity publication | Cloudflare account API token, consumer webhook verification, arbitrary path multiplexing, Cloudflare ingress desired-state mutation |
 | `local_webhooks` primitive | provider-neutral local HTTP listener, route registration, bounded request delivery, response shaping, reload cleanup, and generation fencing | Cloudflare policy, signature verification, replay/idempotency semantics, durable business processing |
 | Consumer/provider plugins | stable URL claims, provider signature verification, event parsing, replay/idempotency, and durable domain actions | Cloudflare tunnel token, Rails account credentials, listener process ownership |
 
@@ -26,7 +26,7 @@ slices must prove runtime behavior through:
 - CLI tests that send a local HTTP request through `local_webhooks` into a
   plugin worker mailbox.
 - Lua/plugin tests that claim a stable URL, publish entities, store only secret
-  pointers, and reconcile a single connector config.
+  pointers, and reconcile a single connector process.
 - Reload tests that prove route generations fence stale completions.
 
 The current Cloudflare hosted-preview quick-tunnel plugin remains separate. It
@@ -68,11 +68,18 @@ orchestration that naturally belongs on those models or small adapter POROs.
 Each hub has one Cloudflare named tunnel and one active connector token
 generation. Multiple stable hostnames route through that tunnel.
 
-The stable-url plugin writes one named-tunnel config file with an ingress array:
-one rule per claimed hostname forwarding to the local listener URL, followed by
-the mandatory `http_status:404` catch-all. It must not run `cloudflared tunnel
-run` with `--url`, because that collapses config-file ingress into single
-service mode.
+The current Rails broker returns a Cloudflare remotely managed connector token.
+In that mode, the stable-url plugin writes only the token file and runs
+`cloudflared tunnel run --token-file ...`; it must not pass `--config` or
+`--url`. Hostname and ingress desired state belongs to Rails/Cloudflare API
+management for this mode.
+
+If a later slice switches to locally managed tunnel credentials, then the hub
+plugin may own a named-tunnel config file with an ingress array: one rule per
+claimed hostname forwarding to the local listener URL, followed by the
+mandatory `http_status:404` catch-all. That credentials-file mode must not run
+`cloudflared tunnel run` with `--url`, because that collapses config-file
+ingress into single service mode.
 
 Ingress service ports must match the actual local listener port allocated at
 runtime. A Foreman-managed service must use the real assigned port, not
@@ -286,10 +293,10 @@ stop accepting new requests for that hostname, publish entity state, and let
 any old in-flight completions fall under the stale-generation rule.
 
 The stable-url plugin reconciliation loop compares Rails desired state,
-plugin.db claims, encrypted secret presence, generated cloudflared config,
-process health, and published entities. It repairs missing config, restarts
-stale connectors, marks orphaned claims unhealthy, and releases hostnames only
-through the claim/release contract or Rails revocation.
+plugin.db claims, encrypted secret presence, materialized token-file state,
+process health, and published entities. It repairs missing token files,
+restarts stale connectors, marks orphaned claims unhealthy, and releases
+hostnames only through the claim/release contract or Rails revocation.
 
 ## Ticket Decomposition
 
@@ -297,7 +304,7 @@ through the claim/release contract or Rails revocation.
 |---|---|---|
 | Rails broker | Routes, models, auth, Cloudflare adapter PORO | Model/controller/adapter tests; token redaction assertions; rotation/revocation tests. |
 | `local_webhooks` primitive | Rust listener plus Lua API | CLI unit/integration tests through `cd cli && ./test.sh`; body limit, timeout, mailbox-full, generation fencing, and method rejection tests. |
-| Cloudflare stable-url plugin | Device plugin with plugin.db, secrets, entities, connector process | Lua/plugin tests for claim/release/list, entity publication, secret pointer storage, connector config generation, and reconciliation. |
+| Cloudflare stable-url plugin | Device plugin with plugin.db, secrets, entities, connector process | Lua/plugin tests for claim/release/list, entity publication, secret pointer storage, token-file materialization, and reconciliation. |
 | Consumer plugins | Provider verification and event policy | Provider-specific signature/challenge/replay tests; no access to Cloudflare tunnel token. |
 | Static guardrails | Source/documentation assertions | No hub-stored `mlua::Function` route handlers; no real-looking secrets in examples; no Cloudflare account credentials outside Rails broker code. |
 
