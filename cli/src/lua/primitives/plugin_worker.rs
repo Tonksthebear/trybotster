@@ -18,7 +18,7 @@ use mlua::{Lua, LuaSerdeExt, Table, Value};
 
 use crate::hub::events::{HubEvent, HubEventTx};
 use crate::lua::primitives::json::json_to_lua;
-use crate::lua::primitives::{http, websocket};
+use crate::lua::primitives::{http, local_webhooks, websocket};
 use crate::lua::LuaRuntime;
 use crate::worker::plugin::PLUGIN_WORKER_QUEUE;
 
@@ -139,6 +139,7 @@ enum PluginWorkerRequest {
         watch_id: String,
         events: Vec<crate::file_watcher::FileEvent>,
     },
+    LocalWebhook(local_webhooks::LocalWebhookRequest),
 }
 
 #[derive(Clone, Debug)]
@@ -180,6 +181,24 @@ impl PluginWorkerEventTx {
         self.tx
             .try_send(PluginWorkerRequest::UserFileWatch { watch_id, events })
             .is_ok()
+    }
+
+    pub(crate) fn send_local_webhook_request(
+        &self,
+        request: local_webhooks::LocalWebhookRequest,
+    ) -> Result<(), mpsc::TrySendError<local_webhooks::LocalWebhookRequest>> {
+        self.tx
+            .try_send(PluginWorkerRequest::LocalWebhook(request))
+            .map_err(|err| match err {
+                mpsc::TrySendError::Full(PluginWorkerRequest::LocalWebhook(request)) => {
+                    mpsc::TrySendError::Full(request)
+                }
+                mpsc::TrySendError::Disconnected(PluginWorkerRequest::LocalWebhook(request)) => {
+                    mpsc::TrySendError::Disconnected(request)
+                }
+                mpsc::TrySendError::Full(_) => unreachable!("request variant changed"),
+                mpsc::TrySendError::Disconnected(_) => unreachable!("request variant changed"),
+            })
     }
 }
 
@@ -534,6 +553,9 @@ fn worker_loop(
             }
             PluginWorkerRequest::UserFileWatch { watch_id, events } => {
                 runtime.fire_user_file_watch(&watch_id, events);
+            }
+            PluginWorkerRequest::LocalWebhook(request) => {
+                runtime.fire_local_webhook_request(request);
             }
         }
     }
