@@ -1474,6 +1474,227 @@ fn plugin_owned_http_callback_runs_in_plugin_worker_vm() {
 }
 
 #[test]
+fn plugin_owned_local_webhook_runs_in_plugin_worker_vm() {
+    // SAFETY: This integration filter runs this test in isolation and the
+    // worker VM must resolve the repository Lua modules instead of user config.
+    unsafe {
+        std::env::set_var(
+            "BOTSTER_LUA_PATH",
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua"),
+        )
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let plugin_dir = tmp.path().join("worker-webhook-plugin");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    let url_path = tmp.path().join("webhook-url.txt");
+    let output_path = tmp.path().join("webhook-request.txt");
+    let init_path = plugin_dir.join("init.lua");
+    fs::write(
+        &init_path,
+        format!(
+            r#"
+            local url_path = {url_path}
+            local output_path = {output_path}
+
+            local route = local_webhooks.register({{
+                id = "demo.local-webhook",
+                methods = {{ "POST" }},
+                path = "/hooks/<route_token>",
+                body_limit = 1024,
+                timeout_ms = 2000,
+                response_mode = "handler",
+            }}, function(request)
+                local key = rawget(_G, "_plugin_worker_key")
+                if not key then error("hub webhook closure ran") end
+                fs.write(output_path, table.concat({{
+                    key,
+                    request.method,
+                    request.body,
+                    request.headers["content-type"] or "",
+                    request.remote_addr,
+                }}, "|"))
+                return {{
+                    status = 201,
+                    headers = {{ ["x-worker"] = key }},
+                    body = "handled:" .. request.route_id,
+                }}
+            end)
+
+            if route.url then fs.write(url_path, route.url) end
+            return {{}}
+            "#,
+            url_path = serde_json::to_string(&url_path.to_string_lossy()).unwrap(),
+            output_path = serde_json::to_string(&output_path.to_string_lossy()).unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let runtime = LuaRuntime::new().unwrap();
+    runtime
+        .lua()
+        .load(format!(
+            r#"
+            local loader = require("hub.loader")
+            local ok, err = loader.load_plugin({init_path}, "worker-webhook-plugin", {{ source = "device" }})
+            assert(ok, tostring(err))
+            return true
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval::<bool>()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut url = String::new();
+    while Instant::now() < deadline {
+        if let Ok(content) = fs::read_to_string(&url_path) {
+            url = content;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+
+    let response = reqwest::blocking::Client::new()
+        .post(url.trim())
+        .header("content-type", "application/x-botster-test")
+        .body("payload=ok")
+        .send()
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 201);
+    assert_eq!(
+        response.headers().get("x-worker").unwrap(),
+        "worker-webhook-plugin"
+    );
+    assert_eq!(response.text().unwrap(), "handled:demo.local-webhook");
+
+    let content = fs::read_to_string(output_path).unwrap();
+    assert_eq!(
+        content,
+        "worker-webhook-plugin|POST|payload=ok|application/x-botster-test|127.0.0.1"
+    );
+}
+
+#[test]
+fn plugin_owned_local_webhook_response_modes_and_failures() {
+    // SAFETY: This integration filter runs this test in isolation and the
+    // worker VM must resolve the repository Lua modules instead of user config.
+    unsafe {
+        std::env::set_var(
+            "BOTSTER_LUA_PATH",
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua"),
+        )
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let plugin_dir = tmp.path().join("worker-webhook-modes-plugin");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    let url_path = tmp.path().join("webhook-urls.txt");
+    let ack_path = tmp.path().join("webhook-ack.txt");
+    let init_path = plugin_dir.join("init.lua");
+    fs::write(
+        &init_path,
+        format!(
+            r#"
+            local url_path = {url_path}
+            local ack_path = {ack_path}
+
+            local ack = local_webhooks.register({{
+                id = "demo.ack",
+                methods = {{ "POST" }},
+                path = "/ack/<route_token>",
+                response_mode = "ack",
+            }}, function(request)
+                fs.write(ack_path, request.route_id .. ":" .. request.body)
+                return {{ status = 299, body = "ignored" }}
+            end)
+
+            local fail = local_webhooks.register({{
+                id = "demo.fail",
+                methods = {{ "POST" }},
+                path = "/fail/<route_token>",
+                response_mode = "handler",
+            }}, function(_request)
+                error("private failure detail")
+            end)
+
+            local timeout = local_webhooks.register({{
+                id = "demo.timeout",
+                methods = {{ "POST" }},
+                path = "/timeout/<route_token>",
+                timeout_ms = 1,
+                response_mode = "handler",
+            }}, function(_request)
+                local deadline = os.clock() + 0.15
+                while os.clock() < deadline do end
+                return {{ status = 200, body = "too late" }}
+            end)
+
+            if ack.url and fail.url and timeout.url then
+                fs.write(url_path, table.concat({{ ack.url, fail.url, timeout.url }}, "\n"))
+            end
+            return {{}}
+            "#,
+            url_path = serde_json::to_string(&url_path.to_string_lossy()).unwrap(),
+            ack_path = serde_json::to_string(&ack_path.to_string_lossy()).unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let runtime = LuaRuntime::new().unwrap();
+    runtime
+        .lua()
+        .load(format!(
+            r#"
+            local loader = require("hub.loader")
+            local ok, err = loader.load_plugin({init_path}, "worker-webhook-modes-plugin", {{ source = "device" }})
+            assert(ok, tostring(err))
+            return true
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval::<bool>()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut urls = String::new();
+    while Instant::now() < deadline {
+        if let Ok(content) = fs::read_to_string(&url_path) {
+            urls = content;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let urls: Vec<&str> = urls.lines().collect();
+    assert_eq!(urls.len(), 3, "{urls:?}");
+
+    let client = reqwest::blocking::Client::new();
+    let ack = client.post(urls[0]).body("ack-body").send().unwrap();
+    assert_eq!(ack.status().as_u16(), 202);
+    assert_eq!(ack.text().unwrap(), "accepted");
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut ack_content = String::new();
+    while Instant::now() < deadline {
+        if let Ok(content) = fs::read_to_string(&ack_path) {
+            ack_content = content;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(ack_content, "demo.ack:ack-body");
+
+    let failure = client.post(urls[1]).body("fail").send().unwrap();
+    assert_eq!(failure.status().as_u16(), 500);
+    assert_eq!(failure.text().unwrap(), "webhook handler failed");
+
+    let timeout = client.post(urls[2]).body("slow").send().unwrap();
+    assert_eq!(timeout.status().as_u16(), 504);
+    assert_eq!(timeout.text().unwrap(), "webhook handler timeout");
+}
+
+#[test]
 fn plugin_owned_mcp_handlers_run_in_plugin_worker_vm() {
     // SAFETY: This integration filter runs this test in isolation and the
     // worker VM must resolve the repository Lua modules instead of user config.

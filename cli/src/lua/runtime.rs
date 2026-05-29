@@ -16,6 +16,7 @@ use crate::hub::handle_cache::HandleCache;
 use super::primitives;
 use super::primitives::events::SharedEventCallbacks;
 use super::primitives::http::HttpAsyncRegistry;
+use super::primitives::local_webhooks::LocalWebhookRegistry;
 use super::primitives::socket::registry_keys as socket_registry_keys;
 use super::primitives::timer::TimerRegistry;
 use super::primitives::tui::registry_keys as tui_registry_keys;
@@ -72,6 +73,8 @@ pub struct LuaRuntime {
     hub_client_frame_senders: primitives::HubClientFrameSenders,
     /// Registry of isolated plugin workers.
     plugin_worker_registry: primitives::PluginWorkerRegistry,
+    /// Registry of local webhook listener routes.
+    local_webhook_registry: LocalWebhookRegistry,
     /// Whether any agent has a pending notification to clear on PTY input.
     ///
     /// Set `true` by `notify_pty_notification` when a notification fires.
@@ -208,6 +211,9 @@ impl LuaRuntime {
         // Create plugin worker registry for isolated plugin execution.
         let plugin_worker_registry = primitives::new_plugin_worker_registry();
 
+        // Create local webhook registry for provider-neutral inbound HTTP.
+        let local_webhook_registry = primitives::new_local_webhook_registry();
+
         // Register all primitives
         primitives::register_all(&lua).context("Failed to register Lua primitives")?;
 
@@ -275,6 +281,8 @@ impl LuaRuntime {
 
         primitives::register_plugin_worker(&lua, plugin_worker_registry.clone())
             .context("Failed to register plugin worker primitives")?;
+        primitives::register_local_webhooks(&lua, local_webhook_registry.clone())
+            .context("Failed to register local webhook primitives")?;
 
         // Note: Hub, connection, and worktree primitives are registered later via
         // register_hub_primitives() because they need a HandleCache reference from Hub
@@ -303,6 +311,7 @@ impl LuaRuntime {
             hub_client_pending_requests,
             hub_client_frame_senders,
             plugin_worker_registry,
+            local_webhook_registry,
             pty_input_listening: false,
         })
     }
@@ -737,6 +746,11 @@ impl LuaRuntime {
     /// dropped, otherwise runtime shutdown waits on their blocking watch tasks.
     pub fn shutdown_plugin_workers(&mut self, reason: &str) {
         self.plugin_worker_registry.shutdown_all(reason);
+    }
+
+    /// Stop all local webhook listener routes owned by this runtime.
+    pub fn shutdown_local_webhooks(&mut self) {
+        self.local_webhook_registry.stop_all();
     }
 
     /// Poll user file watches via periodic drain.
@@ -1512,7 +1526,19 @@ impl LuaRuntime {
         self.watcher_registry
             .lock()
             .expect("WatcherEntries mutex poisoned")
-            .set_plugin_worker_event_tx(tx);
+            .set_plugin_worker_event_tx(tx.clone());
+        self.local_webhook_registry.set_plugin_worker_event_tx(tx);
+    }
+
+    pub(crate) fn fire_local_webhook_request(
+        &self,
+        request: primitives::local_webhooks::LocalWebhookRequest,
+    ) {
+        primitives::local_webhooks::fire_local_webhook_request(
+            &self.lua,
+            &self.local_webhook_registry,
+            request,
+        );
     }
 
     /// Fire the Lua callback for a single completed HTTP response.
@@ -1965,6 +1991,7 @@ impl LuaRuntime {
 
 impl Drop for LuaRuntime {
     fn drop(&mut self) {
+        self.shutdown_local_webhooks();
         self.shutdown_plugin_workers("runtime_drop");
         self.stop_all_watchers();
     }
