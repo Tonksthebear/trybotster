@@ -39,9 +39,6 @@ export class TerminalConnection extends HubRoute {
   // Initial/recovery snapshot can arrive before transport wires snapshot listeners.
   // Keep the latest one and replay it atomically once onBinarySnapshot() attaches.
   #earlyBinarySnapshot = null;
-  // Mode replay is part of the attach barrier and can arrive before the
-  // Restty transport has registered its listeners.
-  #earlyModeChanges = [];
   // Tracks whether an authoritative snapshot was already replayed before
   // onOutput() attached. If so, buffered live output is stale by definition.
   #authoritativeSnapshotSeen = false;
@@ -125,10 +122,6 @@ export class TerminalConnection extends HubRoute {
         }
         break;
 
-      case "mode_changed":
-        this.#emitModeChanged(message);
-        break;
-
       default:
         this.emit("message", message);
     }
@@ -187,7 +180,6 @@ export class TerminalConnection extends HubRoute {
     this.#earlyOutputBuffer = [];
     this.#earlyOutputBytes = 0;
     this.#earlyBinarySnapshot = null;
-    this.#earlyModeChanges = [];
     this.#authoritativeSnapshotSeen = false;
     super.destroy();
   }
@@ -275,12 +267,6 @@ export class TerminalConnection extends HubRoute {
     return unsubscribe;
   }
 
-  onModeChanged(callback) {
-    const unsubscribe = this.on("modeChanged", callback);
-    this.#flushEarlyModeChanges();
-    return unsubscribe;
-  }
-
   // ========== Static helper ==========
 
   static key(hubId, sessionUuid) {
@@ -345,25 +331,6 @@ export class TerminalConnection extends HubRoute {
     this.emit("snapshotStart", { byteLength: data.byteLength });
     this.emit("binarySnapshot", data);
     this.emit("snapshotComplete", { byteLength: data.byteLength });
-  }
-
-  #emitModeChanged(message) {
-    const listeners = this.subscribers.get("modeChanged");
-    if (listeners && listeners.size > 0) {
-      this.emit("modeChanged", message);
-    } else {
-      this.#earlyModeChanges.push(message);
-    }
-    this.emit("message", message);
-  }
-
-  #flushEarlyModeChanges() {
-    if (this.#earlyModeChanges.length === 0) return;
-    const buffered = this.#earlyModeChanges;
-    this.#earlyModeChanges = [];
-    for (const message of buffered) {
-      this.emit("modeChanged", message);
-    }
   }
 
   #outputByteLength(data) {

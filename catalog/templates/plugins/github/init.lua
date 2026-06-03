@@ -15,6 +15,10 @@ local mcp_proxy = require("mcp_proxy")
 local notifications = require("notifications")
 local event_routing = require("event_routing")
 
+local ROUTE_REFRESH_SECS = 30
+local route_refresh_timer = nil
+local routed_repos_key = nil
+
 local function normalize_repo(repo)
     if type(repo) ~= "string" then
         return nil
@@ -75,20 +79,50 @@ local function detect_spawn_target_repos()
     return out
 end
 
-local repos = detect_spawn_target_repos()
+local function repos_key(repos)
+    return table.concat(repos or {}, "\n")
+end
+
+local function refresh_event_routing(reason)
+    local repos = detect_spawn_target_repos()
+    local key = repos_key(repos)
+    if key == routed_repos_key then
+        return repos
+    end
+
+    routed_repos_key = key
+    if #repos > 0 then
+        event_routing.start(repos)
+        log.info(string.format("GitHub plugin loaded for %s", table.concat(repos, ", ")))
+    else
+        event_routing.stop()
+        log.info("GitHub plugin loaded without repo event routing")
+    end
+    if reason == "refresh" then
+        log.info("GitHub plugin refreshed repo event routing")
+    end
+    return repos
+end
 
 mcp_proxy.start()
 notifications.register()
+refresh_event_routing("load")
 
-if #repos > 0 then
-    event_routing.start(repos)
-    log.info(string.format("GitHub plugin loaded for %s", table.concat(repos, ", ")))
-else
-    log.info("GitHub plugin loaded without repo event routing")
+if timer and type(timer.every) == "function" then
+    route_refresh_timer = timer.every(ROUTE_REFRESH_SECS, function()
+        local ok, err = pcall(refresh_event_routing, "refresh")
+        if not ok then
+            log.warn("GitHub plugin failed to refresh repo event routing: " .. tostring(err))
+        end
+    end)
 end
 
 return {
     _before_reload = function()
+        if route_refresh_timer and timer and type(timer.cancel) == "function" then
+            timer.cancel(route_refresh_timer)
+            route_refresh_timer = nil
+        end
         event_routing.stop()
         mcp_proxy.stop()
     end,

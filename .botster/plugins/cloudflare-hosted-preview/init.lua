@@ -8,7 +8,7 @@
 -- Cloudflare hosted-preview session action.
 --
 -- The Cloudflare quick-tunnel lifecycle is plugin-owned: this module registers
--- a generic session action, owns the hidden connector session, watches
+-- a generic session action, owns the connector session, watches
 -- cloudflared output, probes URL readiness, and mirrors action state onto the
 -- parent session.
 
@@ -34,10 +34,6 @@ local prepare_seq = state.get("cloudflare_hosted_preview.prepare_seq", { value =
 local event_subs = {}
 
 local M = {}
-
-local function metadata_flag(value)
-    return value == true or value == "true"
-end
 
 local function session_port(session)
     if type(session) ~= "table" then return nil end
@@ -120,7 +116,7 @@ end
 function M.is_connector(subject)
     local metadata = type(subject) == "table" and subject.metadata or nil
     return type(metadata) == "table"
-        and metadata_flag(metadata.system_session)
+        and metadata.owner_plugin == PLUGIN_NAME
         and metadata.system_kind == CONNECTOR_SYSTEM_KIND
 end
 
@@ -218,9 +214,10 @@ local function start_connector(parent, prepared)
         request_id = request_id,
         workspace = parent._workspace_name,
         workspace_id = parent._workspace_id,
-        system_session = true,
         system_kind = CONNECTOR_SYSTEM_KIND,
         owner_plugin = PLUGIN_NAME,
+        visibility = "plugin",
+        surface = PLUGIN_NAME,
         hosted_preview_provider = "cloudflare",
         target_session_uuid = parent.session_uuid,
         target_forward_port = session_port(parent),

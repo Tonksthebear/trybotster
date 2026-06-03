@@ -326,14 +326,7 @@ fn plugin_reloaded_uses_live_entity_broadcast_after_tree_rebroadcast() {
         eb_v1_snapshot_attempts,
         eb_v2_snapshot_attempts,
         eb_v2_snapshot_count,
-    ): (
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-    ) = lua
+    ): (i64, i64, i64, i64, i64, i64) = lua
         .load(&setup)
         .eval()
         .expect("plugin_reloaded rebroadcast harness");

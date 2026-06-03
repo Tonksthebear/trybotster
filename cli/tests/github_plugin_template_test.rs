@@ -287,6 +287,84 @@ fn catalog_plugin_github_template_normalizes_spawn_target_repos() {
 }
 
 #[test]
+fn catalog_plugin_github_template_refreshes_routing_for_new_spawn_target_repo() {
+    let plugin_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates/plugins/github");
+    let init_path = plugin_root.join("init.lua");
+
+    let lua = create_lua_vm();
+    let result: JsonValue = lua
+        .load(format!(
+            r#"
+            _G.__github_test = {{ routed_repos = {{}}, timer_cb = nil, timer_cancelled = nil }}
+            local include_second = false
+            package.preload["mcp_proxy"] = function()
+              return {{
+                start = function() end,
+                stop = function() end,
+              }}
+            end
+            package.preload["notifications"] = function()
+              return {{ register = function() end }}
+            end
+            package.preload["event_routing"] = function()
+              return {{
+                start = function(repos)
+                  _G.__github_test.routed_repos[#_G.__github_test.routed_repos + 1] = repos
+                end,
+                stop = function() end,
+              }}
+            end
+            hub = {{ detect_repo = function() return "owner/current" end }}
+            spawn_targets = {{
+              list = function()
+                local targets = {{
+                  {{ repo = "owner/current", enabled = true }},
+                }}
+                if include_second then
+                  targets[#targets + 1] = {{ repo = "owner/second", enabled = true }}
+                end
+                return targets
+              end,
+            }}
+            timer = {{
+              every = function(_, cb)
+                _G.__github_test.timer_cb = cb
+                return "timer-1"
+              end,
+              cancel = function(id)
+                _G.__github_test.timer_cancelled = id
+              end,
+            }}
+            log = {{ info = function(_) end, warn = function(_) end }}
+
+            local chunk = assert(loadfile({init_path}))
+            local plugin = chunk()
+            include_second = true
+            _G.__github_test.timer_cb()
+            plugin._before_reload()
+            return {{
+              routed_repos = _G.__github_test.routed_repos,
+              timer_cancelled = _G.__github_test.timer_cancelled,
+            }}
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval()
+        .and_then(|value: Value| lua.from_value(value))
+        .expect("GitHub plugin should refresh route subscriptions for newly admitted repos");
+
+    assert_eq!(result["routed_repos"][0], json!(["owner/current"]));
+    assert_eq!(
+        result["routed_repos"][1],
+        json!(["owner/current", "owner/second"])
+    );
+    assert_eq!(result["timer_cancelled"], json!("timer-1"));
+}
+
+#[test]
 fn catalog_plugin_github_mcp_proxy_normalizes_create_pull_request_draft_false() {
     let plugin_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()

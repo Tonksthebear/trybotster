@@ -2044,13 +2044,9 @@ impl WebRtcTransportAdapter {
             TransportEgress::BoundaryJson(value) => serde_json::to_vec(&value)
                 .ok()
                 .map(|data| WebRtcAdapterCommand::Json { data }),
-            TransportEgress::ModeChanged { session_uuid, mode } => serde_json::to_vec(
-                &crate::worker::transport::egress_mode_changed(session_uuid, mode),
-            )
-            .ok()
-            .map(|data| WebRtcAdapterCommand::Json { data }),
             TransportEgress::Binary(data) => Some(WebRtcAdapterCommand::Binary { data }),
             TransportEgress::Snapshot { .. }
+            | TransportEgress::ModeChanged { .. }
             | TransportEgress::KittyChanged { .. }
             | TransportEgress::FocusReportingChanged { .. }
             | TransportEgress::FocusChanged { .. }
@@ -2198,39 +2194,6 @@ mod tests {
                 focused: true,
             }) if session_uuid == "sess-1"
         ));
-    }
-
-    #[test]
-    fn adapter_encodes_mode_changed_to_browser_json_command() {
-        let command = WebRtcTransportAdapter::egress_to_command(TransportEgress::ModeChanged {
-            session_uuid: "sess-1".to_string(),
-            mode: crate::session::protocol::ModeChanged {
-                mouse_mode: Some(15),
-                focus_reporting: Some(true),
-                bracketed_paste: Some(true),
-                ..Default::default()
-            },
-        })
-        .expect("mode changed json command");
-
-        let WebRtcAdapterCommand::Json { data } = command else {
-            panic!("expected json command for mode changed");
-        };
-        let value: serde_json::Value =
-            serde_json::from_slice(&data).expect("mode changed json payload");
-
-        assert_eq!(
-            value,
-            serde_json::json!({
-                "type": "mode_changed",
-                "session_uuid": "sess-1",
-                "mode": {
-                    "mouse_mode": 15,
-                    "focus_reporting": true,
-                    "bracketed_paste": true,
-                },
-            })
-        );
     }
 
     #[test]

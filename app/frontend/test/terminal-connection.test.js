@@ -93,10 +93,9 @@ describe('TerminalConnection', () => {
     ])
   })
 
-  it('buffers early mode_changed events until a mode listener is attached', () => {
+  it('surfaces mode_changed as an ordinary control message', () => {
     const terminal = terminalConnection()
     const genericMessages = []
-    const modeChanges = []
     const message = {
       type: 'mode_changed',
       session_uuid: 'session-1',
@@ -105,9 +104,7 @@ describe('TerminalConnection', () => {
 
     terminal.on('message', (event) => genericMessages.push(event))
     terminal.handleMessage(message)
-    terminal.onModeChanged((event) => modeChanges.push(event))
 
-    expect(modeChanges).toEqual([message])
     expect(genericMessages).toEqual([message])
   })
 })

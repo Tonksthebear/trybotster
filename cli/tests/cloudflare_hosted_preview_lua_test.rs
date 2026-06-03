@@ -232,6 +232,9 @@ fn catalog_plugin_cloudflare_registers_and_runs_generic_session_action() {
                 assert(created_connector_request.session.args[5] == "http://127.0.0.1:4567")
                 assert(created_connector_request.metadata.system_kind == "cloudflare_hosted_preview_connector")
                 assert(created_connector_request.metadata.owner_plugin == "cloudflare-hosted-preview")
+                assert(created_connector_request.metadata.visibility == "plugin")
+                assert(created_connector_request.metadata.surface == "cloudflare-hosted-preview")
+                assert(created_connector_request.metadata.system_session == nil)
                 assert(created_connector_request.metadata.observe_output == true)
                 preview = test_sessions["parent-1"].plugin_state.cloudflare_hosted_preview
                 assert(preview.status == "starting")
@@ -843,9 +846,10 @@ fn catalog_plugin_cloudflare_recovered_connector_restores_parent_action_state() 
             }
             sessions[parent.session_uuid] = parent
             local connector_metadata = {
-              system_session = true,
               system_kind = "cloudflare_hosted_preview_connector",
               owner_plugin = "cloudflare-hosted-preview",
+              visibility = "plugin",
+              surface = "cloudflare-hosted-preview",
               request_id = "parent-recovered:1",
               target_session_uuid = "parent-recovered",
               preview_url = "https://recovered.trycloudflare.com",
@@ -889,6 +893,130 @@ fn catalog_plugin_cloudflare_recovered_connector_restores_parent_action_state() 
             )
             .eval()
             .expect("recovered connector scenario should run")
+        })
+        .expect("install stubs");
+
+    assert!(ok);
+}
+
+#[test]
+fn catalog_plugin_cloudflare_reconcile_uses_owned_plugin_connectors() {
+    let lua = new_lua();
+    let plugin_source = std::fs::read_to_string(plugin_path()).expect("read plugin");
+
+    let ok: bool = lua
+        .load(
+            r#"
+            local store = {}
+            package.loaded["hub.state"] = {
+              get = function(key, default)
+                if store[key] == nil then store[key] = default end
+                return store[key]
+              end,
+              set = function(key, value) store[key] = value end,
+            }
+
+            local sessions = {}
+            local upserts = {}
+            package.loaded["lib.entity_model"] = {
+              upsert_session_action = function(action) upserts[#upserts + 1] = action end,
+              remove_session_action = function(_session_uuid, _action_id) end,
+            }
+            package.loaded["lib.target_context"] = {
+              from_session = function(_session) return {} end,
+              with_metadata = function(metadata, _context) return metadata or {} end,
+            }
+            package.loaded["lib.session"] = {
+              list = function()
+                return { sessions["parent-owned-plugin"] }
+              end,
+              get = function(uuid) return sessions[uuid] end,
+              all_info = function()
+                return {
+                  { session_uuid = "parent-owned-plugin", id = "parent-owned-plugin", session_type = "agent", port = 4567 },
+                }
+              end,
+            }
+
+            local connector_metadata = {
+              system_kind = "cloudflare_hosted_preview_connector",
+              owner_plugin = "cloudflare-hosted-preview",
+              visibility = "plugin",
+              surface = "cloudflare-hosted-preview",
+              target_session_uuid = "parent-owned-plugin",
+              preview_url = "https://owned-plugin.trycloudflare.com",
+              preview_hostname = "owned-plugin.trycloudflare.com",
+            }
+            package.loaded["lib.hub"] = {
+              get = function()
+                return {
+                  list_owned_sessions = function(_, owner_plugin)
+                    assert(owner_plugin == "cloudflare-hosted-preview", tostring(owner_plugin))
+                    return {
+                      {
+                        session_uuid = "conn-owned-plugin",
+                        status = "active",
+                        metadata = connector_metadata,
+                      },
+                    }
+                  end,
+                  update_session = function(_, uuid, fields)
+                    if uuid == "conn-owned-plugin" and fields.metadata then
+                      connector_metadata = fields.metadata
+                    end
+                  end,
+                  prepare_plugin_command = function(_, _opts) error("no prepare expected") end,
+                }
+              end,
+            }
+
+            hooks = { on = function(_name, _key, _fn) end }
+            events = {
+              on = function(name, fn)
+                _G.event_handlers = _G.event_handlers or {}
+                _G.event_handlers[name] = fn
+                return name
+              end,
+              off = function(_sub) end,
+            }
+            http = { request = function() error("no readiness probe expected") end }
+            timer = { after = function() error("no timer expected") end }
+            hub = {}
+
+            local parent = {
+              session_uuid = "parent-owned-plugin",
+              _port = 4567,
+              metadata = {},
+              update = function(self, fields)
+                self.plugin_state = fields.plugin_state
+                _G.last_parent_update = fields
+                require("lib.session_actions").publish_for_session(self)
+              end,
+            }
+            sessions[parent.session_uuid] = parent
+            _G.test_sessions = sessions
+            _G.test_upserts = upserts
+        "#,
+        )
+        .exec()
+        .map(|()| {
+            lua.load(&plugin_source)
+                .set_name("@cloudflare-hosted-preview/init.lua")
+                .exec()
+                .expect("load plugin");
+            lua.load(
+                r#"
+                local preview = test_sessions["parent-owned-plugin"].plugin_state.cloudflare_hosted_preview
+                assert(preview.status == "running", preview.status)
+                assert(preview.url == "https://owned-plugin.trycloudflare.com", tostring(preview.url))
+                assert(preview.connector_session_uuid == "conn-owned-plugin", tostring(preview.connector_session_uuid))
+                assert(test_upserts[#test_upserts].status == "running", tostring(test_upserts[#test_upserts].status))
+                assert(test_upserts[#test_upserts].url == "https://owned-plugin.trycloudflare.com", tostring(test_upserts[#test_upserts].url))
+                return true
+            "#,
+            )
+            .eval()
+            .expect("owned plugin connector reconcile scenario should run")
         })
         .expect("install stubs");
 
@@ -976,8 +1104,10 @@ fn catalog_plugin_cloudflare_closes_all_existing_connectors_before_retry() {
                 session_uuid = uuid,
                 status = "active",
                 metadata = {
-                  system_session = true,
                   system_kind = "cloudflare_hosted_preview_connector",
+                  owner_plugin = "cloudflare-hosted-preview",
+                  visibility = "plugin",
+                  surface = "cloudflare-hosted-preview",
                   target_session_uuid = "parent-retry",
                 },
                 get_meta = function(self, key) return self.metadata[key] end,
