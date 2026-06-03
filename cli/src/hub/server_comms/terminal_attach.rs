@@ -118,12 +118,13 @@ impl Hub {
                     // Use the shared helper so the browser reused-sub path and the
                     // TUI Raw initial snapshot path cannot drift on which fields are replayed.
                     let mode = crate::session::protocol::mode_changed_from_flags(flags);
-                    let _ = worker.try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
-                        crate::worker::client::ClientControlFrame::ModeChanged {
-                            session_uuid: req.session_uuid.clone(),
-                            mode,
-                        },
-                    ));
+                    let _ =
+                        worker.try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                            crate::worker::client::ClientControlFrame::ModeChanged {
+                                session_uuid: req.session_uuid.clone(),
+                                mode,
+                            },
+                        ));
                 }
 
                 Self::send_worker_terminal_attach_state(

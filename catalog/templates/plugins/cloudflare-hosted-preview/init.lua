@@ -8,7 +8,7 @@
 -- Cloudflare hosted-preview session action.
 --
 -- The Cloudflare quick-tunnel lifecycle is plugin-owned: this module registers
--- a generic session action, owns the hidden connector session, watches
+-- a generic session action, owns the connector session, watches
 -- cloudflared output, probes URL readiness, and mirrors only a reachable URL
 -- onto the parent session.
 
@@ -43,10 +43,6 @@ local event_subs = {}
 
 local M = {}
 local close_connector
-
-local function metadata_flag(value)
-    return value == true or value == "true"
-end
 
 local function session_port(session)
     if type(session) ~= "table" then return nil end
@@ -106,6 +102,41 @@ local function session_meta(subject, key)
     end
     local metadata = subject.metadata
     return type(metadata) == "table" and metadata[key] or nil
+end
+
+local function session_uuid(subject)
+    return type(subject) == "table" and (subject.session_uuid or subject.id) or nil
+end
+
+local function connector_scan_sessions()
+    local out = {}
+    local seen = {}
+
+    local function append(session)
+        local uuid = session_uuid(session)
+        if uuid and not seen[uuid] then
+            seen[uuid] = true
+            if type(session) == "table" and not session.session_uuid then
+                session.session_uuid = uuid
+            end
+            out[#out + 1] = session
+        end
+    end
+
+    for _, session in ipairs(Session.list()) do
+        append(session)
+    end
+
+    local ok, owned = pcall(function()
+        return Hub.get():list_owned_sessions(PLUGIN_NAME)
+    end)
+    if ok and type(owned) == "table" then
+        for _, session in ipairs(owned) do
+            append(session)
+        end
+    end
+
+    return out
 end
 
 local function normalize_terminal_text(text)
@@ -388,7 +419,7 @@ end
 function M.is_connector(subject)
     local metadata = type(subject) == "table" and subject.metadata or nil
     return type(metadata) == "table"
-        and metadata_flag(metadata.system_session)
+        and metadata.owner_plugin == PLUGIN_NAME
         and metadata.system_kind == CONNECTOR_SYSTEM_KIND
 end
 
@@ -400,9 +431,9 @@ end
 function M.find_connectors(parent_uuid)
     local connectors = {}
     if not parent_uuid then return connectors end
-    for _, session in ipairs(Session.list()) do
+    for _, session in ipairs(connector_scan_sessions()) do
         if M.is_connector(session)
-            and session:get_meta("target_session_uuid") == parent_uuid
+            and session_meta(session, "target_session_uuid") == parent_uuid
             and session.status ~= "closed" then
             connectors[#connectors + 1] = session
         end
@@ -516,9 +547,10 @@ local function start_connector(parent, prepared)
         request_id = request_id,
         workspace = parent._workspace_name,
         workspace_id = parent._workspace_id,
-        system_session = true,
         system_kind = CONNECTOR_SYSTEM_KIND,
         owner_plugin = PLUGIN_NAME,
+        visibility = "plugin",
+        surface = PLUGIN_NAME,
         hosted_preview_provider = "cloudflare",
         target_session_uuid = parent.session_uuid,
         target_forward_port = session_port(parent),
@@ -842,9 +874,9 @@ reconcile_connector_session = function(session, parent)
 end
 
 function M.reconcile()
-    for _, session in ipairs(Session.list()) do
+    for _, session in ipairs(connector_scan_sessions()) do
         if M.is_connector(session) then
-            local parent_uuid = session:get_meta("target_session_uuid")
+            local parent_uuid = session_meta(session, "target_session_uuid")
             local parent = parent_uuid and Session.get(parent_uuid) or nil
             if not parent then
                 close_connector(session)

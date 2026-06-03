@@ -1576,9 +1576,10 @@ fn catalog_plugin_project_pipelines_home_bind_lists_use_entity_empty_templates()
         "catalog/templates/plugins/project-pipelines/project_pipelines/web/screens/home.lua",
     ))
     .expect("read project pipelines home screen");
-    let surface = std::fs::read_to_string(project_root_dir().join(
-        "catalog/templates/plugins/project-pipelines/project_pipelines/web/surface.lua",
-    ))
+    let surface = std::fs::read_to_string(
+        project_root_dir()
+            .join("catalog/templates/plugins/project-pipelines/project_pipelines/web/surface.lua"),
+    )
     .expect("read project pipelines surface");
 
     assert_eq!(
@@ -1710,7 +1711,8 @@ fn catalog_plugin_project_pipelines_notification_counts_only_use_current_agents(
 }
 
 #[test]
-fn catalog_plugin_project_pipelines_attention_items_include_questions_and_notified_current_agents() {
+fn catalog_plugin_project_pipelines_attention_items_include_questions_and_notified_current_agents()
+{
     let lua = Lua::new();
     log::register(&lua).expect("register log");
 

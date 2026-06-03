@@ -980,12 +980,10 @@ impl SessionIoRuntime {
         // typed ClientControlFrame::ModeChanged for any clients that want the
         // complete terminal mode state (mouse_mode, etc.).
         if let Some(mode) = mode_delta {
-            self.deliver_terminal_control(
-                crate::worker::client::ClientControlFrame::ModeChanged {
-                    session_uuid: self.session_uuid.clone(),
-                    mode,
-                },
-            );
+            self.deliver_terminal_control(crate::worker::client::ClientControlFrame::ModeChanged {
+                session_uuid: self.session_uuid.clone(),
+                mode,
+            });
         }
     }
 
@@ -1694,9 +1692,7 @@ mod tests {
             .expect("write snapshot");
 
         // Expect Scrollback first
-        match block_on_with_timeout(async {
-            client_rx.recv().await.expect("scrollback")
-        }) {
+        match block_on_with_timeout(async { client_rx.recv().await.expect("scrollback") }) {
             crate::worker::client::ClientWorkerMessage::ControlFrame(
                 crate::worker::client::ClientControlFrame::Scrollback { data, .. },
             ) => assert_eq!(data, b"mode-snapshot"),
@@ -1704,23 +1700,25 @@ mod tests {
         }
 
         // Then subscribed (confirm_subscription = true)
-        match block_on_with_timeout(async {
-            client_rx.recv().await.expect("subscribed")
-        }) {
+        match block_on_with_timeout(async { client_rx.recv().await.expect("subscribed") }) {
             crate::worker::client::ClientWorkerMessage::ControlFrame(
                 crate::worker::client::ClientControlFrame::BoundaryJson(value),
             ) => {
-                assert_eq!(value.get("type").and_then(|v| v.as_str()), Some("subscribed"));
+                assert_eq!(
+                    value.get("type").and_then(|v| v.as_str()),
+                    Some("subscribed")
+                );
             }
             other => panic!("expected subscribed, got {other:?}"),
         }
 
         // Then ModeChanged (the key new behavior)
-        match block_on_with_timeout(async {
-            client_rx.recv().await.expect("mode changed")
-        }) {
+        match block_on_with_timeout(async { client_rx.recv().await.expect("mode changed") }) {
             crate::worker::client::ClientWorkerMessage::ControlFrame(
-                crate::worker::client::ClientControlFrame::ModeChanged { mode: received_mode, .. },
+                crate::worker::client::ClientControlFrame::ModeChanged {
+                    mode: received_mode,
+                    ..
+                },
             ) => {
                 assert_eq!(received_mode, mode);
             }
@@ -1728,9 +1726,7 @@ mod tests {
         }
 
         // Then TerminalAttach(Attached)
-        match block_on_with_timeout(async {
-            client_rx.recv().await.expect("attached")
-        }) {
+        match block_on_with_timeout(async { client_rx.recv().await.expect("attached") }) {
             crate::worker::client::ClientWorkerMessage::ControlFrame(
                 crate::worker::client::ClientControlFrame::TerminalAttach { state, .. },
             ) => {
@@ -1805,23 +1801,25 @@ mod tests {
             .expect("write empty snapshot");
 
         // Expect subscribed first (confirm_subscription = true)
-        match block_on_with_timeout(async {
-            client_rx.recv().await.expect("subscribed")
-        }) {
+        match block_on_with_timeout(async { client_rx.recv().await.expect("subscribed") }) {
             crate::worker::client::ClientWorkerMessage::ControlFrame(
                 crate::worker::client::ClientControlFrame::BoundaryJson(value),
             ) => {
-                assert_eq!(value.get("type").and_then(|v| v.as_str()), Some("subscribed"));
+                assert_eq!(
+                    value.get("type").and_then(|v| v.as_str()),
+                    Some("subscribed")
+                );
             }
             other => panic!("expected subscribed, got {other:?}"),
         }
 
         // Then ModeChanged (the key assertion)
-        match block_on_with_timeout(async {
-            client_rx.recv().await.expect("mode changed")
-        }) {
+        match block_on_with_timeout(async { client_rx.recv().await.expect("mode changed") }) {
             crate::worker::client::ClientWorkerMessage::ControlFrame(
-                crate::worker::client::ClientControlFrame::ModeChanged { mode: received_mode, .. },
+                crate::worker::client::ClientControlFrame::ModeChanged {
+                    mode: received_mode,
+                    ..
+                },
             ) => {
                 assert_eq!(received_mode, mode);
             }
@@ -1829,13 +1827,14 @@ mod tests {
         }
 
         // Then TerminalAttach(Reconnecting)
-        match block_on_with_timeout(async {
-            client_rx.recv().await.expect("reconnecting")
-        }) {
+        match block_on_with_timeout(async { client_rx.recv().await.expect("reconnecting") }) {
             crate::worker::client::ClientWorkerMessage::ControlFrame(
                 crate::worker::client::ClientControlFrame::TerminalAttach { state, .. },
             ) => {
-                assert_eq!(state, crate::worker::client::TerminalAttachState::Reconnecting);
+                assert_eq!(
+                    state,
+                    crate::worker::client::TerminalAttachState::Reconnecting
+                );
             }
             other => panic!("expected Reconnecting, got {other:?}"),
         }
@@ -1846,9 +1845,7 @@ mod tests {
             .expect("write live output after reconnect");
         std::thread::sleep(Duration::from_millis(10));
 
-        match block_on_with_timeout(async {
-            client_rx.recv().await
-        }) {
+        match block_on_with_timeout(async { client_rx.recv().await }) {
             Some(crate::worker::client::ClientWorkerMessage::TerminalBytes { data, .. }) => {
                 assert_eq!(data, b"live-after-reconnect");
             }

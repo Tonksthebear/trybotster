@@ -17,35 +17,6 @@
  */
 import { HubConnectionManager, TerminalConnection } from "connections";
 
-const MOUSE_MODE_BITS = [
-  [1000, 1],
-  [1003, 2],
-  [1002, 4],
-  [1006, 8],
-];
-
-function privateModeSequence(code, enabled) {
-  return `\x1b[?${code}${enabled ? "h" : "l"}`;
-}
-
-function modeChangedToTerminalSequences(mode) {
-  if (!mode || typeof mode !== "object") return "";
-
-  let output = "";
-  if (Number.isInteger(mode.mouse_mode)) {
-    for (const [code, bit] of MOUSE_MODE_BITS) {
-      output += privateModeSequence(code, (mode.mouse_mode & bit) !== 0);
-    }
-  }
-  if (typeof mode.bracketed_paste === "boolean") {
-    output += privateModeSequence(2004, mode.bracketed_paste);
-  }
-  if (typeof mode.focus_reporting === "boolean") {
-    output += privateModeSequence(1004, mode.focus_reporting);
-  }
-  return output;
-}
-
 export class WebRtcPtyTransport {
   static #RESIZE_DEBOUNCE_MS = 30;
   #hubId;
@@ -59,8 +30,6 @@ export class WebRtcPtyTransport {
   #onDisconnect = null;
   #onBinarySnapshot = null;
   #onFocusReportingChanged = null;
-  // ModeChanged is a full mode snapshot, so a newer replay supersedes older buffered state.
-  #pendingModeSequences = "";
   #desiredSize = null; // { cols, rows }
   #resizeTimer = null;
   #destroyed = false;
@@ -123,7 +92,6 @@ export class WebRtcPtyTransport {
   disconnect() {
     this.#clearResizeTimer();
     this.#awaitingReconnectSnapshot = false;
-    this.#pendingModeSequences = "";
     this.#unsubscribers.forEach((unsub) => unsub());
     this.#unsubscribers = [];
     this.#callbacks = null;
@@ -188,7 +156,6 @@ export class WebRtcPtyTransport {
     this.#connectGeneration++;
     this.disconnect();
     this.#desiredSize = null;
-    this.#pendingModeSequences = "";
     this.#onReconnect = null;
     this.#onConnect = null;
     this.#onDisconnect = null;
@@ -213,13 +180,6 @@ export class WebRtcPtyTransport {
     );
 
     this.#unsubscribers.push(
-      this.#terminalConn.onSnapshotComplete(() => {
-        this.#awaitingReconnectSnapshot = false;
-        this.#flushPendingModeSequences();
-      }),
-    );
-
-    this.#unsubscribers.push(
       this.#terminalConn.onBinarySnapshot((data) => {
         console.debug(
           `[WebRtcPtyTransport] binary snapshot hub=${this.#hubId} session=${this.#sessionUuid} bytes=${data?.byteLength ?? 0}`,
@@ -229,22 +189,8 @@ export class WebRtcPtyTransport {
     );
 
     this.#unsubscribers.push(
-      this.#terminalConn.onModeChanged((message) => {
-        const sequences = modeChangedToTerminalSequences(message?.mode);
-        if (!sequences) return;
-        if (this.#awaitingReconnectSnapshot) {
-          this.#pendingModeSequences = sequences;
-          return;
-        }
-        this.#callbacks?.onData?.(sequences);
-      }),
-    );
-
-    this.#unsubscribers.push(
       this.#terminalConn.on("message", (message) => {
         if (message?.type === "focus_reporting_changed") {
-          // Coexists with modeChanged -> DEC ?1004h/l replay: this path
-          // resends browser focus state, while the DEC path updates Restty.
           this.#onFocusReportingChanged?.(!!message.enabled);
         }
       }),
@@ -252,7 +198,8 @@ export class WebRtcPtyTransport {
 
     this.#unsubscribers.push(
       this.#terminalConn.onOutput((data) => {
-        this.#flushPendingModeSequences();
+        // Empty-live reconnects keep the existing Restty WASM handle, so mode
+        // state stays in Restty without a replay frame.
         this.#awaitingReconnectSnapshot = false;
         this.#callbacks?.onData?.(data);
       }),
@@ -295,13 +242,6 @@ export class WebRtcPtyTransport {
       cols: options.cols,
       rows: options.rows,
     };
-  }
-
-  #flushPendingModeSequences() {
-    if (!this.#pendingModeSequences) return;
-    const sequences = this.#pendingModeSequences;
-    this.#pendingModeSequences = "";
-    this.#callbacks?.onData?.(sequences);
   }
 
   #clearResizeTimer() {

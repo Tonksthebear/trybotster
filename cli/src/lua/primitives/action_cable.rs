@@ -281,7 +281,10 @@ pub fn poll_lua_action_cable_channels(
                 }
             }
 
-            let key = entry.callback_key.as_ref().expect("platform entry must have key");
+            let key = entry
+                .callback_key
+                .as_ref()
+                .expect("platform entry must have key");
 
             // Clone the callback key for safe firing outside the lock.
             pending.push((
@@ -362,23 +365,27 @@ pub(crate) fn fire_single_ac_message(
             (None, entry.owner_plugin.clone(), entry.handler_id.clone())
         } else {
             match entry.callback_key.as_ref() {
-                Some(k) => match lua.registry_value::<mlua::Function>(k) {
-                    Ok(cb) => match lua.create_registry_value(cb) {
-                        Ok(cloned) => (Some(cloned), None, entry.handler_id.clone()),
-                        Err(e) => {
-                            log::warn!(
+                Some(k) => {
+                    match lua.registry_value::<mlua::Function>(k) {
+                        Ok(cb) => match lua.create_registry_value(cb) {
+                            Ok(cloned) => (Some(cloned), None, entry.handler_id.clone()),
+                            Err(e) => {
+                                log::warn!(
                                 "[ActionCable-Lua] Failed to clone callback key for {channel_id}: {e}"
                             );
+                                return;
+                            }
+                        },
+                        Err(e) => {
+                            log::warn!("[ActionCable-Lua] Failed to retrieve callback for {channel_id}: {e}");
                             return;
                         }
-                    },
-                    Err(e) => {
-                        log::warn!("[ActionCable-Lua] Failed to retrieve callback for {channel_id}: {e}");
-                        return;
                     }
-                },
+                }
                 None => {
-                    log::warn!("[ActionCable-Lua] Platform entry missing callback_key for {channel_id}");
+                    log::warn!(
+                        "[ActionCable-Lua] Platform entry missing callback_key for {channel_id}"
+                    );
                     return;
                 }
             }
@@ -1176,26 +1183,45 @@ mod tests {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let calls_clone = calls.clone();
         let stub = lua
-            .create_function(move |_, (owner, kind, hid, _name, payload, _timeout): (String, String, String, mlua::Value, mlua::Table, u64)| {
-                let mut c = calls_clone.lock().unwrap();
-                c.push(format!("owner={},kind={},hid={},channel={},msg_present={}",
-                    owner, kind, hid,
-                    payload.get::<String>("channel_id").unwrap_or_default(),
-                    payload.get::<mlua::Table>("message").is_ok()));
-                Ok(())
-            })
+            .create_function(
+                move |_,
+                      (owner, kind, hid, _name, payload, _timeout): (
+                    String,
+                    String,
+                    String,
+                    mlua::Value,
+                    mlua::Table,
+                    u64,
+                )| {
+                    let mut c = calls_clone.lock().unwrap();
+                    c.push(format!(
+                        "owner={},kind={},hid={},channel={},msg_present={}",
+                        owner,
+                        kind,
+                        hid,
+                        payload.get::<String>("channel_id").unwrap_or_default(),
+                        payload.get::<mlua::Table>("message").is_ok()
+                    ));
+                    Ok(())
+                },
+            )
             .unwrap();
         lua.globals().set("__plugin_worker_invoke", stub).unwrap();
 
         // Build a registry entry that is plugin-owned.
         let mut registry_map = HashMap::new();
-        let cb = lua.create_function(|_, (msg, ch): (mlua::Value, String)| Ok(())).unwrap();
+        let cb = lua
+            .create_function(|_, (msg, ch): (mlua::Value, String)| Ok(()))
+            .unwrap();
         let cb_key = lua.create_registry_value(cb).unwrap();
-        registry_map.insert("ch_1".to_string(), AcCallbackEntry {
-            callback_key: Some(cb_key),
-            owner_plugin: Some("test-plugin".to_string()),
-            handler_id: Some("test-plugin:ac_ch_1".to_string()),
-        });
+        registry_map.insert(
+            "ch_1".to_string(),
+            AcCallbackEntry {
+                callback_key: Some(cb_key),
+                owner_plugin: Some("test-plugin".to_string()),
+                handler_id: Some("test-plugin:ac_ch_1".to_string()),
+            },
+        );
         let registry = std::sync::Arc::new(std::sync::Mutex::new(registry_map));
 
         let channels: HashMap<String, LuaAcChannel> = HashMap::new();
@@ -1220,15 +1246,20 @@ mod tests {
             .unwrap();
 
         let recorded = calls.lock().unwrap();
-        assert!(recorded.iter().any(|s| s.contains("owner=test-plugin") && s.contains("kind=ac_message")),
-            "expected worker invoke for plugin-owned AC message, got: {:?}", *recorded);
+        assert!(
+            recorded
+                .iter()
+                .any(|s| s.contains("owner=test-plugin") && s.contains("kind=ac_message")),
+            "expected worker invoke for plugin-owned AC message, got: {:?}",
+            *recorded
+        );
     }
 
     #[test]
     #[cfg(any())]
     fn test_raw_ac_path_panics_with_active_plugin_context() {
-        use std::panic::catch_unwind;
         use crate::lua::primitives::plugin_worker::enter_plugin_worker;
+        use std::panic::catch_unwind;
 
         let lua = Lua::new();
 
@@ -1236,11 +1267,14 @@ mod tests {
         let mut registry_map = HashMap::new();
         let cb = lua.create_function(|_, _| Ok(())).unwrap();
         let cb_key = lua.create_registry_value(cb).unwrap();
-        registry_map.insert("ch_raw".to_string(), AcCallbackEntry {
-            callback_key: Some(cb_key),
-            owner_plugin: None,
-            handler_id: None,
-        });
+        registry_map.insert(
+            "ch_raw".to_string(),
+            AcCallbackEntry {
+                callback_key: Some(cb_key),
+                owner_plugin: None,
+                handler_id: None,
+            },
+        );
         let registry = std::sync::Arc::new(std::sync::Mutex::new(registry_map));
 
         let channels: HashMap<String, LuaAcChannel> = HashMap::new();
@@ -1269,7 +1303,10 @@ mod tests {
         // In debug builds the debug_assert should have panicked the thread.
         // In release the assert is compiled out, so we accept either outcome for the test.
         if cfg!(debug_assertions) {
-            assert!(result.is_err(), "expected panic from bypass-leak assert in debug build");
+            assert!(
+                result.is_err(),
+                "expected panic from bypass-leak assert in debug build"
+            );
         }
     }
 }
