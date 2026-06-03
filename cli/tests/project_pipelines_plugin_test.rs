@@ -3367,7 +3367,8 @@ fn catalog_plugin_project_pipelines_start_run_threads_stacked_base_metadata() {
 }
 
 #[test]
-fn catalog_plugin_project_pipelines_start_run_infers_base_ref_from_closed_pr_dependency() {
+fn catalog_plugin_project_pipelines_start_run_explicit_base_ref_does_not_stack_on_closed_dependency(
+) {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
 
@@ -3382,12 +3383,6 @@ fn catalog_plugin_project_pipelines_start_run_infers_base_ref_from_closed_pr_dep
               ["ticket-child"] = {{ id = "ticket-child", title = "Child", target_id = "target-1" }},
               ["ticket-parent"] = {{ id = "ticket-parent", title = "Parent", target_id = "target-1" }},
             }}
-            local parent_run = {{
-              id = "run-parent",
-              ticket_id = "ticket-parent",
-              base_ref = "project-pipelines/grandparent",
-              base_target_path = "/worktrees/parent-pr",
-            }}
             local step = {{ id = "step-1", kind = "agent", name = "Implement", agent_name = "codex" }}
 
             package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
@@ -3400,21 +3395,13 @@ fn catalog_plugin_project_pipelines_start_run_infers_base_ref_from_closed_pr_dep
                 assert(ticket_id == "ticket-child")
                 return {{ {{ ticket_id = "ticket-child", depends_on_ticket_id = "ticket-parent", depends_on_status = "closed" }} }}
               end,
-              latest_ticket_run = function(ticket_id)
-                assert(ticket_id == "ticket-parent")
-                return parent_run
-              end,
-              latest_merge_pr_artifact = function(run_id)
-                assert(run_id == "run-parent")
-                return {{ kind = "merge", uri = "https://github.test/pulls/11", payload = "{{}}" }}
-              end,
               get_pipeline = function(id) return {{ id = id }} end,
               pipeline_steps = function() return {{ step }} end,
               create_run = function(attrs)
-                assert(attrs.base_ticket_id == "ticket-parent")
-                assert(attrs.base_run_id == "run-parent")
-                assert(attrs.base_ref == "project-pipelines/ticket-parent")
-                assert(attrs.base_target_path == "/worktrees/parent-pr")
+                assert(attrs.base_ticket_id == nil)
+                assert(attrs.base_run_id == nil)
+                assert(attrs.base_ref == "main")
+                assert(attrs.base_target_path == nil)
                 run = attrs
                 run.id = "run-child"
                 return run
@@ -3429,14 +3416,23 @@ fn catalog_plugin_project_pipelines_start_run_infers_base_ref_from_closed_pr_dep
               get_run_step_visit = function() return {{ id = "visit-child" }} end,
               latest_step_session = function() return nil end,
               append_event = function() end,
+              latest_ticket_run = function()
+                error("closed dependencies must not infer stacked base runs")
+              end,
+              latest_merge_pr_artifact = function()
+                error("closed dependencies must not infer stacked base refs")
+              end,
             }}
             package.loaded["lib.agent"] = {{ get = function() return nil end }}
             package.loaded["lib.hub"] = {{
               get = function()
                 return {{
                   create_agent = function(_, opts)
-                    assert(opts.base_ref == "project-pipelines/ticket-parent")
-                    assert(opts.base_target_path == "/worktrees/parent-pr")
+                    assert(opts.base_ref == "main")
+                    assert(opts.base_target_path == nil)
+                    assert(opts.metadata.base_ticket_id == nil)
+                    assert(opts.metadata.base_run_id == nil)
+                    assert(opts.metadata.base_ref == "main")
                     return {{ ok = true, status = "queued", request_id = opts.request_id }}
                   end,
                 }}
@@ -3446,14 +3442,69 @@ fn catalog_plugin_project_pipelines_start_run_infers_base_ref_from_closed_pr_dep
             local started = require("project_pipelines.engine").start_run({{
               ticket_id = "ticket-child",
               pipeline_id = "pipe-1",
+              base_ref = "main",
             }})
-            assert(started.run.base_ref == "project-pipelines/ticket-parent")
+            assert(started.run.base_ticket_id == nil)
+            assert(started.run.base_run_id == nil)
+            assert(started.run.base_ref == "main")
             return "ok"
             "#,
             plugin_dir = plugin_dir.display()
         ))
         .eval()
-        .expect("project pipelines should infer stacked base refs from closed PR dependencies");
+        .expect("project pipelines should honor explicit base refs without stacking on closed dependencies");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_start_run_blocks_open_dependencies() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{}}
+            package.loaded["lib.agent"] = {{ get = function() return nil end }}
+            package.loaded["lib.hub"] = {{ get = function() return {{}} end }}
+            package.loaded["project_pipelines.repo"] = {{
+              prune_legacy_seed_data = function() end,
+              get_ticket = function(id)
+                assert(id == "ticket-child")
+                return {{ id = id, title = "Child", target_id = "target-1" }}
+              end,
+              open_ticket_run = function() return nil end,
+              blocking_ticket_dependencies = function(ticket_id)
+                assert(ticket_id == "ticket-child")
+                return {{ {{ ticket_id = "ticket-child", depends_on_ticket_id = "ticket-parent", depends_on_title = "Parent", depends_on_status = "open" }} }}
+              end,
+              get_pipeline = function()
+                error("dependency gating must run before pipeline lookup")
+              end,
+            }}
+
+            local ok, err = pcall(require("project_pipelines.engine").start_run, {{
+              ticket_id = "ticket-child",
+              pipeline_id = "pipe-1",
+              base_ref = "main",
+            }})
+
+            assert(ok == false)
+            assert(tostring(err):find("ticket dependencies must close before starting a run: Parent (open)", 1, true))
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("project pipelines should block start_run while dependencies are open");
 
     assert_eq!(result, "ok");
 }
