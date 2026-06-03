@@ -510,10 +510,10 @@ Stacked pipeline work is modeled explicitly on runs. `base_ref` records the
 branch, commit, or PR head that the run should start from; `base_ticket_id` and
 `base_run_id` keep the semantic link to upstream pipeline work; and
 `base_target_path` can point at an existing source worktree when the base ref is
-only available there. When a closed dependency has PR merge metadata, new runs
-infer `base_ref` from that dependency's pipeline branch so follow-on work stacks
-on the dependency branch instead of silently assuming main. Merge agents for PR
-pipelines must open stacked PRs against `base_ref`.
+only available there. Ticket dependencies control run ordering only; they do
+not select a branch base. Callers that need stacked work must pass the base
+metadata explicitly. Merge agents for PR pipelines must open stacked PRs against
+`base_ref` when it is present.
 
 ## Persistence And Evolution
 

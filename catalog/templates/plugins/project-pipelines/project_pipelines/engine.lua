@@ -59,30 +59,12 @@ local function ticket_workspace_name(ticket, fallback)
     return "Pipeline - " .. title
 end
 
-local function infer_base_from_dependencies(ticket_id)
-    for _, dependency in ipairs(repo.closed_ticket_dependencies(ticket_id)) do
-        local dependency_ticket = repo.get_ticket(dependency.depends_on_ticket_id)
-        local dependency_run = repo.latest_ticket_run(dependency.depends_on_ticket_id)
-        local pr_artifact = dependency_run and repo.latest_merge_pr_artifact(dependency_run.id) or nil
-        if dependency_ticket and dependency_run and pr_artifact then
-            return {
-                base_ticket_id = dependency_ticket.id,
-                base_run_id = dependency_run.id,
-                base_ref = ticket_branch_for(dependency_ticket, dependency_run.id),
-                base_target_path = dependency_run.base_target_path,
-            }
-        end
-    end
-    return {}
-end
-
-local function run_base_attrs(params, ticket_id)
-    local inferred = infer_base_from_dependencies(ticket_id)
+local function run_base_attrs(params)
     return {
-        base_ticket_id = params.base_ticket_id or inferred.base_ticket_id,
-        base_run_id = params.base_run_id or params.parent_run_id or inferred.base_run_id,
-        base_ref = params.base_ref or inferred.base_ref,
-        base_target_path = params.base_target_path or inferred.base_target_path,
+        base_ticket_id = params.base_ticket_id,
+        base_run_id = params.base_run_id or params.parent_run_id,
+        base_ref = params.base_ref,
+        base_target_path = params.base_target_path,
     }
 end
 
@@ -1413,7 +1395,7 @@ function M.start_run(params)
         error("pipeline has no steps: " .. tostring(pipeline_id))
     end
 
-    local base_attrs = run_base_attrs(params, params.ticket_id)
+    local base_attrs = run_base_attrs(params)
     local run = repo.create_run{
         ticket_id = params.ticket_id,
         pipeline_id = pipeline_id,
