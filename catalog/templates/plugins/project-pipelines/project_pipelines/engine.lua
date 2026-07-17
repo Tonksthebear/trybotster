@@ -933,7 +933,65 @@ local function run_command_step(run, step)
     return result, nil
 end
 
-function M.activate_step(run, step)
+local function unmet_ticket_dependencies(ticket_id)
+    local unmet = {}
+    local dependencies = type(repo.ticket_dependencies) == "function" and repo.ticket_dependencies(ticket_id) or {}
+    for _, dependency in ipairs(dependencies) do
+        if dependency.depends_on_status ~= "closed" then
+            local unavailable = util.is_blank(dependency.depends_on_status)
+            local reason = unavailable and "unavailable_ticket" or "open_ticket"
+            local label = dependency.depends_on_title or dependency.depends_on_ticket_id
+            local prompt
+            if unavailable then
+                prompt = "Restore or remove unavailable dependency ticket " .. tostring(dependency.depends_on_ticket_id) .. " before continuing."
+            else
+                prompt = "Close dependency ticket " .. tostring(label) .. " (" .. tostring(dependency.depends_on_ticket_id) .. ", status: " .. tostring(dependency.depends_on_status) .. ") before continuing."
+            end
+            unmet[#unmet + 1] = {
+                dependency_id = dependency.id,
+                depends_on_ticket_id = dependency.depends_on_ticket_id,
+                depends_on_title = dependency.depends_on_title,
+                depends_on_status = dependency.depends_on_status,
+                reason = reason,
+                prompt = prompt,
+            }
+        end
+    end
+    return unmet
+end
+
+local function dependency_block(run, attrs)
+    local unmet = unmet_ticket_dependencies(run.ticket_id)
+    if #unmet == 0 then
+        return nil
+    end
+
+    local payload = {
+        step_id = attrs.step_id,
+        run_step_id = attrs.run_step_id,
+        target_step_id = attrs.target_step_id,
+        source = attrs.source,
+        reason = "ticket_dependencies",
+        unmet_dependencies = unmet,
+    }
+    repo.append_event("step.advance_blocked", {
+        run_id = run.id,
+        ticket_id = run.ticket_id,
+        payload = payload,
+    })
+    return {
+        ok = false,
+        status = "blocked",
+        reason = "ticket_dependencies",
+        step_id = attrs.step_id,
+        run_step_id = attrs.run_step_id,
+        target_step_id = attrs.target_step_id,
+        source = attrs.source,
+        unmet_dependencies = unmet,
+    }
+end
+
+function M.activate_step(run, step, options)
     if not step then
         repo.update_run(run.id, { status = "done", current_step_id = nil, current_run_step_id = nil })
         repo.append_event("run.completed", { run_id = run.id, ticket_id = run.ticket_id, payload = {} })
@@ -964,13 +1022,28 @@ function M.activate_step(run, step)
         return { ok = true, status = "done", merge = merge_result }
     end
 
+    options = options or {}
+    local blocked = dependency_block(run, {
+        step_id = run.current_step_id,
+        run_step_id = run.current_run_step_id,
+        target_step_id = step.id,
+        source = options.source or "activate_step",
+    })
+    if blocked then
+        return blocked
+    end
+
     local now = util.now()
     local visit = repo.create_run_step_visit(run.id, step.id, { status = "active", started_at = now })
     repo.update_run(run.id, { status = "active", current_step_id = step.id, current_run_step_id = visit.id })
+    local activation_payload = { step_id = step.id, run_step_id = visit.id, sequence = visit.sequence, kind = step.kind, name = step.name }
+    for key, value in pairs(options.activation_payload or {}) do
+        activation_payload[key] = value
+    end
     repo.append_event("step.activated", {
         run_id = run.id,
         ticket_id = run.ticket_id,
-        payload = { step_id = step.id, run_step_id = visit.id, sequence = visit.sequence, kind = step.kind, name = step.name },
+        payload = activation_payload,
     })
     notification_policy.notify_phase_transition({
         run_id = run.id,
@@ -981,14 +1054,18 @@ function M.activate_step(run, step)
     })
 
     if step.kind == "agent" then
-        local created, err = spawn_step_agent(repo.get_run(run.id), step)
+        local created, err = spawn_step_agent(repo.get_run(run.id), step, options.spawn_options)
         if err then
             repo.update_run(run.id, { status = "blocked" })
-            repo.update_run_step(run.id, step.id, { status = "blocked" })
+            if options.source_event then
+                repo.update_run_step_visit(visit.id, { status = "blocked" })
+            else
+                repo.update_run_step(run.id, step.id, { status = "blocked" })
+            end
             repo.append_event("step.spawn_failed", {
                 run_id = run.id,
                 ticket_id = run.ticket_id,
-                payload = { step_id = step.id, error = err },
+                payload = { step_id = step.id, run_step_id = visit.id, source_event = options.source_event, error = err },
             })
             return { ok = false, error = err }
         end
@@ -1265,53 +1342,35 @@ function M.handle_pr_review_submitted(link, event)
         return { ok = false, reason = "no_implementation_step", ticket = ticket, run = run }
     end
 
-    local visit = repo.create_run_step_visit(run.id, step.id, {
-        status = "active",
-        started_at = util.now(),
-    })
-    repo.update_run(run.id, { status = "active", current_step_id = step.id, current_run_step_id = visit.id })
-    repo.append_event("step.activated", {
-        run_id = run.id,
-        ticket_id = ticket.id,
-        payload = {
-            step_id = step.id,
-            run_step_id = visit.id,
-            sequence = visit.sequence,
-            kind = step.kind,
-            name = step.name,
+    local activation = M.activate_step(run, step, {
+        source = "pr_review_submitted",
+        source_event = "pr_review_submitted",
+        activation_payload = {
             source_event = "pr_review_submitted",
             pr_review_state = state,
             pr_link_id = link.id,
         },
+        spawn_options = {
+            source_event = "pr_review_submitted",
+            extra_prompt = pr_review_extra_prompt(ticket, link, event),
+            notification_title = state == "changes_requested" and "PR changes requested" or "PR review commented",
+            notification_body = "GitHub review feedback was sent back to " .. tostring(step.name) .. " for ticket " .. tostring(ticket.title or ticket.id) .. ".",
+        },
     })
-    notification_policy.notify_phase_transition({
-        run_id = run.id,
-        ticket_id = ticket.id,
-        ticket = ticket,
-        step = step,
-        run_step = visit,
-    })
-
-    local agent, err = spawn_step_agent(repo.get_run(run.id), step, {
-        source_event = "pr_review_submitted",
-        extra_prompt = pr_review_extra_prompt(ticket, link, event),
-        notification_title = state == "changes_requested" and "PR changes requested" or "PR review commented",
-        notification_body = "GitHub review feedback was sent back to " .. tostring(step.name) .. " for ticket " .. tostring(ticket.title or ticket.id) .. ".",
-    })
-    if err then
-        repo.update_run(run.id, { status = "blocked" })
-        repo.update_run_step_visit(visit.id, { status = "blocked" })
-        repo.append_event("step.spawn_failed", {
-            run_id = run.id,
-            ticket_id = ticket.id,
-            payload = { step_id = step.id, run_step_id = visit.id, source_event = "pr_review_submitted", error = err },
-        })
-        refresh_surfaces()
-        return { ok = false, status = "blocked", error = err, ticket = ticket, run = repo.get_run(run.id), step = step, run_step = repo.get_run_step_visit(visit.id) }
-    end
 
     refresh_surfaces()
-    return { ok = true, status = "reactivated", ticket = ticket, run = repo.get_run(run.id), step = step, run_step = repo.get_run_step_visit(visit.id), agent = agent }
+    activation.ticket = ticket
+    activation.run = repo.get_run(run.id)
+    activation.step = step
+    if activation.ok and activation.run and not util.is_blank(activation.run.current_run_step_id) then
+        activation.run_step = repo.get_run_step_visit(activation.run.current_run_step_id)
+    elseif activation.run_step_id then
+        activation.run_step = repo.get_run_step_visit(activation.run_step_id)
+    end
+    if activation.ok then
+        activation.status = "reactivated"
+    end
+    return activation
 end
 
 function M.handle_pr_comment(link, event)
@@ -1460,6 +1519,37 @@ function M.request_step_advance(params, context)
             } or nil,
         }
     end
+
+    local next_step, transition_error = next_step_override, nil
+    if not next_step then
+        next_step, transition_error = repo.next_step(run, step, active_visit_id)
+    end
+    if transition_error then
+        repo.update_run(run.id, { status = "blocked" })
+        if active_visit_id then
+            repo.update_run_step_visit(active_visit_id, { status = "blocked" })
+        end
+        repo.append_event("step.advance_blocked", {
+            run_id = run.id,
+            ticket_id = run.ticket_id,
+            payload = { step_id = step.id, run_step_id = active_visit_id, transition_error = transition_error },
+        })
+        return { ok = false, status = "blocked", step = step, transition_error = transition_error }
+    end
+    if next_step then
+        local blocked = dependency_block(run, {
+            step_id = step.id,
+            run_step_id = active_visit_id,
+            target_step_id = next_step.id,
+            source = "request_step_advance",
+        })
+        if blocked then
+            blocked.step = step
+            blocked.target_step = next_step
+            return blocked
+        end
+    end
+
     if override_unmet_gates and util.is_blank(params.override_reason) then
         error("override_reason is required when override_unmet_gates=true")
     end
@@ -1478,22 +1568,6 @@ function M.request_step_advance(params, context)
         })
     end
 
-    local next_step, transition_error = next_step_override, nil
-    if not next_step then
-        next_step, transition_error = repo.next_step(run, step, active_visit_id)
-    end
-    if transition_error then
-        repo.update_run(run.id, { status = "blocked" })
-        if active_visit_id then
-            repo.update_run_step_visit(active_visit_id, { status = "blocked" })
-        end
-        repo.append_event("step.advance_blocked", {
-            run_id = run.id,
-            ticket_id = run.ticket_id,
-            payload = { step_id = step.id, run_step_id = active_visit_id, transition_error = transition_error },
-        })
-        return { ok = false, status = "blocked", step = step, transition_error = transition_error }
-    end
     if active_visit_id then
         repo.update_run_step_visit(active_visit_id, { status = "done", completed_at = util.now() })
     else
@@ -1552,6 +1626,19 @@ function M.retry_step_agent(params, context)
     end
     if not visit then
         error("no run step visit found for current step")
+    end
+
+    local blocked = dependency_block(run, {
+        step_id = step.id,
+        run_step_id = visit.id,
+        target_step_id = step.id,
+        source = "retry_step_agent",
+    })
+    if blocked then
+        blocked.step = step
+        blocked.run = run
+        blocked.run_step = visit
+        return blocked
     end
 
     repo.update_run(run.id, { status = "active", current_step_id = step.id, current_run_step_id = visit.id })
