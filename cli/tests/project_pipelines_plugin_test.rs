@@ -1337,10 +1337,12 @@ fn catalog_plugin_project_pipelines_falls_back_to_existing_implementer_when_no_m
             local posted = nil
             local notified = nil
             local dependency_status = "open"
+            local spawn_fails = false
+            local visit_status = nil
 
             package.loaded["lib.agent"] = {{
               get = function(session_uuid)
-                if session_uuid == "sess-impl" then
+                if session_uuid == "sess-impl" and not spawn_fails then
                   return {{ info = function() return {{ session_uuid = session_uuid }} end }}
                 end
                 return nil
@@ -1354,6 +1356,9 @@ fn catalog_plugin_project_pipelines_falls_back_to_existing_implementer_when_no_m
                   end,
                   notify = function(_, session_uuid, notification)
                     notified = {{ session_uuid = session_uuid, notification = notification }}
+                  end,
+                  create_agent = function()
+                    error("spawn unavailable")
                   end,
                 }}
               end,
@@ -1412,21 +1417,25 @@ fn catalog_plugin_project_pipelines_falls_back_to_existing_implementer_when_no_m
                 assert(run_id == "run-1")
                 assert(step_id == "impl")
                 local visit = {{ id = "visit-2", run_id = run_id, step_id = step_id, status = attrs.status, sequence = 2 }}
+                visit_status = attrs.status
                 visits[#visits + 1] = visit
                 return visit
               end,
               update_run = function(run_id, attrs)
                 assert(run_id == "run-1")
-                assert(attrs.status == "active")
-                assert(attrs.current_step_id == "impl")
-                assert(attrs.current_run_step_id == "visit-2")
-                return {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipeline-1", status = "active", target_id = "target-1", current_step_id = "impl", current_run_step_id = "visit-2" }}
+                if attrs.status == "active" then
+                  assert(attrs.current_step_id == "impl")
+                  assert(attrs.current_run_step_id == "visit-2")
+                else
+                  assert(attrs.status == "blocked")
+                end
+                return {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipeline-1", status = attrs.status, target_id = "target-1", current_step_id = "impl", current_run_step_id = "visit-2" }}
               end,
               append_event = function(kind, event)
                 events[#events + 1] = {{ kind = kind, event = event }}
               end,
               get_run_step_visit = function(run_step_id)
-                return {{ id = run_step_id, run_id = "run-1", step_id = "impl", status = "active" }}
+                return {{ id = run_step_id, run_id = "run-1", step_id = "impl", status = visit_status }}
               end,
               latest_step_session = function(run_id, step_id)
                 assert(run_id == "run-1")
@@ -1435,8 +1444,12 @@ fn catalog_plugin_project_pipelines_falls_back_to_existing_implementer_when_no_m
               end,
               update_run_step_visit = function(run_step_id, attrs)
                 assert(run_step_id == "visit-2")
-                assert(attrs.agent_session_uuid == "sess-impl")
-                return {{ id = run_step_id, run_id = "run-1", step_id = "impl", agent_session_uuid = attrs.agent_session_uuid }}
+                if attrs.agent_session_uuid then
+                  assert(attrs.agent_session_uuid == "sess-impl")
+                elseif attrs.status then
+                  visit_status = attrs.status
+                end
+                return {{ id = run_step_id, run_id = "run-1", step_id = "impl", status = visit_status, agent_session_uuid = attrs.agent_session_uuid }}
               end,
             }}
 
@@ -1489,6 +1502,23 @@ fn catalog_plugin_project_pipelines_falls_back_to_existing_implementer_when_no_m
             assert(events[3].kind == "ticket.pr_review_submitted")
             assert(events[4].kind == "step.activated")
             assert(events[5].kind == "step.agent_prompted")
+
+            spawn_fails = true
+            local failed = integration.handle_pr_review_submitted({{
+              provider = "github",
+              repo = "owner/repo",
+              pr_number = 42,
+              pr_url = "https://github.com/owner/repo/pull/42",
+              review_id = 125,
+              review_html_url = "https://github.com/owner/repo/pull/42#pullrequestreview-125",
+              reviewer = "reviewer",
+              state = "changes_requested",
+              body = "Please retry.",
+            }})
+            assert(failed.ok == false)
+            assert(failed.status == "blocked")
+            assert(failed.run_step.id == "visit-2")
+            assert(failed.run_step.status == "blocked")
             return "ok"
             "#,
             plugin_dir = plugin_dir.display()
@@ -3175,6 +3205,7 @@ fn catalog_plugin_project_pipelines_start_run_queues_agent_and_links_later_by_re
               open_ticket_run = function() return nil end,
               blocking_ticket_dependencies = function() return {{}} end,
               closed_ticket_dependencies = function() return {{}} end,
+              ticket_dependencies = function() return {{}} end,
               get_pipeline = function(id)
                 assert(id == "pipe-1")
                 return pipeline
@@ -3327,6 +3358,7 @@ fn catalog_plugin_project_pipelines_start_run_threads_stacked_base_metadata() {
               open_ticket_run = function() return nil end,
               blocking_ticket_dependencies = function() return {{}} end,
               closed_ticket_dependencies = function() return {{}} end,
+              ticket_dependencies = function() return {{}} end,
               get_pipeline = function(id) return {{ id = id }} end,
               pipeline_steps = function() return {{ step }} end,
               create_run = function(attrs)
@@ -3427,6 +3459,7 @@ fn catalog_plugin_project_pipelines_start_run_explicit_base_ref_does_not_stack_o
                 assert(ticket_id == "ticket-child")
                 return {{ {{ ticket_id = "ticket-child", depends_on_ticket_id = "ticket-parent", depends_on_status = "closed" }} }}
               end,
+              ticket_dependencies = function() return {{}} end,
               get_pipeline = function(id) return {{ id = id }} end,
               pipeline_steps = function() return {{ step }} end,
               create_run = function(attrs)
@@ -3849,6 +3882,7 @@ fn catalog_plugin_project_pipelines_step_advance_can_override_to_specific_step()
                 return {{ id = ticket_id, title = "Verify fallback" }}
               end,
               latest_step_session = function() return nil end,
+              ticket_dependencies = function() return {{}} end,
             }}
             package.loaded["lib.agent"] = {{ get = function() return nil end }}
             package.loaded["lib.hub"] = {{

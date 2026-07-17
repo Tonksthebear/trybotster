@@ -935,7 +935,7 @@ end
 
 local function unmet_ticket_dependencies(ticket_id)
     local unmet = {}
-    local dependencies = type(repo.ticket_dependencies) == "function" and repo.ticket_dependencies(ticket_id) or {}
+    local dependencies = repo.ticket_dependencies(ticket_id)
     for _, dependency in ipairs(dependencies) do
         if dependency.depends_on_status ~= "closed" then
             local unavailable = util.is_blank(dependency.depends_on_status)
@@ -1057,17 +1057,13 @@ function M.activate_step(run, step, options)
         local created, err = spawn_step_agent(repo.get_run(run.id), step, options.spawn_options)
         if err then
             repo.update_run(run.id, { status = "blocked" })
-            if options.source_event then
-                repo.update_run_step_visit(visit.id, { status = "blocked" })
-            else
-                repo.update_run_step(run.id, step.id, { status = "blocked" })
-            end
+            repo.update_run_step_visit(visit.id, { status = "blocked" })
             repo.append_event("step.spawn_failed", {
                 run_id = run.id,
                 ticket_id = run.ticket_id,
                 payload = { step_id = step.id, run_step_id = visit.id, source_event = options.source_event, error = err },
             })
-            return { ok = false, error = err }
+            return { ok = false, status = "blocked", run_step_id = visit.id, error = err }
         end
         return { ok = true, status = "active", agent = created }
     end
