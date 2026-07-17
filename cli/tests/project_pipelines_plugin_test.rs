@@ -1336,6 +1336,7 @@ fn catalog_plugin_project_pipelines_falls_back_to_existing_implementer_when_no_m
             local visits = {{}}
             local posted = nil
             local notified = nil
+            local dependency_status = "open"
 
             package.loaded["lib.agent"] = {{
               get = function(session_uuid)
@@ -1401,6 +1402,12 @@ fn catalog_plugin_project_pipelines_falls_back_to_existing_implementer_when_no_m
                   {{ id = "review", kind = "agent", name = "Review", agent_name = "codex" }},
                 }}
               end,
+              ticket_dependencies = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{
+                  {{ id = "dependency-1", ticket_id = ticket_id, depends_on_ticket_id = "ticket-prerequisite", depends_on_title = "Prerequisite", depends_on_status = dependency_status }},
+                }}
+              end,
               create_run_step_visit = function(run_id, step_id, attrs)
                 assert(run_id == "run-1")
                 assert(step_id == "impl")
@@ -1434,13 +1441,38 @@ fn catalog_plugin_project_pipelines_falls_back_to_existing_implementer_when_no_m
             }}
 
             local integration = require("project_pipelines.github_integration")
-            local response = integration.handle_pr_review_submitted({{
+            local blocked = integration.handle_pr_review_submitted({{
               provider = "github",
               repo = "owner/repo",
               pr_number = 42,
               pr_url = "https://github.com/owner/repo/pull/42",
               review_id = 123,
               review_html_url = "https://github.com/owner/repo/pull/42#pullrequestreview-123",
+              reviewer = "reviewer",
+              state = "changes_requested",
+              body = "Please fix the failing path.",
+            }})
+
+            assert(blocked.ok == false)
+            assert(blocked.status == "blocked")
+            assert(blocked.reason == "ticket_dependencies")
+            assert(blocked.source == "pr_review_submitted")
+            assert(blocked.target_step_id == "impl")
+            assert(blocked.unmet_dependencies[1].reason == "open_ticket")
+            assert(#visits == 0)
+            assert(posted == nil)
+            assert(notified == nil)
+            assert(events[1].kind == "ticket.pr_review_submitted")
+            assert(events[2].kind == "step.advance_blocked")
+
+            dependency_status = "closed"
+            local response = integration.handle_pr_review_submitted({{
+              provider = "github",
+              repo = "owner/repo",
+              pr_number = 42,
+              pr_url = "https://github.com/owner/repo/pull/42",
+              review_id = 124,
+              review_html_url = "https://github.com/owner/repo/pull/42#pullrequestreview-124",
               reviewer = "reviewer",
               state = "changes_requested",
               body = "Please fix the failing path.",
@@ -1454,9 +1486,9 @@ fn catalog_plugin_project_pipelines_falls_back_to_existing_implementer_when_no_m
             assert(posted.message.payload.instructions:match("Please fix the failing path%."))
             assert(notified.notification.title == "PR changes requested")
             assert(#visits == 1)
-            assert(events[1].kind == "ticket.pr_review_submitted")
-            assert(events[2].kind == "step.activated")
-            assert(events[3].kind == "step.agent_prompted")
+            assert(events[3].kind == "ticket.pr_review_submitted")
+            assert(events[4].kind == "step.activated")
+            assert(events[5].kind == "step.agent_prompted")
             return "ok"
             "#,
             plugin_dir = plugin_dir.display()
@@ -3510,6 +3542,239 @@ fn catalog_plugin_project_pipelines_start_run_blocks_open_dependencies() {
 }
 
 #[test]
+fn catalog_plugin_project_pipelines_public_dependency_write_blocks_advance_before_side_effects() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local handlers = {{}}
+            local dependencies = {{}}
+            local dependency_status = "open"
+            local events = {{}}
+            local mutation_calls = 0
+            local notification_calls = 0
+            local create_agent_calls = 0
+            local merge_requests = 0
+            local final_advance = false
+            local run = {{
+              id = "run-child",
+              ticket_id = "ticket-child",
+              pipeline_id = "pipe-1",
+              target_id = "target-1",
+              status = "active",
+              current_step_id = "plan",
+              current_run_step_id = "visit-plan",
+            }}
+            local steps = {{
+              plan = {{ id = "plan", pipeline_id = "pipe-1", kind = "agent", name = "Plan", agent_name = "codex" }},
+              implement = {{ id = "implement", pipeline_id = "pipe-1", kind = "agent", name = "Implement", agent_name = "codex" }},
+              command = {{ id = "command", pipeline_id = "pipe-1", kind = "command", name = "Command", command = "true" }},
+            }}
+
+            json = {{
+              decode = function() return {{}} end,
+              encode = function() return "{{}}" end,
+            }}
+            mcp = {{
+              tool = function(name, _spec, handler) handlers[name] = handler end,
+              prompt = function() end,
+            }}
+
+            local repo = {{
+              prune_legacy_seed_data = function() end,
+              add_ticket_dependency = function(ticket_id, depends_on_ticket_id)
+                local dependency = {{
+                  id = "dependency-public",
+                  ticket_id = ticket_id,
+                  depends_on_ticket_id = depends_on_ticket_id,
+                  created_at = 1,
+                }}
+                dependencies[#dependencies + 1] = dependency
+                return dependency
+              end,
+              ticket_dependencies = function(ticket_id)
+                local joined = {{}}
+                for _, dependency in ipairs(dependencies) do
+                  if dependency.ticket_id == ticket_id then
+                    joined[#joined + 1] = {{
+                      id = dependency.id,
+                      ticket_id = dependency.ticket_id,
+                      depends_on_ticket_id = dependency.depends_on_ticket_id,
+                      depends_on_title = dependency_status and "Prerequisite" or nil,
+                      depends_on_status = dependency_status,
+                    }}
+                  end
+                end
+                return joined
+              end,
+              get_run = function(id) assert(id == "run-child"); return run end,
+              get_step = function(id) return steps[id] end,
+              get_ticket = function(id) return {{ id = id, title = id, target_id = "target-1" }} end,
+              get_pipeline = function() return {{ id = "pipe-1", merge_policy = "direct" }} end,
+              step_gates = function() return {{}} end,
+              latest_review_for_run_step = function() return nil end,
+              next_step = function()
+                if final_advance then return nil end
+                return steps.implement
+              end,
+              append_event = function(kind, attrs)
+                events[#events + 1] = {{ kind = kind, attrs = attrs }}
+              end,
+              update_run_step_visit = function(id, attrs)
+                mutation_calls = mutation_calls + 1
+                return {{ id = id, status = attrs.status }}
+              end,
+              update_run_step = function()
+                mutation_calls = mutation_calls + 1
+              end,
+              create_run_step_visit = function(run_id, step_id, attrs)
+                mutation_calls = mutation_calls + 1
+                assert(run_id == "run-child")
+                return {{ id = "visit-implement", run_id = run_id, step_id = step_id, status = attrs.status, sequence = 2 }}
+              end,
+              update_run = function(id, attrs)
+                mutation_calls = mutation_calls + 1
+                assert(id == "run-child")
+                for key, value in pairs(attrs) do run[key] = value end
+                if attrs.status == "done" then
+                  run.current_step_id = nil
+                  run.current_run_step_id = nil
+                end
+                return run
+              end,
+              get_run_step_visit = function(id)
+                return {{ id = id, run_id = "run-child", step_id = run.current_step_id, status = run.status }}
+              end,
+              latest_step_session = function() return nil end,
+              list_pr_links = function() return {{}} end,
+            }}
+            package.loaded["project_pipelines.repo"] = setmetatable(repo, {{
+              __index = function() return function() return {{}} end end,
+            }})
+            package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() notification_calls = notification_calls + 1 end,
+            }}
+            package.loaded["lib.config_resolver"] = {{ list_agents = function() return {{}} end }}
+            package.loaded["lib.agent"] = {{ get = function() return nil end }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  create_agent = function(_, opts)
+                    create_agent_calls = create_agent_calls + 1
+                    return {{ status = "queued", request_id = opts.request_id }}
+                  end,
+                }}
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            engine.request_merge = function()
+              merge_requests = merge_requests + 1
+              return {{ status = "queued" }}
+            end
+            require("project_pipelines.mcp").register()
+
+            local added = handlers.project_pipelines_add_ticket_dependency({{
+              ticket_id = "ticket-child",
+              depends_on_ticket_id = "ticket-prerequisite",
+            }}, {{}})
+            assert(added.ok == true)
+            assert(#dependencies == 1)
+            assert(dependencies[1].depends_on_ticket_id == "ticket-prerequisite")
+
+            local function reset_attempt(status)
+              dependency_status = status
+              events = {{}}
+              mutation_calls = 0
+              notification_calls = 0
+              create_agent_calls = 0
+              run.status = "active"
+              run.current_step_id = "plan"
+              run.current_run_step_id = "visit-plan"
+            end
+
+            for _, status in ipairs({{ "open", "active", "blocked" }}) do
+              reset_attempt(status)
+              local response = handlers.project_pipelines_request_step_advance({{
+                run_id = "run-child",
+                summary = "advance",
+              }}, {{}}).result
+              assert(response.ok == false)
+              assert(response.status == "blocked")
+              assert(response.reason == "ticket_dependencies")
+              assert(response.step_id == "plan")
+              assert(response.run_step_id == "visit-plan")
+              assert(response.target_step_id == "implement")
+              assert(response.source == "request_step_advance")
+              assert(response.unmet_dependencies[1].reason == "open_ticket")
+              assert(response.unmet_dependencies[1].depends_on_status == status)
+              assert(response.unmet_dependencies[1].prompt:find("Close dependency ticket", 1, true))
+              assert(#events == 1 and events[1].kind == "step.advance_blocked")
+              assert(events[1].attrs.payload.reason == "ticket_dependencies")
+              assert(mutation_calls == 0)
+              assert(notification_calls == 0)
+              assert(create_agent_calls == 0)
+              assert(run.current_step_id == "plan" and run.current_run_step_id == "visit-plan")
+            end
+
+            reset_attempt(nil)
+            local missing = handlers.project_pipelines_request_step_advance({{ run_id = "run-child" }}, {{}}).result
+            assert(missing.ok == false)
+            assert(missing.unmet_dependencies[1].reason == "unavailable_ticket")
+            assert(missing.unmet_dependencies[1].dependency_id == "dependency-public")
+            assert(missing.unmet_dependencies[1].depends_on_ticket_id == "ticket-prerequisite")
+            assert(missing.unmet_dependencies[1].prompt:find("Restore or remove unavailable dependency ticket", 1, true))
+            assert(mutation_calls == 0 and notification_calls == 0 and create_agent_calls == 0)
+
+            reset_attempt("open")
+            local forced = handlers.project_pipelines_request_step_advance({{
+              run_id = "run-child",
+              next_step_id = "implement",
+              override_unmet_gates = true,
+              override_reason = "force route",
+            }}, {{}}).result
+            assert(forced.ok == false and forced.reason == "ticket_dependencies")
+            assert(#events == 1 and events[1].kind == "step.advance_blocked")
+            assert(mutation_calls == 0)
+
+            local direct = engine.activate_step(run, steps.implement)
+            assert(direct.ok == false and direct.source == "activate_step")
+            assert(mutation_calls == 0 and notification_calls == 0 and create_agent_calls == 0)
+            local direct_command = engine.activate_step(run, steps.command)
+            assert(direct_command.ok == false and direct_command.target_step_id == "command")
+            assert(mutation_calls == 0 and notification_calls == 0 and create_agent_calls == 0)
+
+            reset_attempt("closed")
+            local advanced = handlers.project_pipelines_request_step_advance({{ run_id = "run-child" }}, {{}}).result
+            assert(advanced.ok == true)
+            assert(run.current_step_id == "implement")
+            assert(create_agent_calls == 1)
+
+            reset_attempt("open")
+            final_advance = true
+            local completed = handlers.project_pipelines_request_step_advance({{ run_id = "run-child" }}, {{}}).result
+            assert(completed.ok == true)
+            assert(completed.activation.status == "done")
+            assert(run.status == "done" and run.current_step_id == nil and run.current_run_step_id == nil)
+            assert(merge_requests == 1)
+            final_advance = false
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("public ticket dependency rows should gate production advance and direct activation paths");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_step_advance_can_override_to_specific_step() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
@@ -3677,6 +3942,9 @@ fn catalog_plugin_project_pipelines_retry_step_agent_requeues_current_visit() {
             local ticket = {{ id = "ticket-verify", title = "Retry verify", target_id = "target-1" }}
             local events = {{}}
             local create_agent_calls = 0
+            local post_calls = 0
+            local notify_calls = 0
+            local dependency_status = "open"
 
             package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
             package.loaded["project_pipelines.repo"] = {{
@@ -3685,7 +3953,15 @@ fn catalog_plugin_project_pipelines_retry_step_agent_requeues_current_visit() {
               get_ticket = function(id) assert(id == "ticket-verify"); return ticket end,
               get_run_step_visit = function(id) assert(id == "visit-verify"); return visit end,
               get_run_step = function(run_id, step_id) assert(run_id == "run-verify"); assert(step_id == "verify"); return visit end,
-              latest_step_session = function() return nil end,
+              ticket_dependencies = function(ticket_id)
+                assert(ticket_id == "ticket-verify")
+                return {{
+                  {{ id = "dependency-verify", ticket_id = ticket_id, depends_on_ticket_id = "ticket-parent", depends_on_title = "Parent", depends_on_status = dependency_status }},
+                }}
+              end,
+              latest_step_session = function()
+                return dependency_status == "closed" and {{ agent_session_uuid = "sess-live" }} or nil
+              end,
               update_run = function(id, attrs)
                 assert(id == "run-verify")
                 for key, value in pairs(attrs or {{}}) do run[key] = value end
@@ -3700,10 +3976,24 @@ fn catalog_plugin_project_pipelines_retry_step_agent_requeues_current_visit() {
                 events[#events + 1] = {{ kind = kind, event = event }}
               end,
             }}
-            package.loaded["lib.agent"] = {{ get = function() return nil end }}
+            package.loaded["lib.agent"] = {{
+              get = function(session_uuid)
+                if session_uuid == "sess-live" then return {{}} end
+                return nil
+              end,
+            }}
             package.loaded["lib.hub"] = {{
               get = function()
                 return {{
+                  post = function(_, session_uuid, message)
+                    assert(session_uuid == "sess-live")
+                    assert(message.payload.step_id == "verify")
+                    post_calls = post_calls + 1
+                  end,
+                  notify = function(_, session_uuid)
+                    assert(session_uuid == "sess-live")
+                    notify_calls = notify_calls + 1
+                  end,
                   create_agent = function(_, opts)
                     create_agent_calls = create_agent_calls + 1
                     assert(opts.request_id == "project-pipelines:run-verify:verify:agent")
@@ -3715,38 +4005,59 @@ fn catalog_plugin_project_pipelines_retry_step_agent_requeues_current_visit() {
               end,
             }}
 
-            local result = require("project_pipelines.engine").retry_step_agent({{
+            local engine = require("project_pipelines.engine")
+            local blocked = engine.retry_step_agent({{
               run_id = "run-verify",
               reason = "spawn failed before linking",
             }}, {{ session_uuid = "sess-human" }})
 
+            assert(blocked.ok == false)
+            assert(blocked.status == "blocked")
+            assert(blocked.reason == "ticket_dependencies")
+            assert(blocked.source == "retry_step_agent")
+            assert(blocked.unmet_dependencies[1].reason == "open_ticket")
+            assert(run.status == "blocked")
+            assert(visit.status == "blocked")
+            assert(visit.agent_session_uuid == "sess-dead")
+            assert(create_agent_calls == 0)
+            assert(events[1].kind == "step.advance_blocked")
+
+            dependency_status = "closed"
+            local result = engine.retry_step_agent({{
+              run_id = "run-verify",
+              reason = "dependency closed; retry explicitly",
+            }}, {{ session_uuid = "sess-human" }})
+
             assert(result.ok == true)
-            assert(create_agent_calls == 1)
+            assert(result.agent.reused == true)
+            assert(create_agent_calls == 0)
+            assert(post_calls == 1)
+            assert(notify_calls == 1)
             assert(run.status == "active")
             assert(run.current_run_step_id == "visit-verify")
             assert(visit.status == "active")
-            assert(visit.agent_session_uuid == "")
+            assert(visit.agent_session_uuid == "sess-live")
 
             local saw_retry = false
-            local saw_requested = false
+            local saw_prompted = false
             for _, event in ipairs(events) do
               if event.kind == "step.agent_retry_requested" then
                 saw_retry = true
                 assert(event.event.payload.run_step_id == "visit-verify")
                 assert(event.event.payload.requested_by_session_uuid == "sess-human")
-              elseif event.kind == "step.agent_requested" then
-                saw_requested = true
-                assert(event.event.payload.request_id == "project-pipelines:run-verify:verify:agent")
+              elseif event.kind == "step.agent_prompted" then
+                saw_prompted = true
+                assert(event.event.payload.session_uuid == "sess-live")
               end
             end
             assert(saw_retry)
-            assert(saw_requested)
+            assert(saw_prompted)
             return "ok"
             "#,
             plugin_dir = plugin_dir.display()
         ))
         .eval()
-        .expect("project pipelines should retry blocked agent steps by reusing the current visit");
+        .expect("project pipelines should gate retry and then reuse the live session after explicit recovery");
 
     assert_eq!(result, "ok");
 }
