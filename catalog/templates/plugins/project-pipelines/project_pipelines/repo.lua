@@ -6,6 +6,7 @@
 -- @version 1.1.0
 
 local db = require("project_pipelines.db")
+local source_definitions = require("project_pipelines.source_definitions")
 local util = require("project_pipelines.util")
 
 local M = {}
@@ -73,6 +74,41 @@ local GATE_UPDATE_FIELDS = {
     required_fields = true,
     command = true,
 }
+
+local function sourced_definition_error()
+    error(
+        "Botster Stack Delivery structure is package-owned; edit the checked-in source at "
+        .. source_definitions.source_path())
+end
+
+local function sourced_step(step)
+    if not step then
+        return false
+    end
+    return source_definitions.pipeline_id_for_step(step.id) ~= nil
+        or source_definitions.is_sourced_pipeline_id(step.pipeline_id)
+end
+
+local function sourced_gate(gate)
+    if not gate then
+        return false
+    end
+    if source_definitions.step_id_for_gate(gate.id) ~= nil then
+        return true
+    end
+    return sourced_step(db.pipeline_steps:where{ id = gate.step_id })
+end
+
+local function assert_public_step_update_allowed(step, attrs)
+    if not sourced_step(step) then
+        return
+    end
+    for field, _value in pairs(attrs or {}) do
+        if field ~= "agent_name" then
+            sourced_definition_error()
+        end
+    end
+end
 
 local TICKET_UPDATE_FIELDS = {
     title = true,
@@ -1254,6 +1290,165 @@ function M.get_pipeline_definition(pipeline_id)
     return pipeline
 end
 
+local function exact_update(model, table_name, current, desired, fields, now)
+    local set = {}
+    local clear = {}
+    local changed = false
+    for _, field in ipairs(fields) do
+        if current[field] ~= desired[field] then
+            changed = true
+            if desired[field] == nil then
+                clear[#clear + 1] = field
+            else
+                set[field] = desired[field]
+            end
+        end
+    end
+    if not changed then
+        return false
+    end
+    set.updated_at = now
+    model:update{ where = { id = current.id }, set = set }
+    for _, field in ipairs(clear) do
+        db:eval("UPDATE " .. table_name .. " SET " .. field .. " = NULL WHERE id = ?", current.id)
+    end
+    return true
+end
+
+local function insert_sourced_pipeline(definition, now)
+    db.pipelines:insert{
+        id = definition.id,
+        name = definition.name,
+        description = definition.description,
+        merge_policy = definition.merge_policy,
+        version_label = definition.version_label,
+        archived_at = definition.archived_at,
+        replacement_pipeline_id = definition.replacement_pipeline_id,
+        supersedes_pipeline_id = definition.supersedes_pipeline_id,
+        created_at = now,
+        updated_at = now,
+    }
+end
+
+local function reconcile_sourced_definition(definition)
+    local now = util.now()
+    local changed = false
+    local step_ids = {}
+    local gate_ids = {}
+
+    local pipeline = M.get_pipeline(definition.id)
+    if not pipeline then
+        insert_sourced_pipeline(definition, now)
+        changed = true
+    else
+        changed = exact_update(
+            db.pipelines,
+            "pipelines",
+            pipeline,
+            definition,
+            source_definitions.pipeline_fields(),
+            now) or changed
+    end
+
+    -- Insert every missing step without transitions first. The second pass can
+    -- then converge links after all stable step IDs exist.
+    for _, source_step in ipairs(definition.steps or {}) do
+        step_ids[source_step.id] = true
+        if not M.get_step(source_step.id) then
+            insert_step({
+                id = source_step.id,
+                pipeline_id = definition.id,
+                position = source_step.position,
+                kind = source_step.kind,
+                name = source_step.name,
+                agent_name = source_step.agent_name,
+                prompt = source_step.prompt,
+                command = source_step.command,
+            }, now)
+            changed = true
+        end
+    end
+
+    for _, source_step in ipairs(definition.steps or {}) do
+        local step = M.get_step(source_step.id)
+        local desired = util.copy(source_step)
+        desired.pipeline_id = definition.id
+        desired.gates = nil
+        -- agent_name is insertion policy. Existing operator choices are never
+        -- reconciled from the package source.
+        desired.agent_name = nil
+        changed = exact_update(
+            db.pipeline_steps,
+            "pipeline_steps",
+            step,
+            desired,
+            source_definitions.step_fields(),
+            now) or changed
+
+        for _, source_gate in ipairs(source_step.gates or {}) do
+            gate_ids[source_gate.id] = true
+            local desired_gate = util.copy(source_gate)
+            desired_gate.step_id = source_step.id
+            desired_gate.required_fields = encode_required_fields(desired_gate.required_fields)
+            local gate = M.get_gate(source_gate.id)
+            if not gate then
+                insert_gate(desired_gate, now)
+                changed = true
+            else
+                changed = exact_update(
+                    db.pipeline_gates,
+                    "pipeline_gates",
+                    gate,
+                    desired_gate,
+                    source_definitions.gate_fields(),
+                    now) or changed
+            end
+        end
+    end
+
+    -- Package authority owns the exact graph shape. These private deletes sit
+    -- below public history guards and cannot be reached through MCP or UI.
+    for _, step in ipairs(M.pipeline_steps(definition.id)) do
+        for _, gate in ipairs(M.step_gates(step.id)) do
+            if not gate_ids[gate.id] then
+                db:eval("DELETE FROM pipeline_gates WHERE id = ?", gate.id)
+                changed = true
+            end
+        end
+    end
+    for _, step in ipairs(M.pipeline_steps(definition.id)) do
+        if not step_ids[step.id] then
+            db:eval("DELETE FROM pipeline_steps WHERE id = ?", step.id)
+            changed = true
+        end
+    end
+
+    if changed then
+        M.append_event("pipeline.source_reconciled", {
+            payload = {
+                pipeline_id = definition.id,
+                source_path = source_definitions.source_path(),
+            },
+        })
+    end
+    return changed
+end
+
+function M.reconcile_sourced_definitions()
+    local changed = false
+    with_transaction(function()
+        for _, definition in ipairs(source_definitions.definitions()) do
+            changed = reconcile_sourced_definition(definition) or changed
+        end
+    end)
+    if changed then
+        publish_entity_snapshot("pipeline")
+        publish_entity_snapshot("pipeline_step")
+        publish_entity_snapshot("pipeline_gate")
+    end
+    return changed
+end
+
 function M.get_default_pipeline()
     return first("SELECT * FROM pipelines WHERE archived_at IS NULL ORDER BY created_at ASC LIMIT 1")
 end
@@ -1270,6 +1465,9 @@ function M.update_pipeline(pipeline_id, attrs)
     local pipeline = M.get_pipeline(pipeline_id)
     if not pipeline then
         error("pipeline not found: " .. tostring(pipeline_id))
+    end
+    if source_definitions.is_sourced_pipeline_id(pipeline_id) then
+        sourced_definition_error()
     end
     local set = filter_update(attrs, PIPELINE_UPDATE_FIELDS)
     if not has_fields(set) then
@@ -1318,6 +1516,7 @@ function M.update_step(step_id, attrs)
     if not step then
         error("step not found: " .. tostring(step_id))
     end
+    assert_public_step_update_allowed(step, attrs)
     local set = filter_update(attrs, STEP_UPDATE_FIELDS)
     if not has_fields(set) then
         return step
@@ -1347,6 +1546,9 @@ function M.update_gate(gate_id, attrs)
     if not gate then
         error("gate not found: " .. tostring(gate_id))
     end
+    if sourced_gate(gate) then
+        sourced_definition_error()
+    end
     local set = filter_update(attrs, GATE_UPDATE_FIELDS)
     if not has_fields(set) then
         return decode_gate_row(gate)
@@ -1372,6 +1574,9 @@ end
 function M.create_pipeline(attrs)
     util.assert_present(attrs.id, "pipeline id")
     util.assert_present(attrs.name, "pipeline name")
+    if source_definitions.is_sourced_pipeline_id(attrs.id) then
+        sourced_definition_error()
+    end
     local now = util.now()
     local published_step_ids = {}
     local published_gate_ids = {}
@@ -1460,6 +1665,11 @@ end
 function M.create_step(attrs)
     util.assert_present(attrs.pipeline_id, "pipeline_id")
     util.assert_present(attrs.name, "step name")
+    if source_definitions.is_sourced_pipeline_id(attrs.pipeline_id)
+        or source_definitions.pipeline_id_for_step(attrs.id) ~= nil
+    then
+        sourced_definition_error()
+    end
     if not M.get_pipeline(attrs.pipeline_id) then
         error("pipeline not found: " .. tostring(attrs.pipeline_id))
     end
@@ -1492,6 +1702,9 @@ function M.delete_step(step_id)
     local step = M.get_step(step_id)
     if not step then
         return nil
+    end
+    if sourced_step(step) then
+        sourced_definition_error()
     end
     local usage = first("SELECT COUNT(*) AS count FROM run_steps WHERE step_id = ?", step_id)
     if usage and tonumber(usage.count or 0) > 0 then
@@ -1531,6 +1744,12 @@ end
 function M.create_gate(attrs)
     util.assert_present(attrs.step_id, "step_id")
     util.assert_present(attrs.prompt, "gate prompt")
+    if source_definitions.pipeline_id_for_step(attrs.step_id) ~= nil
+        or source_definitions.step_id_for_gate(attrs.id) ~= nil
+        or sourced_step(M.get_step(attrs.step_id))
+    then
+        sourced_definition_error()
+    end
     if not M.get_step(attrs.step_id) then
         error("step not found: " .. tostring(attrs.step_id))
     end
@@ -1546,6 +1765,9 @@ function M.delete_gate(gate_id)
     local gate = M.get_gate(gate_id)
     if not gate then
         return nil
+    end
+    if sourced_gate(gate) then
+        sourced_definition_error()
     end
     local usage = first("SELECT COUNT(*) AS count FROM gate_results WHERE gate_id = ?", gate_id)
     if usage and tonumber(usage.count or 0) > 0 then
@@ -1565,6 +1787,9 @@ function M.delete_pipeline(pipeline_id)
     local pipeline = M.get_pipeline(pipeline_id)
     if not pipeline then
         return nil
+    end
+    if source_definitions.is_sourced_pipeline_id(pipeline_id) then
+        sourced_definition_error()
     end
     local usage = first("SELECT COUNT(*) AS count FROM runs WHERE pipeline_id = ?", pipeline_id)
     if usage and tonumber(usage.count or 0) > 0 then
