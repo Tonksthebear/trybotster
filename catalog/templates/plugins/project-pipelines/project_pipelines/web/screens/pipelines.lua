@@ -412,7 +412,8 @@ local function sourced_pipeline_fields(pipeline)
         ui.text{ text = pipeline.description or "", size = "xs" },
         ui.text{ text = "Merge policy: " .. tostring(pipeline.merge_policy or "direct"), size = "xs", tone = "muted" },
         ui.text{
-            text = "Structural changes come from " .. source_definitions.source_path(),
+            text = "Structure, prompts, and lifecycle changes (including archive or retirement) come from "
+                .. source_definitions.source_path(),
             size = "xs",
             tone = "muted",
         },

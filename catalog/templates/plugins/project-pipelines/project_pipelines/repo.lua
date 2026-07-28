@@ -1330,6 +1330,23 @@ local function insert_sourced_pipeline(definition, now)
     }
 end
 
+local function record_source_prune_skipped(definition, entity_type, entity_id, reason)
+    local payload = {
+        pipeline_id = definition.id,
+        entity_type = entity_type,
+        entity_id = entity_id,
+        reason = reason,
+        source_path = source_definitions.source_path(),
+    }
+    if not first(
+        "SELECT id FROM events WHERE kind = ? AND payload = ? LIMIT 1",
+        "pipeline.source_prune_skipped",
+        util.encode(payload))
+    then
+        M.append_event("pipeline.source_prune_skipped", { payload = payload })
+    end
+end
+
 local function reconcile_sourced_definition(definition)
     local now = util.now()
     local changed = false
@@ -1406,20 +1423,39 @@ local function reconcile_sourced_definition(definition)
         end
     end
 
-    -- Package authority owns the exact graph shape. These private deletes sit
-    -- below public history guards and cannot be reached through MCP or UI.
+    -- Package authority owns the exact graph shape, but historical rows remain
+    -- durable evidence. Drift with history stays visible instead of being
+    -- silently orphaned by the private reconciliation path.
     for _, step in ipairs(M.pipeline_steps(definition.id)) do
         for _, gate in ipairs(M.step_gates(step.id)) do
             if not gate_ids[gate.id] then
-                db:eval("DELETE FROM pipeline_gates WHERE id = ?", gate.id)
-                changed = true
+                local usage = first("SELECT COUNT(*) AS count FROM gate_results WHERE gate_id = ?", gate.id)
+                if usage and tonumber(usage.count or 0) > 0 then
+                    record_source_prune_skipped(
+                        definition,
+                        "pipeline_gate",
+                        gate.id,
+                        "existing gate result history")
+                else
+                    db:eval("DELETE FROM pipeline_gates WHERE id = ?", gate.id)
+                    changed = true
+                end
             end
         end
     end
     for _, step in ipairs(M.pipeline_steps(definition.id)) do
         if not step_ids[step.id] then
-            db:eval("DELETE FROM pipeline_steps WHERE id = ?", step.id)
-            changed = true
+            local usage = first("SELECT COUNT(*) AS count FROM run_steps WHERE step_id = ?", step.id)
+            if usage and tonumber(usage.count or 0) > 0 then
+                record_source_prune_skipped(
+                    definition,
+                    "pipeline_step",
+                    step.id,
+                    "existing run step history")
+            else
+                db:eval("DELETE FROM pipeline_steps WHERE id = ?", step.id)
+                changed = true
+            end
         end
     end
 
@@ -1441,16 +1477,16 @@ function M.reconcile_sourced_definitions()
             changed = reconcile_sourced_definition(definition) or changed
         end
     end)
-    if changed then
-        publish_entity_snapshot("pipeline")
-        publish_entity_snapshot("pipeline_step")
-        publish_entity_snapshot("pipeline_gate")
-    end
     return changed
 end
 
 function M.get_default_pipeline()
-    return first("SELECT * FROM pipelines WHERE archived_at IS NULL ORDER BY created_at ASC LIMIT 1")
+    for _, pipeline in ipairs(M.list_pipelines()) do
+        if not source_definitions.is_sourced_pipeline_id(pipeline.id) then
+            return pipeline
+        end
+    end
+    return nil
 end
 
 function M.pipeline_steps(pipeline_id)

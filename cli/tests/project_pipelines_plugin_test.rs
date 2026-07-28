@@ -4661,12 +4661,13 @@ fn catalog_plugin_project_pipelines_init_prunes_then_reconciles_before_registrat
             package.preload["project_pipelines.repo"] = function()
               return {{
                 prune_legacy_seed_data = function() record("prune") end,
-                reconcile_sourced_definitions = function() record("reconcile") end,
+                reconcile_sourced_definitions = function() record("reconcile"); return true end,
               }}
             end
             package.preload["project_pipelines.engine"] = function()
               return {{
                 register_entities = function() record("entities") end,
+                publish_entity_snapshots = function() record("snapshots") end,
                 reconcile_agent_sessions = function() end,
               }}
             end
@@ -4685,7 +4686,7 @@ fn catalog_plugin_project_pipelines_init_prunes_then_reconciles_before_registrat
             hooks = nil
 
             assert(loadfile({init_path}))()
-            assert(table.concat(calls, ",") == "prune,reconcile,entities,notifications,mcp,surface")
+            assert(table.concat(calls, ",") == "prune,reconcile,entities,snapshots,notifications,mcp,surface")
             return "ok"
             "#,
             plugin_dir = plugin_dir.display(),
@@ -4694,6 +4695,69 @@ fn catalog_plugin_project_pipelines_init_prunes_then_reconciles_before_registrat
         ))
         .eval()
         .expect("Project Pipelines init should reconcile source before registrations");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_reconcile_failure_keeps_registrations_available() {
+    let lua = Lua::new();
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let init_path = plugin_dir.join("init.lua");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+            local calls = {{}}
+            local warnings = {{}}
+            local function record(name) calls[#calls + 1] = name end
+
+            package.preload["project_pipelines.repo"] = function()
+              return {{
+                prune_legacy_seed_data = function() record("prune") end,
+                reconcile_sourced_definitions = function()
+                  record("reconcile")
+                  error("database is locked")
+                end,
+              }}
+            end
+            package.preload["project_pipelines.engine"] = function()
+              return {{
+                register_entities = function() record("entities") end,
+                publish_entity_snapshots = function() record("snapshots") end,
+                reconcile_agent_sessions = function() end,
+              }}
+            end
+            package.preload["project_pipelines.github_integration"] = function() return {{}} end
+            package.preload["project_pipelines.notification_policy"] = function()
+              return {{ register = function() record("notifications") end }}
+            end
+            package.preload["project_pipelines.mcp"] = function()
+              return {{ register = function() record("mcp") end }}
+            end
+            package.preload["project_pipelines.web.surface"] = function()
+              return {{ register = function() record("surface") end }}
+            end
+            log = {{
+              info = function() end,
+              warn = function(message) warnings[#warnings + 1] = message end,
+            }}
+            events = nil
+            hooks = nil
+
+            assert(loadfile({init_path}))()
+            assert(table.concat(calls, ",") == "prune,reconcile,entities,notifications,mcp,surface")
+            assert(#warnings == 1)
+            assert(warnings[1]:find("source reconciliation failed", 1, true))
+            assert(warnings[1]:find("database is locked", 1, true))
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display(),
+            init_path =
+                serde_json::to_string(&init_path.to_string_lossy()).expect("encode init path"),
+        ))
+        .eval()
+        .expect("Project Pipelines registrations should survive reconciliation failure");
 
     assert_eq!(result, "ok");
 }
@@ -4782,6 +4846,8 @@ fn catalog_plugin_project_pipelines_sourced_workbench_keeps_only_device_agent_co
             assert(copy:find("Package-owned", 1, true))
             assert(copy:find("Read-only structure", 1, true))
             assert(copy:find("device-local", 1, true))
+            assert(copy:find("lifecycle changes", 1, true))
+            assert(copy:find("archive or retirement", 1, true))
             assert(copy:find("source_definitions.lua", 1, true))
             return "ok"
             "#,
@@ -4849,6 +4915,7 @@ fn catalog_plugin_project_pipelines_sourced_definition_reconciles_real_sqlite_an
             assert(imported.archived_at == nil)
             assert(imported.replacement_pipeline_id == nil)
             assert(#imported.steps == 5)
+            assert(repo.get_default_pipeline() == nil)
 
             local expected_agents = {
               botster_stack_plan = "codex",
@@ -4949,7 +5016,6 @@ fn catalog_plugin_project_pipelines_sourced_definition_reconciles_real_sqlite_an
               created_at = 1,
               updated_at = 1,
             }
-
             repo.create_pipeline{
               id = "operator-pipeline",
               name = "Operator Pipeline",
@@ -4957,6 +5023,7 @@ fn catalog_plugin_project_pipelines_sourced_definition_reconciles_real_sqlite_an
               merge_policy = "direct",
             }
             local unrelated_before = repo.get_pipeline("operator-pipeline")
+            assert(repo.get_default_pipeline().id == "operator-pipeline")
 
             assert(repo.reconcile_sourced_definitions() == true)
             local event_count = db:eval(
@@ -5085,6 +5152,78 @@ fn catalog_plugin_project_pipelines_sourced_definition_reconciles_real_sqlite_an
         )
         .eval()
         .expect("sourced definition should round-trip and reconcile through real plugin.db");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_sourced_reconcile_preserves_historical_graph_drift() {
+    let temp = TempDir::new().expect("temp data dir");
+    let lua = project_pipelines_db_lua(temp.path());
+    let result: String = lua
+        .load(
+            r#"
+            local repo = require("project_pipelines.repo")
+            local db = require("project_pipelines.db")
+
+            assert(repo.reconcile_sourced_definitions() == true)
+            db.pipeline_steps:insert{
+              id = "historical-source-step",
+              pipeline_id = "botster_stack_delivery",
+              position = 99,
+              kind = "agent",
+              name = "Historical",
+              prompt = "historical",
+              created_at = 1,
+              updated_at = 1,
+            }
+            db.pipeline_gates:insert{
+              id = "historical-source-gate",
+              step_id = "historical-source-step",
+              kind = "attestation",
+              prompt = "historical",
+              required_fields = "[\"proof\"]",
+              created_at = 1,
+              updated_at = 1,
+            }
+            db.run_steps:insert{
+              id = "historical-run-step",
+              run_id = "historical-run",
+              step_id = "historical-source-step",
+              sequence = 1,
+              status = "done",
+              created_at = 1,
+              updated_at = 1,
+            }
+            db.gate_results:insert{
+              id = "historical-gate-result",
+              run_id = "historical-run",
+              run_step_id = "historical-run-step",
+              step_id = "historical-source-step",
+              gate_id = "historical-source-gate",
+              status = "passed",
+              created_at = 1,
+            }
+
+            assert(repo.reconcile_sourced_definitions() == false)
+            assert(repo.get_step("historical-source-step") ~= nil)
+            assert(repo.get_gate("historical-source-gate") ~= nil)
+            assert(db.run_steps:where{ id = "historical-run-step" }.step_id == "historical-source-step")
+            assert(db.gate_results:where{ id = "historical-gate-result" }.gate_id == "historical-source-gate")
+            local skipped = db:eval(
+              "SELECT COUNT(*) AS count FROM events WHERE kind = ?",
+              "pipeline.source_prune_skipped")[1].count
+            assert(skipped == 2)
+            assert(repo.reconcile_sourced_definitions() == false)
+            local skipped_after = db:eval(
+              "SELECT COUNT(*) AS count FROM events WHERE kind = ?",
+              "pipeline.source_prune_skipped")[1].count
+            assert(skipped_after == skipped)
+            return "ok"
+            "#,
+        )
+        .eval()
+        .expect("sourced reconciliation should preserve graph rows referenced by history");
 
     assert_eq!(result, "ok");
 }

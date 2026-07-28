@@ -39,8 +39,15 @@ local surface = require("project_pipelines.web.surface")
 local M = {}
 
 repo.prune_legacy_seed_data()
-repo.reconcile_sourced_definitions()
+local reconciled_ok, reconciled = pcall(repo.reconcile_sourced_definitions)
+if not reconciled_ok then
+    log.warn("[project-pipelines] source reconciliation failed: " .. tostring(reconciled))
+    reconciled = false
+end
 engine.register_entities()
+if reconciled then
+    engine.publish_entity_snapshots()
+end
 notification_policy.register()
 mcp_tools.register()
 surface.register()

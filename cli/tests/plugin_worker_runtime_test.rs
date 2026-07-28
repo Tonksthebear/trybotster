@@ -1788,16 +1788,15 @@ fn plugin_owned_mcp_handlers_run_in_plugin_worker_vm() {
 
 #[test]
 fn project_pipelines_worker_init_serves_sourced_stack_definition_through_public_mcp() {
-    // SAFETY: The focused integration filter runs this test in isolation. The
-    // worker resolves repository Lua modules and persists into a temporary
-    // device data root.
+    // SAFETY: This file's existing test convention sets BOTSTER_LUA_PATH so
+    // worker VMs resolve repository modules. The device data root is scoped to
+    // this Lua runtime below, avoiding another process-global environment var.
     let tmp = TempDir::new().unwrap();
     unsafe {
         std::env::set_var(
             "BOTSTER_LUA_PATH",
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua"),
         );
-        std::env::set_var("BOTSTER_CONFIG_DIR", tmp.path());
     }
 
     let init_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1814,8 +1813,12 @@ fn project_pipelines_worker_init_serves_sourced_stack_definition_through_public_
                 server_id = function() return "hub-test" end,
                 detect_repo = function() return "Tonksthebear/trybotster" end,
             }}
+            _G.config = {{
+                data_dir = function() return {data_dir} end,
+            }}
             _G.mcp = require("lib.mcp")
             require("lib.plugin_db").install()
+            require("lib.commands").register("plugin_entity_publish", function() return {{}} end)
 
             local loader = require("hub.loader")
             local ok, err = loader.load_plugin(
@@ -1844,12 +1847,10 @@ fn project_pipelines_worker_init_serves_sourced_stack_definition_through_public_
             return true
             "#,
             init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+            data_dir = serde_json::to_string(&tmp.path().to_string_lossy()).unwrap(),
         ))
         .eval::<bool>()
         .unwrap();
 
     drop(runtime);
-    unsafe {
-        std::env::remove_var("BOTSTER_CONFIG_DIR");
-    }
 }

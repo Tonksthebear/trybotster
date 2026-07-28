@@ -55,11 +55,12 @@ Stack Delivery is a narrow package-owned definition reconciled idempotently
 from `project_pipelines/source_definitions.lua`; users and agents create every
 other reusable pipeline explicitly through the GUI and MCP tools. Package-owned
 pipeline metadata, steps, transitions, prompts, and gates are read-only through
-public APIs. Step agent selection remains device-local operator policy: source
-values initialize a missing step, while later reconciliation preserves the
-operator's choice. Projects are the durable container for multi-phase or
-cross-target work; tickets remain one concrete unit of work in one spawn
-target.
+public APIs. Its lifecycle is source-controlled too: archiving, retiring, or
+replacing Botster Stack Delivery requires changing the checked-in definition.
+Step agent selection remains device-local operator policy: source values
+initialize a missing step, while later reconciliation preserves the operator's
+choice. Projects are the durable container for multi-phase or cross-target work;
+tickets remain one concrete unit of work in one spawn target.
 
 Pipeline MCP CRUD:
 
@@ -571,7 +572,11 @@ Delivery from `project_pipelines/source_definitions.lua` before registering
 entities, MCP tools, and surfaces. Reconciliation updates stable rows in place,
 preserves run history and device-local agent selections, removes graph drift,
 and is a no-op when the database already matches the checked-in source.
-User-owned definitions retain normal GUI and MCP CRUD behavior.
+Historical steps and gates that no longer appear in source are retained when
+run or gate-result history still references them, with an audit event recording
+the skipped prune. User-owned definitions retain normal GUI and MCP CRUD
+behavior, and only user-owned definitions participate in implicit default
+selection when a caller omits `pipeline_id`.
 
 ## Starting A Run
 
