@@ -10,13 +10,59 @@
 use std::path::PathBuf;
 
 use botster::lua::primitives::log;
-use mlua::Lua;
+use mlua::{Lua, LuaOptions, StdLib, Table};
+use tempfile::TempDir;
 
 fn project_root_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("cli has repo parent")
         .to_path_buf()
+}
+
+fn project_pipelines_db_lua(data_dir: &std::path::Path) -> Lua {
+    let lua =
+        unsafe { Lua::unsafe_new_with(StdLib::ALL_SAFE | StdLib::FFI, LuaOptions::default()) };
+    botster::lua::primitives::fs::register(&lua).expect("register fs");
+    botster::lua::primitives::log::register(&lua).expect("register log");
+    botster::lua::primitives::json::register(&lua).expect("register json");
+
+    let cli_lua = project_root_dir().join("cli/lua");
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let package: Table = lua.globals().get("package").expect("package table");
+    let current_path: String = package.get("path").expect("package.path");
+    package
+        .set(
+            "path",
+            format!(
+                "{}/?.lua;{}/?/init.lua;{}/lib/?.lua;{}/vendor/?.lua;{}/vendor/?/init.lua;{}/?.lua;{}/?/init.lua;{}",
+                cli_lua.display(),
+                cli_lua.display(),
+                cli_lua.display(),
+                cli_lua.display(),
+                cli_lua.display(),
+                plugin_dir.display(),
+                plugin_dir.display(),
+                current_path
+            ),
+        )
+        .expect("set package.path");
+
+    lua.load(format!(
+        r#"
+        config = {{ data_dir = function() return {data_dir} end }}
+        hooks = {{ on = function() end }}
+        events = {{ on = function() end }}
+        local plugin_db = require("lib.plugin_db")
+        plugin_db._reset_for_tests()
+        plugin_db.install()
+        _loading_plugin_name = "project-pipelines"
+        "#,
+        data_dir = serde_json::to_string(&data_dir.to_string_lossy()).expect("encode data dir"),
+    ))
+    .exec()
+    .expect("install real plugin.db");
+    lua
 }
 
 #[test]
@@ -4596,6 +4642,449 @@ fn catalog_plugin_project_pipelines_start_run_rejects_archived_pipelines() {
         ))
         .eval()
         .expect("project pipelines start_run should reject archived pipelines");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_init_prunes_then_reconciles_before_registration() {
+    let lua = Lua::new();
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let init_path = plugin_dir.join("init.lua");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+            local calls = {{}}
+            local function record(name) calls[#calls + 1] = name end
+
+            package.preload["project_pipelines.repo"] = function()
+              return {{
+                prune_legacy_seed_data = function() record("prune") end,
+                reconcile_sourced_definitions = function() record("reconcile") end,
+              }}
+            end
+            package.preload["project_pipelines.engine"] = function()
+              return {{
+                register_entities = function() record("entities") end,
+                reconcile_agent_sessions = function() end,
+              }}
+            end
+            package.preload["project_pipelines.github_integration"] = function() return {{}} end
+            package.preload["project_pipelines.notification_policy"] = function()
+              return {{ register = function() record("notifications") end }}
+            end
+            package.preload["project_pipelines.mcp"] = function()
+              return {{ register = function() record("mcp") end }}
+            end
+            package.preload["project_pipelines.web.surface"] = function()
+              return {{ register = function() record("surface") end }}
+            end
+            log = {{ info = function() end, warn = function() end }}
+            events = nil
+            hooks = nil
+
+            assert(loadfile({init_path}))()
+            assert(table.concat(calls, ",") == "prune,reconcile,entities,notifications,mcp,surface")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display(),
+            init_path =
+                serde_json::to_string(&init_path.to_string_lossy()).expect("encode init path"),
+        ))
+        .eval()
+        .expect("Project Pipelines init should reconcile source before registrations");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_sourced_workbench_keeps_only_device_agent_controls() {
+    let lua = Lua::new();
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local definition = require("project_pipelines.source_definitions").definitions()[1]
+            local steps = definition.steps
+            local gates = {{}}
+            for _, step in ipairs(steps) do
+              gates[step.id] = step.gates
+            end
+
+            package.loaded["project_pipelines.repo"] = {{
+              get_pipeline = function(id)
+                assert(id == definition.id)
+                return definition
+              end,
+              pipeline_steps = function(id)
+                assert(id == definition.id)
+                return steps
+              end,
+              step_gates = function(id)
+                return gates[id] or {{}}
+              end,
+            }}
+            package.loaded["project_pipelines.web.actions"] = {{
+              feedback = function() return {{}} end,
+            }}
+            package.loaded["project_pipelines.web.ui"] = {{
+              page_header = function(opts) opts.type = "page_header"; return opts end,
+              panel = function(child) return {{ type = "panel", children = child }} end,
+              row = function(...) return {{ type = "row", children = {{...}} }} end,
+              badge = function(text) return {{ type = "badge", text = text }} end,
+              field_action = function(_id, params) return {{ params = params }} end,
+              agent_options = function(selected) return {{ {{ value = selected, label = selected }} }} end,
+            }}
+            ui = setmetatable({{
+              action = function(id, params) return {{ id = id, params = params }} end,
+              stack = function(opts) opts.type = "stack"; return opts end,
+            }}, {{
+              __index = function(_table, kind)
+                return function(opts)
+                  opts = opts or {{}}
+                  opts.type = kind
+                  return opts
+                end
+              end,
+            }})
+
+            local screen = require("project_pipelines.web.screens.pipelines")
+            local tree = screen.edit({{ params = {{ pipeline_id = definition.id }} }}, {{
+              path = function(path) return path end,
+            }})
+
+            local selects = {{}}
+            local structural_controls = 0
+            local text = {{}}
+            local function walk(node)
+              if type(node) ~= "table" then return end
+              if node.type == "select" then selects[#selects + 1] = node end
+              if node.type == "textarea" or node.type == "text_input" or node.type == "checkbox" then
+                structural_controls = structural_controls + 1
+              end
+              if node.text then text[#text + 1] = tostring(node.text) end
+              for _, child in pairs(node) do
+                if type(child) == "table" then walk(child) end
+              end
+            end
+            walk(tree)
+
+            assert(structural_controls == 0)
+            assert(#selects == 5)
+            for _, select in ipairs(selects) do
+              assert(select.label == "Selected agent")
+              assert(select.on_change.params.field == "agent_name")
+            end
+            local copy = table.concat(text, "\n")
+            assert(copy:find("Package-owned", 1, true))
+            assert(copy:find("Read-only structure", 1, true))
+            assert(copy:find("device-local", 1, true))
+            assert(copy:find("source_definitions.lua", 1, true))
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("sourced workbench should render package structure read-only");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_sourced_definition_reconciles_real_sqlite_and_guards_public_crud(
+) {
+    let temp = TempDir::new().expect("temp data dir");
+    let lua = project_pipelines_db_lua(temp.path());
+    let result: String = lua
+        .load(
+            r#"
+            local source = require("project_pipelines.source_definitions")
+            local repo = require("project_pipelines.repo")
+            local db = require("project_pipelines.db")
+
+            local definitions = source.definitions()
+            assert(#definitions == 1)
+            local expected = definitions[1]
+            assert(expected.id == "botster_stack_delivery")
+            assert(expected.name == "Botster Stack Delivery")
+            assert(expected.merge_policy == "pr")
+            assert(expected.version_label == "Repository playbooks — 2026-07-28")
+            assert(expected.supersedes_pipeline_id == "botster_delivery")
+            assert(expected.archived_at == nil)
+            assert(expected.replacement_pipeline_id == nil)
+
+            local routes = source.routes()
+            assert(#routes == 8)
+            local expected_routes = {
+              ["botster-core"] = "botster-core-playbook",
+              ["botster-hub"] = "botster-hub-playbook",
+              ["botster-hub-client"] = "botster-hub-client-playbook",
+              ["botster-web"] = "botster-web-playbook",
+              ["botster-tui"] = "botster-tui-playbook",
+              ["botster-tui-kit"] = "botster-tui-kit-playbook",
+              ["botster-terminal-ghostty"] = "botster-terminal-ghostty-playbook",
+              ["Project Pipelines package/plugin paths"] = "project-pipelines-playbook",
+            }
+            for _, route in ipairs(routes) do
+              assert(expected_routes[route.target] == route.playbook)
+              expected_routes[route.target] = nil
+            end
+            assert(next(expected_routes) == nil)
+            for _, step in ipairs(expected.steps) do
+              assert(step.prompt:find("- botster-tui-kit -> [[botster-tui-kit-playbook]]", 1, true))
+              assert(not step.prompt:find("[[botster-core-playbook]] [[botster-hub-playbook]]", 1, true))
+            end
+
+            assert(repo.get_pipeline(expected.id) == nil)
+            assert(repo.reconcile_sourced_definitions() == true)
+            local imported = repo.get_pipeline_definition(expected.id)
+            assert(imported.name == expected.name)
+            assert(imported.description == expected.description)
+            assert(imported.merge_policy == expected.merge_policy)
+            assert(imported.version_label == expected.version_label)
+            assert(imported.supersedes_pipeline_id == expected.supersedes_pipeline_id)
+            assert(imported.archived_at == nil)
+            assert(imported.replacement_pipeline_id == nil)
+            assert(#imported.steps == 5)
+
+            local expected_agents = {
+              botster_stack_plan = "codex",
+              botster_stack_plan_review = "claude",
+              botster_stack_implement = "codex",
+              botster_stack_review = "claude",
+              botster_stack_verify = "codex",
+            }
+            local gate_count = 0
+            for index, step in ipairs(imported.steps) do
+              local source_step = expected.steps[index]
+              assert(step.id == source_step.id)
+              assert(step.pipeline_id == expected.id)
+              assert(step.position == source_step.position)
+              assert(step.kind == source_step.kind)
+              assert(step.name == source_step.name)
+              assert(step.agent_name == expected_agents[step.id])
+              assert(step.prompt == source_step.prompt)
+              assert(step.command == source_step.command)
+              assert(step.next_step_id == source_step.next_step_id)
+              assert(step.on_approved_step_id == source_step.on_approved_step_id)
+              assert(step.on_changes_requested_step_id == source_step.on_changes_requested_step_id)
+              assert(step.on_blocked_step_id == source_step.on_blocked_step_id)
+              assert(#step.gates == #source_step.gates)
+              gate_count = gate_count + #step.gates
+              local gate = step.gates[1]
+              local source_gate = source_step.gates[1]
+              assert(gate.id == source_gate.id)
+              assert(gate.step_id == source_step.id)
+              assert(gate.kind == source_gate.kind)
+              assert(gate.prompt == source_gate.prompt)
+              assert(gate.command == source_gate.command)
+              assert(#gate.required_fields == #source_gate.required_fields)
+              for field_index, field in ipairs(source_gate.required_fields) do
+                assert(gate.required_fields[field_index] == field)
+              end
+            end
+            assert(gate_count == 5)
+
+            for index, step in ipairs(imported.steps) do
+              local selected = "device-agent-" .. tostring(index)
+              if index == 1 then
+                repo.update_step(step.id, { agent_name = selected })
+              else
+                repo.update_step_agent(step.id, selected)
+              end
+              expected_agents[step.id] = selected
+            end
+
+            local before_mixed = repo.get_step("botster_stack_plan")
+            local ok_mixed, err_mixed = pcall(repo.update_step, before_mixed.id, {
+              agent_name = "must-not-apply",
+              prompt = "must-not-apply",
+            })
+            assert(ok_mixed == false)
+            assert(tostring(err_mixed):find(source.source_path(), 1, true))
+            local after_mixed = repo.get_step(before_mixed.id)
+            assert(after_mixed.agent_name == before_mixed.agent_name)
+            assert(after_mixed.prompt == before_mixed.prompt)
+
+            db.pipelines:update{
+              where = { id = expected.id },
+              set = { name = "Stale Stack", version_label = "stale", archived_at = 123 },
+            }
+            db.pipeline_steps:update{
+              where = { id = "botster_stack_plan" },
+              set = { position = 99, prompt = "stale prompt" },
+            }
+            db.pipeline_gates:update{
+              where = { id = "botster_stack_plan_gate" },
+              set = { prompt = "stale gate", required_fields = "[\"stale\"]" },
+            }
+            db.pipeline_steps:insert{
+              id = "source-extra-step",
+              pipeline_id = expected.id,
+              position = 99,
+              kind = "agent",
+              name = "Extra",
+              prompt = "extra",
+              created_at = 1,
+              updated_at = 1,
+            }
+            db.pipeline_gates:insert{
+              id = "source-extra-gate",
+              step_id = "source-extra-step",
+              kind = "attestation",
+              prompt = "extra",
+              required_fields = "[\"extra\"]",
+              created_at = 1,
+              updated_at = 1,
+            }
+            db.run_steps:insert{
+              id = "history-run-step",
+              run_id = "history-run",
+              step_id = "botster_stack_plan",
+              sequence = 1,
+              status = "done",
+              created_at = 1,
+              updated_at = 1,
+            }
+
+            repo.create_pipeline{
+              id = "operator-pipeline",
+              name = "Operator Pipeline",
+              description = "untouched",
+              merge_policy = "direct",
+            }
+            local unrelated_before = repo.get_pipeline("operator-pipeline")
+
+            assert(repo.reconcile_sourced_definitions() == true)
+            local event_count = db:eval(
+              "SELECT COUNT(*) AS count FROM events WHERE kind = ?",
+              "pipeline.source_reconciled")[1].count
+            assert(repo.reconcile_sourced_definitions() == false)
+            local event_count_after = db:eval(
+              "SELECT COUNT(*) AS count FROM events WHERE kind = ?",
+              "pipeline.source_reconciled")[1].count
+            assert(event_count_after == event_count)
+            assert(repo.get_step("source-extra-step") == nil)
+            assert(repo.get_gate("source-extra-gate") == nil)
+            local history = db.run_steps:where{ id = "history-run-step" }
+            assert(history.step_id == "botster_stack_plan")
+
+            local converged = repo.get_pipeline_definition(expected.id)
+            assert(converged.name == expected.name)
+            assert(converged.version_label == expected.version_label)
+            assert(converged.archived_at == nil)
+            assert(converged.steps[1].position == 1)
+            assert(converged.steps[1].prompt == expected.steps[1].prompt)
+            assert(converged.steps[1].gates[1].prompt == expected.steps[1].gates[1].prompt)
+            for _, step in ipairs(converged.steps) do
+              assert(step.agent_name == expected_agents[step.id])
+            end
+            local unrelated_after = repo.get_pipeline("operator-pipeline")
+            assert(unrelated_after.name == unrelated_before.name)
+            assert(unrelated_after.description == unrelated_before.description)
+            assert(unrelated_after.updated_at == unrelated_before.updated_at)
+
+            db.tickets:insert{
+              id = "tui-kit-ticket",
+              target_id = "tgt_3dfae49c02454037bf13554f552baf7f",
+              title = "TUI kit routing proof",
+              description = "downstream fixture",
+              status = "open",
+              created_at = 1,
+              updated_at = 1,
+            }
+            db.runs:insert{
+              id = "tui-kit-run",
+              ticket_id = "tui-kit-ticket",
+              pipeline_id = expected.id,
+              status = "active",
+              current_step_id = "botster_stack_plan",
+              current_run_step_id = "history-run-step",
+              target_id = "tgt_3dfae49c02454037bf13554f552baf7f",
+              created_at = 1,
+              updated_at = 1,
+            }
+            db.run_steps:update{
+              where = { id = "history-run-step" },
+              set = { run_id = "tui-kit-run" },
+            }
+
+            local handlers = {}
+            mcp = {
+              tool = function(name, _spec, handler) handlers[name] = handler end,
+              prompt = function() end,
+            }
+            package.loaded["project_pipelines.entities"] = {}
+            package.loaded["project_pipelines.notification_policy"] = {}
+            package.loaded["lib.hub"] = { get = function() return {} end }
+            package.loaded["lib.agent"] = {}
+            package.loaded["lib.config_resolver"] = { list_agents = function() return {} end }
+            package.loaded["project_pipelines.engine"] = nil
+            package.loaded["project_pipelines.mcp"] = nil
+            require("project_pipelines.mcp").register()
+
+            local served = handlers.project_pipelines_get_pipeline{
+              pipeline_id = expected.id,
+            }
+            assert(served.ok == true)
+            assert(#served.result.steps == 5)
+            for _, step in ipairs(served.result.steps) do
+              assert(step.prompt:find("- botster-tui-kit -> [[botster-tui-kit-playbook]]", 1, true))
+            end
+            local context = handlers.project_pipelines_current_context(
+              { run_id = "tui-kit-run" },
+              { session_uuid = "fixture-session" })
+            assert(context.ok == true)
+            assert(context.result.ticket.target_id == "tgt_3dfae49c02454037bf13554f552baf7f")
+            assert(context.result.run.target_id == "tgt_3dfae49c02454037bf13554f552baf7f")
+            assert(context.result.current_step.id == "botster_stack_plan")
+            assert(context.result.current_step.prompt:find(
+              "- botster-tui-kit -> [[botster-tui-kit-playbook]]", 1, true))
+
+            local function rejects(fn)
+              local ok, err = pcall(fn)
+              assert(ok == false)
+              assert(tostring(err):find(source.source_path(), 1, true))
+            end
+            rejects(function() repo.create_pipeline{ id = expected.id, name = "Duplicate" } end)
+            rejects(function() repo.update_pipeline(expected.id, { name = "Changed" }) end)
+            rejects(function() repo.delete_pipeline(expected.id) end)
+            rejects(function() repo.create_step{ pipeline_id = expected.id, name = "Changed" } end)
+            rejects(function() repo.update_step("botster_stack_plan", { prompt = "Changed" }) end)
+            rejects(function() repo.delete_step("botster_stack_plan") end)
+            rejects(function() repo.create_gate{ step_id = "botster_stack_plan", prompt = "Changed", required_fields = { "x" } } end)
+            rejects(function() repo.update_gate("botster_stack_plan_gate", { prompt = "Changed" }) end)
+            rejects(function() repo.delete_gate("botster_stack_plan_gate") end)
+
+            repo.update_pipeline("operator-pipeline", { name = "Mutable" })
+            local mutable_step = repo.create_step{
+              id = "operator-step",
+              pipeline_id = "operator-pipeline",
+              name = "Operator Step",
+              kind = "agent",
+              prompt = "before",
+            }
+            repo.update_step(mutable_step.id, { prompt = "after" })
+            local mutable_gate = repo.create_gate{
+              id = "operator-gate",
+              step_id = mutable_step.id,
+              kind = "attestation",
+              prompt = "before",
+              required_fields = { "proof" },
+            }
+            repo.update_gate(mutable_gate.id, { prompt = "after" })
+            repo.delete_gate(mutable_gate.id)
+            repo.delete_step(mutable_step.id)
+            repo.delete_pipeline("operator-pipeline")
+
+            return "ok"
+            "#,
+        )
+        .eval()
+        .expect("sourced definition should round-trip and reconcile through real plugin.db");
 
     assert_eq!(result, "ok");
 }

@@ -9,6 +9,7 @@ for _, module_name in ipairs({
     "project_pipelines.util",
     "project_pipelines.db",
     "project_pipelines.entity_contract",
+    "project_pipelines.source_definitions",
     "project_pipelines.repo",
     "project_pipelines.entities",
     "project_pipelines.engine",
@@ -38,6 +39,7 @@ local surface = require("project_pipelines.web.surface")
 local M = {}
 
 repo.prune_legacy_seed_data()
+repo.reconcile_sourced_definitions()
 engine.register_entities()
 notification_policy.register()
 mcp_tools.register()

@@ -6,6 +6,7 @@
 -- @version 1.1.0
 
 local repo = require("project_pipelines.repo")
+local source_definitions = require("project_pipelines.source_definitions")
 local view = require("project_pipelines.web.ui")
 local actions = require("project_pipelines.web.actions")
 
@@ -327,6 +328,97 @@ local function edit_step(step, steps, state)
     return view.panel{ ui.stack{ direction = "vertical", gap = "3", children = children } }
 end
 
+local function sourced_gate(gate)
+    local children = {
+        view.row{
+            view.badge(gate.kind, "muted"),
+            ui.text{ text = gate.id, size = "xs", tone = "muted" },
+        },
+        ui.text{ text = gate.prompt or "", size = "xs" },
+    }
+    if gate.command and gate.command ~= "" then
+        table.insert(children, ui.text{ text = gate.command, size = "xs", tone = "muted" })
+    end
+    return view.panel{ ui.stack{ direction = "vertical", gap = "2", children = children } }
+end
+
+local function sourced_step(step, state)
+    local children = {
+        view.row{
+            view.badge(step.position, "muted"),
+            ui.text{ text = step.name, size = "sm", weight = "semibold" },
+            view.badge(step.kind, "muted"),
+        },
+        ui.text{ text = step.prompt or "", size = "xs" },
+    }
+
+    if step.kind == "agent" then
+        table.insert(children, ui.select{
+            id = "step-" .. step.id .. "-agent",
+            label = "Selected agent",
+            placeholder = step.agent_name or "Select agent",
+            options = view.agent_options(step.agent_name),
+            on_change = view.field_action("project_pipelines.update_step_field", {
+                step_id = step.id,
+                field = "agent_name",
+            }),
+        })
+        table.insert(children, ui.text{
+            text = "Agent selection is device-local and is preserved when package-owned structure is reconciled.",
+            size = "xs",
+            tone = "muted",
+        })
+        local agent_error = feedback_error(state, step.id, "agent_name")
+        if agent_error then
+            table.insert(children, ui.text{ text = agent_error, size = "xs", tone = "danger" })
+        end
+    elseif step.command and step.command ~= "" then
+        table.insert(children, ui.text{ text = step.command, size = "xs", tone = "muted" })
+    end
+
+    table.insert(children, ui.text{ text = "Transitions", size = "xs", weight = "semibold" })
+    for _, transition in ipairs({
+        { field = "next_step_id", label = "Default next step" },
+        { field = "on_approved_step_id", label = "On review approved" },
+        { field = "on_changes_requested_step_id", label = "On changes requested" },
+        { field = "on_blocked_step_id", label = "On blocked" },
+    }) do
+        if step[transition.field] and step[transition.field] ~= "" then
+            table.insert(children, ui.text{
+                text = transition.label .. ": " .. step[transition.field],
+                size = "xs",
+                tone = "muted",
+            })
+        end
+    end
+
+    local gates = repo.step_gates(step.id)
+    if #gates > 0 then
+        table.insert(children, ui.text{ text = "Gates", size = "xs", weight = "semibold" })
+        for _, gate in ipairs(gates) do
+            table.insert(children, sourced_gate(gate))
+        end
+    end
+
+    return view.panel{ ui.stack{ direction = "vertical", gap = "3", children = children } }
+end
+
+local function sourced_pipeline_fields(pipeline)
+    return view.panel{ ui.stack{ direction = "vertical", gap = "2", children = {
+        view.row{
+            view.badge("Package-owned", "accent"),
+            view.badge("Read-only structure", "muted"),
+        },
+        ui.text{ text = pipeline.description or "", size = "xs" },
+        ui.text{ text = "Merge policy: " .. tostring(pipeline.merge_policy or "direct"), size = "xs", tone = "muted" },
+        ui.text{
+            text = "Structural changes come from " .. source_definitions.source_path(),
+            size = "xs",
+            tone = "muted",
+        },
+    } } }
+end
+
 function M.edit(view_state, ctx)
     local params = view_state and view_state.params or {}
     local pipeline = repo.get_pipeline(params.pipeline_id)
@@ -347,18 +439,19 @@ function M.edit(view_state, ctx)
         table.insert(meta, view.badge("archived", "muted"))
     end
 
+    local is_sourced = source_definitions.is_sourced_pipeline_id(pipeline.id)
     local children = {
         view.page_header{
-            title = "Edit Pipeline",
+            title = is_sourced and "Pipeline Definition" or "Edit Pipeline",
             back_id = "pipeline-" .. pipeline.id .. "-back",
             back_path = ctx.path("/pipelines"),
             meta = meta,
         },
-        edit_pipeline_fields(pipeline, state),
+        is_sourced and sourced_pipeline_fields(pipeline) or edit_pipeline_fields(pipeline, state),
         ui.text{ text = "Steps", size = "md", weight = "semibold" },
     }
     for _, step in ipairs(steps) do
-        table.insert(children, edit_step(step, steps, state))
+        table.insert(children, is_sourced and sourced_step(step, state) or edit_step(step, steps, state))
     end
 
     return ui.stack{ direction = "vertical", gap = "4", children = children }

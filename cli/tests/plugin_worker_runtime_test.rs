@@ -1785,3 +1785,71 @@ fn plugin_owned_mcp_handlers_run_in_plugin_worker_vm() {
         .eval::<bool>()
         .unwrap();
 }
+
+#[test]
+fn project_pipelines_worker_init_serves_sourced_stack_definition_through_public_mcp() {
+    // SAFETY: The focused integration filter runs this test in isolation. The
+    // worker resolves repository Lua modules and persists into a temporary
+    // device data root.
+    let tmp = TempDir::new().unwrap();
+    unsafe {
+        std::env::set_var(
+            "BOTSTER_LUA_PATH",
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua"),
+        );
+        std::env::set_var("BOTSTER_CONFIG_DIR", tmp.path());
+    }
+
+    let init_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .join("catalog/templates/plugins/project-pipelines/init.lua");
+    let runtime = LuaRuntime::new().unwrap();
+    runtime
+        .lua()
+        .load(format!(
+            r#"
+            _G.hub = {{
+                hub_id = function() return "hub-test" end,
+                server_id = function() return "hub-test" end,
+                detect_repo = function() return "Tonksthebear/trybotster" end,
+            }}
+            _G.mcp = require("lib.mcp")
+            require("lib.plugin_db").install()
+
+            local loader = require("hub.loader")
+            local ok, err = loader.load_plugin(
+                {init_path},
+                "project-pipelines",
+                {{ source = "device" }})
+            assert(ok, tostring(err))
+
+            local content, tool_err = require("lib.mcp").call_tool(
+                "project_pipelines_get_pipeline",
+                {{ pipeline_id = "botster_stack_delivery" }},
+                {{ session_uuid = "sourced-definition-smoke" }})
+            assert(tool_err == nil, tostring(tool_err))
+            assert(content and content[1] and content[1].text, "missing MCP content")
+            local response = json.decode(content[1].text)
+            assert(response.ok == true)
+            assert(response.result.id == "botster_stack_delivery")
+            assert(response.result.version_label == "Repository playbooks — 2026-07-28")
+            assert(#response.result.steps == 5)
+            for _, step in ipairs(response.result.steps) do
+                assert(step.prompt:find(
+                    "- botster-tui-kit -> [[botster-tui-kit-playbook]]",
+                    1,
+                    true))
+            end
+            return true
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval::<bool>()
+        .unwrap();
+
+    drop(runtime);
+    unsafe {
+        std::env::remove_var("BOTSTER_CONFIG_DIR");
+    }
+}

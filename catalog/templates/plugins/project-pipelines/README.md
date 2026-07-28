@@ -13,8 +13,11 @@ Device-level Botster development plugin for project/ticket workflows.
 
 The plugin is intentionally split across modules:
 
-- `init.lua` clears hot-reload module cache, registers tools, surfaces, and events.
+- `init.lua` clears hot-reload module cache, prunes legacy seed data, reconciles
+  package-owned definitions, then registers tools, surfaces, and events.
 - `project_pipelines/db.lua` owns the plugin SQLite schema.
+- `project_pipelines/source_definitions.lua` owns checked-in package pipeline
+  structure, prompts, stable IDs, and repository routing.
 - `project_pipelines/repo.lua` owns persistence and audit events.
 - `project_pipelines/entity_contract.lua` owns published entity type names and read-model field contracts.
 - `project_pipelines/entities.lua` owns plugin entity read models and publishes dynamic state to clients.
@@ -47,10 +50,16 @@ The plugin is intentionally split across modules:
 
 ## Pipeline Definitions
 
-The plugin does not seed default pipelines or sample tickets. Users and agents
-create reusable pipeline definitions explicitly through the GUI and MCP tools.
-Projects are the durable container for multi-phase or cross-target work; tickets
-remain one concrete unit of work in one spawn target.
+The plugin does not seed sample tickets or arbitrary default pipelines. Botster
+Stack Delivery is a narrow package-owned definition reconciled idempotently
+from `project_pipelines/source_definitions.lua`; users and agents create every
+other reusable pipeline explicitly through the GUI and MCP tools. Package-owned
+pipeline metadata, steps, transitions, prompts, and gates are read-only through
+public APIs. Step agent selection remains device-local operator policy: source
+values initialize a missing step, while later reconciliation preserves the
+operator's choice. Projects are the durable container for multi-phase or
+cross-target work; tickets remain one concrete unit of work in one spawn
+target.
 
 Pipeline MCP CRUD:
 
@@ -555,9 +564,14 @@ metadata explicitly. Merge agents for PR pipelines must open stacked PRs against
 
 State lives in the plugin database at the Botster device data root under `plugin-data/project-pipelines/db.sqlite`. The schema is additive-friendly, but non-additive changes need an explicit `version` bump and migration function in `project_pipelines_db.lua`.
 
-During the first load after the seedless pipeline change, the plugin performs a
-one-shot cleanup check for the old `massive_feature` seed pipeline and records a
-`pipeline.legacy_prune_checked` event so hot reloads do not repeat the cleanup.
+During startup, the plugin first performs the one-shot cleanup check for the old
+`massive_feature` seed pipeline and records a `pipeline.legacy_prune_checked`
+event so hot reloads do not repeat the cleanup. It then reconciles Botster Stack
+Delivery from `project_pipelines/source_definitions.lua` before registering
+entities, MCP tools, and surfaces. Reconciliation updates stable rows in place,
+preserves run history and device-local agent selections, removes graph drift,
+and is a no-op when the database already matches the checked-in source.
+User-owned definitions retain normal GUI and MCP CRUD behavior.
 
 ## Starting A Run
 
