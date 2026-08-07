@@ -177,12 +177,14 @@ impl SessionConnection {
         let (response_tx, response_rx) = std::sync::mpsc::channel::<Frame>();
         let terminal_subscriptions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         self.response_rx = Some(response_rx);
-        self.session_io_tx = Some(session_io_tx.clone());
+        // Move session_io_tx into the connection; do not pass a sibling
+        // request_tx into SessionIoWorkerConfig (that field is not on main /
+        // this Ghostty branch — it belongs to unfinished SessionIo work).
+        self.session_io_tx = Some(session_io_tx);
         self.reader_alive.store(true, Ordering::Release);
         let _handle = SessionIoWorker::spawn(SessionIoWorkerConfig {
             stream: reader_stream,
             write_stream,
-            request_tx: session_io_tx,
             request_rx: Some(request_rx),
             session_uuid,
             event_tx,
