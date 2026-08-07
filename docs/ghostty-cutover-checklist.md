@@ -55,3 +55,9 @@ Hub **does not** decode GHOSTSNP. Green hub CI proves transport/plumbing only. R
 - Restty main worktree imported it via `RESTTY_EXTERNAL_SNAPSHOT` integration test: **pass**.
 - Non-GHOSTSNP blob: import fails closed.
 - Release `cargo check --release` with Zig 0.16 + `-Dcpu=baseline` path: **pass** on clean trybotster main.
+
+## Monorepo browser vendor (2026-08-07)
+
+- SPA `app/frontend/vendor/` refreshed from restty `origin/main` `09a24424ee9918a47dce925ea0ef1672be0d7412` (`bun run build:wasm` + `build:lib`; Ghostty pin `22d13172…`, Zig 0.16.0, sole lib_vt re-export patch).
+- Vendored entry: `restty.js` + `chunk-rb0ddq85.js` (replaces prior `chunk-8q8zx13k.js`).
+- Capability proof: embedded wasm exports `restty_snapshot_import` only (no `_export`/`_ptr`/`_len`); cold-cutover GHOSTSNP import path for browser `loadBinarySnapshot`.
