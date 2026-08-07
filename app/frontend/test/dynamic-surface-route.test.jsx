@@ -1,7 +1,7 @@
 import React from 'react'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render, screen, cleanup } from '@testing-library/react'
-import { MemoryRouter, Route, Routes } from 'react-router-dom'
+import { MemoryRouter, Route, Routes } from 'react-router'
 import { useRouteRegistryStore } from '../store/route-registry-store'
 
 // UiTree is the hub-subscribing mount. For this unit test we don't want to
