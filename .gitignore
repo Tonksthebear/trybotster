@@ -73,3 +73,6 @@ node_modules
 
 # Botster worktree-local Mise env
 /mise.local.toml
+
+# Local helper (not part of monorepo product)
+script/pull-botster-repos
