@@ -9,10 +9,6 @@ use std::pin::Pin;
 
 use crate::ghostty_vt;
 
-const ESC: u8 = 0x1b;
-const BEL: u8 = 0x07;
-const MAX_OSC_QUERY_BUFFER_BYTES: usize = 512;
-
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Default scrollback limit in bytes (matches ghostty's default of 10MB).
@@ -126,9 +122,6 @@ struct CallbackState {
     bell: Option<Box<dyn FnMut() + Send>>,
     pwd_changed: Option<Box<dyn FnMut() + Send>>,
     notification: Option<Box<dyn FnMut(&str, &str) + Send>>,
-    semantic_prompt: Option<Box<dyn FnMut(ghostty_vt::GhosttySemanticPromptAction) + Send>>,
-    mode_changed: Option<Box<dyn FnMut(u16, bool) + Send>>,
-    kitty_keyboard_changed: Option<Box<dyn FnMut() + Send>>,
 }
 
 unsafe extern "C" fn write_pty_trampoline(
@@ -174,67 +167,30 @@ unsafe extern "C" fn pwd_changed_trampoline(
     }
 }
 
-unsafe extern "C" fn notification_trampoline(
+unsafe extern "C" fn desktop_notification_trampoline(
     _terminal: *mut ghostty_vt::GhosttyTerminalOpaque,
     userdata: *mut c_void,
-    title: *const u8,
-    title_len: usize,
-    body: *const u8,
-    body_len: usize,
+    notification: *const ghostty_vt::GhosttyTerminalDesktopNotification,
 ) {
     let state = unsafe { &mut *(userdata as *mut CallbackState) };
     if let Some(ref mut cb) = state.notification {
-        let title_str = if title.is_null() || title_len == 0 {
-            ""
-        } else {
-            std::str::from_utf8(unsafe { std::slice::from_raw_parts(title, title_len) })
-                .unwrap_or("")
-        };
-        let body_str = if body.is_null() || body_len == 0 {
-            ""
-        } else {
-            std::str::from_utf8(unsafe { std::slice::from_raw_parts(body, body_len) }).unwrap_or("")
-        };
-        cb(title_str, body_str);
-    }
-}
-
-unsafe extern "C" fn semantic_prompt_trampoline(
-    _terminal: *mut ghostty_vt::GhosttyTerminalOpaque,
-    userdata: *mut c_void,
-    action: ghostty_vt::GhosttySemanticPromptAction,
-) {
-    let state = unsafe { &mut *(userdata as *mut CallbackState) };
-    if let Some(ref mut cb) = state.semantic_prompt {
-        cb(action);
-    }
-}
-
-unsafe extern "C" fn mode_changed_trampoline(
-    _terminal: *mut ghostty_vt::GhosttyTerminalOpaque,
-    userdata: *mut c_void,
-    mode: u16,
-    enabled: bool,
-) {
-    let state = unsafe { &mut *(userdata as *mut CallbackState) };
-    if let Some(ref mut cb) = state.mode_changed {
-        cb(mode, enabled);
-    }
-}
-
-unsafe extern "C" fn kitty_keyboard_changed_trampoline(
-    _terminal: *mut ghostty_vt::GhosttyTerminalOpaque,
-    userdata: *mut c_void,
-) {
-    let state = unsafe { &mut *(userdata as *mut CallbackState) };
-    if let Some(ref mut cb) = state.kitty_keyboard_changed {
-        cb();
+        if notification.is_null() {
+            return;
+        }
+        // SAFETY: Ghostty borrows the notification for the duration of this call.
+        let n = unsafe { &*notification };
+        cb(n.title.as_str(), n.body.as_str());
     }
 }
 
 // ── CallbackConfig ────────────────────────────────────────────────────────────
 
 /// Configuration for terminal effect callbacks.
+///
+/// Upstream ghostty-org no longer provides first-class hooks for OSC 133
+/// semantic prompt marks or kitty keyboard change events. Mode transitions are
+/// observed by polling `mode_get` / mode flags after VT writes (see session
+/// reader loop), not via a push callback.
 #[allow(missing_debug_implementations)]
 pub struct CallbackConfig {
     /// Called when the terminal needs to write back to the PTY (e.g., color query responses).
@@ -245,14 +201,8 @@ pub struct CallbackConfig {
     pub bell: Option<Box<dyn FnMut() + Send>>,
     /// Called when the working directory changes (OSC 7).
     pub pwd_changed: Option<Box<dyn FnMut() + Send>>,
-    /// Called when an OSC notification is received (title, body).
+    /// Called when an OSC desktop notification is received (title, body).
     pub notification: Option<Box<dyn FnMut(&str, &str) + Send>>,
-    /// Called when Ghostty reports a semantic prompt action via OSC 133.
-    pub semantic_prompt: Option<Box<dyn FnMut(ghostty_vt::GhosttySemanticPromptAction) + Send>>,
-    /// Called when a terminal mode changes (mode_id, enabled).
-    pub mode_changed: Option<Box<dyn FnMut(u16, bool) + Send>>,
-    /// Called when kitty keyboard protocol state changes.
-    pub kitty_keyboard_changed: Option<Box<dyn FnMut() + Send>>,
 }
 
 impl Default for CallbackConfig {
@@ -263,9 +213,6 @@ impl Default for CallbackConfig {
             bell: None,
             pwd_changed: None,
             notification: None,
-            semantic_prompt: None,
-            mode_changed: None,
-            kitty_keyboard_changed: None,
         }
     }
 }
@@ -279,7 +226,6 @@ impl Default for CallbackConfig {
 pub struct TerminalParser {
     terminal: ghostty_vt::Terminal,
     _callback_state: Option<Pin<Box<CallbackState>>>,
-    osc_query_buffer: Vec<u8>,
     color_cache: HashMap<usize, Rgb>,
 }
 
@@ -304,7 +250,6 @@ impl TerminalParser {
         Self {
             terminal,
             _callback_state: None,
-            osc_query_buffer: Vec::new(),
             color_cache: HashMap::new(),
         }
     }
@@ -327,9 +272,6 @@ impl TerminalParser {
             bell: config.bell,
             pwd_changed: config.pwd_changed,
             notification: config.notification,
-            semantic_prompt: config.semantic_prompt,
-            mode_changed: config.mode_changed,
-            kitty_keyboard_changed: config.kitty_keyboard_changed,
         });
 
         let state_ptr = &*state as *const CallbackState as *mut c_void;
@@ -351,32 +293,25 @@ impl TerminalParser {
                 terminal.set_pwd_changed_callback(Some(pwd_changed_trampoline));
             }
             if state.notification.is_some() {
-                terminal.set_notification_callback(Some(notification_trampoline));
-            }
-            if state.semantic_prompt.is_some() {
-                terminal.set_semantic_prompt_callback(Some(semantic_prompt_trampoline));
-            }
-            if state.mode_changed.is_some() {
-                terminal.set_mode_changed_callback(Some(mode_changed_trampoline));
-            }
-            if state.kitty_keyboard_changed.is_some() {
-                terminal
-                    .set_kitty_keyboard_changed_callback(Some(kitty_keyboard_changed_trampoline));
+                terminal.set_desktop_notification_callback(Some(desktop_notification_trampoline));
             }
         }
 
         Self {
             terminal,
             _callback_state: Some(state),
-            osc_query_buffer: Vec::new(),
             color_cache: HashMap::new(),
         }
     }
 
     /// Feed raw PTY bytes into the terminal emulator.
+    ///
+    /// OSC 4/10/11/12 color queries are answered by upstream Ghostty through
+    /// the `write_pty` callback after colors are applied via
+    /// [`Self::apply_color_cache_map`]. The previous host-side dual answer path
+    /// double-fired on this pin and is intentionally removed.
     pub fn process(&mut self, data: &[u8]) {
         self.terminal.write(data);
-        self.answer_osc_color_queries(data);
     }
 
     /// Resize the terminal.
@@ -394,6 +329,64 @@ impl TerminalParser {
     /// Mutable access to the underlying ghostty Terminal.
     pub fn terminal_mut(&mut self) -> &mut ghostty_vt::Terminal {
         &mut self.terminal
+    }
+
+    /// Export an opaque `GHOSTSNP` snapshot of the underlying terminal.
+    pub fn snapshot_export(&self) -> Result<Vec<u8>, ghostty_vt::SnapshotError> {
+        self.terminal.snapshot_export()
+    }
+
+    /// Import an opaque `GHOSTSNP` snapshot, then re-install host callbacks.
+    ///
+    /// Upstream decode produces a **new** terminal handle. Userdata and all
+    /// OPT callbacks (write_pty, title, bell, pwd, desktop_notification, builtin
+    /// color-scheme) must be re-applied after the swap or attach paths lose
+    /// live event delivery and OSC query replies.
+    pub fn snapshot_import(&mut self, data: &[u8]) -> Result<(), ghostty_vt::SnapshotError> {
+        self.terminal.snapshot_import(data)?;
+        self.reinstall_terminal_hooks();
+        // Re-seed host colors onto the new handle so OSC answers stay correct.
+        if !self.color_cache.is_empty() {
+            let colors = self.color_cache.clone();
+            self.apply_color_cache_map(&colors);
+        }
+        Ok(())
+    }
+
+    /// Re-bind userdata and callbacks after a handle swap (snapshot import).
+    fn reinstall_terminal_hooks(&mut self) {
+        // SAFETY: Callback trampolines remain valid for the lifetime of
+        // `_callback_state`; userdata points into the pinned box when present.
+        unsafe {
+            if let Some(state) = self._callback_state.as_ref() {
+                let state_ptr =
+                    std::ptr::from_ref::<CallbackState>(state.as_ref().get_ref()) as *mut c_void;
+                self.terminal.set_userdata(state_ptr);
+                self.terminal.enable_builtin_color_scheme_callback();
+                if state.write_pty.is_some() {
+                    self.terminal
+                        .set_write_pty_callback(Some(write_pty_trampoline));
+                }
+                if state.title_changed.is_some() {
+                    self.terminal
+                        .set_title_changed_callback(Some(title_changed_trampoline));
+                }
+                if state.bell.is_some() {
+                    self.terminal.set_bell_callback(Some(bell_trampoline));
+                }
+                if state.pwd_changed.is_some() {
+                    self.terminal
+                        .set_pwd_changed_callback(Some(pwd_changed_trampoline));
+                }
+                if state.notification.is_some() {
+                    self.terminal
+                        .set_desktop_notification_callback(Some(desktop_notification_trampoline));
+                }
+            } else {
+                // No-callback constructor still installs the builtin color-scheme path.
+                self.terminal.enable_builtin_color_scheme_callback();
+            }
+        }
     }
 
     /// Effective foreground color (override or default), if set.
@@ -484,8 +477,17 @@ impl TerminalParser {
             self.terminal.set_color_cursor((*cursor).into());
         }
 
+        // Prefer a single full-palette set when the cache is complete; otherwise
+        // merge individual entries so OSC 4 queries hit the seeded colors.
         if let Some(palette) = complete_palette(colors) {
             self.terminal.set_color_palette(&palette);
+        } else {
+            for (index, color) in colors {
+                if *index < 256 {
+                    self.terminal
+                        .set_palette_entry(*index, (*color).into());
+                }
+            }
         }
     }
 
@@ -496,187 +498,6 @@ impl TerminalParser {
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .unwrap_or_default()
     }
-
-    fn answer_osc_color_queries(&mut self, data: &[u8]) {
-        if self._callback_state.is_none() {
-            return;
-        }
-
-        append_with_limit(&mut self.osc_query_buffer, data, MAX_OSC_QUERY_BUFFER_BYTES);
-        let queries = extract_complete_osc_color_queries(&mut self.osc_query_buffer);
-        let responses: Vec<Vec<u8>> = queries
-            .into_iter()
-            .filter_map(|query| self.format_osc_color_query_response(&query))
-            .collect();
-        let Some(state) = self
-            ._callback_state
-            .as_mut()
-            .map(|state| state.as_mut().get_mut())
-        else {
-            return;
-        };
-        let Some(write_pty) = state.write_pty.as_mut() else {
-            return;
-        };
-        for response in responses {
-            write_pty(&response);
-        }
-    }
-
-    fn format_osc_color_query_response(&self, query: &[u8]) -> Option<Vec<u8>> {
-        let (query, terminator) = parse_osc_color_query(query)?;
-        let color = match query {
-            OscColorQuery::DefaultForeground => self
-                .terminal
-                .foreground_color_default()
-                .or_else(|| self.terminal.foreground_color())
-                .map(Into::into)?,
-            OscColorQuery::DefaultBackground => self
-                .terminal
-                .background_color_default()
-                .or_else(|| self.terminal.background_color())
-                .map(Into::into)?,
-            OscColorQuery::DefaultCursor => self
-                .terminal
-                .cursor_color_default()
-                .or_else(|| self.terminal.cursor_color())
-                .map(Into::into)?,
-            OscColorQuery::Palette(index) => *self.color_cache.get(&(index as usize))?,
-        };
-
-        let mut response = format!(
-            "\x1b]{};rgb:{:02x}{:02x}/{:02x}{:02x}/{:02x}{:02x}",
-            query.response_code(),
-            color.r,
-            color.r,
-            color.g,
-            color.g,
-            color.b,
-            color.b
-        )
-        .into_bytes();
-        response.extend_from_slice(terminator);
-        Some(response)
-    }
-}
-
-fn append_with_limit(buffer: &mut Vec<u8>, data: &[u8], max_bytes: usize) {
-    if data.len() >= max_bytes {
-        buffer.clear();
-        buffer.extend_from_slice(&data[data.len() - max_bytes..]);
-        return;
-    }
-
-    let overflow = buffer
-        .len()
-        .saturating_add(data.len())
-        .saturating_sub(max_bytes);
-    if overflow > 0 {
-        buffer.drain(..overflow);
-    }
-    buffer.extend_from_slice(data);
-}
-
-fn extract_complete_osc_color_queries(buffer: &mut Vec<u8>) -> Vec<Vec<u8>> {
-    let mut sequences = Vec::new();
-    let mut idx = 0usize;
-    let mut remainder_start = None;
-
-    while idx + 1 < buffer.len() {
-        if buffer[idx] == ESC && buffer[idx + 1] == b']' {
-            let start = idx;
-            let mut scan = idx + 2;
-            let mut end = None;
-
-            while scan < buffer.len() {
-                if buffer[scan] == BEL {
-                    end = Some(scan + 1);
-                    break;
-                }
-                if buffer[scan] == ESC && scan + 1 < buffer.len() && buffer[scan + 1] == b'\\' {
-                    end = Some(scan + 2);
-                    break;
-                }
-                scan += 1;
-            }
-
-            if let Some(end_idx) = end {
-                let seq = buffer[start..end_idx].to_vec();
-                if parse_osc_color_query(&seq).is_some() {
-                    sequences.push(seq);
-                }
-                idx = end_idx;
-                continue;
-            }
-
-            remainder_start = Some(start);
-            break;
-        }
-
-        idx += 1;
-    }
-
-    let remainder = if let Some(start) = remainder_start {
-        buffer[start..].to_vec()
-    } else if buffer.last() == Some(&ESC) {
-        vec![ESC]
-    } else {
-        Vec::new()
-    };
-
-    buffer.clear();
-    buffer.extend_from_slice(&remainder);
-    sequences
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OscColorQuery {
-    DefaultForeground,
-    DefaultBackground,
-    DefaultCursor,
-    Palette(u8),
-}
-
-impl OscColorQuery {
-    fn response_code(self) -> String {
-        match self {
-            Self::DefaultForeground => "10".to_string(),
-            Self::DefaultBackground => "11".to_string(),
-            Self::DefaultCursor => "12".to_string(),
-            Self::Palette(index) => format!("4;{index}"),
-        }
-    }
-}
-
-fn parse_osc_color_query(seq: &[u8]) -> Option<(OscColorQuery, &'static [u8])> {
-    if seq.len() < 6 || seq[0] != ESC || seq[1] != b']' {
-        return None;
-    }
-
-    let (payload, terminator) = if seq.ends_with(&[BEL]) {
-        (&seq[2..seq.len() - 1], &[BEL][..])
-    } else if seq.ends_with(&[ESC, b'\\']) {
-        (&seq[2..seq.len() - 2], b"\x1b\\".as_slice())
-    } else {
-        return None;
-    };
-
-    let (code, value) = payload.split_once_by(|byte| *byte == b';')?;
-    let query = match code {
-        b"10" if value == b"?" => OscColorQuery::DefaultForeground,
-        b"11" if value == b"?" => OscColorQuery::DefaultBackground,
-        b"12" if value == b"?" => OscColorQuery::DefaultCursor,
-        b"4" => {
-            let (index, value) = value.split_once_by(|byte| *byte == b';')?;
-            if value != b"?" {
-                return None;
-            }
-            let index = std::str::from_utf8(index).ok()?.parse::<u8>().ok()?;
-            OscColorQuery::Palette(index)
-        }
-        _ => return None,
-    };
-    Some((query, terminator))
 }
 
 fn complete_palette(colors: &HashMap<usize, Rgb>) -> Option<[ghostty_vt::GhosttyColorRgb; 256]> {
@@ -685,22 +506,6 @@ fn complete_palette(colors: &HashMap<usize, Rgb>) -> Option<[ghostty_vt::Ghostty
         *slot = (*colors.get(&index)?).into();
     }
     Some(palette)
-}
-
-trait SplitOnceBytes {
-    fn split_once_by<P>(&self, pred: P) -> Option<(&[u8], &[u8])>
-    where
-        P: FnMut(&u8) -> bool;
-}
-
-impl SplitOnceBytes for [u8] {
-    fn split_once_by<P>(&self, mut pred: P) -> Option<(&[u8], &[u8])>
-    where
-        P: FnMut(&u8) -> bool,
-    {
-        let idx = self.iter().position(&mut pred)?;
-        Some((&self[..idx], &self[idx + 1..]))
-    }
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -972,72 +777,103 @@ mod tests {
         assert_eq!(calls[0], (String::new(), "Hello world".to_string()));
     }
 
+    /// Upstream decode swaps to a new terminal handle. Without re-binding
+    /// userdata/callbacks after import, host hooks go silent (punch-list blocker).
     #[test]
-    fn semantic_prompt_callback_smoke_test() {
+    fn snapshot_import_reinstalls_callbacks_on_new_handle() {
         let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let calls_cb = std::sync::Arc::clone(&calls);
         let callbacks = CallbackConfig {
-            semantic_prompt: Some(Box::new(move |action| {
+            notification: Some(Box::new(move |title: &str, body: &str| {
                 calls_cb
                     .lock()
-                    .expect("semantic calls poisoned")
-                    .push(action);
+                    .expect("notification calls poisoned")
+                    .push((title.to_string(), body.to_string()));
             })),
             ..CallbackConfig::default()
         };
         let mut parser = TerminalParser::new_with_callbacks(24, 80, 100, callbacks);
 
-        parser.process(b"\x1b]133;A\x07");
+        let snapshot = parser
+            .snapshot_export()
+            .expect("snapshot export before import");
+        parser
+            .snapshot_import(&snapshot)
+            .expect("snapshot import must succeed");
 
-        let calls = calls.lock().expect("semantic calls poisoned");
+        // Must fire on the *new* handle after reinstall — red without the fix.
+        parser.process(b"\x1b]9;after import\x07");
+
+        let calls = calls.lock().expect("notification calls poisoned");
         assert_eq!(
-            calls.as_slice(),
-            &[crate::ghostty_vt::GhosttySemanticPromptAction::FreshLineNewPrompt]
+            calls.len(),
+            1,
+            "desktop_notification callback must survive snapshot import handle swap"
         );
+        assert_eq!(calls[0], (String::new(), "after import".to_string()));
     }
 
+    /// `TerminalParser::new` (no host callbacks) still installs the builtin
+    /// color-scheme OPT; import must re-enable it on the new handle (L3).
+    ///
+    /// Observation needs `write_pty` to capture Ghostty's DSR reply, so this
+    /// uses a write_pty-only config (no other host callbacks). Both `new` and
+    /// `new_with_callbacks` call `enable_builtin_color_scheme_callback` in
+    /// `reinstall_terminal_hooks`.
     #[test]
-    fn mode_changed_callback_smoke_test() {
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let calls_cb = std::sync::Arc::clone(&calls);
+    fn snapshot_import_reinstalls_builtin_color_scheme_path() {
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writes_cb = std::sync::Arc::clone(&writes);
         let callbacks = CallbackConfig {
-            mode_changed: Some(Box::new(move |mode: u16, enabled: bool| {
-                calls_cb
+            write_pty: Some(Box::new(move |data: &[u8]| {
+                writes_cb
                     .lock()
-                    .expect("mode calls poisoned")
-                    .push((mode, enabled));
+                    .expect("write buffer poisoned")
+                    .extend_from_slice(data);
             })),
             ..CallbackConfig::default()
         };
         let mut parser = TerminalParser::new_with_callbacks(24, 80, 100, callbacks);
+        parser
+            .terminal_mut()
+            .set_color_background(Rgb::new(0, 0, 0).into());
 
-        parser.process(b"\x1b[?2004h");
+        let snapshot = parser.snapshot_export().expect("export");
+        parser.snapshot_import(&snapshot).expect("import");
 
-        let calls = calls.lock().expect("mode calls poisoned");
+        writes.lock().expect("write buffer poisoned").clear();
+        parser.process(b"\x1b[?996n");
+        assert_eq!(
+            writes.lock().expect("write buffer poisoned").as_slice(),
+            b"\x1b[?997;1n",
+            "dark scheme must answer after import (builtin color-scheme reinstalled)"
+        );
+
+        // Pure ::new path (else branch of reinstall_terminal_hooks): must not
+        // panic and must leave a usable terminal after import.
+        let mut bare = TerminalParser::new(24, 80, 100);
+        bare.terminal_mut()
+            .set_color_background(Rgb::new(0, 0, 0).into());
+        let bare_snap = bare.snapshot_export().expect("bare export");
+        bare.snapshot_import(&bare_snap)
+            .expect("bare ::new import reinstalls builtin color-scheme hook");
+        bare.process(b"\x1b[?996n");
+        bare.process(b"alive after bare import");
         assert!(
-            calls.iter().any(
-                |(mode, enabled)| *mode == crate::ghostty_vt::MODE_BRACKETED_PASTE && *enabled
-            ),
-            "expected bracketed paste mode change, got {calls:?}"
+            bare.contents().contains("alive after bare import"),
+            "TerminalParser::new remains usable after snapshot import"
         );
     }
 
     #[test]
-    fn kitty_keyboard_changed_callback_smoke_test() {
-        let calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
-        let calls_cb = std::sync::Arc::clone(&calls);
-        let callbacks = CallbackConfig {
-            kitty_keyboard_changed: Some(Box::new(move || {
-                let mut count = calls_cb.lock().expect("kitty calls poisoned");
-                *count += 1;
-            })),
-            ..CallbackConfig::default()
-        };
-        let mut parser = TerminalParser::new_with_callbacks(24, 80, 100, callbacks);
-
-        parser.process(b"\x1b[>3u");
-
-        assert_eq!(*calls.lock().expect("kitty calls poisoned"), 1);
+    fn mode_get_path_tracks_bracketed_paste_without_callback() {
+        // Upstream removed mode_changed callbacks; session polls mode_get.
+        let mut parser = TerminalParser::new(24, 80, 100);
+        assert!(!parser.bracketed_paste());
+        parser.process(b"\x1b[?2004h");
+        assert!(parser.bracketed_paste());
+        parser.process(b"\x1b[?2004l");
+        assert!(!parser.bracketed_paste());
     }
 
     #[test]

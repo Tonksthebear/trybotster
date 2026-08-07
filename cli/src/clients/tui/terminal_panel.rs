@@ -235,11 +235,17 @@ impl TerminalPanel {
 
         if !data.is_empty() {
             // Single-call import: one opaque blob restores the whole terminal.
-            if let Err(e) = self.parser.terminal_mut().snapshot_import(data) {
+            // Upstream GHOSTSNP decode produces a new terminal sized to the
+            // snapshot (not the pre-import create dims) — re-sync panel dims.
+            // Import at parser level so userdata/callbacks re-bind after the
+            // upstream handle swap (decode produces a new terminal).
+            if let Err(e) = self.parser.snapshot_import(data) {
                 log::error!("[terminal_panel] snapshot_import failed: {e}");
                 // Don't transition to Connected — snapshot is malformed
                 return;
             }
+            let term = self.parser.terminal();
+            self.dims = (term.rows(), term.cols());
         }
 
         // Client-local defaults should win over the serialized session
@@ -467,10 +473,7 @@ mod tests {
         source
             .terminal_mut()
             .set_color_background(Rgb::new(240, 241, 242).into());
-        let snapshot = source
-            .terminal()
-            .snapshot_export()
-            .expect("source snapshot export");
+        let snapshot = source.snapshot_export().expect("source snapshot export");
 
         panel.connect("sess-0");
         panel.on_scrollback(&snapshot);
@@ -617,6 +620,49 @@ mod tests {
 
         // snapshot_import fails on bad version → stays in Connecting
         assert_eq!(panel.state(), PanelState::Connecting);
+    }
+
+    /// Acceptance bar #14: GHOSTSNP import resizes the terminal to snapshot
+    /// geometry. Panel dims must re-sync to the *actual* post-import size so a
+    /// later corrective `resize` is not swallowed by a stale cache hit.
+    #[test]
+    fn scrollback_import_resyncs_dims_when_snapshot_geometry_differs() {
+        // Snapshot is 12×40 — deliberately different from the panel/caller size.
+        let mut source = crate::terminal::TerminalParser::new(12, 40, TUI_SCROLLBACK);
+        source.process(b"geometry probe");
+        let snapshot = source.snapshot_export().expect("source snapshot export");
+
+        let mut panel = TerminalPanel::new(24, 80);
+        panel.connect("sess-0");
+        // Caller-supplied dims still claim 24×80 (stale attach metadata path).
+        panel.on_scrollback_with_dims(24, 80, &snapshot);
+
+        assert_eq!(panel.state(), PanelState::Connected);
+        assert_eq!(
+            panel.dims(),
+            (12, 40),
+            "panel dims must match post-import terminal geometry, not caller dims"
+        );
+
+        // Corrective resize back to the layout size must *not* early-return.
+        // With a stale dims cache of (24, 80) this would wrongly return None and
+        // leave the terminal at 12×40 while the TUI thinks it is already 24×80.
+        let msg = panel.resize(24, 80, "sess-0");
+        assert!(
+            msg.is_some(),
+            "corrective resize after import must not be swallowed by stale dims"
+        );
+        assert_eq!(panel.dims(), (24, 80));
+
+        // Same-dims after re-sync is still a proper no-op.
+        let mut panel2 = TerminalPanel::new(24, 80);
+        panel2.connect("sess-0");
+        panel2.on_scrollback_with_dims(24, 80, &snapshot);
+        assert_eq!(panel2.dims(), (12, 40));
+        assert!(
+            panel2.resize(12, 40, "sess-0").is_none(),
+            "resize to already-correct post-import dims must remain a no-op"
+        );
     }
 
     #[test]

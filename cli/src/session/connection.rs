@@ -177,6 +177,9 @@ impl SessionConnection {
         let (response_tx, response_rx) = std::sync::mpsc::channel::<Frame>();
         let terminal_subscriptions = Arc::new(Mutex::new(std::collections::HashMap::new()));
         self.response_rx = Some(response_rx);
+        // Move session_io_tx into the connection; do not pass a sibling
+        // request_tx into SessionIoWorkerConfig (that field is not on main /
+        // this Ghostty branch — it belongs to unfinished SessionIo work).
         self.session_io_tx = Some(session_io_tx);
         self.reader_alive.store(true, Ordering::Release);
         let _handle = SessionIoWorker::spawn(SessionIoWorkerConfig {
@@ -260,7 +263,7 @@ impl SessionConnection {
 
     /// Request and receive an opaque terminal snapshot from the session process.
     ///
-    /// Returns an opaque blob produced by `ghostty_terminal_snapshot_export`.
+    /// Returns an opaque `GHOSTSNP` blob produced by `ghostty_snapshot_encode_alloc`.
     /// Clients import it via `terminal.snapshot_import()`.
     pub fn get_snapshot(&mut self) -> Result<Vec<u8>> {
         let req = encode_empty(FRAME_GET_SNAPSHOT);
