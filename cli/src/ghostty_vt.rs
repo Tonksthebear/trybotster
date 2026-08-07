@@ -2280,7 +2280,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_export_fails_closed_on_garbage_is_not_applicable_to_export() {
+    fn snapshot_import_rejects_non_ghostsnp_garbage_fail_closed() {
         // Import of non-GHOSTSNP data fails closed (no dual-decode).
         let mut term = Terminal::new(80, 24, 0).expect("terminal");
         term.write(b"keep me");

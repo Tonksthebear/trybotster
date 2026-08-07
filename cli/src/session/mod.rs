@@ -135,7 +135,6 @@ enum SessionOutput {
 }
 
 /// Events from ghostty callbacks (fired during process(), relayed to reader thread).
-#[allow(dead_code)]
 enum VtEvent {
     Notification { title: String, body: String },
 }
@@ -864,7 +863,7 @@ fn handle_hub_frame(
                 .map(|p| {
                     let cols = p.terminal().cols();
                     let rows = p.terminal().rows();
-                    let snapshot = p.terminal().snapshot_export().unwrap_or_else(|err| {
+                    let snapshot = p.snapshot_export().unwrap_or_else(|err| {
                         // Fail closed at the API; empty bytes tell the client the
                         // export did not produce a valid GHOSTSNP payload.
                         log::error!("[session] snapshot_export failed: {err}");

@@ -237,7 +237,9 @@ impl TerminalPanel {
             // Single-call import: one opaque blob restores the whole terminal.
             // Upstream GHOSTSNP decode produces a new terminal sized to the
             // snapshot (not the pre-import create dims) — re-sync panel dims.
-            if let Err(e) = self.parser.terminal_mut().snapshot_import(data) {
+            // Import at parser level so userdata/callbacks re-bind after the
+            // upstream handle swap (decode produces a new terminal).
+            if let Err(e) = self.parser.snapshot_import(data) {
                 log::error!("[terminal_panel] snapshot_import failed: {e}");
                 // Don't transition to Connected — snapshot is malformed
                 return;
@@ -471,10 +473,7 @@ mod tests {
         source
             .terminal_mut()
             .set_color_background(Rgb::new(240, 241, 242).into());
-        let snapshot = source
-            .terminal()
-            .snapshot_export()
-            .expect("source snapshot export");
+        let snapshot = source.snapshot_export().expect("source snapshot export");
 
         panel.connect("sess-0");
         panel.on_scrollback(&snapshot);
@@ -631,10 +630,7 @@ mod tests {
         // Snapshot is 12×40 — deliberately different from the panel/caller size.
         let mut source = crate::terminal::TerminalParser::new(12, 40, TUI_SCROLLBACK);
         source.process(b"geometry probe");
-        let snapshot = source
-            .terminal()
-            .snapshot_export()
-            .expect("source snapshot export");
+        let snapshot = source.snapshot_export().expect("source snapshot export");
 
         let mut panel = TerminalPanel::new(24, 80);
         panel.connect("sess-0");
