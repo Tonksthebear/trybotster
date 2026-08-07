@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import clsx from 'clsx'
 import { useSettingsStore } from '../../store/settings-store'
 import ConfigEditor from './ConfigEditor'

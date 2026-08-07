@@ -7,7 +7,7 @@ import HubInfoPanel from '../components/settings/HubInfoPanel'
 
 const navigate = vi.hoisted(() => vi.fn())
 
-vi.mock('react-router-dom', async () => ({
+vi.mock('react-router', async () => ({
   useNavigate: () => navigate,
 }))
 

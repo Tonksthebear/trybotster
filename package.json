@@ -27,9 +27,9 @@
     "@tanstack/react-query": "^5.100.5",
     "clsx": "^2.1.1",
     "motion": "^12.38.0",
-    "react": "^19.2.5",
-    "react-dom": "^19.2.5",
-    "react-router-dom": "^7.14.1",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-router": "^8.3.0",
     "zustand": "^5.0.12"
   }
 }

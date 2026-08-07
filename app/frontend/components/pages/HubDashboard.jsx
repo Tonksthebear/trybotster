@@ -1,5 +1,5 @@
 import React from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { useHubStore } from '../../store/hub-store'
 
 export default function HubDashboard() {

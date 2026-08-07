@@ -1,7 +1,7 @@
 import React from 'react'
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { render, screen, waitFor, act, cleanup } from '@testing-library/react'
-import { MemoryRouter, useLocation } from 'react-router-dom'
+import { MemoryRouter, useLocation } from 'react-router'
 import { AppRoutes } from '../components/AppShell'
 import { resetHubListSubscriptionForTest, useHubStore } from '../store/hub-store'
 import { useRouteRegistryStore } from '../store/route-registry-store'

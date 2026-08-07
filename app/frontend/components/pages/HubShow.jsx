@@ -1,5 +1,5 @@
 import React from 'react'
-import { useParams, Link } from 'react-router-dom'
+import { useParams, Link } from 'react-router'
 import UiTree from '../UiTree'
 import SessionActionsMenu from '../workspace/SessionActionsMenu'
 import ShareHub from '../hub/ShareHub'

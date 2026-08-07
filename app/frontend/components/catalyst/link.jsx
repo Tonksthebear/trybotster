@@ -1,6 +1,6 @@
 import * as Headless from '@headlessui/react'
 import React, { forwardRef } from 'react'
-import { Link as RouterLink } from 'react-router-dom'
+import { Link as RouterLink } from 'react-router'
 
 function isInternalHref(href) {
   if (!href || typeof href !== 'string') return false

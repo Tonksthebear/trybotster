@@ -41,12 +41,21 @@ Replaced:
 
 - **mode_changed** → poll via `ghostty_terminal_get` + `GHOSTTY_TERMINAL_DATA_MODE` / mode flags after each VT write
 
-## Hard regressions (documented only)
+## Hard regressions (CORE-1 — documented only, not shipping)
 
-Upstream no longer exposes first-class hooks for:
+Upstream libghostty-vt no longer exposes first-class hooks for the two
+fork-era callbacks below. **Policy:** do not reimplement via byte-scanning
+or invent host-side VT parsers. Track product need separately if/when a
+consumer requires them; the cutover does not block on restoration.
 
-1. **OSC 133 semantic prompt marks** — session no longer emits `FRAME_PROMPT_MARK` from a Ghostty callback. No byte-scanning reimplementation.
-2. **Kitty keyboard change notifications** — no dedicated push callback. Kitty enablement still appears in polled mode flags (`kitty_enabled`) when it changes with other mode polls, but there is no OSC-style push event path.
+| Residual ID | Former fork hook | Effect | Mitigation / tracking |
+|---|---|---|---|
+| CORE-1a | `semantic_prompt` (OSC 133) | Session no longer emits `FRAME_PROMPT_MARK` from a Ghostty callback | None in-tree. Product consumers that need prompt marks must wait for an upstream lib_vt surface or an explicit future Botster design (not a snapshot-format concern). |
+| CORE-1b | `kitty_keyboard_changed` | No dedicated push callback on keyboard protocol changes | Kitty enablement still appears in **polled** mode flags (`kitty_enabled`) when it changes with other post-write mode polls. No OSC-style push event path. |
+
+Status: **accepted residual** of the upstream pin. Revisit only if a
+shipping feature (TUI chrome, agent prompt boundary, etc.) hard-depends
+on push semantics.
 
 ## Build
 
