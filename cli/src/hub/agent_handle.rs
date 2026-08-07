@@ -469,7 +469,7 @@ impl PtyHandle {
 
     /// Get an opaque terminal snapshot of the current state via session RPC.
     ///
-    /// Returns an opaque blob from `ghostty_terminal_snapshot_export`.
+    /// Returns an opaque `GHOSTSNP` blob from `ghostty_snapshot_encode_alloc`.
     /// Clients import it via `terminal.snapshot_import()`.
     #[must_use]
     pub fn get_snapshot(&self) -> Vec<u8> {

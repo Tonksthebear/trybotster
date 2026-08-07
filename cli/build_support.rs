@@ -1,6 +1,12 @@
 use std::path::PathBuf;
 
-pub const REQUIRED_ZIG_VERSION: &str = "0.15.2";
+/// Exact Zig toolchain required to build the vendored Ghostty pin.
+///
+/// Upstream Ghostty declares `minimum_zig_version = "0.16.0"` at
+/// `22d13172cde98a0a4dda05d3d6a3fcb0dd8ed018`. A near-miss toolchain fails
+/// deep inside the Zig build, so the preflight gate requires this exact
+/// version string.
+pub const REQUIRED_ZIG_VERSION: &str = "0.16.0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ZigCommand {
@@ -42,11 +48,15 @@ pub fn zig_candidates(
     }
 
     if let Some(home) = home {
-        let mise_zig = PathBuf::from(home).join(".local/share/mise/installs/zig/0.15.2/bin/zig");
+        // Keep the hardcoded mise install path in lockstep with REQUIRED_ZIG_VERSION.
+        let mise_zig =
+            PathBuf::from(home).join(format!(
+                ".local/share/mise/installs/zig/{REQUIRED_ZIG_VERSION}/bin/zig"
+            ));
         if path_exists(&mise_zig) {
             candidates.push(direct_zig(
                 mise_zig.display().to_string(),
-                "mise Zig 0.15.2 install",
+                format!("mise Zig {REQUIRED_ZIG_VERSION} install"),
             ));
         }
     }
@@ -88,4 +98,13 @@ pub fn zig_global_cache_dir(out_dir: &str, configured: Option<String>) -> String
             .display()
             .to_string()
     })
+}
+
+/// Local Zig cache scoped to Cargo's OUT_DIR so builds do not write `.zig-cache`
+/// into the shared vendored Ghostty checkout.
+pub fn zig_local_cache_dir(out_dir: &str) -> String {
+    PathBuf::from(out_dir)
+        .join("zig-local-cache")
+        .display()
+        .to_string()
 }

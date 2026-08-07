@@ -3,15 +3,45 @@
 //! Provides terminal creation, VT byte processing, ANSI/VT formatting,
 //! mode queries, effect callbacks, and render state for TUI rendering.
 //! This replaces `alacritty_terminal` as the terminal emulator engine.
+//!
+//! Snapshots use upstream's `GHOSTSNP` format via `ghostty_snapshot_encode_alloc`
+//! and the one-shot decoder (`decoder_new_buf` → `decode` → `free`). Decode
+//! produces a caller-owned terminal (not in-place restore). Old fork-format
+//! blobs fail closed with no dual-decode path.
+//!
+//! # Upstream callback regressions (documented only)
+//!
+//! Upstream ghostty-org no longer exposes first-class OPT hooks for OSC 133
+//! semantic prompt marks or kitty keyboard protocol change notifications.
+//! Those Botster session event paths are intentionally retired rather than
+//! reimplemented on top of byte scanning. Mode state is polled via
+//! `ghostty_terminal_get` + `GHOSTTY_TERMINAL_DATA_MODE` instead of a
+//! `mode_changed` callback.
+
+// Rust guideline compliant 2024-12
 
 use std::ffi::c_void;
+use std::fmt;
 use std::ptr;
+
+/// Host-facing snapshot format label for Ghostty-owned opaque payloads.
+pub const GHOSTTY_SNAPSHOT_FORMAT: &str = "ghostty-terminal-snapshot-v1";
+
+/// Upstream snapshot envelope magic (`GHOSTSNP`).
+pub const GHOSTSNP_MAGIC: &[u8] = b"GHOSTSNP";
+
+/// Bytes of unfinished VT sequence retained for snapshot continuation.
+///
+/// Encode fails with `GHOSTTY_INVALID_VALUE` when the parser is mid-sequence
+/// and continuation tracking was never enabled. Value matches upstream's
+/// `c-vt-snapshot` reference example.
+const CONTINUATION_MAX_BYTES: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // Raw FFI bindings
 // ---------------------------------------------------------------------------
 
-#[repr(C)]
+#[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 enum GhosttyResult {
@@ -27,9 +57,22 @@ enum GhosttyResult {
 /// Borrowed byte string from the C API. Valid only until the next terminal mutation.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct GhosttyString {
-    ptr: *const u8,
-    len: usize,
+pub struct GhosttyString {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+impl GhosttyString {
+    /// Interpret as UTF-8 for the duration of a callback (lossy on invalid bytes is not used;
+    /// invalid sequences yield an empty string to keep host logic simple).
+    pub fn as_str(&self) -> &str {
+        if self.ptr.is_null() || self.len == 0 {
+            return "";
+        }
+        // SAFETY: Ghostty guarantees the pointer is valid for `len` during the callback.
+        let bytes = unsafe { std::slice::from_raw_parts(self.ptr, self.len) };
+        std::str::from_utf8(bytes).unwrap_or("")
+    }
 }
 
 /// RGB color value.
@@ -47,16 +90,6 @@ pub struct GhosttyColorRgb {
 pub enum GhosttyColorScheme {
     Light = 0,
     Dark = 1,
-}
-
-// ── Terminal options / creation ─────────────────────────────────────────────
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct GhosttyTerminalOptions {
-    cols: u16,
-    rows: u16,
-    max_scrollback: usize,
 }
 
 // ── Modes ──────────────────────────────────────────────────────────────────
@@ -122,6 +155,16 @@ enum GhosttyTerminalData {
     ColorBackgroundDefault = 23,
     ColorCursorDefault = 24,
     ColorPaletteDefault = 25,
+    /// Query a single mode via [`GhosttyTerminalModeConfig`] (upstream DATA_MODE).
+    Mode = 37,
+}
+
+/// A terminal mode and its boolean value (frozen upstream layout).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct GhosttyTerminalModeConfig {
+    mode: GhosttyMode,
+    value: bool,
 }
 
 #[repr(i32)]
@@ -161,7 +204,7 @@ impl ScrollbarState {
     }
 }
 
-// ── Terminal options (set) ─────────────────────────────────────────────────
+// ── Terminal options (set) — numbers match upstream ghostty-org pin ────────
 
 #[repr(i32)]
 #[derive(Debug, Clone, Copy)]
@@ -182,11 +225,16 @@ enum GhosttyTerminalOption {
     ColorBackground = 12,
     ColorCursor = 13,
     ColorPalette = 14,
-    PwdChanged = 15,
-    Notification = 16,
-    SemanticPrompt = 17,
-    ModeChanged = 18,
-    KittyKeyboardChanged = 19,
+    // 15–24: kitty image / selection / cursor / glyph options (unused here)
+    PwdChanged = 25,
+    // 26: clipboard write (unused)
+    ScrollbackMaxBytes = 27,
+    // 28: scrollback max lines (unused)
+    /// Desktop notification via OSC 9 / OSC 777 (renamed from fork's Notification).
+    DesktopNotification = 29,
+    // 30: progress report (unused)
+    /// Maximum retained bytes of an unfinished VT sequence (`size_t*`).
+    ContinuationMaxBytes = 31,
 }
 
 // ── Callback function pointer types ────────────────────────────────────────
@@ -217,49 +265,22 @@ type GhosttyTerminalTitleChangedFn =
 type GhosttyTerminalPwdChangedFn =
     Option<unsafe extern "C" fn(terminal: GhosttyTerminalPtr, userdata: *mut c_void)>;
 
-type GhosttyTerminalNotificationFn = Option<
-    unsafe extern "C" fn(
-        terminal: GhosttyTerminalPtr,
-        userdata: *mut c_void,
-        title: *const u8,
-        title_len: usize,
-        body: *const u8,
-        body_len: usize,
-    ),
->;
-
-#[repr(i32)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GhosttySemanticPromptAction {
-    FreshLine = 0,
-    FreshLineNewPrompt = 1,
-    NewCommand = 2,
-    PromptStart = 3,
-    EndPromptStartInput = 4,
-    EndPromptStartInputTerminateEol = 5,
-    EndInputStartOutput = 6,
-    EndCommand = 7,
+/// Borrowed desktop-notification request from upstream (sized struct).
+#[repr(C)]
+pub struct GhosttyTerminalDesktopNotification {
+    pub size: usize,
+    pub title: GhosttyString,
+    pub body: GhosttyString,
 }
 
-type GhosttyTerminalSemanticPromptFn = Option<
+/// C callback type for desktop notifications (OSC 9 / OSC 777).
+pub type GhosttyTerminalDesktopNotificationFn = Option<
     unsafe extern "C" fn(
-        terminal: GhosttyTerminalPtr,
+        terminal: *mut GhosttyTerminalOpaque,
         userdata: *mut c_void,
-        action: GhosttySemanticPromptAction,
+        notification: *const GhosttyTerminalDesktopNotification,
     ),
 >;
-
-type GhosttyTerminalModeChangedFn = Option<
-    unsafe extern "C" fn(
-        terminal: GhosttyTerminalPtr,
-        userdata: *mut c_void,
-        mode: u16,
-        enabled: bool,
-    ),
->;
-
-type GhosttyTerminalKittyKeyboardChangedFn =
-    Option<unsafe extern "C" fn(terminal: GhosttyTerminalPtr, userdata: *mut c_void)>;
 
 // ── Scroll viewport ───────────────────────────────────────────────────────
 
@@ -594,6 +615,11 @@ struct GhosttyFormatterTerminalOptions {
     unwrap: bool,
     trim: bool,
     extra: GhosttyFormatterTerminalExtra,
+    /// Optional `GhosttySelection *`. Null formats the whole screen.
+    ///
+    /// Not layout-optional: `size` is `sizeof` of the whole struct, so omitting
+    /// this field makes Ghostty read the selection pointer out of bounds (SIGSEGV).
+    selection: *const c_void,
 }
 
 // ── Opaque handles ─────────────────────────────────────────────────────────
@@ -613,22 +639,101 @@ type GhosttyFormatterPtr = *mut GhosttyFormatterOpaque;
 
 // ── Log callback ──────────────────────────────────────────────────────────
 
-/// Callback invoked by ghostty's Zig logging. Routes through Rust's `log` crate.
-extern "C" fn ghostty_log_callback(level: u8, ptr: *const u8, len: usize) {
-    // SAFETY: Zig passes a valid pointer+length from a stack buffer.
-    let msg = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(ptr, len)) };
+/// Upstream log severity (matches `GhosttySysLogLevel`).
+#[repr(i32)]
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+enum GhosttySysLogLevel {
+    Error = 0,
+    Warning = 1,
+    Info = 2,
+    Debug = 3,
+}
+
+/// System option identifiers for `ghostty_sys_set`.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy)]
+enum GhosttySysOption {
+    Log = 2,
+}
+
+type GhosttySysLogFn = unsafe extern "C" fn(
+    userdata: *mut c_void,
+    level: GhosttySysLogLevel,
+    scope: *const u8,
+    scope_len: usize,
+    message: *const u8,
+    message_len: usize,
+);
+
+/// Callback invoked by ghostty's system logging. Routes through Rust's `log` crate.
+///
+/// # Safety
+/// Called from Ghostty with borrowed scope/message buffers valid only for the call.
+unsafe extern "C" fn ghostty_log_callback(
+    _userdata: *mut c_void,
+    level: GhosttySysLogLevel,
+    scope: *const u8,
+    scope_len: usize,
+    message: *const u8,
+    message_len: usize,
+) {
+    // SAFETY: Ghostty guarantees scope/message are valid for this call.
+    let msg = unsafe {
+        if message.is_null() || message_len == 0 {
+            ""
+        } else {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(message, message_len))
+        }
+    };
+    let scope = unsafe {
+        if scope.is_null() || scope_len == 0 {
+            ""
+        } else {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(scope, scope_len))
+        }
+    };
     match level {
-        0 => log::error!(target: "ghostty", "{msg}"),
-        1 => log::warn!(target: "ghostty", "{msg}"),
-        2 => log::info!(target: "ghostty", "{msg}"),
-        _ => log::debug!(target: "ghostty", "{msg}"),
+        GhosttySysLogLevel::Error => {
+            if scope.is_empty() {
+                log::error!(target: "ghostty", "{msg}");
+            } else {
+                log::error!(target: "ghostty", "[{scope}] {msg}");
+            }
+        }
+        GhosttySysLogLevel::Warning => {
+            if scope.is_empty() {
+                log::warn!(target: "ghostty", "{msg}");
+            } else {
+                log::warn!(target: "ghostty", "[{scope}] {msg}");
+            }
+        }
+        GhosttySysLogLevel::Info => {
+            if scope.is_empty() {
+                log::info!(target: "ghostty", "{msg}");
+            } else {
+                log::info!(target: "ghostty", "[{scope}] {msg}");
+            }
+        }
+        GhosttySysLogLevel::Debug => {
+            if scope.is_empty() {
+                log::debug!(target: "ghostty", "{msg}");
+            } else {
+                log::debug!(target: "ghostty", "[{scope}] {msg}");
+            }
+        }
     }
 }
 
 /// Install the log callback. Call once at startup before creating any terminals.
 pub fn init_logging() {
+    // ghostty_sys_set(LOG) takes a pointer to a GhosttySysLogFn function pointer.
+    let mut cb: GhosttySysLogFn = ghostty_log_callback;
     unsafe {
-        ghostty_vt_set_log_callback(ghostty_log_callback);
+        let _ = ghostty_sys_set(
+            GhosttySysOption::Log,
+            &mut cb as *mut GhosttySysLogFn as *const c_void,
+        );
     }
 }
 
@@ -636,14 +741,15 @@ pub fn init_logging() {
 
 #[allow(dead_code)]
 extern "C" {
-    // Logging
-    fn ghostty_vt_set_log_callback(cb: extern "C" fn(level: u8, ptr: *const u8, len: usize));
+    // System options (logging, etc.)
+    fn ghostty_sys_set(option: GhosttySysOption, value: *const c_void) -> GhosttyResult;
 
-    // Terminal lifecycle
+    // Terminal lifecycle: (allocator, &term, cols, rows); scrollback via OPT 27
     fn ghostty_terminal_new(
         allocator: *const c_void,
         terminal: *mut GhosttyTerminalPtr,
-        options: GhosttyTerminalOptions,
+        cols: u16,
+        rows: u16,
     ) -> GhosttyResult;
     fn ghostty_terminal_free(terminal: GhosttyTerminalPtr);
     fn ghostty_terminal_reset(terminal: GhosttyTerminalPtr);
@@ -660,14 +766,7 @@ extern "C" {
         cell_height_px: u32,
     ) -> GhosttyResult;
 
-    // Mode queries
-    fn ghostty_terminal_mode_get(
-        terminal: GhosttyTerminalPtr,
-        mode: GhosttyMode,
-        out_value: *mut bool,
-    ) -> GhosttyResult;
-
-    // Terminal data
+    // Terminal data (modes via DATA_MODE + GhosttyTerminalModeConfig)
     fn ghostty_terminal_get(
         terminal: GhosttyTerminalPtr,
         data: GhosttyTerminalData,
@@ -801,19 +900,82 @@ extern "C" {
     fn ghostty_style_default(style: *mut GhosttyStyle);
     fn ghostty_style_is_default(style: *const GhosttyStyle) -> bool;
 
-    // ── Opaque terminal snapshot transfer ───────────────────────────────
-    fn ghostty_terminal_snapshot_export(
+    // ── Opaque terminal snapshot transfer (GHOSTSNP) ────────────────────
+    fn ghostty_snapshot_encode_alloc(
         terminal: GhosttyTerminalPtr,
         allocator: *const c_void,
         out_ptr: *mut *mut u8,
         out_len: *mut usize,
     ) -> GhosttyResult;
 
-    fn ghostty_terminal_snapshot_import(
-        terminal: GhosttyTerminalPtr,
-        data: *const u8,
-        data_len: usize,
+    fn ghostty_snapshot_decoder_new_buf(
+        allocator: *const c_void,
+        decoder: *mut GhosttySnapshotDecoderPtr,
+        ptr: *const u8,
+        len: usize,
     ) -> GhosttyResult;
+
+    fn ghostty_snapshot_decoder_decode(
+        decoder: GhosttySnapshotDecoderPtr,
+        terminal: *mut GhosttyTerminalPtr,
+    ) -> GhosttyResult;
+
+    fn ghostty_snapshot_decoder_free(decoder: GhosttySnapshotDecoderPtr);
+}
+
+/// Opaque snapshot decoder handle.
+#[repr(C)]
+struct GhosttySnapshotDecoderOpaque {
+    _opaque: [u8; 0],
+}
+type GhosttySnapshotDecoderPtr = *mut GhosttySnapshotDecoderOpaque;
+
+/// Typed errors for fail-closed snapshot export/import.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotError {
+    /// libghostty-vt returned a non-success result code.
+    OperationFailed {
+        operation: &'static str,
+        result: i32,
+    },
+    /// Success was reported but a required handle was null.
+    NullHandle {
+        operation: &'static str,
+    },
+}
+
+impl SnapshotError {
+    const fn operation(operation: &'static str, result: GhosttyResult) -> Self {
+        Self::OperationFailed {
+            operation,
+            result: result as i32,
+        }
+    }
+}
+
+impl fmt::Display for SnapshotError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OperationFailed { operation, result } => {
+                write!(f, "{operation} failed with Ghostty result {result}")
+            }
+            Self::NullHandle { operation } => {
+                write!(f, "{operation} returned a null Ghostty handle")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotError {}
+
+struct DecoderGuard(GhosttySnapshotDecoderPtr);
+
+impl Drop for DecoderGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { ghostty_snapshot_decoder_free(self.0) };
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -889,21 +1051,62 @@ unsafe extern "C" fn builtin_color_scheme_trampoline(
 
 impl Terminal {
     /// Create a new terminal with the given dimensions.
+    ///
+    /// `max_scrollback` is a byte budget for retained scrollback pages
+    /// (`GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_BYTES`). Continuation tracking is
+    /// armed immediately so mid-sequence snapshot encodes succeed.
     pub fn new(cols: u16, rows: u16, max_scrollback: usize) -> Result<Self, &'static str> {
-        let opts = GhosttyTerminalOptions {
-            cols,
-            rows,
-            max_scrollback,
-        };
         let mut handle: GhosttyTerminalPtr = ptr::null_mut();
+        let result = unsafe { ghostty_terminal_new(ptr::null(), &mut handle, cols, rows) };
 
-        let result = unsafe { ghostty_terminal_new(ptr::null(), &mut handle, opts) };
-
-        match result {
-            GhosttyResult::Success => Ok(Terminal { handle }),
-            GhosttyResult::OutOfMemory => Err("ghostty_terminal_new: out of memory"),
-            _ => Err("ghostty_terminal_new: failed"),
+        if result != GhosttyResult::Success {
+            return match result {
+                GhosttyResult::OutOfMemory => Err("ghostty_terminal_new: out of memory"),
+                _ => Err("ghostty_terminal_new: failed"),
+            };
         }
+        if handle.is_null() {
+            return Err("ghostty_terminal_new: null handle");
+        }
+
+        let terminal = Terminal { handle };
+
+        // Scrollback via OPT after create (no longer part of terminal_new args).
+        let result = unsafe {
+            ghostty_terminal_set(
+                terminal.handle,
+                GhosttyTerminalOption::ScrollbackMaxBytes,
+                &max_scrollback as *const usize as *const c_void,
+            )
+        };
+        if result != GhosttyResult::Success {
+            return Err("ghostty_terminal_set scrollback: failed");
+        }
+
+        terminal
+            .enable_continuation_tracking()
+            .map_err(|_| "ghostty_terminal_set continuation: failed")?;
+
+        Ok(terminal)
+    }
+
+    /// Arm snapshot continuation tracking on this terminal.
+    ///
+    /// Must run before any VT byte can leave the parser mid-sequence, and again
+    /// after every import (decoded terminals come back with tracking disabled).
+    fn enable_continuation_tracking(&self) -> Result<(), SnapshotError> {
+        let limit = CONTINUATION_MAX_BYTES;
+        let result = unsafe {
+            ghostty_terminal_set(
+                self.handle,
+                GhosttyTerminalOption::ContinuationMaxBytes,
+                &limit as *const usize as *const c_void,
+            )
+        };
+        if result != GhosttyResult::Success {
+            return Err(SnapshotError::operation("set_continuation", result));
+        }
+        Ok(())
     }
 
     /// Raw handle for passing to render state update.
@@ -937,10 +1140,19 @@ impl Terminal {
     // ── Mode queries ───────────────────────────────────────────────────
 
     /// Query a terminal mode by its packed GhosttyMode constant.
+    ///
+    /// Uses `ghostty_terminal_get` + `GHOSTTY_TERMINAL_DATA_MODE` (upstream
+    /// replaced the fork's dedicated `ghostty_terminal_mode_get`).
     pub fn mode_get(&self, mode: GhosttyMode) -> bool {
-        let mut out = false;
-        let result = unsafe { ghostty_terminal_mode_get(self.handle, mode, &mut out) };
-        result == GhosttyResult::Success && out
+        let mut query = GhosttyTerminalModeConfig { mode, value: false };
+        let result = unsafe {
+            ghostty_terminal_get(
+                self.handle,
+                GhosttyTerminalData::Mode,
+                &mut query as *mut GhosttyTerminalModeConfig as *mut c_void,
+            )
+        };
+        result == GhosttyResult::Success && query.value
     }
 
     /// Whether the cursor is currently hidden (`DECTCEM` off).
@@ -1268,60 +1480,22 @@ impl Terminal {
         }
     }
 
-    /// Set the notification callback (OSC 9/777).
+    /// Set the desktop notification callback (OSC 9/777).
+    ///
+    /// Upstream renamed this option from the fork's `Notification` to
+    /// `DesktopNotification` and passes a sized struct rather than loose
+    /// title/body pointers.
     ///
     /// # Safety
     /// The function pointer must be valid and the userdata must be set.
-    pub unsafe fn set_notification_callback(&mut self, cb: GhosttyTerminalNotificationFn) {
-        unsafe {
-            ghostty_terminal_set(
-                self.handle,
-                GhosttyTerminalOption::Notification,
-                cb.map_or(ptr::null(), |f| f as *const c_void),
-            );
-        }
-    }
-
-    /// Set the semantic_prompt callback (OSC 133).
-    ///
-    /// # Safety
-    /// The function pointer must be valid and the userdata must be set.
-    pub unsafe fn set_semantic_prompt_callback(&mut self, cb: GhosttyTerminalSemanticPromptFn) {
-        unsafe {
-            ghostty_terminal_set(
-                self.handle,
-                GhosttyTerminalOption::SemanticPrompt,
-                cb.map_or(ptr::null(), |f| f as *const c_void),
-            );
-        }
-    }
-
-    /// Set the mode_changed callback (CSI h/l).
-    ///
-    /// # Safety
-    /// The function pointer must be valid and the userdata must be set.
-    pub unsafe fn set_mode_changed_callback(&mut self, cb: GhosttyTerminalModeChangedFn) {
-        unsafe {
-            ghostty_terminal_set(
-                self.handle,
-                GhosttyTerminalOption::ModeChanged,
-                cb.map_or(ptr::null(), |f| f as *const c_void),
-            );
-        }
-    }
-
-    /// Set the kitty_keyboard_changed callback.
-    ///
-    /// # Safety
-    /// The function pointer must be valid and the userdata must be set.
-    pub unsafe fn set_kitty_keyboard_changed_callback(
+    pub unsafe fn set_desktop_notification_callback(
         &mut self,
-        cb: GhosttyTerminalKittyKeyboardChangedFn,
+        cb: GhosttyTerminalDesktopNotificationFn,
     ) {
         unsafe {
             ghostty_terminal_set(
                 self.handle,
-                GhosttyTerminalOption::KittyKeyboardChanged,
+                GhosttyTerminalOption::DesktopNotification,
                 cb.map_or(ptr::null(), |f| f as *const c_void),
             );
         }
@@ -1371,6 +1545,35 @@ impl Terminal {
                 palette.as_ptr() as *const c_void,
             );
         }
+    }
+
+    /// Read the current 256-color palette (with any OSC overrides).
+    pub fn color_palette(&self) -> Option<[GhosttyColorRgb; 256]> {
+        let mut palette = [GhosttyColorRgb { r: 0, g: 0, b: 0 }; 256];
+        let result = unsafe {
+            ghostty_terminal_get(
+                self.handle,
+                GhosttyTerminalData::ColorPalette,
+                palette.as_mut_ptr() as *mut c_void,
+            )
+        };
+        (result == GhosttyResult::Success).then_some(palette)
+    }
+
+    /// Update a single default palette entry via read-modify-write.
+    ///
+    /// Upstream answers OSC 4 queries from the terminal palette; partial host
+    /// caches must merge into the full 256-entry table rather than only
+    /// answering from a side map.
+    pub fn set_palette_entry(&mut self, index: usize, color: GhosttyColorRgb) {
+        if index >= 256 {
+            return;
+        }
+        let mut palette = self
+            .color_palette()
+            .unwrap_or([GhosttyColorRgb { r: 0, g: 0, b: 0 }; 256]);
+        palette[index] = color;
+        self.set_color_palette(&palette);
     }
 
     // ── Viewport scrolling ─────────────────────────────────────────────
@@ -1481,38 +1684,80 @@ impl Terminal {
             unwrap,
             trim,
             extra: terminal_extra,
+            selection: ptr::null(),
         };
 
         self.format_with_opts(opts)
     }
 
-    // ── Opaque terminal snapshot transfer ───────────────────────────────
+    // ── Opaque terminal snapshot transfer (GHOSTSNP) ────────────────────
 
-    /// Export the entire terminal state as one opaque blob.
-    pub fn snapshot_export(&self) -> Option<Vec<u8>> {
-        let mut ptr: *mut u8 = ptr::null_mut();
-        let mut len: usize = 0;
+    /// Export the entire terminal state as one opaque `GHOSTSNP` blob.
+    ///
+    /// Fail-closed: non-success result codes surface as [`SnapshotError`]
+    /// rather than a silent `None`.
+    pub fn snapshot_export(&self) -> Result<Vec<u8>, SnapshotError> {
+        let mut out_ptr: *mut u8 = ptr::null_mut();
+        let mut out_len: usize = 0;
         let result = unsafe {
-            ghostty_terminal_snapshot_export(self.handle, ptr::null(), &mut ptr, &mut len)
+            ghostty_snapshot_encode_alloc(self.handle, ptr::null(), &mut out_ptr, &mut out_len)
         };
-        if result == GhosttyResult::Success && !ptr.is_null() && len > 0 {
-            let data = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
-            unsafe { ghostty_free(ptr::null(), ptr, len) };
-            Some(data)
-        } else {
-            None
+        if result != GhosttyResult::Success {
+            return Err(SnapshotError::operation("snapshot_export", result));
         }
+        let bytes = if out_ptr.is_null() || out_len == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(out_ptr, out_len) }.to_vec()
+        };
+        if !out_ptr.is_null() {
+            unsafe { ghostty_free(ptr::null(), out_ptr, out_len) };
+        }
+        Ok(bytes)
     }
 
     /// Import an entire terminal state from an opaque blob produced by
-    /// `snapshot_export()`.
-    pub fn snapshot_import(&mut self, data: &[u8]) -> Result<(), &'static str> {
-        let result =
-            unsafe { ghostty_terminal_snapshot_import(self.handle, data.as_ptr(), data.len()) };
-        match result {
-            GhosttyResult::Success => Ok(()),
-            _ => Err("ghostty_terminal_snapshot_import: failed"),
+    /// [`snapshot_export`].
+    ///
+    /// Upstream decoding produces a **new** caller-owned terminal rather than
+    /// restoring into the existing handle. This swaps `self.handle` only after
+    /// a successful decode (failed import leaves the current terminal intact)
+    /// and re-arms continuation tracking on the decoded terminal.
+    pub fn snapshot_import(&mut self, data: &[u8]) -> Result<(), SnapshotError> {
+        let mut decoder: GhosttySnapshotDecoderPtr = ptr::null_mut();
+        let result = unsafe {
+            ghostty_snapshot_decoder_new_buf(
+                ptr::null(),
+                &mut decoder,
+                data.as_ptr(),
+                data.len(),
+            )
+        };
+        if result != GhosttyResult::Success {
+            return Err(SnapshotError::operation("snapshot_decoder", result));
         }
+        let decoder = DecoderGuard(decoder);
+
+        let mut decoded: GhosttyTerminalPtr = ptr::null_mut();
+        let result = unsafe { ghostty_snapshot_decoder_decode(decoder.0, &mut decoded) };
+        if result != GhosttyResult::Success {
+            return Err(SnapshotError::operation("snapshot_import", result));
+        }
+        if decoded.is_null() {
+            return Err(SnapshotError::NullHandle {
+                operation: "snapshot_import",
+            });
+        }
+
+        let previous = self.handle;
+        self.handle = decoded;
+        if !previous.is_null() {
+            unsafe { ghostty_terminal_free(previous) };
+        }
+
+        // Decoded terminals come back with continuation tracking disabled.
+        self.enable_continuation_tracking()?;
+        Ok(())
     }
 
     fn format_with_opts(
@@ -2012,6 +2257,11 @@ mod tests {
         );
 
         let snapshot = replayed.snapshot_export().expect("snapshot export");
+        assert!(
+            snapshot.starts_with(GHOSTSNP_MAGIC),
+            "export must be GHOSTSNP, got {:?}",
+            &snapshot[..snapshot.len().min(GHOSTSNP_MAGIC.len())]
+        );
         let mut restored = Terminal::new(80, 24, 1000).expect("terminal creation failed");
         restored
             .snapshot_import(&snapshot)
@@ -2019,6 +2269,36 @@ mod tests {
         assert_eq!(
             restored.format_plain().expect("restored plain screen"),
             baseline.format_plain().expect("baseline plain screen")
+        );
+
+        // Continuation re-arm: mid-sequence encode after import must succeed.
+        restored.write(b"\x1b[31");
+        let re_export = restored
+            .snapshot_export()
+            .expect("re-export after import with unfinished VT");
+        assert!(re_export.starts_with(GHOSTSNP_MAGIC));
+    }
+
+    #[test]
+    fn snapshot_export_fails_closed_on_garbage_is_not_applicable_to_export() {
+        // Import of non-GHOSTSNP data fails closed (no dual-decode).
+        let mut term = Terminal::new(80, 24, 0).expect("terminal");
+        term.write(b"keep me");
+        let err = term
+            .snapshot_import(b"not a ghostty snapshot")
+            .expect_err("garbage must fail closed");
+        assert!(
+            matches!(
+                err,
+                SnapshotError::OperationFailed { .. } | SnapshotError::NullHandle { .. }
+            ),
+            "unexpected error: {err}"
+        );
+        // Handle swap only on success — original content remains.
+        let plain = term.format_plain().expect("plain");
+        assert!(
+            String::from_utf8_lossy(&plain).contains("keep me"),
+            "failed import must leave terminal intact"
         );
     }
 

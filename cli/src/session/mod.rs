@@ -19,9 +19,13 @@
 //! # Event detection
 //!
 //! The reader thread emits event frames for terminal state changes:
-//! - **Ghostty callbacks**: all event detection via patched libghostty-vt callbacks
-//!   (title, bell, pwd/OSC 7, notifications/OSC 9/777, prompt marks/OSC 133, mode changes)
-//! - **Zero byte scanning**: ghostty handles all VT parsing, Rust only wires callbacks to frames
+//! - **Ghostty callbacks** where upstream still exposes OPT hooks: title, bell,
+//!   pwd/OSC 7, desktop notifications/OSC 9/777
+//! - **Mode poll path**: after each VT write, query modes via `mode_get` /
+//!   terminal data and emit sparse `ModeChanged` when flags differ
+//! - **Documented losses** on upstream ghostty-org: OSC 133 semantic prompt
+//!   marks and dedicated kitty keyboard change notifications (no dual-path
+//!   byte scanning reimplementation)
 //!
 //! # What it does NOT do
 //!
@@ -134,26 +138,20 @@ enum SessionOutput {
 #[allow(dead_code)]
 enum VtEvent {
     Notification { title: String, body: String },
-    SemanticPrompt(crate::ghostty_vt::GhosttySemanticPromptAction),
-    ModeChanged { mode: u16, enabled: bool },
-    KittyKeyboardChanged,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 struct SessionCallbackFlags {
     notification: bool,
-    semantic_prompt: bool,
-    mode_changed: bool,
-    kitty_keyboard_changed: bool,
+    /// Poll mode flags via `mode_get` after each VT write and emit sparse ModeChanged.
+    mode_poll: bool,
 }
 
 impl SessionCallbackFlags {
     fn all_enabled() -> Self {
         Self {
             notification: true,
-            semantic_prompt: true,
-            mode_changed: true,
-            kitty_keyboard_changed: true,
+            mode_poll: true,
         }
     }
 
@@ -176,9 +174,16 @@ impl SessionCallbackFlags {
                 }
                 "none" => flags = Self::default(),
                 "notification" => flags.notification = true,
-                "semantic_prompt" => flags.semantic_prompt = true,
-                "mode_changed" => flags.mode_changed = true,
-                "kitty_keyboard_changed" => flags.kitty_keyboard_changed = true,
+                // Legacy tokens: semantic_prompt / kitty_keyboard_changed are
+                // hard upstream losses (documented). mode_changed maps to poll.
+                "semantic_prompt" | "kitty_keyboard_changed" => {
+                    log::warn!(
+                        "[session] BOTSTER_GHOSTTY_SESSION_CALLBACKS token '{}' is not \
+                         available on upstream ghostty (documented regression); ignored",
+                        token
+                    );
+                }
+                "mode_changed" | "mode_poll" => flags.mode_poll = true,
                 other => {
                     log::warn!(
                         "[session] ignoring unknown BOTSTER_GHOSTTY_SESSION_CALLBACKS token: {}",
@@ -435,11 +440,10 @@ fn run_session(
     let pwd_changed_flag = Arc::new(AtomicBool::new(false));
     let callback_flags = SessionCallbackFlags::from_env();
     log::info!(
-        "[session] enabled ghostty callbacks: notification={}, semantic_prompt={}, mode_changed={}, kitty_keyboard_changed={}",
+        "[session] enabled ghostty paths: notification={}, mode_poll={} \
+         (semantic_prompt + kitty_keyboard callbacks are upstream losses)",
         callback_flags.notification,
-        callback_flags.semantic_prompt,
-        callback_flags.mode_changed,
-        callback_flags.kitty_keyboard_changed
+        callback_flags.mode_poll
     );
 
     let parser = {
@@ -448,9 +452,6 @@ fn run_session(
         let bell_flag_cb = Arc::clone(&bell_flag);
         let pwd_flag = Arc::clone(&pwd_changed_flag);
         let notif_tx = _event_tx.clone();
-        let prompt_tx = _event_tx.clone();
-        let mode_tx = _event_tx.clone();
-        let kitty_tx = _event_tx.clone();
 
         let callbacks = CallbackConfig {
             write_pty: Some(Box::new(move |data: &[u8]| unsafe {
@@ -472,22 +473,6 @@ fn run_session(
                         body: body.to_string(),
                     });
                 }) as Box<dyn FnMut(&str, &str) + Send>
-            }),
-            semantic_prompt: callback_flags.semantic_prompt.then(|| {
-                Box::new(move |action| {
-                    let _ = prompt_tx.try_send(VtEvent::SemanticPrompt(action));
-                })
-                    as Box<dyn FnMut(crate::ghostty_vt::GhosttySemanticPromptAction) + Send>
-            }),
-            mode_changed: callback_flags.mode_changed.then(|| {
-                Box::new(move |mode: u16, enabled: bool| {
-                    let _ = mode_tx.try_send(VtEvent::ModeChanged { mode, enabled });
-                }) as Box<dyn FnMut(u16, bool) + Send>
-            }),
-            kitty_keyboard_changed: callback_flags.kitty_keyboard_changed.then(|| {
-                Box::new(move || {
-                    let _ = kitty_tx.try_send(VtEvent::KittyKeyboardChanged);
-                }) as Box<dyn FnMut() + Send>
             }),
         };
         let mut parser = TerminalParser::new_with_callbacks(
@@ -554,6 +539,7 @@ fn run_session(
     let pwd_flag_reader = Arc::clone(&pwd_changed_flag);
     let (output_tx, output_rx) = std::sync::mpsc::sync_channel::<SessionOutput>(256);
     let output_tx_child = output_tx.clone();
+    let mode_poll = callback_flags.mode_poll;
     let _reader_thread = thread::Builder::new()
         .name("session-reader".to_string())
         .spawn(move || {
@@ -568,6 +554,7 @@ fn run_session(
                 bell_flag_reader,
                 pwd_flag_reader,
                 event_rx,
+                mode_poll,
             );
         })
         .context("spawn reader thread")?;
@@ -877,8 +864,10 @@ fn handle_hub_frame(
                 .map(|p| {
                     let cols = p.terminal().cols();
                     let rows = p.terminal().rows();
-                    let snapshot = p.terminal().snapshot_export().unwrap_or_else(|| {
-                        log::error!("[session] snapshot_export failed");
+                    let snapshot = p.terminal().snapshot_export().unwrap_or_else(|err| {
+                        // Fail closed at the API; empty bytes tell the client the
+                        // export did not produce a valid GHOSTSNP payload.
+                        log::error!("[session] snapshot_export failed: {err}");
                         Vec::new()
                     });
                     log::info!(
@@ -1004,27 +993,59 @@ fn parser_cwd(parser: &Arc<Mutex<TerminalParser>>) -> Option<String> {
 
 // ─── Reader loop ─────────────────────────────────────────────────────────────
 
-/// Convert a Ghostty semantic prompt action to its transport name.
-fn semantic_prompt_name(action: crate::ghostty_vt::GhosttySemanticPromptAction) -> &'static str {
-    use crate::ghostty_vt::GhosttySemanticPromptAction;
+/// Diff two mode flag snapshots into a sparse ModeChanged (None = unchanged).
+fn mode_changed_delta(before: &ModeFlags, after: &ModeFlags) -> Option<ModeChanged> {
+    let mut changed = ModeChanged::default();
+    let mut any = false;
+    if before.kitty_enabled != after.kitty_enabled {
+        changed.kitty_enabled = Some(after.kitty_enabled);
+        any = true;
+    }
+    if before.cursor_visible != after.cursor_visible {
+        changed.cursor_visible = Some(after.cursor_visible);
+        any = true;
+    }
+    if before.bracketed_paste != after.bracketed_paste {
+        changed.bracketed_paste = Some(after.bracketed_paste);
+        any = true;
+    }
+    if before.mouse_mode != after.mouse_mode {
+        changed.mouse_mode = Some(after.mouse_mode);
+        any = true;
+    }
+    if before.alt_screen != after.alt_screen {
+        changed.alt_screen = Some(after.alt_screen);
+        any = true;
+    }
+    if before.focus_reporting != after.focus_reporting {
+        changed.focus_reporting = Some(after.focus_reporting);
+        any = true;
+    }
+    if before.application_cursor != after.application_cursor {
+        changed.application_cursor = Some(after.application_cursor);
+        any = true;
+    }
+    any.then_some(changed)
+}
 
-    match action {
-        GhosttySemanticPromptAction::FreshLine => "fresh_line",
-        GhosttySemanticPromptAction::FreshLineNewPrompt => "fresh_line_new_prompt",
-        GhosttySemanticPromptAction::NewCommand => "new_command",
-        GhosttySemanticPromptAction::PromptStart => "prompt_start",
-        GhosttySemanticPromptAction::EndPromptStartInput => "end_prompt_start_input",
-        GhosttySemanticPromptAction::EndPromptStartInputTerminateEol => {
-            "end_prompt_start_input_terminate_eol"
-        }
-        GhosttySemanticPromptAction::EndInputStartOutput => "end_input_start_output",
-        GhosttySemanticPromptAction::EndCommand => "end_command",
+fn live_mode_flags(parser: &TerminalParser) -> ModeFlags {
+    ModeFlags {
+        kitty_enabled: parser.kitty_enabled(),
+        cursor_visible: !parser.cursor_hidden(),
+        bracketed_paste: parser.bracketed_paste(),
+        mouse_mode: parser.mouse_mode(),
+        alt_screen: parser.alt_screen_active(),
+        focus_reporting: parser.focus_reporting(),
+        application_cursor: parser.application_cursor(),
     }
 }
 
 /// Read PTY output, feed parser, forward to the session socket via channel.
-/// Terminal state change events are driven entirely by ghostty callbacks —
-/// no byte scanning or mode diffing in Rust.
+///
+/// Mode transitions use the `mode_get` poll path after each VT write (upstream
+/// removed the mode_changed callback). Desktop notifications still arrive via
+/// OPT_DESKTOP_NOTIFICATION. OSC 133 prompt marks and dedicated kitty-keyboard
+/// change callbacks are upstream losses and are not synthesized.
 fn reader_loop(
     fd: RawFd,
     parser: Arc<Mutex<TerminalParser>>,
@@ -1036,9 +1057,14 @@ fn reader_loop(
     bell_flag: Arc<AtomicBool>,
     pwd_changed_flag: Arc<AtomicBool>,
     event_rx: std::sync::mpsc::Receiver<VtEvent>,
+    mode_poll: bool,
 ) {
     let mut buf = [0u8; 4096];
     let mut file = ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+    let mut last_modes = parser
+        .lock()
+        .map(|p| live_mode_flags(&p))
+        .unwrap_or_default();
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -1059,7 +1085,7 @@ fn reader_loop(
             Ok(n) => {
                 let data = &buf[..n];
 
-                // Feed parser — ghostty callbacks fire during process()
+                // Feed parser — remaining ghostty callbacks fire during process()
                 if let Ok(mut p) = parser.lock() {
                     p.process(data);
 
@@ -1088,6 +1114,17 @@ fn reader_loop(
                             )));
                         }
                     }
+
+                    // Mode poll path (replaces mode_changed callback)
+                    if mode_poll {
+                        let after = live_mode_flags(&p);
+                        if let Some(changed) = mode_changed_delta(&last_modes, &after) {
+                            if let Ok(frame) = encode_json(FRAME_MODE_CHANGED, &changed) {
+                                let _ = output_tx.try_send(SessionOutput::EventFrame(frame));
+                            }
+                            last_modes = after;
+                        }
+                    }
                 }
 
                 // Bell (flag set by ghostty callback)
@@ -1095,41 +1132,11 @@ fn reader_loop(
                     let _ = output_tx.try_send(SessionOutput::EventFrame(encode_empty(FRAME_BELL)));
                 }
 
-                // Drain events from ghostty callbacks (notification, prompt, mode)
+                // Drain notification events from the desktop_notification callback
                 while let Ok(event) = event_rx.try_recv() {
                     let frame = match event {
                         VtEvent::Notification { title, body } => {
                             encode_json(FRAME_NOTIFICATION, &NotificationPayload { title, body })
-                        }
-                        VtEvent::SemanticPrompt(action) => encode_json(
-                            FRAME_PROMPT_MARK,
-                            &PromptMarkPayload {
-                                mark: semantic_prompt_name(action).to_string(),
-                            },
-                        ),
-                        VtEvent::KittyKeyboardChanged => {
-                            let kitty = parser.lock().map(|p| p.kitty_enabled()).unwrap_or(false);
-                            let mut changed = ModeChanged::default();
-                            changed.kitty_enabled = Some(kitty);
-                            encode_json(FRAME_MODE_CHANGED, &changed)
-                        }
-                        VtEvent::ModeChanged { mode, enabled } => {
-                            use crate::ghostty_vt::*;
-                            let mut changed = ModeChanged::default();
-                            match mode {
-                                MODE_CURSOR_VISIBLE => changed.cursor_visible = Some(enabled),
-                                MODE_ALT_SCREEN_SAVE => changed.alt_screen = Some(enabled),
-                                MODE_NORMAL_MOUSE | MODE_BUTTON_MOUSE | MODE_ANY_MOUSE => {
-                                    if let Ok(p) = parser.lock() {
-                                        changed.mouse_mode = Some(p.mouse_mode());
-                                    }
-                                }
-                                MODE_BRACKETED_PASTE => changed.bracketed_paste = Some(enabled),
-                                MODE_FOCUS_EVENT => changed.focus_reporting = Some(enabled),
-                                MODE_DECCKM => changed.application_cursor = Some(enabled),
-                                _ => continue,
-                            };
-                            encode_json(FRAME_MODE_CHANGED, &changed)
                         }
                     };
                     if let Ok(frame) = frame {
