@@ -9,10 +9,10 @@ set -e
 # Always set test mode to prevent keyring access
 export BOTSTER_ENV=test
 
-# Vendored Ghostty currently builds with Zig 0.15.2. Prefer the local mise
-# install when present so release/integration builds do not drift to newer Zig.
-if [ -z "${BOTSTER_ZIG:-}" ] && [ -x "$HOME/.local/share/mise/installs/zig/0.15.2/bin/zig" ]; then
-    export BOTSTER_ZIG="$HOME/.local/share/mise/installs/zig/0.15.2/bin/zig"
+# Vendored Ghostty pin requires Zig 0.16.0 exact. Prefer the local mise
+# install when present so release/integration builds do not drift.
+if [ -z "${BOTSTER_ZIG:-}" ] && [ -x "$HOME/.local/share/mise/installs/zig/0.16.0/bin/zig" ]; then
+    export BOTSTER_ZIG="$HOME/.local/share/mise/installs/zig/0.16.0/bin/zig"
 fi
 
 # Parse arguments

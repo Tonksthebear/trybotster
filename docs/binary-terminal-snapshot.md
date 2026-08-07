@@ -30,19 +30,25 @@ After import, the destination terminal must be **observationally identical** to 
 - Kitty keyboard protocol stack
 - PWD and title
 
-## API
+## API (upstream GHOSTSNP — current)
 
-Two functions — that's it:
+```c
+// Source: allocate opaque GHOSTSNP blob (free with ghostty_free, same allocator)
+ghostty_snapshot_encode_alloc(terminal, allocator, &ptr, &len);
 
-```zig
-// Source side: serialize entire terminal as one opaque blob
-ghostty_snapshot_terminal_export(terminal, alloc, out_ptr, out_len) -> Result
-
-// Destination side: clear terminal, load blob, become identical
-ghostty_snapshot_terminal_import(terminal, data, len) -> Result
+// Destination: one-shot decoder produces a *new* caller-owned terminal
+ghostty_snapshot_decoder_new_buf(allocator, &decoder, data, len);
+ghostty_snapshot_decoder_decode(decoder, &terminal); // not in-place restore
+ghostty_snapshot_decoder_free(decoder);
 ```
 
-## Wire Format
+Continuation (`GHOSTTY_TERMINAL_OPT_CONTINUATION_MAX_BYTES`) must be armed at
+create and re-armed after every import. Wire magic: `GHOSTSNP`. See
+[ghostty-upstream-snapshot-v1.md](./ghostty-upstream-snapshot-v1.md).
+
+## Wire Format (legacy fork — retired, fail closed)
+
+> Not readable after the upstream cutover. No dual-decode.
 
 ```
 [u8: TERMINAL_SNAPSHOT_VERSION]

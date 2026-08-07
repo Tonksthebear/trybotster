@@ -459,15 +459,16 @@ pub fn handshake_session(
 
 // ─── Binary snapshot ────────────────────────────────────────────────────────
 //
-// The snapshot is an opaque blob produced by `ghostty_snapshot_terminal_export`
-// and consumed by `ghostty_snapshot_terminal_import`. The session process
-// exports it, the SessionIo/ClientWorker data plane routes it opaquely, and
-// clients import it.
+// The snapshot is an opaque `GHOSTSNP` blob produced by
+// `ghostty_snapshot_encode_alloc` and consumed by the one-shot decoder
+// (`ghostty_snapshot_decoder_new_buf` → `ghostty_snapshot_decoder_decode` →
+// `ghostty_snapshot_decoder_free`). Decode produces a caller-owned terminal
+// (not in-place restore). The session process exports it, the
+// SessionIo/ClientWorker data plane routes it opaquely, and clients import it
+// via the Rust wrapper (which re-binds host callbacks after the handle swap).
 //
-// Internal format (owned by ghostty snapshot.zig):
-//   [u8 version] [u8 screen_count] [u8 active_key]
-//   Per screen: [u8 key] [u32 blob_len] [screen blob: pages + cursor/charset/kitty]
-//   Terminal state: dims, scrolling region, modes, colors, tabstops, pwd, title, flags
+// Wire envelope (upstream): 8-byte magic `"GHOSTSNP"` + u16 LE format version,
+// followed by checksummed record stream (see ghostty `include/ghostty/vt/snapshot.h`).
 
 #[cfg(test)]
 mod tests {
