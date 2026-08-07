@@ -53,6 +53,14 @@ Upstream decode sizes the **new** terminal to the snapshot dimensions. TUI
 into `self.dims` after a successful import. Leaving caller dims cached makes
 `resize()` early-return and swallow the corrective layout size.
 
+## Callbacks after import (punch-list blocker)
+
+Decode replaces the terminal handle. Host userdata and OPT callbacks are
+**not** part of the snapshot. Import must go through
+`TerminalParser::snapshot_import`, which re-installs userdata, write_pty,
+title/bell/pwd/desktop_notification, the builtin color-scheme hook, and
+re-seeds `color_cache` onto the new handle.
+
 ## Gates
 
 - workspace `clippy -D warnings` (cli)

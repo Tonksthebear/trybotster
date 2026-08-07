@@ -331,6 +331,64 @@ impl TerminalParser {
         &mut self.terminal
     }
 
+    /// Export an opaque `GHOSTSNP` snapshot of the underlying terminal.
+    pub fn snapshot_export(&self) -> Result<Vec<u8>, ghostty_vt::SnapshotError> {
+        self.terminal.snapshot_export()
+    }
+
+    /// Import an opaque `GHOSTSNP` snapshot, then re-install host callbacks.
+    ///
+    /// Upstream decode produces a **new** terminal handle. Userdata and all
+    /// OPT callbacks (write_pty, title, bell, pwd, desktop_notification, builtin
+    /// color-scheme) must be re-applied after the swap or attach paths lose
+    /// live event delivery and OSC query replies.
+    pub fn snapshot_import(&mut self, data: &[u8]) -> Result<(), ghostty_vt::SnapshotError> {
+        self.terminal.snapshot_import(data)?;
+        self.reinstall_terminal_hooks();
+        // Re-seed host colors onto the new handle so OSC answers stay correct.
+        if !self.color_cache.is_empty() {
+            let colors = self.color_cache.clone();
+            self.apply_color_cache_map(&colors);
+        }
+        Ok(())
+    }
+
+    /// Re-bind userdata and callbacks after a handle swap (snapshot import).
+    fn reinstall_terminal_hooks(&mut self) {
+        // SAFETY: Callback trampolines remain valid for the lifetime of
+        // `_callback_state`; userdata points into the pinned box when present.
+        unsafe {
+            if let Some(state) = self._callback_state.as_ref() {
+                let state_ptr =
+                    std::ptr::from_ref::<CallbackState>(state.as_ref().get_ref()) as *mut c_void;
+                self.terminal.set_userdata(state_ptr);
+                self.terminal.enable_builtin_color_scheme_callback();
+                if state.write_pty.is_some() {
+                    self.terminal
+                        .set_write_pty_callback(Some(write_pty_trampoline));
+                }
+                if state.title_changed.is_some() {
+                    self.terminal
+                        .set_title_changed_callback(Some(title_changed_trampoline));
+                }
+                if state.bell.is_some() {
+                    self.terminal.set_bell_callback(Some(bell_trampoline));
+                }
+                if state.pwd_changed.is_some() {
+                    self.terminal
+                        .set_pwd_changed_callback(Some(pwd_changed_trampoline));
+                }
+                if state.notification.is_some() {
+                    self.terminal
+                        .set_desktop_notification_callback(Some(desktop_notification_trampoline));
+                }
+            } else {
+                // No-callback constructor still installs the builtin color-scheme path.
+                self.terminal.enable_builtin_color_scheme_callback();
+            }
+        }
+    }
+
     /// Effective foreground color (override or default), if set.
     pub fn foreground_color(&self) -> Option<Rgb> {
         self.terminal.foreground_color().map(Into::into)
@@ -717,6 +775,42 @@ mod tests {
         let calls = calls.lock().expect("notification calls poisoned");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], (String::new(), "Hello world".to_string()));
+    }
+
+    /// Upstream decode swaps to a new terminal handle. Without re-binding
+    /// userdata/callbacks after import, host hooks go silent (punch-list blocker).
+    #[test]
+    fn snapshot_import_reinstalls_callbacks_on_new_handle() {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let calls_cb = std::sync::Arc::clone(&calls);
+        let callbacks = CallbackConfig {
+            notification: Some(Box::new(move |title: &str, body: &str| {
+                calls_cb
+                    .lock()
+                    .expect("notification calls poisoned")
+                    .push((title.to_string(), body.to_string()));
+            })),
+            ..CallbackConfig::default()
+        };
+        let mut parser = TerminalParser::new_with_callbacks(24, 80, 100, callbacks);
+
+        let snapshot = parser
+            .snapshot_export()
+            .expect("snapshot export before import");
+        parser
+            .snapshot_import(&snapshot)
+            .expect("snapshot import must succeed");
+
+        // Must fire on the *new* handle after reinstall — red without the fix.
+        parser.process(b"\x1b]9;after import\x07");
+
+        let calls = calls.lock().expect("notification calls poisoned");
+        assert_eq!(
+            calls.len(),
+            1,
+            "desktop_notification callback must survive snapshot import handle swap"
+        );
+        assert_eq!(calls[0], (String::new(), "after import".to_string()));
     }
 
     #[test]
