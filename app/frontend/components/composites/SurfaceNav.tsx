@@ -4,7 +4,7 @@
 // into first-class workspace navigation without each plugin patching layout.
 
 import React, { useMemo, useState, type ReactElement } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import clsx from 'clsx'
 
 // @ts-expect-error JS store module has no declarations yet.
