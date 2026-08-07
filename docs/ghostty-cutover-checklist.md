@@ -41,12 +41,13 @@ Hub **does not** decode GHOSTSNP. Green hub CI proves transport/plumbing only. R
 
 ## Known residuals (not blockers for cutover)
 
-| Item | Notes |
-|---|---|
-| CORE-1 callbacks | `semantic_prompt` (OSC 133), `kitty_keyboard_changed` — no upstream equivalent; documented in trybotster docs |
-| restty wasm freestanding | kitty_graphics disabled by upstream; search ABI residual; pre-existing suite reds |
-| trybotster CI | `scan_js` / `scan_ruby` can fail independently of Ghostty (npm audit / brakeman) |
-| Release SIGILL risk | Release builds use `-Dcpu=baseline` in trybotster `cli/build.rs`; re-verify on ship machines |
+| Item | Notes | Follow-up disposition |
+|---|---|---|
+| CORE-1 callbacks | `semantic_prompt` (OSC 133), `kitty_keyboard_changed` — no upstream equivalent | **Accepted residual.** Full table in `docs/ghostty-upstream-snapshot-v1.md` (CORE-1a/b). No shipping APIs planned. |
+| restty kitty_graphics | Upstream `terminal/build_options.zig` disables kitty_graphics on freestanding/WASM | **Accepted residual** of freestanding lib_vt. Not a snapshot-format bug. Track on restty roadmap, not cutover. |
+| restty search ABI | Pre-existing reds; design lives in restty `docs/development/search.md` (cooperative WASM step API) | **Out of cutover scope.** Multi-phase product work; do not re-port search as part of GHOSTSNP. |
+| trybotster CI scan_js/scan_ruby | npm audit (react-router advisories) / brakeman `--ensure-latest` | **Fixed separately** (`react-router@8.3.0` SPA migration; brakeman 8.0.5). Independent of Ghostty. |
+| Release SIGILL risk | Release builds use `-Dcpu=baseline` in trybotster `cli/build.rs` | Re-verify on ship machines. |
 
 ## Phase 4 proof (2026-08-07)
 

@@ -1,5 +1,5 @@
 import React from 'react'
-import { useLocation } from 'react-router-dom'
+import { useLocation } from 'react-router'
 import TerminalView from './TerminalView'
 
 // Mounts exactly the TerminalView for the current route's session uuid.

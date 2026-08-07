@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { useHubStore } from '../../store/hub-store'
 
 export default function ConnectionOverlay({ suppress = false }) {
