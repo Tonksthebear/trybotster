@@ -11,6 +11,17 @@
 
 The Tonksthebear Ghostty fork is retired. Submodule: `cli/vendor/ghostty`.
 
+### Existing checkouts — submodule URL sync
+
+`.gitmodules` now points at ghostty-org, but **already-cloned worktrees keep the
+old Tonksthebear URL in `.git/config`** until synced:
+
+```bash
+git submodule sync --recursive
+git submodule update --init cli/vendor/ghostty
+cd cli/vendor/ghostty && git rev-parse HEAD   # expect 22d13172…
+```
+
 ## Snapshot API
 
 - **Export:** `ghostty_snapshot_encode_alloc` → typed `Result` (`SnapshotError`), not silent `Option`

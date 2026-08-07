@@ -1723,6 +1723,12 @@ impl Terminal {
     /// restoring into the existing handle. This swaps `self.handle` only after
     /// a successful decode (failed import leaves the current terminal intact)
     /// and re-arms continuation tracking on the decoded terminal.
+    ///
+    /// # Host callbacks
+    ///
+    /// This low-level import does **not** re-bind userdata or OPT callbacks.
+    /// Prefer [`crate::terminal::TerminalParser::snapshot_import`] for any
+    /// handle that has host hooks installed.
     pub fn snapshot_import(&mut self, data: &[u8]) -> Result<(), SnapshotError> {
         let mut decoder: GhosttySnapshotDecoderPtr = ptr::null_mut();
         let result = unsafe {

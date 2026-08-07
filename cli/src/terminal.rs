@@ -813,6 +813,58 @@ mod tests {
         assert_eq!(calls[0], (String::new(), "after import".to_string()));
     }
 
+    /// `TerminalParser::new` (no host callbacks) still installs the builtin
+    /// color-scheme OPT; import must re-enable it on the new handle (L3).
+    ///
+    /// Observation needs `write_pty` to capture Ghostty's DSR reply, so this
+    /// uses a write_pty-only config (no other host callbacks). Both `new` and
+    /// `new_with_callbacks` call `enable_builtin_color_scheme_callback` in
+    /// `reinstall_terminal_hooks`.
+    #[test]
+    fn snapshot_import_reinstalls_builtin_color_scheme_path() {
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writes_cb = std::sync::Arc::clone(&writes);
+        let callbacks = CallbackConfig {
+            write_pty: Some(Box::new(move |data: &[u8]| {
+                writes_cb
+                    .lock()
+                    .expect("write buffer poisoned")
+                    .extend_from_slice(data);
+            })),
+            ..CallbackConfig::default()
+        };
+        let mut parser = TerminalParser::new_with_callbacks(24, 80, 100, callbacks);
+        parser
+            .terminal_mut()
+            .set_color_background(Rgb::new(0, 0, 0).into());
+
+        let snapshot = parser.snapshot_export().expect("export");
+        parser.snapshot_import(&snapshot).expect("import");
+
+        writes.lock().expect("write buffer poisoned").clear();
+        parser.process(b"\x1b[?996n");
+        assert_eq!(
+            writes.lock().expect("write buffer poisoned").as_slice(),
+            b"\x1b[?997;1n",
+            "dark scheme must answer after import (builtin color-scheme reinstalled)"
+        );
+
+        // Pure ::new path (else branch of reinstall_terminal_hooks): must not
+        // panic and must leave a usable terminal after import.
+        let mut bare = TerminalParser::new(24, 80, 100);
+        bare.terminal_mut()
+            .set_color_background(Rgb::new(0, 0, 0).into());
+        let bare_snap = bare.snapshot_export().expect("bare export");
+        bare.snapshot_import(&bare_snap)
+            .expect("bare ::new import reinstalls builtin color-scheme hook");
+        bare.process(b"\x1b[?996n");
+        bare.process(b"alive after bare import");
+        assert!(
+            bare.contents().contains("alive after bare import"),
+            "TerminalParser::new remains usable after snapshot import"
+        );
+    }
+
     #[test]
     fn mode_get_path_tracks_bracketed_paste_without_callback() {
         // Upstream removed mode_changed callbacks; session polls mode_get.
