@@ -984,7 +984,7 @@ fn catalog_plugin_project_pipelines_entity_publish_snapshots_and_deltas_use_plug
         .from_value(value)
         .expect("project pipelines entities result json");
 
-    assert_eq!(result["registrations"].as_array().unwrap().len(), 18);
+    assert_eq!(result["registrations"].as_array().unwrap().len(), 19);
     assert!(result["registrations"]
         .as_array()
         .unwrap()
@@ -1399,10 +1399,7 @@ fn catalog_plugin_github_event_routing_emits_lifecycle_through_parent_hub() {
         result["parent_requests"][0]["event"],
         json!("pr_review_submitted")
     );
-    assert_eq!(
-        result["parent_requests"][0]["data"]["pr_number"],
-        json!(42)
-    );
+    assert_eq!(result["parent_requests"][0]["data"]["pr_number"], json!(42));
     assert_eq!(result["local_emits"], json!(0));
     assert_eq!(result["acked"], json!(true));
 }

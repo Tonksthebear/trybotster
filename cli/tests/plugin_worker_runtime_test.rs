@@ -264,7 +264,7 @@ fn plugin_owned_notification_claim_runs_in_plugin_worker_vm() {
 }
 
 #[test]
-fn plugin_worker_session_action_can_prepare_plugin_command_on_parent_hub() {
+fn plugin_worker_session_action_can_run_parent_hub_command_primitives() {
     // SAFETY: This integration filter runs this test in isolation and the
     // worker VM must resolve the repository Lua modules instead of user config.
     unsafe {
@@ -294,6 +294,13 @@ fn plugin_worker_session_action_can_prepare_plugin_command_on_parent_hub() {
                     command = "cloudflared",
                     context = { parent_session_uuid = session_uuid },
                 })
+                parent:run_command_gate({
+                    request_id = "gate-" .. session_uuid,
+                    command = "git status --short",
+                    cwd = "/tmp/worker-checkout",
+                    timeout_secs = 120,
+                    context = { parent_session_uuid = session_uuid },
+                })
                 return "queued"
             end,
         })
@@ -318,6 +325,9 @@ fn plugin_worker_session_action_can_prepare_plugin_command_on_parent_hub() {
             hub.prepare_plugin_command = function(opts)
                 _G.prepare_request = opts
             end
+            hub.run_command_gate = function(opts)
+                _G.command_gate_request = opts
+            end
             package.loaded["lib.session"] = {{
                 get = function(session_uuid)
                     return {{
@@ -337,6 +347,11 @@ fn plugin_worker_session_action_can_prepare_plugin_command_on_parent_hub() {
             assert(prepare_request.request_id == "prep-sess-worker", tostring(prepare_request and prepare_request.request_id))
             assert(prepare_request.command == "cloudflared", tostring(prepare_request and prepare_request.command))
             assert(prepare_request.context.parent_session_uuid == "sess-worker")
+            assert(command_gate_request.request_id == "gate-sess-worker", tostring(command_gate_request and command_gate_request.request_id))
+            assert(command_gate_request.command == "git status --short", tostring(command_gate_request and command_gate_request.command))
+            assert(command_gate_request.cwd == "/tmp/worker-checkout", tostring(command_gate_request and command_gate_request.cwd))
+            assert(command_gate_request.timeout_secs == 120, tostring(command_gate_request and command_gate_request.timeout_secs))
+            assert(command_gate_request.context.parent_session_uuid == "sess-worker")
             return true
             "#,
             init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),

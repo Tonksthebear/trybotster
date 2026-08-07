@@ -33,6 +33,9 @@ function M.status_tone(status)
     if status == "blocked" or status == "failed" or status == "blocker" or status == "high" then
         return "danger"
     end
+    if status == "cancelled" then
+        return "muted"
+    end
     if status == "active" then
         return "accent"
     end
@@ -61,6 +64,9 @@ function M.status_state(status)
     end
     if status == "blocked" or status == "failed" or status == "blocker" or status == "high" then
         return "danger"
+    end
+    if status == "cancelled" then
+        return "neutral"
     end
     return "neutral"
 end
@@ -189,8 +195,9 @@ function M.agent_options(current, target_path)
     for _, name in ipairs(ConfigResolver.list_agents(device_root, target_path)) do
         add(name)
     end
-    add("codex")
+    add("grok")
     add("claude")
+    add("codex")
 
     table.sort(options, function(a, b) return a.value < b.value end)
     return options

@@ -3,14 +3,14 @@
 -- @category plugins
 -- @dest plugins/orchestrator/init.lua
 -- @scope device
--- @version 2.3.0
+-- @version 2.4.0
 
 -- Orchestrator plugin
 --
 -- Workspace-aware orchestration across hubs: list/create/delete agents,
--- move sessions between workspaces, and rename/list workspaces.
--- Hub connections are transparent — Hub.get(hub_id) auto-connects on demand
--- via hub_discovery. No manual connection management is needed here.
+-- create accessories, move sessions between workspaces, and rename/list
+-- workspaces. Hub connections are transparent — Hub.get(hub_id) auto-connects
+-- on demand via hub_discovery. No manual connection management is needed here.
 --
 -- Runs a periodic cleanup timer to remove connections to hubs that have
 -- stopped running (Hub.cleanup_dead()).
@@ -20,6 +20,7 @@
 --   list_hubs      — list all running hubs and their agents
 --   list_spawn_targets — list admitted spawn targets with capabilities
 --   create_agent   — create an agent on any hub (supports target_name + label)
+--   create_accessory — create an accessory (rails-server, terminal, …)
 --   list_workspaces — list workspace manifests on a hub
 --   rename_workspace — rename a workspace by ID
 --   move_agent_workspace — move a live session between workspaces
@@ -285,6 +286,108 @@ mcp.tool("create_agent", {
         if params.label and result and result.id then
             pcall(function()
                 h:update_session(result.id, { label = params.label })
+            end)
+            result.label = params.label
+        end
+
+        return result
+    end)
+end)
+
+mcp.tool("create_accessory", {
+    description = "Create an accessory session (e.g. rails-server, terminal) on a hub. Use list_spawn_targets for target_id/target_name. Pass workspace_name to place it in a workspace. Use branch/from_worktree for the worktree; omit for target root (main checkout).",
+    input_schema = {
+        type = "object",
+        properties = {
+            hub_id = {
+                type = "string",
+                description = "Hub ID. Omit for local hub.",
+            },
+            accessory_name = {
+                type = "string",
+                description = "Accessory config name (e.g. 'rails-server', 'terminal').",
+            },
+            workspace_id = {
+                type = "string",
+                description = "Target workspace ID.",
+            },
+            workspace_name = {
+                type = "string",
+                description = "Target workspace name (used if workspace_id is omitted).",
+            },
+            target_id = {
+                type = "string",
+                description = "Spawn target ID.",
+            },
+            target_name = {
+                type = "string",
+                description = "Spawn target name (alternative to target_id).",
+            },
+            branch = {
+                type = "string",
+                description = "Branch label for the accessory (default main).",
+            },
+            from_worktree = {
+                type = "string",
+                description = "Existing worktree path. Omit to use the target root (main checkout).",
+            },
+            label = {
+                type = "string",
+                description = "Optional display label for the accessory session.",
+            },
+        },
+        required = { "accessory_name" },
+    },
+}, function(params)
+    local target = nil
+    local resolved_id = params.target_id
+    if not resolved_id and params.target_name then
+        local all = spawn_targets.list()
+        for _, t in ipairs(all) do
+            if t.name == params.target_name then
+                resolved_id = t.id
+                break
+            end
+        end
+        if not resolved_id then
+            return { error = string.format("No spawn target found with name '%s'", params.target_name) }
+        end
+    end
+
+    if resolved_id then
+        local info = spawn_targets.get(resolved_id)
+        if info then
+            target = {
+                target_id = info.id,
+                target_path = info.path,
+            }
+            local inspection = spawn_targets.inspect(info.path)
+            if inspection and inspection.repo_name then
+                target.target_repo = inspection.repo_name
+            end
+        end
+    end
+
+    return Hub.call_safely(params.hub_id, function()
+        local h = Hub.get(params.hub_id)
+        local result = h:create_accessory({
+            accessory_name = params.accessory_name,
+            workspace_id = params.workspace_id,
+            workspace_name = params.workspace_name,
+            target_id = target and target.target_id or params.target_id,
+            target_path = target and target.target_path or params.target_path,
+            target_repo = target and target.target_repo or params.target_repo,
+            branch = params.branch or "main",
+            from_worktree = params.from_worktree or (target and target.target_path) or nil,
+            metadata = {
+                label = params.label or params.accessory_name,
+            },
+        })
+
+        if params.label and result and (result.id or result.session_uuid) then
+            local sid = result.id or result.session_uuid
+            pcall(function()
+                h:update_session(sid, { label = params.label })
             end)
             result.label = params.label
         end
@@ -579,6 +682,22 @@ hooks.on("hub_rpc_request", "orchestrator_rpc", function(client_id, message)
                 repo = message.repo,
                 metadata = message.metadata,
                 request_id = message.request_id,
+            })
+        end)
+    elseif message.type == "create_accessory" then
+        respond(function()
+            return local_hub:create_accessory({
+                accessory_name = message.accessory_name,
+                branch = message.branch or "main",
+                from_worktree = message.from_worktree,
+                agent_name = message.agent_name,
+                workspace_id = message.workspace_id,
+                workspace_name = message.workspace_name,
+                target_id = message.target_id,
+                target_path = message.target_path,
+                target_repo = message.target_repo,
+                metadata = message.metadata,
+                session = message.session,
             })
         end)
     elseif message.type == "list_workspaces" then

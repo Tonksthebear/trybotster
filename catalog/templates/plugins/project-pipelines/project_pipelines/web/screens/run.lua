@@ -168,6 +168,17 @@ function M.render(view_state, ctx)
             tone = ui.bind(run_path .. "/current_agent_button_tone"),
             action = ui.action("botster.nav.open", { path = ui.bind(run_path .. "/current_agent_path") }),
         }),
+        ui.bind_if(run_path .. "/can_cancel", ui.button{
+            id = ui.bind(run_path .. "/cancel_button_id"),
+            label = "Cancel run",
+            icon = "x-mark",
+            variant = "ghost",
+            tone = "danger",
+            action = ui.action("project_pipelines.cancel_run", {
+                run_id = run_id,
+                reason = "Cancelled from the run detail screen.",
+            }),
+        }),
     }
 
     return ui.stack{ direction = "vertical", gap = "4", children = {

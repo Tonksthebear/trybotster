@@ -127,8 +127,9 @@ local function list_agent_choices(target_id)
     end
     if #choices == 0 then
         return {
-            { name = "codex", label = "codex" },
+            { name = "grok", label = "grok" },
             { name = "claude", label = "claude" },
+            { name = "codex", label = "codex" },
         }
     end
     table.sort(choices, function(a, b) return a.name < b.name end)
@@ -655,6 +656,20 @@ function M.register()
         return sync_ok(engine.start_run(params))
     end)
 
+    tool("project_pipelines_cancel_run", {
+        description = "Cancel an active or blocked pipeline run without advancing steps or requesting a merge. This marks the current step cancelled and closes agents owned by the run.",
+        input_schema = {
+            type = "object",
+            properties = {
+                run_id = { type = "string" },
+                reason = { type = "string" },
+            },
+            required = { "run_id" },
+        },
+    }, function(params, context)
+        return ok(engine.cancel_run(params, context))
+    end)
+
     tool("project_pipelines_request_merge", {
         description = "Spawn a merge agent for a ticket whose latest run is complete.",
         input_schema = {
@@ -698,6 +713,7 @@ function M.register()
                 ticket_id = { type = "string" },
                 merge_confirmed = { type = "boolean" },
                 merge_commit = { type = "string" },
+                base_branch = { type = "string" },
                 pr_url = { type = "string" },
                 merge_summary = { type = "string" },
             },
@@ -707,6 +723,7 @@ function M.register()
         return ok(engine.close_ticket(params.ticket_id, {
             merge_confirmed = params.merge_confirmed == true,
             merge_commit = params.merge_commit,
+            base_branch = params.base_branch,
             pr_url = params.pr_url,
             merge_summary = params.merge_summary,
             closed_by_session_uuid = context and context.session_uuid,
@@ -951,7 +968,7 @@ function M.register()
     end)
 
     tool("project_pipelines_ask_human", {
-        description = "Ask the human a durable pipeline question visible in the Project Pipelines sidebar.",
+        description = "Ask a durable pipeline question. It routes to the active project/global question orchestrator first and falls back to the human when none is active.",
         input_schema = {
             type = "object",
             properties = {
@@ -964,6 +981,52 @@ function M.register()
         },
     }, function(params, context)
         return ok(engine.ask_human(params, context))
+    end)
+
+    tool("project_pipelines_claim_question_orchestrator", {
+        description = "Claim ownership of answering Project Pipelines questions from the calling agent session. Omit project_id to become the global fallback; provide it to own one project. This does not require the agent to belong to a ticket.",
+        input_schema = {
+            type = "object",
+            properties = {
+                project_id = { type = "string" },
+                replace = { type = "boolean", description = "Replace another active owner. Inactive owners are replaced automatically." },
+            },
+        },
+    }, function(params, context)
+        return ok(engine.claim_question_orchestrator(params, context))
+    end)
+
+    tool("project_pipelines_release_question_orchestrator", {
+        description = "Release the calling session's project-specific or global question-orchestrator claim.",
+        input_schema = {
+            type = "object",
+            properties = {
+                project_id = { type = "string" },
+            },
+        },
+    }, function(params, context)
+        return ok(engine.release_question_orchestrator(params, context))
+    end)
+
+    tool("project_pipelines_question_orchestrator_status", {
+        description = "List project and global question-orchestrator assignments and whether each assigned session is currently active.",
+        input_schema = { type = "object", properties = {} },
+    }, function()
+        return ok(engine.question_orchestrator_status())
+    end)
+
+    tool("project_pipelines_escalate_question", {
+        description = "Escalate an open question assigned to the calling orchestrator back to the human without answering it.",
+        input_schema = {
+            type = "object",
+            properties = {
+                question_id = { type = "string" },
+                reason = { type = "string" },
+            },
+            required = { "question_id" },
+        },
+    }, function(params, context)
+        return ok(engine.escalate_question(params, context))
     end)
 
     tool("project_pipelines_ask_agent", {

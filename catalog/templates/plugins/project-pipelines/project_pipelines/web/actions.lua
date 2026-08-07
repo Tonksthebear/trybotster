@@ -238,6 +238,24 @@ function M.register()
         }
     end)
 
+    action.on("project_pipelines.cancel_run", "project_pipelines.cancel_run", function(envelope, ctx)
+        local payload = value_payload(envelope)
+        if util.is_blank(payload.run_id) then
+            return action.result{ ok = false, error = "run_id is required" }
+        end
+        local ok, result = pcall(engine.cancel_run, {
+            run_id = payload.run_id,
+            reason = payload.reason or "Cancelled from the Project Pipelines UI.",
+        }, ctx)
+        refresh(ctx)
+        if not ok then
+            return action.result{ ok = false, error = tostring(result) }
+        end
+        return action.result{
+            message = result.already_cancelled and "Run was already cancelled." or "Run cancelled.",
+        }
+    end)
+
     action.on("project_pipelines.spawn_ticket_session", "project_pipelines.spawn_ticket_session", function(envelope, ctx)
         local payload = value_payload(envelope)
         if util.is_blank(payload.ticket_id) then

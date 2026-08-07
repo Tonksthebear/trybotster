@@ -209,7 +209,25 @@ recommended flow, default vault checklist items, statuses, and evidence shape.
 
 Review agents leave findings through `project_pipelines_submit_review`. Blocker and high findings keep `review_clear` gates blocked until each finding is resolved or waived with `project_pipelines_resolve_finding`.
 
-Agents ask for help through project-pipelines tools, not the generic Botster inbox. `project_pipelines_ask_human` creates a durable human question visible in the sidebar and ticket page. `project_pipelines_ask_agent` creates the same durable question and spawns an advisor agent. Answers are read with `project_pipelines_receive_question_answers` or from `project_pipelines_current_context`; question answers wake the asking session with a Project Pipelines notification, not a generic `receive_messages()` inbox doorbell.
+Agents ask for help through project-pipelines tools, not the generic Botster
+inbox. `project_pipelines_ask_human` creates a durable question visible in the
+sidebar and ticket page. When a live question orchestrator has claimed that
+project, the question is delegated there first; otherwise the global claim is
+used, then the human is notified as the final fallback. Any active agent can
+claim this role without belonging to a ticket through
+`project_pipelines_claim_question_orchestrator`, inspect claims with
+`project_pipelines_question_orchestrator_status`, and release its claim with
+`project_pipelines_release_question_orchestrator`. A claimed agent answers with
+`project_pipelines_answer_question` or returns a decision to the human with
+`project_pipelines_escalate_question`.
+
+`project_pipelines_ask_agent` still creates a durable question and spawns a
+dedicated advisor agent. Answers are read with
+`project_pipelines_receive_question_answers` or from
+`project_pipelines_current_context`; question answers wake the asking session
+with a Project Pipelines notification, not a generic `receive_messages()` inbox
+doorbell. The active project/global question orchestrator is also notified when
+a ticket merges so it can coordinate any follow-up.
 
 Review agents must reject dead code, deprecated code paths, unwired implementation, missing focused tests, and broad "pre-existing failure" excuses. If a failure is not fixed, the reviewer should require exact evidence that it is unrelated to the ticket.
 

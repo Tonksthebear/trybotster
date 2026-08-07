@@ -275,6 +275,16 @@ function Hub._handle_worker_parent_request(payload)
         return { result = { ok = true } }
     end
 
+    if kind == "run_command_gate" then
+        local ok, err = pcall(function()
+            return hub.run_command_gate(payload.opts or {})
+        end)
+        if not ok then
+            return { error = tostring(err) }
+        end
+        return { result = { ok = true } }
+    end
+
     if kind == "send_message" then
         return { result = local_hub:send_message(payload.agent_id, payload.text, payload.session) }
     end
@@ -798,6 +808,26 @@ function Hub:prepare_plugin_command(opts)
 
     local result = remote_request(self, {
         type = "prepare_plugin_command",
+        opts = opts,
+    }, 10000)
+    if result.error then
+        error(result.error)
+    end
+    return result.result or { ok = true }
+end
+
+--- Run a plugin-owned one-shot command on this hub.
+-- Completion is delivered asynchronously through `command_gate_completed`.
+-- Plugin workers must cross this proxy because their worker-local `hub` table
+-- intentionally does not expose command execution primitives.
+function Hub:run_command_gate(opts)
+    opts = copy_table(opts or {})
+    if self._is_local then
+        return hub.run_command_gate(opts)
+    end
+
+    local result = remote_request(self, {
+        type = "run_command_gate",
         opts = opts,
     }, 10000)
     if result.error then

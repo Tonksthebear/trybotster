@@ -234,7 +234,7 @@ function M.render(_view_state, ctx)
             ui.list{ children = {
                 ui.bind_list{
                     source = "/project-pipelines.run",
-                    where = { status = "active" },
+                    where = { live = true },
                     item_template = running_run_template(),
                     empty_template = view.empty(
                         "No running pipelines",
@@ -248,7 +248,7 @@ function M.render(_view_state, ctx)
             ui.list{ children = {
                 ui.bind_list{
                     source = "/project-pipelines.ticket",
-                    where = { status = "open", latest_run_status = "done" },
+                    where = { latest_run_status = "done" },
                     item_template = merge_ticket_template(),
                     empty_template = view.empty(
                         "No tickets ready to merge",

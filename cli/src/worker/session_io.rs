@@ -19,6 +19,11 @@ pub const SESSION_IO_WORKER_QUEUE: BoundedQueueConfig =
 /// Request sent to a session I/O worker.
 #[derive(Debug, Clone)]
 pub enum SessionIoRequest {
+    /// Internal lifecycle signal sent when the connection reader exits.
+    ///
+    /// This wakes the companion request thread even while external mailbox
+    /// sender clones remain alive across client cleanup or reconnect races.
+    ReaderStopped,
     /// Write raw PTY input to the session process.
     PtyInput {
         /// Raw input bytes.

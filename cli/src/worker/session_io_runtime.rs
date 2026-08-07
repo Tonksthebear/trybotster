@@ -38,6 +38,7 @@ const MAX_BATCH_AGE: Duration = Duration::from_millis(4);
 pub(crate) struct SessionIoWorkerConfig {
     pub stream: UnixStream,
     pub write_stream: UnixStream,
+    pub request_tx: tokio::sync::mpsc::Sender<SessionIoRequest>,
     pub request_rx: Option<tokio::sync::mpsc::Receiver<SessionIoRequest>>,
     pub session_uuid: String,
     pub event_tx: broadcast::Sender<PtyEvent>,
@@ -157,7 +158,9 @@ struct SessionIoRequestProcessor {
 impl SessionIoRequestProcessor {
     fn run(&mut self) {
         while let Some(request) = self.request_rx.blocking_recv() {
-            if !self.reader_alive.load(Ordering::Acquire) {
+            if matches!(request, SessionIoRequest::ReaderStopped)
+                || !self.reader_alive.load(Ordering::Acquire)
+            {
                 break;
             }
             self.handle_request(request);
@@ -349,6 +352,7 @@ impl SessionIoRequestProcessor {
                     log::warn!("[session-io] shutdown request failed: {e}");
                 }
             }
+            SessionIoRequest::ReaderStopped => {}
         }
     }
 
@@ -411,6 +415,7 @@ struct SessionIoRuntime {
     response_tx: std::sync::mpsc::Sender<Frame>,
     hub_event_tx: HubEventTx,
     reader_alive: Arc<AtomicBool>,
+    request_tx: tokio::sync::mpsc::Sender<SessionIoRequest>,
     pending_snapshot_requests: Arc<Mutex<VecDeque<PendingSnapshotRequest>>>,
     terminal_subscriptions: Arc<Mutex<HashMap<String, TerminalOutputSubscription>>>,
     terminal_filter_buffers: HashMap<String, Vec<u8>>,
@@ -432,6 +437,7 @@ impl SessionIoRuntime {
             response_tx: config.response_tx,
             hub_event_tx: config.hub_event_tx,
             reader_alive: config.reader_alive,
+            request_tx: config.request_tx,
             pending_snapshot_requests: config.pending_snapshot_requests,
             terminal_subscriptions: config.terminal_subscriptions,
             terminal_filter_buffers: HashMap::new(),
@@ -475,7 +481,7 @@ impl SessionIoRuntime {
             let frames = self.decoder.feed(&buf[..n]);
             for frame in frames {
                 if !self.handle_frame(frame) {
-                    self.reader_alive.store(false, Ordering::Release);
+                    self.mark_reader_stopped();
                     return;
                 }
             }
@@ -494,7 +500,17 @@ impl SessionIoRuntime {
                 exit_code: None,
             });
         }
+        self.mark_reader_stopped();
+    }
+
+    fn mark_reader_stopped(&self) {
         self.reader_alive.store(false, Ordering::Release);
+
+        // The request processor may be asleep in blocking_recv() while sender
+        // clones remain registered with client workers. Wake it explicitly so
+        // reconnects cannot accumulate one detached thread per old connection.
+        // If the queue is full, an existing request already guarantees a wake.
+        let _ = self.request_tx.try_send(SessionIoRequest::ReaderStopped);
     }
 
     fn handle_frame(&mut self, frame: Frame) -> bool {
@@ -1291,6 +1307,7 @@ mod tests {
         SessionIoWorker::spawn(SessionIoWorkerConfig {
             stream: reader,
             write_stream,
+            request_tx: request_tx.clone(),
             request_rx: Some(request_rx),
             session_uuid: session_uuid.to_string(),
             event_tx,
@@ -1330,6 +1347,63 @@ mod tests {
             rx.try_recv().is_err(),
             "unexpected extra hub event after ordered boundary"
         );
+    }
+
+    #[test]
+    fn reader_exit_stops_request_thread_while_mailbox_sender_remains_alive() {
+        let (peer, reader) = UnixStream::pair().expect("unix pair");
+        let write_stream = reader.try_clone().expect("clone request stream");
+        let (event_tx, _event_rx) = broadcast::channel(32);
+        let (response_tx, _response_rx) = mpsc::channel();
+        let (hub_tx, _hub_rx) = tokio_mpsc::channel(64);
+        let (request_tx, request_rx) = tokio_mpsc::channel(32);
+        let alive = Arc::new(AtomicBool::new(true));
+
+        let handle = SessionIoWorker::spawn(SessionIoWorkerConfig {
+            stream: reader,
+            write_stream,
+            request_tx: request_tx.clone(),
+            request_rx: Some(request_rx),
+            session_uuid: "sess-reader-stop".to_string(),
+            event_tx,
+            kitty_enabled: Arc::new(AtomicBool::new(false)),
+            cursor_visible: Arc::new(AtomicBool::new(true)),
+            resize_pending: Arc::new(AtomicBool::new(false)),
+            last_output_at: Arc::new(AtomicU64::new(0)),
+            last_human_input_ms: Arc::new(AtomicI64::new(0)),
+            response_tx,
+            hub_event_tx: HubEventTx::from(hub_tx),
+            reader_alive: Arc::clone(&alive),
+            pending_snapshot_requests: Arc::new(Mutex::new(VecDeque::new())),
+            terminal_subscriptions: Arc::new(Mutex::new(HashMap::new())),
+        })
+        .expect("spawn worker");
+
+        drop(peer);
+
+        let deadline = Instant::now() + TEST_EVENT_TIMEOUT;
+        while (!handle._join.is_finished() || !handle._request_join.is_finished())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        assert!(!alive.load(Ordering::Acquire));
+        assert!(handle._join.is_finished(), "reader thread did not exit");
+        assert!(
+            handle._request_join.is_finished(),
+            "request thread remained blocked while a mailbox sender was alive"
+        );
+
+        handle._join.join().expect("join reader thread");
+        handle
+            ._request_join
+            .join()
+            .expect("join request processor thread");
+
+        // Retaining this sender through both joins proves that channel closure
+        // was not what allowed the request processor to stop.
+        drop(request_tx);
     }
 
     #[test]

@@ -3,12 +3,12 @@
   "enabledMcpjsonServers": ["postgresql", "sequential-thinking"],
   "permissions": {
     "allow": [
-      "Edit:*",
-      "Write:*",
-      "MultiEdit:*",
-      "NotebookEdit:*",
-      "Bash:*",
-      "Skill:*"
+      "Edit",
+      "Write",
+      "MultiEdit",
+      "NotebookEdit",
+      "Bash",
+      "Skill"
     ],
     "defaultMode": "acceptEdits"
   },

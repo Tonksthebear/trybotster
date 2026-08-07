@@ -27,6 +27,16 @@ local function lua_pattern_escape(value)
     return tostring(value):gsub("([^%w])", "%%%1")
 end
 
+local function shell_quote(value)
+    return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
+end
+
+local function trim(value)
+    local text = tostring(value or "")
+    text = text:gsub("^%s+", ""):gsub("%s+$", "")
+    return text
+end
+
 local function agent_branch_for(ticket, run, step)
     local base = ticket and ticket.id or run.id
     base = tostring(base):gsub("[^%w._-]", "-")
@@ -91,6 +101,26 @@ local function live_ticket_worktree(ticket_id)
 end
 
 local M = {}
+
+local function live_question_orchestrator(project_id, excluded_session_uuid)
+    local candidates = {}
+    if not util.is_blank(project_id) then
+        candidates[#candidates + 1] = repo.get_question_orchestrator(project_id)
+    end
+    candidates[#candidates + 1] = repo.get_question_orchestrator(nil)
+    local first_assignment = nil
+    for _, assignment in ipairs(candidates) do
+        if assignment then
+            first_assignment = first_assignment or assignment
+            local session = assignment.session_uuid ~= excluded_session_uuid
+                and Agent.get(assignment.session_uuid) or nil
+            if session then
+                return assignment, session, first_assignment
+            end
+        end
+    end
+    return nil, nil, first_assignment
+end
 
 function M.register_entities()
     entities.register()
@@ -422,13 +452,178 @@ function M.ask_human(params, context)
         asked_by_session_uuid = resolved.session_uuid,
         blocking = params.blocking ~= false,
     }
+    local assignment, orchestrator, attempted_assignment =
+        live_question_orchestrator(resolved.ticket.project_id, resolved.session_uuid)
+    local routed = false
+    local route_error = nil
+    if orchestrator and assignment.session_uuid ~= resolved.session_uuid then
+        local ok, err = pcall(function()
+            Hub.get():post(assignment.session_uuid, {
+                type = "task",
+                from_agent_id = OWNER,
+                from_label = "Project Pipelines",
+                payload = {
+                    question_id = question.id,
+                    ticket_id = question.ticket_id,
+                    run_id = question.run_id,
+                    project_id = resolved.ticket.project_id,
+                    question = question.question,
+                    instructions = table.concat({
+                        "You are the active Project Pipelines question orchestrator.",
+                        "Investigate this question using the ticket and run context, delegating to the context-owning ticket session when useful.",
+                        "Answer with project_pipelines_answer_question.",
+                        "If human judgment is required, call project_pipelines_escalate_question instead of guessing.",
+                    }, " "),
+                },
+            })
+            Hub.get():notify(assignment.session_uuid, {
+                source = OWNER,
+                title = "Pipeline question needs an answer",
+                body = tostring(resolved.ticket.title or resolved.ticket.id) .. ": " .. tostring(question.question),
+                action = {
+                    kind = "mcp_tool",
+                    name = "project_pipelines_get_ticket",
+                    params = { ticket_id = resolved.ticket.id },
+                },
+            })
+        end)
+        routed = ok
+        route_error = ok and nil or tostring(err)
+        if ok then
+            question = repo.update_question(question.id, {
+                advisor_session_uuid = assignment.session_uuid,
+            })
+        end
+    end
+    repo.append_event(routed and "question.orchestrator_routed" or "question.orchestrator_fallback", {
+        run_id = question.run_id,
+        ticket_id = question.ticket_id,
+        payload = {
+            question_id = question.id,
+            session_uuid = (assignment or attempted_assignment) and (assignment or attempted_assignment).session_uuid or nil,
+            scope = (assignment or attempted_assignment) and (assignment or attempted_assignment).scope or nil,
+            reason = not attempted_assignment and "unclaimed"
+                or (not orchestrator and "inactive_or_asking_session")
+                or route_error,
+        },
+    })
+    if not routed then
+        notification_policy.notify_question_asked({
+            question = question,
+            ticket = resolved.ticket,
+            run = resolved.run,
+            step_id = resolved.step_id,
+        })
+    end
+    refresh_surfaces()
+    return question
+end
+
+local function session_label(session, session_uuid)
+    if type(session) ~= "table" then
+        return session_uuid
+    end
+    local info = nil
+    if type(session.info) == "function" then
+        local ok, value = pcall(session.info, session)
+        if ok then info = value end
+    end
+    return session.label
+        or session.display_name
+        or session.name
+        or session.agent_name
+        or (type(info) == "table" and (info.label or info.display_name or info.name or info.agent_name))
+        or session_uuid
+end
+
+function M.claim_question_orchestrator(params, context)
+    params = params or {}
+    local session_uuid = context and context.session_uuid or params.session_uuid
+    util.assert_present(session_uuid, "calling session_uuid")
+    local session = Agent.get(session_uuid)
+    if not session then
+        error("calling agent session is not active: " .. tostring(session_uuid))
+    end
+
+    local current = repo.get_question_orchestrator(params.project_id)
+    local replace = params.replace == true
+    if current and current.session_uuid ~= session_uuid and not Agent.get(current.session_uuid) then
+        replace = true
+    end
+    local assignment = repo.claim_question_orchestrator{
+        project_id = params.project_id,
+        session_uuid = session_uuid,
+        session_label = session_label(session, session_uuid),
+        replace = replace,
+    }
+    refresh_surfaces(context)
+    return {
+        assignment = assignment,
+        scope = assignment.scope,
+        message = assignment.scope == "project"
+            and "This session now owns questions for project " .. tostring(assignment.project_id) .. "."
+            or "This session now owns globally unassigned Project Pipelines questions.",
+    }
+end
+
+function M.release_question_orchestrator(params, context)
+    params = params or {}
+    local session_uuid = context and context.session_uuid or params.session_uuid
+    util.assert_present(session_uuid, "calling session_uuid")
+    local assignment = repo.get_question_orchestrator(params.project_id)
+    if not assignment then
+        return { released = false, reason = "not_claimed" }
+    end
+    if assignment.session_uuid ~= session_uuid and params.force ~= true then
+        error("question orchestrator is owned by " .. tostring(assignment.session_label or assignment.session_uuid))
+    end
+    repo.release_question_orchestrator(params.project_id)
+    refresh_surfaces(context)
+    return { released = true, assignment = assignment }
+end
+
+function M.question_orchestrator_status()
+    local assignments = {}
+    for _, assignment in ipairs(repo.list_question_orchestrators()) do
+        assignment.active = Agent.get(assignment.session_uuid) ~= nil
+        assignments[#assignments + 1] = assignment
+    end
+    return assignments
+end
+
+function M.escalate_question(params, context)
+    params = params or {}
+    local question = repo.get_question(util.assert_present(params.question_id, "question_id"))
+    if not question then
+        error("question not found: " .. tostring(params.question_id))
+    end
+    if question.status ~= "open" then
+        error("question is no longer open: " .. tostring(question.status))
+    end
+    local session_uuid = context and context.session_uuid or params.session_uuid
+    if not util.is_blank(question.advisor_session_uuid)
+        and question.advisor_session_uuid ~= session_uuid then
+        error("question is assigned to another orchestrator")
+    end
+    question = repo.update_question(question.id, { advisor_session_uuid = "" })
+    local ticket = repo.get_ticket(question.ticket_id)
+    local run = question.run_id and repo.get_run(question.run_id) or nil
+    repo.append_event("question.escalated_to_human", {
+        run_id = question.run_id,
+        ticket_id = question.ticket_id,
+        payload = {
+            question_id = question.id,
+            reason = params.reason,
+            escalated_by_session_uuid = session_uuid,
+        },
+    })
     notification_policy.notify_question_asked({
         question = question,
-        ticket = resolved.ticket,
-        run = resolved.run,
-        step_id = resolved.step_id,
+        ticket = ticket,
+        run = run,
+        step_id = question.step_id,
     })
-    refresh_surfaces()
+    refresh_surfaces(context)
     return question
 end
 
@@ -590,7 +785,7 @@ function M.request_merge(params, context)
             and "After opening or updating the PR, you remain the PR steward. Submitted PR reviews and PR comments may be delivered back to you. Triage them before delegating: answer informational comments on the PR, send actionable code feedback back to the implementer or another ticket agent, and keep the conversation on the PR when the human asked or said something there. Use Project Pipelines human questions only for decisions that did not originate on the PR, or when you need a durable pipeline-level waiver/decision record in addition to the PR reply."
             or "",
         merge_policy == "pr"
-            and "Coordinate with agents that worked on this ticket using Botster MCP. Use project_pipelines_get_ticket or project_pipelines_current_context to find ticket sessions and run steps, list_hubs to inspect live agents, post_message to send structured tasks, and notify_session to wake the target agent. Delegate implementation work to the existing implementer, architectural/product reasoning to the planner or other context-owning agent, verification questions to the verifier, and review interpretation to the reviewer when available. Use project_pipelines_ask_agent only when no existing ticket agent owns the needed context."
+            and "Coordinate with agents that worked on this ticket using Botster MCP. Use project_pipelines_get_ticket or project_pipelines_current_context to find ticket sessions and run steps, list_hubs to inspect live agents, and post_message to send structured tasks (so the target gets a PTY doorbell and durable inbox state). Do not use attention-only notify_session-style wakeups. Delegate implementation work to the existing implementer, architectural/product reasoning to the planner or other context-owning agent, verification questions to the verifier, and review interpretation to the reviewer when available. Use project_pipelines_ask_agent only when no existing ticket agent owns the needed context."
             or "",
         merge_policy == "pr"
             and "When delegating PR review feedback, include the linked PR, review URL/body, required changes, expected evidence, and instruction to update the existing PR branch. Do not create a new run or a new PR for ordinary PR review revisions."
@@ -613,7 +808,7 @@ function M.request_merge(params, context)
     local ok, created = pcall(function()
         return Hub.get():create_agent{
             request_id = request_id,
-            agent_name = params.agent_name or "codex",
+            agent_name = params.agent_name or "grok",
             issue_or_branch = ticket_branch_for(ticket, run.id),
             base_ref = run.base_ref,
             base_target_path = run.base_target_path,
@@ -742,7 +937,7 @@ function M.spawn_ticket_session(params, context)
         end
         result = Hub.get():create_agent{
             request_id = request_id,
-            agent_name = params.agent_name or "codex",
+            agent_name = params.agent_name or "grok",
             issue_or_branch = branch,
             from_worktree = from_worktree,
             target_id = ticket.target_id,
@@ -762,13 +957,13 @@ function M.spawn_ticket_session(params, context)
         repo.append_event("ticket.manual_agent_requested", {
             run_id = latest_run and latest_run.id or nil,
             ticket_id = ticket.id,
-            payload = { request_id = request_id, agent_name = params.agent_name or "codex", session_uuid = result and result.session_uuid },
+            payload = { request_id = request_id, agent_name = params.agent_name or "grok", session_uuid = result and result.session_uuid },
         })
         link_manual_ticket_session(ticket.id, result and result.session_uuid, request_id, {
             run_id = latest_run and latest_run.id or nil,
             session_type = "agent",
             role = "manual-agent",
-            agent_name = params.agent_name or "codex",
+            agent_name = params.agent_name or "grok",
         })
     end
 
@@ -823,6 +1018,224 @@ function M.delete_manual_ticket_session(params, context)
     return { ticket = ticket, session_uuid = session_uuid, removed = true, closed = session ~= nil }
 end
 
+local function merged_ticket_location(context)
+    local merge_target = util.is_blank(context.base_branch) and "main" or tostring(context.base_branch)
+    if util.is_blank(context.merge_commit) then
+        return merge_target
+    end
+    return merge_target .. " at " .. tostring(context.merge_commit)
+end
+
+local function command_output_tail(data)
+    local detail = trim(data and data.stderr_tail)
+    if util.is_blank(detail) then detail = trim(data and data.error) end
+    if util.is_blank(detail) then detail = trim(data and data.stdout_tail) end
+    if #detail > 1200 then
+        detail = detail:sub(#detail - 1199)
+    end
+    return detail
+end
+
+local function pull_conflict_files(data)
+    local marker = "__PROJECT_PIPELINES_PULL_CONFLICTS__"
+    local output = tostring(data and data.stdout_tail or "")
+    local marker_start, marker_end = output:find(marker, 1, true)
+    if marker_start then
+        local files = trim(output:sub(marker_end + 1))
+        if #files > 1200 then
+            files = files:sub(1, 1200)
+        end
+        return files
+    end
+
+    local combined = output .. "\n" .. tostring(data and data.stderr_tail or "")
+    if combined:find("CONFLICT", 1, true)
+        or combined:find("Automatic merge failed", 1, true)
+        or combined:find("would be overwritten by merge", 1, true) then
+        return ""
+    end
+    return nil
+end
+
+local function notify_merge_pull_result(context, data)
+    local success = data and data.success == true
+    local conflict_files = success and nil or pull_conflict_files(data)
+    local location = merged_ticket_location(context)
+    local title = tostring(context.ticket_title or context.ticket_id)
+    local instructions
+    local body
+    local pull_status
+    if success then
+        pull_status = "updated"
+        body = "Ticket “" .. title .. "” merged into " .. location
+            .. ". Your checkout was updated with git pull; existing local changes were preserved."
+        instructions = body .. " Review the ticket context if follow-up coordination is needed."
+    elseif conflict_files ~= nil then
+        pull_status = "conflicted"
+        if util.is_blank(conflict_files) then
+            local detail = command_output_tail(data)
+            body = "Ticket “" .. title .. "” merged into " .. location
+                .. ", but git pull could not update your checkout because incoming changes conflict with existing local changes."
+            instructions = body
+                .. " Existing local changes remain. Resolve the conflict before continuing."
+                .. (util.is_blank(detail) and "" or ("\n\nGit pull output:\n" .. detail))
+        else
+            body = "Ticket “" .. title .. "” merged into " .. location
+                .. ", but git pull left merge conflicts in your checkout."
+            instructions = body
+                .. " Existing local changes remain. Resolve the conflicts before continuing."
+                .. " Conflicted files:\n" .. conflict_files
+        end
+    else
+        pull_status = "failed"
+        local detail = command_output_tail(data)
+        body = "Ticket “" .. title .. "” merged into " .. location
+            .. ", but git pull did not complete. Existing local changes remain."
+        instructions = body
+            .. (util.is_blank(detail) and "" or ("\n\nGit pull output:\n" .. detail))
+    end
+
+    local ok, err = pcall(function()
+        Hub.get():post(context.session_uuid, {
+            type = "task",
+            from_agent_id = OWNER,
+            from_label = "Project Pipelines",
+            payload = {
+                kind = "ticket_merged",
+                ticket_id = context.ticket_id,
+                project_id = context.project_id,
+                run_id = context.run_id,
+                merge_commit = context.merge_commit,
+                base_branch = context.base_branch,
+                pr_url = context.pr_url,
+                merge_summary = context.merge_summary,
+                checkout_path = context.checkout_path,
+                pull_status = pull_status,
+                conflict_files = conflict_files,
+                instructions = instructions,
+            },
+        })
+        Hub.get():notify(context.session_uuid, {
+            source = OWNER,
+            title = pull_status == "conflicted" and "Merged ticket has checkout conflicts"
+                or (pull_status == "failed" and "Merged ticket checkout update failed" or "Pipeline ticket merged"),
+            body = body,
+            action = {
+                kind = "mcp_tool",
+                name = "project_pipelines_get_ticket",
+                params = { ticket_id = context.ticket_id },
+            },
+        })
+    end)
+    repo.append_event("ticket.merge_orchestrator_pull_completed", {
+        run_id = context.run_id,
+        ticket_id = context.ticket_id,
+        payload = {
+            request_id = context.request_id,
+            session_uuid = context.session_uuid,
+            checkout_path = context.checkout_path,
+            pull_status = pull_status,
+            conflict_files = conflict_files,
+            exit_status = data and data.exit_status or nil,
+            error = data and data.error or nil,
+        },
+    })
+    repo.append_event("ticket.merge_orchestrator_notified", {
+        run_id = context.run_id,
+        ticket_id = context.ticket_id,
+        payload = {
+            session_uuid = context.session_uuid,
+            scope = context.scope,
+            pull_status = pull_status,
+            delivered = ok,
+            error = ok and nil or tostring(err),
+        },
+    })
+    return ok
+end
+
+local function notify_question_orchestrator_of_merge(ticket, run, attrs)
+    if not ticket then
+        return nil
+    end
+    local assignment, session = live_question_orchestrator(ticket.project_id)
+    if not assignment or not session then
+        return nil
+    end
+    local info = nil
+    if type(session.info) == "function" then
+        local ok, value = pcall(session.info, session)
+        if ok then info = value end
+    end
+    local checkout_path = info and (info.worktree_path or info.cwd or info.target_path) or nil
+    local base_branch = util.is_blank(attrs.base_branch) and "main" or tostring(attrs.base_branch)
+    local request_id = string.format(
+        "%s:%s:merge-orchestrator-pull:%s",
+        OWNER,
+        ticket.id,
+        tostring(attrs.merge_commit or base_branch):gsub("[^%w._-]", "-")
+    )
+    local context = {
+        owner_plugin = OWNER,
+        operation = "merge_orchestrator_pull",
+        request_id = request_id,
+        session_uuid = assignment.session_uuid,
+        scope = assignment.scope,
+        checkout_path = checkout_path,
+        ticket_id = ticket.id,
+        ticket_title = ticket.title,
+        project_id = ticket.project_id,
+        run_id = run and run.id or nil,
+        merge_commit = attrs.merge_commit,
+        base_branch = base_branch,
+        pr_url = attrs.pr_url,
+        merge_summary = attrs.merge_summary or attrs.summary,
+    }
+    if util.is_blank(checkout_path) then
+        return notify_merge_pull_result(context, {
+            success = false,
+            error = "The orchestrator session has no checkout path.",
+        })
+    end
+
+    local branch_arg = shell_quote(base_branch)
+    local command = "pull_status=0; "
+        .. "GIT_TERMINAL_PROMPT=0 GIT_MERGE_AUTOEDIT=no "
+        .. "git pull --no-rebase --no-autostash --no-edit origin " .. branch_arg
+        .. " || pull_status=$?; "
+        .. "if [ \"$pull_status\" -ne 0 ]; then "
+        .. "conflicts=\"$(git diff --name-only --diff-filter=U)\"; "
+        .. "if [ -n \"$conflicts\" ]; then "
+        .. "printf '\\n__PROJECT_PIPELINES_PULL_CONFLICTS__\\n%s\\n' \"$conflicts\"; "
+        .. "fi; fi; exit \"$pull_status\""
+    local ok, result = pcall(function()
+        return Hub.get():run_command_gate{
+            request_id = request_id,
+            command = command,
+            cwd = checkout_path,
+            timeout_secs = 120,
+            context = context,
+        }
+    end)
+    if not ok then
+        return notify_merge_pull_result(context, {
+            success = false,
+            error = tostring(result),
+        })
+    end
+    repo.append_event("ticket.merge_orchestrator_pull_started", {
+        run_id = context.run_id,
+        ticket_id = context.ticket_id,
+        payload = {
+            request_id = request_id,
+            session_uuid = context.session_uuid,
+            checkout_path = checkout_path,
+            base_branch = base_branch,
+        },
+    })
+    return result
+end
+
 function M.close_ticket(ticket_id, attrs)
     util.assert_present(ticket_id, "ticket_id")
     attrs = attrs or {}
@@ -849,7 +1262,8 @@ function M.close_ticket(ticket_id, attrs)
     local errors = {}
     for _, session_uuid in ipairs(repo.ticket_session_uuids(ticket_id)) do
         local ok, result = pcall(function()
-            return Hub.get():delete_agent(session_uuid, false)
+            local delete_worktree = attrs.merge_confirmed == true
+            return Hub.get():delete_agent(session_uuid, delete_worktree)
         end)
         if ok then
             table.insert(closed_sessions, { session_uuid = session_uuid, result = result })
@@ -883,6 +1297,9 @@ function M.close_ticket(ticket_id, attrs)
         pr_url = attrs.pr_url,
         merge_summary = attrs.merge_summary or attrs.summary,
     })
+    if attrs.merge_confirmed == true then
+        notify_question_orchestrator_of_merge(ticket, latest_run, attrs)
+    end
     refresh_surfaces()
     return { ticket = updated, closed_sessions = closed_sessions, errors = errors }
 end
@@ -907,7 +1324,7 @@ local function run_command_step(run, step)
 
     local request_id = string.format("%s:%s:%s:command:%s", OWNER, run.id, step.id, command_gate and command_gate.id or "step")
     local ok, result = pcall(function()
-        return hub.run_command_gate{
+        return Hub.get():run_command_gate{
             request_id = request_id,
             command = command,
             cwd = target_path,
@@ -1148,7 +1565,7 @@ local function pr_steward_review_prompt(ticket, link, event)
     end
     lines[#lines + 1] = "You are the PR steward. Triage this through project_pipelines_current_context and project_pipelines_get_ticket before acting."
     lines[#lines + 1] = "You are an orchestrator, not the implementer. Do not implement PR feedback yourself, and do not answer architecture/product questions from your own judgment alone when an existing ticket agent has relevant context."
-    lines[#lines + 1] = "If the feedback is informational, answer on the PR using the GitHub MCP tools after checking the appropriate ticket context. If the human asked or said something through the PR, ask clarifying follow-up questions and provide answers on that PR thread instead of switching to project_pipelines_ask_human. If it needs code changes, delegate to the existing implementer with Botster MCP messaging tools such as list_hubs, post_message, and notify_session, and route the pipeline back to implementation when needed. If it is architectural/product reasoning, delegate to the existing planner or other context-owning ticket agent and synthesize their answer back to the PR. Use Project Pipelines human questions only for non-PR-originated decisions or when a durable pipeline-level waiver/decision record is required in addition to the PR reply."
+    lines[#lines + 1] = "If the feedback is informational, answer on the PR using the GitHub MCP tools after checking the appropriate ticket context. If the human asked or said something through the PR, ask clarifying follow-up questions and provide answers on that PR thread instead of switching to project_pipelines_ask_human. If it needs code changes, delegate to the existing implementer with Botster MCP messaging tools such as list_hubs and post_message (doorbell + inbox), and route the pipeline back to implementation when needed. If it is architectural/product reasoning, delegate to the existing planner or other context-owning ticket agent and synthesize their answer back to the PR. Use Project Pipelines human questions only for non-PR-originated decisions or when a durable pipeline-level waiver/decision record is required in addition to the PR reply."
     lines[#lines + 1] = "Do not create a new PR or new ticket run for ordinary PR review revisions. Keep the existing linked PR as the delivery envelope."
     return table.concat(lines, "\n\n")
 end
@@ -1170,7 +1587,7 @@ local function pr_steward_comment_prompt(ticket, link, event)
         lines[#lines + 1] = "Comment body:\n" .. tostring(event.comment_body)
     end
     lines[#lines + 1] = "You are the PR steward. Triage this through project_pipelines_current_context and project_pipelines_get_ticket before acting."
-    lines[#lines + 1] = "If the human asked or said something through the PR, answer on that PR thread using the GitHub MCP tools after checking the appropriate ticket context. If it needs code changes, delegate to the existing implementer with Botster MCP messaging tools such as list_hubs, post_message, and notify_session, and route the pipeline back to implementation when needed."
+    lines[#lines + 1] = "If the human asked or said something through the PR, answer on that PR thread using the GitHub MCP tools after checking the appropriate ticket context. If it needs code changes, delegate to the existing implementer with Botster MCP messaging tools such as list_hubs and post_message (doorbell + inbox), and route the pipeline back to implementation when needed."
     lines[#lines + 1] = "Do not create a new PR or new ticket run for ordinary PR conversation comments. Keep the existing linked PR as the delivery envelope."
     return table.concat(lines, "\n\n")
 end
@@ -1301,6 +1718,20 @@ function M.handle_pr_review_submitted(link, event)
     if not ticket or not run then
         return { ok = false, reason = "missing_ticket_or_run" }
     end
+    if run.status == "cancelled" then
+        repo.append_event("ticket.pr_review_ignored", {
+            run_id = run.id,
+            ticket_id = ticket.id,
+            payload = {
+                reason = "run_cancelled",
+                pr_link_id = link.id,
+                review_id = event.review_id,
+                state = event.state,
+            },
+        })
+        refresh_surfaces()
+        return { ok = true, status = "ignored", reason = "run_cancelled", ticket = ticket, run = run }
+    end
 
     local state = string.lower(tostring(event.state or ""))
     repo.append_event("ticket.pr_review_submitted", {
@@ -1421,6 +1852,9 @@ function M.start_run(params)
         error("ticket not found: " .. tostring(params.ticket_id))
     end
     local ticket = repo.get_ticket(params.ticket_id)
+    if ticket.status == "closed" then
+        error("closed tickets cannot start pipeline runs: " .. tostring(params.ticket_id))
+    end
     local open_run = repo.open_ticket_run(params.ticket_id)
     if open_run then
         error("ticket already has an open run: " .. tostring(open_run.id))
@@ -1466,6 +1900,81 @@ function M.start_run(params)
     local first_step = repo.next_step(run)
     local activation = M.activate_step(run, first_step)
     return { run = repo.get_run(run.id), activation = activation }
+end
+
+function M.cancel_run(params, context)
+    params = params or {}
+    local run_id = util.assert_present(params.run_id, "run_id")
+    local run = repo.get_run(run_id)
+    if not run then
+        error("run not found: " .. tostring(run_id))
+    end
+    if run.status == "cancelled" then
+        refresh_surfaces(context)
+        return { ok = true, status = "cancelled", already_cancelled = true, run = run }
+    end
+    if run.status ~= "active" and run.status ~= "blocked" then
+        error("only active or blocked runs can be cancelled; run status is " .. tostring(run.status))
+    end
+
+    local current_step_id = run.current_step_id
+    local current_run_step_id = run.current_run_step_id
+    if not util.is_blank(current_run_step_id) then
+        repo.update_run_step_visit(current_run_step_id, {
+            status = "cancelled",
+            completed_at = util.now(),
+        })
+    end
+
+    -- Make the run terminal before closing agents. Agent lifecycle callbacks can
+    -- fire synchronously and must observe the terminal state.
+    repo.update_run(run.id, {
+        status = "cancelled",
+        current_step_id = "",
+        current_run_step_id = "",
+    })
+
+    local closed_sessions = {}
+    local errors = {}
+    local seen = {}
+    for _, run_step in ipairs(repo.run_steps(run.id)) do
+        local session_uuid = run_step.agent_session_uuid
+        if not util.is_blank(session_uuid) and not seen[session_uuid] then
+            seen[session_uuid] = true
+            local session = Agent.get(session_uuid)
+            if session then
+                local ok, result = pcall(function()
+                    return Hub.get():delete_agent(session_uuid, false)
+                end)
+                if ok then
+                    closed_sessions[#closed_sessions + 1] = session_uuid
+                else
+                    errors[#errors + 1] = { session_uuid = session_uuid, error = tostring(result) }
+                end
+            end
+        end
+    end
+
+    repo.append_event("run.cancelled", {
+        run_id = run.id,
+        ticket_id = run.ticket_id,
+        payload = {
+            step_id = current_step_id,
+            run_step_id = current_run_step_id,
+            reason = params.reason,
+            requested_by_session_uuid = params.requested_by_session_uuid or (context and context.session_uuid),
+            closed_sessions = closed_sessions,
+            errors = errors,
+        },
+    })
+    refresh_surfaces(context)
+    return {
+        ok = true,
+        status = "cancelled",
+        run = repo.get_run(run.id),
+        closed_sessions = closed_sessions,
+        errors = errors,
+    }
 end
 
 function M.request_step_advance(params, context)
@@ -1675,9 +2184,21 @@ function M.handle_command_gate_completed(data)
     if context.owner_plugin ~= OWNER then
         return
     end
+    if context.operation == "merge_orchestrator_pull" then
+        notify_merge_pull_result(context, data)
+        return
+    end
     local run_id = context.run_id
     local step_id = context.step_id
     if util.is_blank(run_id) or util.is_blank(step_id) then
+        return
+    end
+    local run = repo.get_run(run_id)
+    if not run or (run.status ~= "active" and run.status ~= "blocked") then
+        return
+    end
+    if run.current_step_id ~= step_id
+        or (not util.is_blank(context.run_step_id) and run.current_run_step_id ~= context.run_step_id) then
         return
     end
     local gate_id = context.gate_id
@@ -1790,6 +2311,13 @@ function M.handle_agent_created(info)
         return
     end
 
+    if run.status == "cancelled" then
+        pcall(function()
+            Hub.get():delete_agent(session_uuid, false)
+        end)
+        return
+    end
+
     local run_step = nil
     if run.current_run_step_id then
         run_step = repo.get_run_step_visit(run.current_run_step_id)
@@ -1850,7 +2378,7 @@ function M.handle_agent_lifecycle(info)
         },
     })
 
-    if info.status == "failed" then
+    if info.status == "failed" and (run.status == "active" or run.status == "blocked") then
         repo.update_run(run.id, { status = "blocked" })
         if run.current_run_step_id then
             repo.update_run_step_visit(run.current_run_step_id, { status = "blocked" })

@@ -11,7 +11,7 @@
 -- let it drift and leaked a raw path into agent-facing context, where agents
 -- mistook it for their working directory. target_id is the sole stored handle.
 local db = plugin.db{
-    version = 10,
+    version = 11,
     migrations = {
         -- v9: drop the denormalized target_path columns. target_path is now
         -- fully derived from target_id at point of use. Guarded so it is a
@@ -79,6 +79,15 @@ local db = plugin.db{
             description = { "text" },
             status = { "text", required = true },
             created_at = { "integer", required = true },
+            updated_at = { "integer", required = true },
+        },
+        question_orchestrators = {
+            id = { "text", required = true, primary = true },
+            scope = { "text", required = true },
+            project_id = { "text" },
+            session_uuid = { "text", required = true },
+            session_label = { "text" },
+            claimed_at = { "integer", required = true },
             updated_at = { "integer", required = true },
         },
         project_targets = {
@@ -279,6 +288,7 @@ local indexes = {
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_ticket_dependencies_ticket ON ticket_dependencies(ticket_id)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_ticket_dependencies_depends_on ON ticket_dependencies(depends_on_ticket_id)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_project_targets_project ON project_targets(project_id, target_id)",
+    "CREATE INDEX IF NOT EXISTS idx_project_pipelines_question_orchestrators_session ON question_orchestrators(session_uuid, updated_at)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_gates_step ON pipeline_gates(step_id)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_runs_ticket ON runs(ticket_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_runs_base_ticket ON runs(base_ticket_id, created_at)",

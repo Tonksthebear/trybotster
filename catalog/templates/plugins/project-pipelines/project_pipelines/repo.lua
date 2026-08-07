@@ -1127,7 +1127,101 @@ function M.project_detail(project_id)
         project = project,
         targets = M.project_targets(project_id),
         tickets = M.project_tickets(project_id),
+        question_orchestrator = M.get_question_orchestrator(project_id),
     }
+end
+
+local function question_orchestrator_id(project_id)
+    if util.is_blank(project_id) then
+        return "global"
+    end
+    return "project:" .. tostring(project_id)
+end
+
+function M.get_question_orchestrator(project_id)
+    return db.question_orchestrators:where{ id = question_orchestrator_id(project_id) }
+end
+
+function M.resolve_question_orchestrator(project_id)
+    if not util.is_blank(project_id) then
+        local project_assignment = M.get_question_orchestrator(project_id)
+        if project_assignment then
+            return project_assignment
+        end
+    end
+    return M.get_question_orchestrator(nil)
+end
+
+function M.list_question_orchestrators()
+    return rows([[SELECT * FROM question_orchestrators
+                  ORDER BY CASE WHEN scope = 'global' THEN 0 ELSE 1 END,
+                           updated_at DESC]])
+end
+
+function M.claim_question_orchestrator(attrs)
+    attrs = attrs or {}
+    util.assert_present(attrs.session_uuid, "session_uuid")
+    local project_id = util.is_blank(attrs.project_id) and nil or attrs.project_id
+    if project_id and not M.get_project(project_id) then
+        error("project not found: " .. tostring(project_id))
+    end
+
+    local id = question_orchestrator_id(project_id)
+    local current = db.question_orchestrators:where{ id = id }
+    if current and current.session_uuid ~= attrs.session_uuid and attrs.replace ~= true then
+        error("question orchestrator is already claimed by " .. tostring(current.session_label or current.session_uuid))
+    end
+
+    local now = util.now()
+    local assignment = {
+        id = id,
+        scope = project_id and "project" or "global",
+        project_id = project_id,
+        session_uuid = attrs.session_uuid,
+        session_label = attrs.session_label or attrs.session_uuid,
+        claimed_at = current and current.claimed_at or now,
+        updated_at = now,
+    }
+    if current then
+        db.question_orchestrators:update{
+            where = { id = id },
+            set = {
+                session_uuid = assignment.session_uuid,
+                session_label = assignment.session_label,
+                claimed_at = assignment.claimed_at,
+                updated_at = assignment.updated_at,
+            },
+        }
+    else
+        db.question_orchestrators:insert(assignment)
+    end
+    M.append_event("question_orchestrator.claimed", {
+        payload = {
+            scope = assignment.scope,
+            project_id = assignment.project_id,
+            session_uuid = assignment.session_uuid,
+            session_label = assignment.session_label,
+            replaced_session_uuid = current and current.session_uuid or nil,
+        },
+    })
+    return db.question_orchestrators:where{ id = id }
+end
+
+function M.release_question_orchestrator(project_id)
+    local id = question_orchestrator_id(project_id)
+    local assignment = db.question_orchestrators:where{ id = id }
+    if not assignment then
+        return nil
+    end
+    db.question_orchestrators:delete{ id = id }
+    M.append_event("question_orchestrator.released", {
+        payload = {
+            scope = assignment.scope,
+            project_id = assignment.project_id,
+            session_uuid = assignment.session_uuid,
+        },
+    })
+    return assignment
 end
 
 function M.create_project(attrs)
@@ -1179,6 +1273,7 @@ function M.delete_project(project_id)
     end
     with_transaction(function()
         db:eval("DELETE FROM project_targets WHERE project_id = ?", project_id)
+        db:eval("DELETE FROM question_orchestrators WHERE project_id = ?", project_id)
         db.projects:delete{ id = project_id }
         M.append_event("project.deleted", { payload = { project_id = project_id } })
     end)

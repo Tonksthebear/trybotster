@@ -445,6 +445,12 @@ local function decorate_ticket_entity(entity, opts)
         entity.tail_label = util.is_blank(merge_session_uuid) and "Merge queued" or "Merge active"
         entity.active_work_label = entity.tail_label
         entity.active_work_detail = "Merge agent is handling final integration."
+    elseif latest and latest.status == "cancelled" then
+        entity.latest_run_badge = "cancelled"
+        entity.latest_run_tone = "muted"
+        entity.tail_label = "Pipeline cancelled"
+        entity.active_work_label = "Ready for pipeline"
+        entity.active_work_detail = "The latest pipeline run was cancelled."
     elseif latest then
         entity.latest_run_badge = latest.status == "done" and "ready for merge"
             or latest.status == "blocked" and "blocked"
@@ -735,6 +741,9 @@ local function decorate_run_entity(entity, opts)
     entity.pipeline_name = pipeline and pipeline.name or entity.pipeline_id
     entity.current_step_name = step and step.name or "No current step"
     entity.status_tone = view and view.status_tone(entity.status) or "muted"
+    entity.live = entity.status == "active" or entity.status == "blocked"
+    entity.can_cancel = entity.live
+    entity.cancel_button_id = "run-" .. tostring(entity.id or "") .. "-cancel"
     entity.detail_label = entity.pipeline_name .. " - current step: " .. entity.current_step_name
     entity.label = entity.ticket_title .. " - " .. entity.pipeline_name .. " (" .. tostring(entity.status) .. ")"
     entity.path = "/pipelines/runs/" .. entity.id
@@ -1349,6 +1358,11 @@ end
 local function run_detail(request, context)
     local id = query_value(request, "id")
     if util.is_blank(id) then
+        if query_value(request, "live") == true then
+            return run_entities(rows([[SELECT * FROM runs
+                                       WHERE status IN ('active', 'blocked')
+                                       ORDER BY updated_at DESC, created_at DESC, id DESC]]), context)
+        end
         local status = query_value(request, "status")
         if not util.is_blank(status) then
             return run_entities(rows("SELECT * FROM runs WHERE status = ? ORDER BY updated_at DESC, created_at DESC, id DESC", status), context)

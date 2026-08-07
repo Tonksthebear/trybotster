@@ -61,7 +61,7 @@ M.home_screen = {
     {
         name = "running_pipelines",
         source = "/" .. M.types.run,
-        where_fields = { "status" },
+        where_fields = { "live" },
         fields = {
             "current_step_name",
             "current_agent_button_label",
@@ -81,7 +81,7 @@ M.home_screen = {
     {
         name = "prs_and_merge",
         source = "/" .. M.types.ticket,
-        where_fields = { "latest_run_status", "status" },
+        where_fields = { "latest_run_status" },
         fields = {
             "has_latest_run",
             "has_merge_pr_url",
@@ -285,6 +285,8 @@ M.screens = {
             source = "/" .. M.types.run,
             where_fields = { "id" },
             fields = {
+                "can_cancel",
+                "cancel_button_id",
                 "current_agent_button_id",
                 "current_agent_button_label",
                 "current_agent_button_tone",

@@ -384,6 +384,467 @@ fn catalog_plugin_project_pipelines_pr_policy_rejects_closing_open_pr() {
 }
 
 #[test]
+fn catalog_plugin_project_pipelines_routes_human_questions_to_claimed_orchestrator() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local posted = nil
+            local notified = nil
+            local human_pushes = 0
+            local events = {{}}
+            local question = nil
+
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() end,
+              notify_question_asked = function()
+                human_pushes = human_pushes + 1
+              end,
+            }}
+            package.loaded["lib.agent"] = {{
+              get = function(session_uuid)
+                if session_uuid == "sess-orchestrator" then return {{ label = "Question Boss" }} end
+                return nil
+              end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  post = function(_, session_uuid, message)
+                    posted = {{ session_uuid = session_uuid, message = message }}
+                  end,
+                  notify = function(_, session_uuid, notification)
+                    notified = {{ session_uuid = session_uuid, notification = notification }}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              find_active_assignment = function() return nil end,
+              get_ticket = function(ticket_id)
+                assert(ticket_id == "ticket-1")
+                return {{ id = ticket_id, project_id = "project-1", title = "Answer routing" }}
+              end,
+              get_run = function() return nil end,
+              create_question = function(attrs)
+                question = {{
+                  id = "question-1",
+                  ticket_id = attrs.ticket_id,
+                  kind = attrs.kind,
+                  status = "open",
+                  question = attrs.question,
+                  asked_by_session_uuid = attrs.asked_by_session_uuid,
+                }}
+                return question
+              end,
+              get_question_orchestrator = function(project_id)
+                if project_id == "project-1" then
+                  return {{
+                    id = "project:project-1",
+                    scope = "project",
+                    project_id = project_id,
+                    session_uuid = "sess-orchestrator",
+                  }}
+                end
+                assert(project_id == nil)
+                return nil
+              end,
+              update_question = function(question_id, attrs)
+                assert(question_id == "question-1")
+                for key, value in pairs(attrs) do question[key] = value end
+                return question
+              end,
+              get_question = function(question_id)
+                assert(question_id == "question-1")
+                return question
+              end,
+              append_event = function(kind, event)
+                events[#events + 1] = {{ kind = kind, event = event }}
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            local routed = engine.ask_human({{
+              ticket_id = "ticket-1",
+              question = "Which option should we ship?",
+            }}, {{ session_uuid = "sess-implementer" }})
+
+            assert(routed.advisor_session_uuid == "sess-orchestrator")
+            assert(human_pushes == 0)
+            assert(posted.session_uuid == "sess-orchestrator")
+            assert(posted.message.payload.question_id == "question-1")
+            assert(posted.message.payload.instructions:match("project_pipelines_answer_question"))
+            assert(posted.message.payload.instructions:match("project_pipelines_escalate_question"))
+            assert(notified.notification.action.name == "project_pipelines_get_ticket")
+            assert(events[1].kind == "question.orchestrator_routed")
+
+            local escalated = engine.escalate_question({{
+              question_id = "question-1",
+              reason = "Needs a product decision",
+            }}, {{ session_uuid = "sess-orchestrator" }})
+            assert(escalated.status == "open")
+            assert(escalated.advisor_session_uuid == "")
+            assert(human_pushes == 1)
+            assert(events[2].kind == "question.escalated_to_human")
+
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect(
+            "human questions should route to the claimed live orchestrator before human fallback",
+        );
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_claims_orchestrator_without_ticket_assignment() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local claimed = nil
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() end,
+              notify_question_asked = function() end,
+            }}
+            package.loaded["lib.agent"] = {{
+              get = function(session_uuid)
+                if session_uuid == "sess-claiming" then return {{ label = "Orchestrator" }} end
+                return nil
+              end,
+            }}
+            package.loaded["lib.hub"] = {{ get = function() return {{}} end }}
+            package.loaded["project_pipelines.repo"] = {{
+              get_question_orchestrator = function(project_id)
+                assert(project_id == "project-1")
+                return {{ session_uuid = "sess-dead", session_label = "Old owner" }}
+              end,
+              claim_question_orchestrator = function(attrs)
+                claimed = attrs
+                return {{
+                  id = "project:project-1",
+                  scope = "project",
+                  project_id = attrs.project_id,
+                  session_uuid = attrs.session_uuid,
+                  session_label = attrs.session_label,
+                }}
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            local result = engine.claim_question_orchestrator({{
+              project_id = "project-1",
+            }}, {{ session_uuid = "sess-claiming" }})
+
+            assert(claimed.session_uuid == "sess-claiming")
+            assert(claimed.session_label == "Orchestrator")
+            assert(claimed.replace == true, "inactive owner should be replaced automatically")
+            assert(result.assignment.project_id == "project-1")
+            assert(result.scope == "project")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("an active agent outside a ticket should be able to claim question ownership");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_command_gates_cross_the_worker_hub_proxy() {
+    let engine = std::fs::read_to_string(
+        project_root_dir()
+            .join("catalog/templates/plugins/project-pipelines/project_pipelines/engine.lua"),
+    )
+    .expect("read project pipelines engine");
+
+    assert_eq!(
+        engine.matches("Hub.get():run_command_gate").count(),
+        2,
+        "merge pulls and command steps must cross the plugin-worker Hub proxy",
+    );
+    assert!(
+        !engine.contains("hub.run_command_gate"),
+        "plugin workers must not call the unavailable worker-local command-gate primitive",
+    );
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_merge_pull_deletes_worktrees_and_updates_orchestrator() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local deleted = nil
+            local posted = nil
+            local notified = nil
+            local pull_gate = nil
+            local events = {{}}
+            hub = {{}}
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() end,
+              notify_question_asked = function() end,
+            }}
+            package.loaded["lib.agent"] = {{
+              get = function(session_uuid)
+                if session_uuid == "sess-orchestrator" then
+                  return {{
+                    info = function()
+                      return {{ worktree_path = "/tmp/orchestrator-worktree" }}
+                    end,
+                  }}
+                end
+                return nil
+              end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  delete_agent = function(_, session_uuid, delete_worktree)
+                    deleted = {{ session_uuid = session_uuid, delete_worktree = delete_worktree }}
+                    return true
+                  end,
+                  post = function(_, session_uuid, message)
+                    posted = {{ session_uuid = session_uuid, message = message }}
+                  end,
+                  notify = function(_, session_uuid, notification)
+                    notified = {{ session_uuid = session_uuid, notification = notification }}
+                  end,
+                  run_command_gate = function(_, opts)
+                    pull_gate = opts
+                    return {{ queued = true, request_id = opts.request_id }}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              get_ticket = function()
+                return {{ id = "ticket-1", project_id = "project-1", title = "Merged ticket", status = "open" }}
+              end,
+              latest_ticket_run = function()
+                return {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipeline-1", status = "done" }}
+              end,
+              get_pipeline = function()
+                return {{ id = "pipeline-1", merge_policy = "direct" }}
+              end,
+              ticket_session_uuids = function() return {{ "sess-ticket" }} end,
+              add_artifact = function(attrs)
+                assert(attrs.kind == "merge")
+                return attrs
+              end,
+              close_ticket = function()
+                return {{ id = "ticket-1", project_id = "project-1", title = "Merged ticket", status = "closed" }}
+              end,
+              get_question_orchestrator = function(project_id)
+                if project_id == "project-1" then
+                  return {{ scope = "project", session_uuid = "sess-orchestrator" }}
+                end
+                assert(project_id == nil)
+                return nil
+              end,
+              append_event = function(kind, event)
+                events[#events + 1] = {{ kind = kind, event = event }}
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            local result = engine.close_ticket("ticket-1", {{
+              merge_confirmed = true,
+              merge_commit = "abc123",
+              base_branch = "main",
+              merge_summary = "Merged at abc123",
+            }})
+
+            assert(result.ticket.status == "closed")
+            assert(deleted.session_uuid == "sess-ticket")
+            assert(deleted.delete_worktree == true)
+            assert(posted == nil, "orchestrator should be notified after the pull completes")
+            assert(notified == nil, "orchestrator should be notified after the pull completes")
+            assert(pull_gate.cwd == "/tmp/orchestrator-worktree")
+            assert(pull_gate.timeout_secs == 120)
+            assert(pull_gate.command:find("git pull --no-rebase --no-autostash --no-edit origin 'main'", 1, true))
+            assert(events[1].kind == "ticket.merge_orchestrator_pull_started")
+
+            engine.handle_command_gate_completed({{
+              success = true,
+              exit_status = 0,
+              stdout_tail = "Already up to date.",
+              context = pull_gate.context,
+            }})
+
+            assert(posted.session_uuid == "sess-orchestrator")
+            assert(posted.message.payload.kind == "ticket_merged")
+            assert(posted.message.payload.merge_commit == "abc123")
+            assert(posted.message.payload.base_branch == "main")
+            assert(posted.message.payload.pull_status == "updated")
+            assert(posted.message.payload.instructions:find(
+              "Your checkout was updated with git pull; existing local changes were preserved.",
+              1,
+              true
+            ))
+            assert(notified.notification.title == "Pipeline ticket merged")
+            assert(notified.notification.body ==
+              "Ticket “Merged ticket” merged into main at abc123. Your checkout was updated with git pull; existing local changes were preserved.")
+            assert(notified.notification.action.name == "project_pipelines_get_ticket")
+            assert(events[2].kind == "ticket.merge_orchestrator_pull_completed")
+            assert(events[2].event.payload.pull_status == "updated")
+            assert(events[3].kind == "ticket.merge_orchestrator_notified")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("confirmed merges should delete ticket worktrees and notify the active orchestrator");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_reports_merge_pull_conflicts_to_orchestrator() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local posted = nil
+            local notified = nil
+            local events = {{}}
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() end,
+              notify_question_asked = function() end,
+            }}
+            package.loaded["lib.agent"] = {{ get = function() return nil end }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  post = function(_, session_uuid, message)
+                    posted = {{ session_uuid = session_uuid, message = message }}
+                  end,
+                  notify = function(_, session_uuid, notification)
+                    notified = {{ session_uuid = session_uuid, notification = notification }}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              append_event = function(kind, event)
+                events[#events + 1] = {{ kind = kind, event = event }}
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            engine.handle_command_gate_completed({{
+              success = false,
+              exit_status = 1,
+              stderr_tail = "Automatic merge failed; fix conflicts and then commit the result.",
+              stdout_tail = "__PROJECT_PIPELINES_PULL_CONFLICTS__\napp/models/ticket.rb\nconfig/routes.rb\n",
+              context = {{
+                owner_plugin = "project-pipelines",
+                operation = "merge_orchestrator_pull",
+                request_id = "pull-1",
+                session_uuid = "sess-orchestrator",
+                scope = "project",
+                checkout_path = "/tmp/orchestrator-worktree",
+                ticket_id = "ticket-1",
+                ticket_title = "Merged ticket",
+                project_id = "project-1",
+                run_id = "run-1",
+                merge_commit = "abc123",
+                base_branch = "main",
+              }},
+            }})
+
+            assert(posted.session_uuid == "sess-orchestrator")
+            assert(posted.message.payload.pull_status == "conflicted")
+            assert(posted.message.payload.conflict_files == "app/models/ticket.rb\nconfig/routes.rb")
+            assert(posted.message.payload.instructions:find("git pull left merge conflicts", 1, true))
+            assert(posted.message.payload.instructions:find("Existing local changes remain.", 1, true))
+            assert(notified.notification.title == "Merged ticket has checkout conflicts")
+            assert(notified.notification.body:find("git pull left merge conflicts", 1, true))
+            assert(events[1].kind == "ticket.merge_orchestrator_pull_completed")
+            assert(events[1].event.payload.pull_status == "conflicted")
+            assert(events[2].kind == "ticket.merge_orchestrator_notified")
+
+            posted = nil
+            notified = nil
+            engine.handle_command_gate_completed({{
+              success = false,
+              exit_status = 1,
+              stderr_tail = "error: Your local changes to the following files would be overwritten by merge:\napp/models/ticket.rb",
+              stdout_tail = "",
+              context = {{
+                owner_plugin = "project-pipelines",
+                operation = "merge_orchestrator_pull",
+                request_id = "pull-2",
+                session_uuid = "sess-orchestrator",
+                scope = "project",
+                checkout_path = "/tmp/orchestrator-worktree",
+                ticket_id = "ticket-1",
+                ticket_title = "Merged ticket",
+                project_id = "project-1",
+                run_id = "run-1",
+                merge_commit = "abc123",
+                base_branch = "main",
+              }},
+            }})
+            assert(posted.message.payload.pull_status == "conflicted")
+            assert(posted.message.payload.conflict_files == "")
+            assert(posted.message.payload.instructions:find(
+              "incoming changes conflict with existing local changes",
+              1,
+              true
+            ))
+            assert(notified.notification.title == "Merged ticket has checkout conflicts")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("merge pull conflicts should be reported to the active orchestrator");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_can_spawn_ticket_session_from_engine() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
@@ -548,7 +1009,7 @@ fn catalog_plugin_project_pipelines_merge_prompt_describes_pr_steward_role() {
             assert(created_agent.prompt:match("project_pipelines_get_ticket"))
             assert(created_agent.prompt:match("list_hubs"))
             assert(created_agent.prompt:match("post_message"))
-            assert(created_agent.prompt:match("notify_session"))
+            assert(not created_agent.prompt:match("notify_session"))
             assert(created_agent.prompt:match("project_pipelines_ask_agent only when no existing ticket agent owns the needed context"))
             assert(created_agent.prompt:match("Do not create a new run or a new PR"))
             return "ok"
@@ -711,7 +1172,7 @@ fn catalog_plugin_project_pipelines_home_shows_linked_pr_records() {
 
     assert!(
         home.contains(r#"source = "/project-pipelines.ticket""#)
-            && home.contains(r#"where = { status = "open", latest_run_status = "done" }"#),
+            && home.contains(r#"where = { latest_run_status = "done" }"#),
         "home PR rows should be driven by the ticket entity stream"
     );
     for binding in [
@@ -880,6 +1341,7 @@ fn catalog_plugin_project_pipelines_closes_linked_ticket_on_pr_merged_event() {
                 assert(attrs.source_event == "pr_merged")
                 assert(attrs.pr_url == "https://github.com/owner/repo/pull/42")
                 assert(attrs.merge_commit == "abc123")
+                assert(attrs.base_branch == "main")
                 closed = attrs
                 return {{ id = "ticket-1", status = "closed" }}
               end,
@@ -891,6 +1353,7 @@ fn catalog_plugin_project_pipelines_closes_linked_ticket_on_pr_merged_event() {
               repo = "owner/repo",
               pr_number = 42,
               pr_url = "https://github.com/owner/repo/pull/42",
+              base_branch = "main",
               merge_commit = "abc123",
             }})
 
@@ -1064,7 +1527,7 @@ fn catalog_plugin_project_pipelines_routes_pr_review_to_live_merge_steward() {
             assert(posted.message.payload.instructions:match("delegate to the existing implementer"))
             assert(posted.message.payload.instructions:match("architectural/product reasoning"))
             assert(posted.message.payload.instructions:match("post_message"))
-            assert(posted.message.payload.instructions:match("notify_session"))
+            assert(not posted.message.payload.instructions:match("notify_session"))
             assert(notified.session_uuid == "sess-merge")
             assert(notified.notification.title == "PR changes requested")
             assert(notified.notification.body:match("👀"))
@@ -1672,6 +2135,15 @@ fn catalog_plugin_project_pipelines_home_bind_lists_use_entity_empty_templates()
     assert!(
         !home.contains("repo."),
         "home should not call repo.* at render time"
+    );
+    assert!(
+        home.contains(r#"where = { live = true }"#),
+        "Running Pipelines should request live runs without filtering by ticket status"
+    );
+    assert!(
+        home.contains(r#"where = { latest_run_status = "done" }"#)
+            && !home.contains(r#"where = { status = "open", latest_run_status = "done" }"#),
+        "PRs And Merge should request completed runs without requiring an exact ticket status"
     );
     for snippet in [
         r#"source = "/project-pipelines.run""#,
@@ -2742,13 +3214,19 @@ fn catalog_plugin_project_pipelines_registers_targeted_overview_hydration() {
               local compact = normalize(sql)
               if compact:find("FROM tickets t LEFT JOIN projects p") then
                 return {{
-                  {{ id = "ticket-merge", title = "Ready", status = "open", project_id = "project-1", target_id = "target-1", created_at = 1 }},
+                  {{ id = "ticket-merge", title = "Ready", status = "active", project_id = "project-1", target_id = "target-1", created_at = 1 }},
                   {{ id = "ticket-standalone", title = "Standalone", status = "open", project_id = "", target_id = "target-1", created_at = 2 }},
                 }}
               end
               if compact == "SELECT * FROM runs WHERE status = ? ORDER BY updated_at DESC, created_at DESC, id DESC" then
                 return {{
                   {{ id = "run-active", ticket_id = "ticket-standalone", pipeline_id = "pipeline-1", status = "active" }},
+                }}
+              end
+              if compact == "SELECT * FROM runs WHERE status IN ('active', 'blocked') ORDER BY updated_at DESC, created_at DESC, id DESC" then
+                return {{
+                  {{ id = "run-active", ticket_id = "ticket-standalone", pipeline_id = "pipeline-1", status = "active" }},
+                  {{ id = "run-blocked", ticket_id = "ticket-closed", pipeline_id = "pipeline-1", status = "blocked" }},
                 }}
               end
               if compact == "SELECT * FROM runs ORDER BY updated_at DESC, created_at DESC, id DESC" then
@@ -2767,6 +3245,7 @@ fn catalog_plugin_project_pipelines_registers_targeted_overview_hydration() {
                 return {{
                   {{ id = "ticket-standalone", title = "Standalone", project_id = "" }},
                   {{ id = "ticket-merge", title = "Ready", project_id = "project-1" }},
+                  {{ id = "ticket-closed", title = "Closed but running", project_id = "project-1", status = "closed" }},
                 }}
               end
               if compact:find("SELECT id FROM projects WHERE id IN") then
@@ -2794,7 +3273,9 @@ fn catalog_plugin_project_pipelines_registers_targeted_overview_hydration() {
                 return {{}}
               end
               if compact:find("FROM pr_links") then
-                return {{}}
+                return {{
+                  {{ id = "pr-merge", ticket_id = "ticket-merge", run_id = "run-done", status = "open", pr_url = "https://example.com/pull/80" }},
+                }}
               end
               if compact:find("FROM pipeline_steps") then
                 return {{}}
@@ -2807,25 +3288,37 @@ fn catalog_plugin_project_pipelines_registers_targeted_overview_hydration() {
             entities.register()
 
             local ticket_items = registered[entities.types.ticket].query({{ where = {{ status = "open", standalone = true }} }})
-            local merge_items = registered[entities.types.ticket].query({{ where = {{ status = "open", latest_run_status = "done" }} }})
-            local run_items = registered[entities.types.run].query({{ where = {{ status = "active" }} }})
+            local merge_items = registered[entities.types.ticket].query({{ where = {{ latest_run_status = "done" }} }})
+            local run_items = registered[entities.types.run].query({{ where = {{ live = true }} }})
             local project_items = registered[entities.types.project].query({{ where = {{ status = "open" }} }})
             local question_items = registered[entities.types.question].query({{ where = {{ status = "open" }} }})
 
             local saw_standalone = false
             local saw_done = false
+            local awaiting_merge = nil
             for _, item in ipairs(ticket_items) do
               if item.standalone == true then saw_standalone = true end
             end
             for _, item in ipairs(merge_items) do
-              if item.latest_run_status == "done" then saw_done = true end
+              if item.latest_run_status == "done" then
+                saw_done = true
+                awaiting_merge = item
+              end
             end
 
             assert(#ticket_items >= 1, "overview ticket scoped query should return working-set ticket rows")
             assert(saw_standalone, "ticket entities should expose standalone for EB scope filtering")
             assert(#merge_items >= 1, "overview merge scoped query should return decorated ticket rows")
             assert(saw_done, "ticket entities should expose latest_run_status for EB scope filtering")
-            assert(#run_items >= 1 and run_items[1].status == "active")
+            assert(awaiting_merge.status == "active", "awaiting-merge tickets may remain active")
+            assert(awaiting_merge.merge_pr_status == "open")
+            assert(awaiting_merge.merge_pr_url == "https://example.com/pull/80")
+            assert(#run_items == 2)
+            assert(run_items[1].status == "active")
+            assert(run_items[1].live == true)
+            assert(run_items[2].status == "blocked")
+            assert(run_items[2].live == true)
+            assert(run_items[2].ticket_title == "Closed but running")
             assert(#project_items == 1 and project_items[1].status == "open")
             assert(#question_items == 1 and question_items[1].status == "open")
             assert(question_items[1].ticket_title == "Standalone")
@@ -2923,6 +3416,7 @@ fn catalog_plugin_project_pipelines_run_entities_decorate_relationship_and_agent
             assert(decorated.current_step_name == "Implement")
             assert(decorated.detail_label == "Default pipeline - current step: Implement")
             assert(decorated.label == "Implement pipelines - Default pipeline (active)")
+            assert(decorated.live == true)
             assert(decorated.path == "/pipelines/runs/run-1")
             assert(decorated.has_ticket == true)
             assert(decorated.ticket_path == "/pipelines/tickets/ticket-1")
@@ -2954,6 +3448,7 @@ fn catalog_plugin_project_pipelines_run_entities_decorate_relationship_and_agent
             assert(fallback.current_agent_button_tone == "accent")
             assert(fallback.current_agent_path == nil)
             assert(fallback.status_tone == "danger")
+            assert(fallback.live == true)
             return "ok"
             "#,
             plugin_dir = plugin_dir.display(),
@@ -4324,7 +4819,7 @@ fn catalog_plugin_project_pipelines_db_v10_migration_adds_nullable_pipeline_colu
             log = {{ warn = function() end }}
 
             require("project_pipelines.db")
-            assert(spec.version == 10)
+            assert(spec.version == 11)
             for _, column in ipairs({{ "version_label", "archived_at", "replacement_pipeline_id", "supersedes_pipeline_id" }}) do
               assert(spec.models.pipelines[column] ~= nil, "fresh model missing " .. column)
             end
@@ -4437,7 +4932,7 @@ fn catalog_plugin_project_pipelines_archive_schema_and_allowlists_are_wired() {
         std::fs::read_to_string(root.join("project_pipelines/entity_contract.lua"))
             .expect("read project pipelines entity contract");
 
-    assert!(db.contains("version = 10"));
+    assert!(db.contains("version = 11"));
     for column in [
         "version_label",
         "archived_at",
