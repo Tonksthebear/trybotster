@@ -41,12 +41,23 @@ use std::io::{self, Read, Write};
 use std::os::unix::io::{FromRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::{mem::ManuallyDrop, thread};
 
 use anyhow::{bail, Context, Result};
+
+/// Last hub frame type seen by the session process (async-signal-safe breadcrumb).
+/// Written on every hub frame; logged on exit so hard deaths can be correlated.
+static LAST_HUB_FRAME_TYPE: AtomicU8 = AtomicU8::new(0);
+/// Last POSIX signal delivered to this session process (0 = none).
+static LAST_SIGNAL: AtomicU8 = AtomicU8::new(0);
+/// Child exit code latched by the waiter thread. `i32::MIN` means not exited.
+/// Survives a full output channel so hub always gets FRAME_PROCESS_EXITED.
+static CHILD_EXIT_CODE: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(i32::MIN);
+const CHILD_EXIT_NONE: i32 = i32::MIN;
 
 use crate::terminal::{CallbackConfig, TerminalParser, DEFAULT_SCROLLBACK_BYTES};
 
@@ -240,6 +251,62 @@ pub struct SpawnConfig {
     pub recovery_identity: Option<serde_json::Value>,
 }
 
+/// Flush session process logs so exit/panic diagnostics reach disk.
+///
+/// Session stdout/stderr are nulled at spawn, so the timestamped log file is
+/// the only diagnostic channel. Hard deaths without a flush leave no exit
+/// reason in `/tmp/botster-session-*.log`.
+pub(crate) fn flush_session_logs() {
+    log::logger().flush();
+}
+
+/// Install signal handlers that record SIGTERM/SIGINT/SIGHUP without logging
+/// from the handler (async-signal-safe). The main loop logs and flushes.
+fn install_session_signal_handlers() {
+    // SAFETY: handler only stores into atomics — no heap, no locks, no log.
+    unsafe extern "C" fn on_signal(sig: libc::c_int) {
+        LAST_SIGNAL.store(sig as u8, Ordering::SeqCst);
+    }
+    unsafe {
+        libc::signal(libc::SIGTERM, on_signal as usize);
+        libc::signal(libc::SIGINT, on_signal as usize);
+        libc::signal(libc::SIGHUP, on_signal as usize);
+    }
+}
+
+fn frame_type_name(frame_type: u8) -> &'static str {
+    match frame_type {
+        protocol::FRAME_PTY_INPUT => "pty_input",
+        protocol::FRAME_RESIZE => "resize",
+        protocol::FRAME_GET_SNAPSHOT => "get_snapshot",
+        protocol::FRAME_GET_SCREEN => "get_screen",
+        protocol::FRAME_GET_MODE_FLAGS => "get_mode_flags",
+        protocol::FRAME_SET_COLOR_PROFILE => "set_color_profile",
+        protocol::FRAME_SHUTDOWN => "shutdown",
+        protocol::FRAME_PING => "ping",
+        protocol::FRAME_SET_TIMEOUT => "set_timeout",
+        0 => "none",
+        _ => "other",
+    }
+}
+
+fn log_session_death_breadcrumb(exit_reason: &str) {
+    let last_frame = LAST_HUB_FRAME_TYPE.load(Ordering::SeqCst);
+    let last_sig = LAST_SIGNAL.load(Ordering::SeqCst);
+    log::info!(
+        "[session] death breadcrumb reason={} last_hub_frame=0x{:02x}({}) last_signal={}",
+        exit_reason,
+        last_frame,
+        frame_type_name(last_frame),
+        if last_sig == 0 {
+            "none".to_string()
+        } else {
+            format!("{last_sig}")
+        }
+    );
+    flush_session_logs();
+}
+
 /// Run the session process.
 ///
 /// This is the entry point called by `botster session`. It:
@@ -274,6 +341,7 @@ pub fn run(session_uuid: &str, socket_path: &str, timeout_secs: u64) -> Result<(
         &session_uuid[..session_uuid.len().min(16)],
         socket_path.display()
     );
+    flush_session_logs();
 
     write_session_pid_file(session_uuid, session_pid)
         .with_context(|| format!("write session pid file for {}", session_uuid))?;
@@ -309,6 +377,20 @@ pub fn run(session_uuid: &str, socket_path: &str, timeout_secs: u64) -> Result<(
     if run_result.is_err() && socket_path.exists() {
         remove_socket_path_logged(session_uuid, socket_path, "session_start_or_run_error");
     }
+
+    match &run_result {
+        Ok(()) => log::info!(
+            "[session {}] run finished ok (pid={})",
+            &session_uuid[..session_uuid.len().min(16)],
+            session_pid
+        ),
+        Err(e) => log::error!(
+            "[session {}] run finished with error (pid={}): {e:#}",
+            &session_uuid[..session_uuid.len().min(16)],
+            session_pid
+        ),
+    }
+    flush_session_logs();
 
     run_result
 }
@@ -572,8 +654,17 @@ fn run_session(
                 }
             };
             log::info!("[session] child exited (code={:?})", exit_code);
+            flush_session_logs();
+            // Latch before shutdown so the main loop can emit FRAME_PROCESS_EXITED
+            // even if the sync channel is full of PTY output (try_send would drop).
+            let latched = exit_code.unwrap_or(-1);
+            CHILD_EXIT_CODE.store(latched, Ordering::SeqCst);
+            // Prefer delivering via the channel first; blocking send is fine —
+            // the child is gone and we must not lose this frame.
+            if let Err(e) = output_tx_child.send(SessionOutput::ChildExited(exit_code)) {
+                log::warn!("[session] failed to queue ChildExited on output channel: {e}");
+            }
             shutdown_for_child.store(true, Ordering::Release);
-            let _ = output_tx_child.try_send(SessionOutput::ChildExited(exit_code));
         })
         .context("spawn child waiter thread")?;
 
@@ -615,6 +706,7 @@ fn run_session(
                     parent_contents.unwrap_or_default(),
                     socket_path_owned.display()
                 );
+                flush_session_logs();
                 shutdown_for_lease.store(true, Ordering::Release);
                 break;
             }
@@ -622,21 +714,23 @@ fn run_session(
         .context("spawn lease watcher")?;
 
     // Main I/O relay loop
+    install_session_signal_handlers();
     stream.set_read_timeout(Some(Duration::from_millis(50)))?;
     let mut hub_decoder = FrameDecoder::new();
     let mut read_buf = [0u8; 8192];
 
     let mut exit_reason = "shutdown_flag";
+    let mut child_exit_delivered = false;
     loop {
-        if shutdown.load(Ordering::Relaxed) {
-            break;
-        }
-
-        // Forward PTY output / child exit to the parent process over the session socket.
+        // Drain outbound frames BEFORE shutdown checks. Child exit sets
+        // shutdown=true; if we break first, hub only sees bare socket EOF
+        // (exit_code=None) and treats a normal agent exit as hard death.
         while let Ok(msg) = output_rx.try_recv() {
             let frame = match msg {
                 SessionOutput::PtyData(data) => encode_frame(FRAME_PTY_OUTPUT, &data),
                 SessionOutput::ChildExited(code) => {
+                    child_exit_delivered = true;
+                    exit_reason = "child_exited";
                     match encode_json(
                         FRAME_PROCESS_EXITED,
                         &serde_json::json!({"exit_code": code}),
@@ -650,8 +744,54 @@ fn run_session(
             if stream.write_all(&frame).is_err() {
                 // Hub disconnected
                 log::info!("[session] hub disconnected (write error)");
+                exit_reason = "hub_write_error";
+                shutdown.store(true, Ordering::Release);
                 break;
             }
+        }
+
+        // If the channel dropped ChildExited under load, still emit from latch.
+        if !child_exit_delivered {
+            let latched = CHILD_EXIT_CODE.load(Ordering::SeqCst);
+            if latched != CHILD_EXIT_NONE {
+                let code = if latched == -1 { None } else { Some(latched) };
+                child_exit_delivered = true;
+                exit_reason = "child_exited";
+                let frame = match encode_json(
+                    FRAME_PROCESS_EXITED,
+                    &serde_json::json!({"exit_code": code}),
+                ) {
+                    Ok(f) => f,
+                    Err(_) => encode_frame(FRAME_PROCESS_EXITED, b"{}"),
+                };
+                if stream.write_all(&frame).is_err() {
+                    log::info!("[session] hub disconnected (write error delivering child exit)");
+                    exit_reason = "hub_write_error";
+                    shutdown.store(true, Ordering::Release);
+                } else {
+                    log::info!(
+                        "[session] delivered latched ChildExited to hub (code={code:?})"
+                    );
+                }
+                flush_session_logs();
+            }
+        }
+
+        let pending_sig = LAST_SIGNAL.load(Ordering::SeqCst);
+        if pending_sig != 0 {
+            log::warn!(
+                "[session] received signal {pending_sig} — shutting down \
+                 (last_hub_frame=0x{:02x} {})",
+                LAST_HUB_FRAME_TYPE.load(Ordering::SeqCst),
+                frame_type_name(LAST_HUB_FRAME_TYPE.load(Ordering::SeqCst))
+            );
+            flush_session_logs();
+            exit_reason = "signal";
+            shutdown.store(true, Ordering::Release);
+            break;
+        }
+        if shutdown.load(Ordering::Relaxed) {
+            break;
         }
 
         // Read hub commands
@@ -747,11 +887,13 @@ fn run_session(
         remove_socket_path_logged(session_uuid, socket_path, exit_reason);
     }
     log::info!(
-        "[session {}] exiting (reason={}, socket_existed={})",
+        "[session {}] exiting (reason={}, socket_existed={}, child_pid={})",
         &session_uuid[..session_uuid.len().min(16)],
         exit_reason,
-        socket_existed
+        socket_existed,
+        child_pid
     );
+    log_session_death_breadcrumb(exit_reason);
     Ok(())
 }
 
@@ -813,6 +955,7 @@ fn handle_hub_frame(
     stream: &mut UnixStream,
     shutdown: &AtomicBool,
 ) {
+    LAST_HUB_FRAME_TYPE.store(frame.frame_type, Ordering::SeqCst);
     match frame.frame_type {
         FRAME_PTY_INPUT => {
             let probe_descriptions =

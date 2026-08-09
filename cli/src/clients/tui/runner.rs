@@ -1771,6 +1771,25 @@ where
                     log::info!("PTY process exited with code {:?}", exit_code);
                     if self.panel_pool.is_focused(&session_uuid) {
                         self.terminal_modes.clear_inner_kitty();
+                        // Clear a stale not_ready modal once the data plane
+                        // confirms exit (EOF death path now fans ProcessExited
+                        // to ClientWorkers instead of leaving not_ready thrash).
+                        if self.mode == "error"
+                            && self
+                                .error_message
+                                .as_deref()
+                                .is_some_and(|msg| msg.contains("not ready for input"))
+                        {
+                            self.error_message = None;
+                            self.mode = "terminal".to_string();
+                            if let Some(lua) = layout_lua {
+                                if let Err(err) = lua.exec("_tui_state.mode = 'terminal'") {
+                                    log::warn!(
+                                        "[TUI] failed to clear not_ready mode after process exit: {err}"
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 Ok(TuiOutput::Message(value)) => {
@@ -1892,8 +1911,12 @@ where
                 } else {
                     session_uuid
                 };
+                // Do not claim reconnect here: ConnectionMissing after hard
+                // session death is permanent until a new session exists. True
+                // reconnect is hub-side and surfaces as terminal_attach
+                // reconnecting/attached, not not_ready.
                 self.error_message = Some(format!(
-                    "Terminal session {session_label} is not ready for input yet. Reconnecting session I/O..."
+                    "Terminal session {session_label} is not ready for input yet."
                 ));
                 self.mode = "error".to_string();
                 if let Some(lua) = layout_lua {

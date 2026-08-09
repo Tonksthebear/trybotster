@@ -96,51 +96,71 @@ impl Hub {
                 != Some(req.subscription_id.as_str())
             {
                 self.replace_terminal_subscription(&subscription_key);
+            } else if self.is_session_reconnect_pending(&req.session_uuid) {
+                // Stale peer registration can survive reader death. Drop it so
+                // post-reconnect cannot resize-only "reuse" a live sub that
+                // died with the old SessionIoWorker (silent attached, no egress).
+                log::debug!(
+                    "[WebRTC] Invalidating reused subscription for {} — SessionIo reconnect pending",
+                    subscription_key
+                );
+                self.replace_terminal_subscription(&subscription_key);
+                return false;
             } else {
-                let _ = pty_handle.enqueue_session_io_request(
+                let resize_result = pty_handle.enqueue_session_io_request(
                     crate::worker::session_io::SessionIoRequest::Resize {
                         rows: req.rows,
                         cols: req.cols,
                     },
                 );
-                let _ = worker.try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
-                    crate::worker::client::ClientControlFrame::BoundaryJson(serde_json::json!({
-                        "type": "subscribed",
-                        "subscriptionId": req.subscription_id.clone(),
-                    })),
-                ));
+                if resize_result.is_err() {
+                    // Live subscription map is gone or mailbox dead — force full reattach.
+                    log::debug!(
+                        "[WebRTC] Reused subscription resize failed for {} ({resize_result:?}); full reattach",
+                        subscription_key
+                    );
+                    self.replace_terminal_subscription(&subscription_key);
+                } else {
+                    let _ = worker.try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                        crate::worker::client::ClientControlFrame::BoundaryJson(serde_json::json!({
+                            "type": "subscribed",
+                            "subscriptionId": req.subscription_id.clone(),
+                        })),
+                    ));
 
-                // Item 3: reattach mode replay (on top of Item 2 producer)
-                // On reused-subscription reattach, emit current mode state (full sparse
-                // ModeChanged from live ModeFlags) *before* "attached" so the client
-                // receives mode state as part of the attach barrier.
-                if let Some(flags) = pty_handle.get_mode_flags() {
-                    // Use the shared helper so the browser reused-sub path and the
-                    // TUI Raw initial snapshot path cannot drift on which fields are replayed.
-                    let mode = crate::session::protocol::mode_changed_from_flags(flags);
-                    let _ =
-                        worker.try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
-                            crate::worker::client::ClientControlFrame::ModeChanged {
-                                session_uuid: req.session_uuid.clone(),
-                                mode,
-                            },
-                        ));
+                    // Item 3: reattach mode replay (on top of Item 2 producer)
+                    // On reused-subscription reattach, emit current mode state (full sparse
+                    // ModeChanged from live ModeFlags) *before* "attached" so the client
+                    // receives mode state as part of the attach barrier.
+                    if let Some(flags) = pty_handle.get_mode_flags() {
+                        // Use the shared helper so the browser reused-sub path and the
+                        // TUI Raw initial snapshot path cannot drift on which fields are replayed.
+                        let mode = crate::session::protocol::mode_changed_from_flags(flags);
+                        let _ = worker.try_send(
+                            crate::worker::client::ClientWorkerMessage::ControlFrame(
+                                crate::worker::client::ClientControlFrame::ModeChanged {
+                                    session_uuid: req.session_uuid.clone(),
+                                    mode,
+                                },
+                            ),
+                        );
+                    }
+
+                    Self::send_worker_terminal_attach_state(
+                        &worker,
+                        &req.subscription_id,
+                        &req.session_uuid,
+                        "attached",
+                    );
+
+                    log::debug!(
+                        "[WebRTC] Reused active terminal subscription for {} resize={}x{}",
+                        subscription_key,
+                        req.cols,
+                        req.rows
+                    );
+                    return true;
                 }
-
-                Self::send_worker_terminal_attach_state(
-                    &worker,
-                    &req.subscription_id,
-                    &req.session_uuid,
-                    "attached",
-                );
-
-                log::debug!(
-                    "[WebRTC] Reused active terminal subscription for {} resize={}x{}",
-                    subscription_key,
-                    req.cols,
-                    req.rows
-                );
-                return true;
             }
         }
 
@@ -196,6 +216,24 @@ impl Hub {
         attached
     }
 
+    /// Pending attach waits for a session to enter `HandleCache`, or for an
+    /// in-flight SessionIo reader reconnect to finish.
+    ///
+    /// Registered sessions that are **not** reconnecting must not re-enter the
+    /// pending loop when SessionIo attach fails — that produces Queue thrash
+    /// (`Queue` ≫ `Started`) on zombie handles.
+    #[must_use]
+    pub(super) fn should_queue_pending_terminal_attach(&self, session_uuid: &str) -> bool {
+        self.handle_cache.get_session(session_uuid).is_none()
+            || self.pending_reconnects.contains_key(session_uuid)
+    }
+
+    /// True while hub is attempting SessionIo reader reconnect for this session.
+    #[must_use]
+    pub(super) fn is_session_reconnect_pending(&self, session_uuid: &str) -> bool {
+        self.pending_reconnects.contains_key(session_uuid)
+    }
+
     pub(super) fn process_pending_terminal_attaches(&mut self) {
         if self.pending_terminal_attaches.is_empty() {
             return;
@@ -234,10 +272,26 @@ impl Hub {
             let Some(intent) = self.pending_terminal_attaches.remove(&key) else {
                 continue;
             };
-            if self.try_attach_pending_terminal_request(&intent.request) {
-            } else {
-                // Session may have disappeared between lookup and attach attempt.
+            // Keep waiting while SessionIo reader reconnect is in flight —
+            // do not attach-spam every tick.
+            if self.is_session_reconnect_pending(intent.request.session_uuid()) {
                 self.pending_terminal_attaches.insert(key, intent);
+                continue;
+            }
+            if self.try_attach_pending_terminal_request(&intent.request) {
+                continue;
+            }
+            // Session vanished between ready scan and attach: keep waiting.
+            // Session still present but attach failed: failure already emitted
+            // (ProcessExited / not_ready / not_found) — do not thrash.
+            if self.should_queue_pending_terminal_attach(intent.request.session_uuid()) {
+                self.pending_terminal_attaches.insert(key, intent);
+            } else {
+                log::debug!(
+                    "[TerminalAttach] Dropping pending attach for {} after failed attach on registered session {}",
+                    key,
+                    intent.request.session_uuid()
+                );
             }
         }
 
@@ -336,15 +390,30 @@ impl Hub {
             return;
         }
 
+        // Wait for missing sessions or SessionIo reader reconnect only.
+        // Dead registered zombies already emitted ProcessExited — no thrash.
+        if !self.should_queue_pending_terminal_attach(&req.session_uuid) {
+            log::debug!(
+                "[WebRTC] Not pending terminal attach for {} — session present but attach failed",
+                subscription_key
+            );
+            return;
+        }
+
         self.replace_pending_terminal_attach(
             &subscription_key,
             PendingTerminalAttachRequest::WebRtc(req.clone()),
         );
+        let state = if self.is_session_reconnect_pending(&req.session_uuid) {
+            "reconnecting"
+        } else {
+            "pending"
+        };
         self.send_terminal_attach_state(
             &req.peer_id,
             &req.subscription_id,
             &req.session_uuid,
-            "pending",
+            state,
         );
     }
 }

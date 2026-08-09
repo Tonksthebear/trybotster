@@ -1255,6 +1255,227 @@ pub(super) fn test_debug_memory_diagnostics_reports_counts_without_heap_claims()
 }
 
 #[test]
+pub(super) fn test_browser_attach_during_reader_reconnect_queues_reconnecting() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let session_uuid = unique_session_uuid("sess-reconnect-attach");
+    let peer_id = "peer-reconnect-attach";
+    let subscription_id = "terminal_reconnect_attach";
+    let key = format!("{peer_id}:{session_uuid}");
+
+    // Session is registered but SessionIo mailbox is gone while hub is
+    // reconnecting the reader — attach must pending as reconnecting, not
+    // permanent-close the client.
+    cleanup_live_session_identity(&session_uuid);
+    hub.handle_cache
+        .add_session(test_session_backed_handle(&session_uuid, 24, 80));
+    hub.pending_reconnects.insert(
+        session_uuid.clone(),
+        crate::hub::ReconnectState {
+            started_at: Instant::now(),
+            attempt_started_at: None,
+            generation: 1,
+            in_flight: true,
+        },
+    );
+    let mut command_rx =
+        install_test_browser_worker(&mut hub, peer_id, &session_uuid, subscription_id);
+
+    hub.create_browser_terminal_subscription(test_browser_subscription_request(
+        peer_id,
+        &session_uuid,
+        subscription_id,
+    ));
+
+    assert!(
+        hub.pending_terminal_attaches.contains_key(&key),
+        "reader reconnect must keep a pending terminal attach"
+    );
+    assert!(
+        hub.should_queue_pending_terminal_attach(&session_uuid),
+        "reconnect-pending sessions are allowed to stay pending"
+    );
+
+    // No thrash: repeated process_pending keeps a single pending intent.
+    for _ in 0..3 {
+        hub.process_pending_terminal_attaches();
+    }
+    assert_eq!(
+        hub.pending_terminal_attaches.len(),
+        1,
+        "reconnect pending must not multiply"
+    );
+
+    let frames = drain_webrtc_json_commands(&mut hub, &mut command_rx, 8);
+    assert!(
+        frames.iter().any(|frame| {
+            frame.get("type").and_then(|v| v.as_str()) == Some("terminal_attach")
+                && frame.get("state").and_then(|v| v.as_str()) == Some("reconnecting")
+        }),
+        "reconnect attach must emit terminal_attach reconnecting, frames={frames:?}"
+    );
+    assert!(
+        !frames.iter().any(|frame| {
+            frame.get("type").and_then(|v| v.as_str()) == Some("process_exited")
+        }),
+        "reconnect attach must not permanent-close with process_exited, frames={frames:?}"
+    );
+
+    hub.pending_reconnects.clear();
+    cleanup_live_session_identity(&session_uuid);
+}
+
+#[test]
+pub(super) fn test_browser_reuse_path_defers_while_reader_reconnect_pending() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let session_uuid = unique_session_uuid("sess-reuse-reconnect");
+    let peer_id = "peer-reuse-reconnect";
+    let subscription_id = "terminal_reuse_reconnect";
+    let key = format!("{peer_id}:{session_uuid}");
+
+    let (session_io_tx, mut session_io_rx) = tokio::sync::mpsc::channel(8);
+    hub.handle_cache
+        .add_session(test_session_backed_handle_with_mailbox(
+            &session_uuid,
+            session_io_tx,
+        ));
+    let mut command_rx =
+        install_test_browser_worker(&mut hub, peer_id, &session_uuid, subscription_id);
+
+    assert!(hub.try_attach_browser_terminal_subscription(
+        &test_browser_subscription_request(peer_id, &session_uuid, subscription_id)
+    ));
+    let _ = drain_initial_webrtc_terminal_attach_requests(&mut session_io_rx);
+    assert!(hub.terminal_subscription_peers.contains_key(&key));
+
+    // Reader death: clear mailbox and mark reconnect pending while hub peer
+    // registration still exists (the production race).
+    hub.pending_reconnects.insert(
+        session_uuid.clone(),
+        crate::hub::ReconnectState {
+            started_at: Instant::now(),
+            attempt_started_at: None,
+            generation: 1,
+            in_flight: true,
+        },
+    );
+
+    hub.create_browser_terminal_subscription(test_browser_subscription_request(
+        peer_id,
+        &session_uuid,
+        subscription_id,
+    ));
+
+    assert!(
+        hub.pending_terminal_attaches.contains_key(&key),
+        "reuse path during reconnect must pending, not claim attached"
+    );
+    assert!(
+        !hub.terminal_subscription_peers.contains_key(&key),
+        "reconnect defer must invalidate stale peer registration for full reattach later"
+    );
+    let frames = drain_webrtc_json_commands(&mut hub, &mut command_rx, 12);
+    assert!(
+        !frames.iter().any(|frame| {
+            frame.get("type").and_then(|v| v.as_str()) == Some("terminal_attach")
+                && frame.get("state").and_then(|v| v.as_str()) == Some("attached")
+        }),
+        "must not claim attached during reconnect, frames={frames:?}"
+    );
+
+    hub.pending_reconnects.clear();
+    cleanup_live_session_identity(&session_uuid);
+}
+
+#[test]
+pub(super) fn test_browser_attach_dead_registered_session_does_not_pending_thrash() {
+    // Session still in HandleCache but SessionIo mailbox is gone and the
+    // process is not live. Pending must not absorb this — that was the
+    // Queue ≫ Started thrash path on every hub tick.
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let session_uuid = unique_session_uuid("sess-dead-attach");
+    let peer_id = "peer-dead-attach";
+    let subscription_id = "terminal_dead_attach";
+    let key = format!("{peer_id}:{session_uuid}");
+
+    cleanup_live_session_identity(&session_uuid);
+    hub.handle_cache
+        .add_session(test_session_backed_handle(&session_uuid, 24, 80));
+    let mut command_rx =
+        install_test_browser_worker(&mut hub, peer_id, &session_uuid, subscription_id);
+
+    let req = test_browser_subscription_request(peer_id, &session_uuid, subscription_id);
+    hub.create_browser_terminal_subscription(req);
+
+    assert!(
+        !hub.pending_terminal_attaches.contains_key(&key),
+        "dead registered session must not enter pending attach"
+    );
+    assert!(
+        !hub.terminal_subscription_peers.contains_key(&key),
+        "failed attach must not register a live terminal subscription"
+    );
+
+    // Repeated create / process_pending must stay quiet (no thrash requeue).
+    for _ in 0..5 {
+        hub.create_browser_terminal_subscription(test_browser_subscription_request(
+            peer_id,
+            &session_uuid,
+            subscription_id,
+        ));
+        hub.process_pending_terminal_attaches();
+    }
+    assert!(
+        hub.pending_terminal_attaches.is_empty(),
+        "pending map must stay empty after dead-session attach failures"
+    );
+
+    let frames = drain_webrtc_json_commands(&mut hub, &mut command_rx, 8);
+    assert!(
+        frames.iter().any(|frame| frame.get("type").and_then(|v| v.as_str()) == Some("process_exited")),
+        "dead attach must emit process_exited once, frames={frames:?}"
+    );
+    cleanup_live_session_identity(&session_uuid);
+}
+
+#[test]
+pub(super) fn test_pending_attach_does_not_requeue_when_registered_session_attach_fails() {
+    let (mut hub, _request_tx, _output_rx) = e2e_hub();
+    let session_uuid = unique_session_uuid("sess-pending-drop");
+    let peer_id = "peer-pending-drop";
+    let subscription_id = "terminal_pending_drop";
+    let key = format!("{peer_id}:{session_uuid}");
+
+    // Start as true pending (session missing).
+    hub.create_browser_terminal_subscription(test_browser_subscription_request(
+        peer_id,
+        &session_uuid,
+        subscription_id,
+    ));
+    assert!(hub.pending_terminal_attaches.contains_key(&key));
+
+    // Session appears without a live SessionIo mailbox → attach fails permanently.
+    cleanup_live_session_identity(&session_uuid);
+    hub.handle_cache
+        .add_session(test_session_backed_handle(&session_uuid, 24, 80));
+    let _command_rx =
+        install_test_browser_worker(&mut hub, peer_id, &session_uuid, subscription_id);
+
+    hub.process_pending_terminal_attaches();
+    assert!(
+        !hub.pending_terminal_attaches.contains_key(&key),
+        "failed attach on a now-registered session must drop pending, not requeue"
+    );
+
+    hub.process_pending_terminal_attaches();
+    hub.process_pending_terminal_attaches();
+    assert!(
+        hub.pending_terminal_attaches.is_empty(),
+        "subsequent ticks must not resurrect thrash pending"
+    );
+    cleanup_live_session_identity(&session_uuid);
+}
+
+#[test]
 pub(super) fn test_terminal_attach_intent_times_out_to_not_found() {
     let (mut hub, _request_tx, _output_rx) = e2e_hub();
     let key = "peer-timeout:sess-timeout".to_string();

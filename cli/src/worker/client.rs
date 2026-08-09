@@ -776,7 +776,11 @@ impl ClientWorker {
     }
 
     async fn deliver_control_frame(&mut self, frame: ClientControlFrame) {
-        if !matches!(self.health, ClientConnectionHealth::Ready) {
+        // Permanent death must not be Ready-gated: WebRTC reconnect windows
+        // would otherwise drop ProcessExited and leave clients thrashing
+        // not_ready against a dead SessionIo mailbox.
+        let is_process_exit = matches!(frame, ClientControlFrame::ProcessExited { .. });
+        if !is_process_exit && !matches!(self.health, ClientConnectionHealth::Ready) {
             return;
         }
 

@@ -17,6 +17,7 @@ import { WebRtcPtyTransport } from '../lib/transport/webrtc_pty_transport'
 function fakeTerminalConnection() {
   return {
     isConnected: vi.fn(() => true),
+    isSessionClosed: vi.fn(() => false),
     hasSubscription: vi.fn(() => false),
     sendResize: vi.fn(() => Promise.resolve(true)),
     requestSnapshot: vi.fn(),
@@ -31,6 +32,7 @@ function fakeTerminalConnection() {
     }),
     onDisconnected: vi.fn(() => vi.fn()),
     onError: vi.fn(() => vi.fn()),
+    onProcessExited: vi.fn(() => vi.fn()),
     release: vi.fn(),
   }
 }
@@ -229,5 +231,91 @@ describe('WebRtcPtyTransport', () => {
       ['snapshot'],
       ['data', new Uint8Array([9, 8, 7])],
     ])
+  })
+
+  it('stops input after soft process_exited but allows a later connect', async () => {
+    const conn = fakeTerminalConnection()
+    let processExitedCallback
+    conn.onProcessExited.mockImplementation((callback) => {
+      processExitedCallback = callback
+      return vi.fn()
+    })
+    mocks.acquire.mockResolvedValue(conn)
+    const transport = new WebRtcPtyTransport({
+      hubId: 'hub-1',
+      sessionUuid: 'session-1',
+    })
+    const onDisconnect = vi.fn()
+    const onError = vi.fn()
+    transport.onDisconnect = onDisconnect
+
+    await transport.connect({
+      rows: 24,
+      cols: 80,
+      callbacks: { onError, onDisconnect: vi.fn() },
+    })
+
+    processExitedCallback({
+      session_uuid: 'session-1',
+      exit_code: null,
+      permanent: false,
+    })
+
+    expect(onDisconnect).toHaveBeenCalled()
+    expect(onError).toHaveBeenCalledWith('Terminal session reconnecting…')
+    expect(transport.sendInput('x')).toBe(false)
+    expect(conn.release).toHaveBeenCalled()
+
+    // Soft close must not brick remount / re-click attach.
+    const next = fakeTerminalConnection()
+    mocks.acquire.mockResolvedValue(next)
+    await transport.connect({
+      rows: 24,
+      cols: 80,
+      callbacks: {},
+    })
+    expect(mocks.acquire).toHaveBeenCalledTimes(2)
+    expect(next.sendResize).toHaveBeenCalled()
+  })
+
+  it('stops input and connect after permanent process_exited', async () => {
+    const conn = fakeTerminalConnection()
+    let processExitedCallback
+    conn.onProcessExited.mockImplementation((callback) => {
+      processExitedCallback = callback
+      return vi.fn()
+    })
+    mocks.acquire.mockResolvedValue(conn)
+    const transport = new WebRtcPtyTransport({
+      hubId: 'hub-1',
+      sessionUuid: 'session-1',
+    })
+    const onDisconnect = vi.fn()
+    const onError = vi.fn()
+    transport.onDisconnect = onDisconnect
+
+    await transport.connect({
+      rows: 24,
+      cols: 80,
+      callbacks: { onError, onDisconnect: vi.fn() },
+    })
+
+    processExitedCallback({
+      session_uuid: 'session-1',
+      exit_code: 1,
+      permanent: true,
+    })
+
+    expect(onDisconnect).toHaveBeenCalled()
+    expect(onError).toHaveBeenCalledWith('Terminal session exited')
+    expect(transport.sendInput('x')).toBe(false)
+
+    // Further connect attempts must no-op after permanent death.
+    await transport.connect({
+      rows: 24,
+      cols: 80,
+      callbacks: {},
+    })
+    expect(mocks.acquire).toHaveBeenCalledTimes(1)
   })
 })

@@ -48,19 +48,31 @@ impl Hub {
         &mut self,
         spec: TerminalClientSubscription,
     ) -> bool {
-        Self::register_worker_session_io_sender(
-            &spec.worker,
-            &spec.session_uuid,
-            spec.pty_handle.clone(),
-            spec.log_prefix,
-        );
-
         let subscription_key = match &spec.initial_snapshot {
             TerminalInitialSnapshot::Raw { subscription_key }
             | TerminalInitialSnapshot::PrefixedGzip { subscription_key } => {
                 subscription_key.clone()
             }
         };
+
+        // Defer before registering a SessionIo sender so reconnect wait is a
+        // clean no-op (create_* already emits reconnecting/pending).
+        if self.is_session_reconnect_pending(&spec.session_uuid) {
+            log::debug!(
+                "[{}] Deferring terminal attach for {} session {} — SessionIo reader reconnect in progress",
+                spec.log_prefix,
+                spec.client_label,
+                spec.session_uuid
+            );
+            return false;
+        }
+
+        Self::register_worker_session_io_sender(
+            &spec.worker,
+            &spec.session_uuid,
+            spec.pty_handle.clone(),
+            spec.log_prefix,
+        );
 
         if !spec.pty_handle.is_session_backed() {
             log::warn!(
@@ -69,19 +81,11 @@ impl Hub {
                 spec.client_label,
                 spec.session_uuid
             );
-            let _ = spec
-                .worker
-                .try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
-                    crate::worker::client::ClientControlFrame::TerminalAttach {
-                        subscription_id: spec.subscription_id,
-                        session_uuid: spec.session_uuid.clone(),
-                        state: crate::worker::client::TerminalAttachState::NotReady,
-                    },
-                ));
-            let _ = spec.worker.try_send(
-                crate::worker::client::ClientWorkerMessage::UnregisterSessionIoSender {
-                    session_uuid: spec.session_uuid,
-                },
+            Self::emit_terminal_attach_failure(
+                &spec.worker,
+                &spec.subscription_id,
+                &spec.session_uuid,
+                TerminalAttachFailureKind::NotFound,
             );
             return false;
         }
@@ -177,26 +181,30 @@ impl Hub {
                 });
 
         if resize_result.is_err() || snapshot_result.is_err() {
+            let process_live = crate::session::session_process_is_live(&spec.session_uuid);
+            let reconnecting = self.is_session_reconnect_pending(&spec.session_uuid);
+            let failure = Self::terminal_attach_failure_kind(
+                process_live,
+                reconnecting,
+                resize_result.as_ref().err().copied(),
+                snapshot_result.as_ref().err().copied(),
+            );
             log::warn!(
-                "[{}] Session I/O attach request failed for {} session {}: resize={:?} snapshot={:?}",
+                "[{}] Session I/O attach request failed for {} session {}: resize={:?} snapshot={:?} process_live={} reconnecting={} failure={failure:?}",
                 spec.log_prefix,
                 spec.client_label,
                 spec.session_uuid,
                 resize_result.err(),
-                snapshot_result.err()
+                snapshot_result.err(),
+                process_live,
+                reconnecting,
             );
-            let _ = spec.worker.try_send(ClientWorkerMessage::ControlFrame(
-                crate::worker::client::ClientControlFrame::TerminalAttach {
-                    subscription_id: spec.subscription_id,
-                    session_uuid: spec.session_uuid.clone(),
-                    state: crate::worker::client::TerminalAttachState::NotReady,
-                },
-            ));
-            let _ = spec
-                .worker
-                .try_send(ClientWorkerMessage::UnregisterSessionIoSender {
-                    session_uuid: spec.session_uuid,
-                });
+            Self::emit_terminal_attach_failure(
+                &spec.worker,
+                &spec.subscription_id,
+                &spec.session_uuid,
+                failure,
+            );
             return false;
         }
 
@@ -210,4 +218,84 @@ impl Hub {
         );
         true
     }
+
+    /// Control-plane failure for terminal attach when SessionIo cannot start.
+    ///
+    /// Dead sessions emit `ProcessExited` (not `not_ready`) so clients stop
+    /// thrash loops. In-flight reader reconnect emits `Reconnecting`. Transient
+    /// mailbox gaps keep `NotReady`.
+    pub(super) fn emit_terminal_attach_failure(
+        worker: &crate::worker::client::ClientWorkerHandle,
+        subscription_id: &str,
+        session_uuid: &str,
+        kind: TerminalAttachFailureKind,
+    ) {
+        use crate::worker::client::{
+            ClientControlFrame, ClientWorkerMessage, TerminalAttachState,
+        };
+
+        let control = match kind {
+            TerminalAttachFailureKind::ProcessExited => ClientControlFrame::ProcessExited {
+                session_uuid: session_uuid.to_string(),
+                exit_code: None,
+            },
+            TerminalAttachFailureKind::NotReady => ClientControlFrame::TerminalAttach {
+                subscription_id: subscription_id.to_string(),
+                session_uuid: session_uuid.to_string(),
+                state: TerminalAttachState::NotReady,
+            },
+            TerminalAttachFailureKind::Reconnecting => ClientControlFrame::TerminalAttach {
+                subscription_id: subscription_id.to_string(),
+                session_uuid: session_uuid.to_string(),
+                state: TerminalAttachState::Reconnecting,
+            },
+            TerminalAttachFailureKind::NotFound => ClientControlFrame::TerminalAttach {
+                subscription_id: subscription_id.to_string(),
+                session_uuid: session_uuid.to_string(),
+                state: TerminalAttachState::NotFound,
+            },
+        };
+        let _ = worker.try_send(ClientWorkerMessage::ControlFrame(control));
+        let _ = worker.try_send(ClientWorkerMessage::UnregisterSessionIoSender {
+            session_uuid: session_uuid.to_string(),
+        });
+    }
+
+    /// Classify attach failure: permanent death vs recoverable gap.
+    ///
+    /// Transient enqueue errors (`MailboxFull`, `ReaderMissing`) always stay
+    /// `NotReady` so a brief race cannot permanently close the browser session.
+    /// Active hub reader-reconnect is `Reconnecting` even when the process
+    /// liveness probe races false. Connection/closed errors with a dead process
+    /// and no reconnect intent are `ProcessExited`.
+    #[must_use]
+    pub(super) fn terminal_attach_failure_kind(
+        process_live: bool,
+        reconnecting: bool,
+        resize_err: Option<crate::session::connection::SessionIoRequestEnqueueError>,
+        snapshot_err: Option<crate::session::connection::SessionIoRequestEnqueueError>,
+    ) -> TerminalAttachFailureKind {
+        use crate::session::connection::SessionIoRequestEnqueueError as E;
+
+        let is_transient = |err: E| matches!(err, E::MailboxFull | E::ReaderMissing);
+        if resize_err.is_some_and(is_transient) || snapshot_err.is_some_and(is_transient) {
+            return TerminalAttachFailureKind::NotReady;
+        }
+        if reconnecting {
+            return TerminalAttachFailureKind::Reconnecting;
+        }
+        if process_live {
+            TerminalAttachFailureKind::NotReady
+        } else {
+            TerminalAttachFailureKind::ProcessExited
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TerminalAttachFailureKind {
+    ProcessExited,
+    NotReady,
+    Reconnecting,
+    NotFound,
 }

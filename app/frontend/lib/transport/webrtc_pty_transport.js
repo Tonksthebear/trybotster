@@ -33,6 +33,7 @@ export class WebRtcPtyTransport {
   #desiredSize = null; // { cols, rows }
   #resizeTimer = null;
   #destroyed = false;
+  #sessionClosed = false;
   #connectGeneration = 0;
 
   constructor({ hubId, sessionUuid }) {
@@ -46,10 +47,27 @@ export class WebRtcPtyTransport {
    */
   async connect(options) {
     if (this.#destroyed) return;
+    // Permanent session death (exit code / not_found) blocks reconnect.
+    // Soft process_exited clears #sessionClosed via a fresh TerminalConnection
+    // so re-click / remount can attach again after hub reader recovery.
+    if (this.#sessionClosed) return;
+
     const generation = ++this.#connectGeneration;
     const requestedSize = this.#connectSize(options);
     const termKey = TerminalConnection.key(this.#hubId, this.#sessionUuid);
-    const existingConn = this.#terminalConn ?? HubConnectionManager.get(termKey);
+    let existingConn = this.#terminalConn ?? HubConnectionManager.get(termKey);
+
+    // Drop a permanently closed pooled connection so acquire() builds fresh.
+    // Prefer manager destroy so we don't release a ref we never acquired.
+    if (existingConn?.isSessionClosed?.()) {
+      if (this.#terminalConn === existingConn) {
+        this.#terminalConn = null;
+      }
+      HubConnectionManager.destroy?.(termKey)
+        ?? existingConn.release?.();
+      existingConn = null;
+    }
+
     const hadSubscription = existingConn?.hasSubscription?.() ?? false;
     this.disconnect();
     this.#desiredSize = requestedSize;
@@ -59,7 +77,11 @@ export class WebRtcPtyTransport {
     );
 
     let terminalConn = this.#terminalConn;
-    if (!terminalConn) {
+    if (!terminalConn || terminalConn.isSessionClosed?.()) {
+      if (terminalConn?.isSessionClosed?.()) {
+        terminalConn.release?.();
+        this.#terminalConn = null;
+      }
       terminalConn = await HubConnectionManager.acquire(
         TerminalConnection,
         termKey,
@@ -74,6 +96,16 @@ export class WebRtcPtyTransport {
 
     if (this.#destroyed || generation !== this.#connectGeneration) {
       terminalConn?.release?.();
+      return;
+    }
+
+    // Manager can return a brand-new wrapper after hard-close destroy.
+    // If it is already permanently closed, latch transport death so later
+    // connect() calls no-op instead of thrashing acquire.
+    if (terminalConn?.isSessionClosed?.()) {
+      this.#terminalConn = null;
+      this.#handleSessionClosed({ permanent: true, reason: "session_closed_on_acquire" });
+      terminalConn.release?.();
       return;
     }
 
@@ -98,32 +130,32 @@ export class WebRtcPtyTransport {
   }
 
   sendInput(data) {
-    if (!this.#terminalConn?.isConnected()) return false;
+    if (this.#sessionClosed || !this.#terminalConn?.isConnected()) return false;
     this.#terminalConn.sendInput(data);
     return true;
   }
 
   sendColorProfile(colors) {
-    if (!this.#terminalConn?.isConnected()) return false;
+    if (this.#sessionClosed || !this.#terminalConn?.isConnected()) return false;
     this.#terminalConn.sendColorProfile(colors);
     return true;
   }
 
   sendFocusChanged(focused) {
-    if (!this.#terminalConn?.isConnected()) return false;
+    if (this.#sessionClosed || !this.#terminalConn?.isConnected()) return false;
     this.#terminalConn.sendFocusChanged(focused);
     return true;
   }
 
   sendFile(data, filename) {
-    if (!this.#terminalConn?.isConnected()) return false;
+    if (this.#sessionClosed || !this.#terminalConn?.isConnected()) return false;
     this.#terminalConn.sendFile(data, filename);
     return true;
   }
 
   resize(cols, rows) {
     this.#desiredSize = { cols, rows };
-    if (!this.#terminalConn?.isConnected()) return true;
+    if (this.#sessionClosed || !this.#terminalConn?.isConnected()) return true;
 
     this.#clearResizeTimer();
 
@@ -226,8 +258,65 @@ export class WebRtcPtyTransport {
       }),
     );
 
+    if (typeof this.#terminalConn.onProcessExited === "function") {
+      this.#unsubscribers.push(
+        this.#terminalConn.onProcessExited((event) => {
+          this.#handleSessionClosed(event);
+        }),
+      );
+    } else {
+      this.#unsubscribers.push(
+        this.#terminalConn.on("processExited", (event) => {
+          this.#handleSessionClosed(event);
+        }),
+      );
+      this.#unsubscribers.push(
+        this.#terminalConn.on("ptyClosed", (event) => {
+          this.#handleSessionClosed(event);
+        }),
+      );
+    }
+
+    if (this.#terminalConn.isSessionClosed?.()) {
+      this.#handleSessionClosed();
+      return;
+    }
+
     if (this.#terminalConn.isConnected()) {
       this.#callbacks?.onConnect?.();
+    }
+  }
+
+  #handleSessionClosed(event) {
+    this.#awaitingReconnectSnapshot = false;
+    this.#clearResizeTimer();
+
+    // TerminalConnection sets permanent=false for reader-death (null exit_code).
+    // not_found / numeric exit codes are permanent.
+    const isSoft = event?.permanent === false;
+
+    if (!isSoft) {
+      if (this.#sessionClosed) return;
+      this.#sessionClosed = true;
+    }
+
+    console.debug(
+      `[WebRtcPtyTransport] session closed hub=${this.#hubId} session=${this.#sessionUuid} soft=${isSoft}`,
+      event,
+    );
+    this.#onDisconnect?.();
+    this.#callbacks?.onDisconnect?.();
+    this.#callbacks?.onError?.(
+      event?.message
+        || (isSoft ? "Terminal session reconnecting…" : "Terminal session exited"),
+    );
+
+    if (isSoft) {
+      // Unbind local handlers and release so the next connect()/remount is clean.
+      this.disconnect();
+      const conn = this.#terminalConn;
+      this.#terminalConn = null;
+      conn?.release?.();
     }
   }
 

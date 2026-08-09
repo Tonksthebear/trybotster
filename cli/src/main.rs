@@ -1135,6 +1135,9 @@ fn main() -> Result<()> {
     std::panic::set_hook(Box::new(move |panic_info| {
         // Log the panic
         log::error!("PANIC: {:?}", panic_info);
+        // Session processes null stdout/stderr; flush the file logger so the
+        // panic is on disk before abort (critical for diagnosing hard deaths).
+        log::logger().flush();
 
         // Ensure terminal is cleaned up before printing panic
         let _ = disable_raw_mode();

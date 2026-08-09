@@ -147,6 +147,9 @@ impl Hub {
         if let Err(e) = self.lua.fire_json_event("session_reconnected", &data) {
             log::error!("[Session] Failed to fire session_reconnected: {e}");
         }
+
+        // Resume any client attaches that waited out the reader reconnect.
+        self.process_pending_terminal_attaches();
     }
 
     pub(super) fn handle_session_unregistered_event(&mut self, session_uuid: String) {

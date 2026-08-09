@@ -2012,11 +2012,14 @@ impl WebRtcTransportAdapter {
             TransportEgress::ProcessExited {
                 subscription_id,
                 session_uuid,
-                ..
+                exit_code,
             } => serde_json::to_vec(&serde_json::json!({
                 "type": "process_exited",
                 "subscriptionId": subscription_id,
                 "session_uuid": session_uuid,
+                // Browser soft-closes on null (reader reconnect) and hard-closes
+                // on a numeric code — omitting this made every exit look soft.
+                "exit_code": exit_code,
             }))
             .ok()
             .map(|data| WebRtcAdapterCommand::Json { data }),
@@ -2154,6 +2157,35 @@ mod tests {
             ClientWorkerMessage::SessionInput { ref session_uuid, ref data }
                 if session_uuid == "sess-1" && data == b"abc"
         ));
+    }
+
+    #[test]
+    fn egress_process_exited_includes_exit_code_for_browser_soft_hard_split() {
+        let with_code = WebRtcTransportAdapter::egress_to_command(TransportEgress::ProcessExited {
+            subscription_id: "terminal_sess-1".to_string(),
+            session_uuid: "sess-1".to_string(),
+            exit_code: Some(0),
+        })
+        .expect("process_exited command");
+        let WebRtcAdapterCommand::Json { data } = with_code else {
+            panic!("expected JSON command");
+        };
+        let value: serde_json::Value = serde_json::from_slice(&data).expect("json");
+        assert_eq!(value["type"], "process_exited");
+        assert_eq!(value["session_uuid"], "sess-1");
+        assert_eq!(value["exit_code"], 0);
+
+        let soft = WebRtcTransportAdapter::egress_to_command(TransportEgress::ProcessExited {
+            subscription_id: "terminal_sess-1".to_string(),
+            session_uuid: "sess-1".to_string(),
+            exit_code: None,
+        })
+        .expect("soft process_exited command");
+        let WebRtcAdapterCommand::Json { data } = soft else {
+            panic!("expected JSON command");
+        };
+        let value: serde_json::Value = serde_json::from_slice(&data).expect("json");
+        assert!(value["exit_code"].is_null(), "null exit_code must be present for soft close");
     }
 
     #[test]
