@@ -113,6 +113,54 @@ pub(super) fn test_terminal_stream_rejects_non_session_backed_data_plane() {
 }
 
 #[test]
+pub(super) fn test_terminal_stream_dead_session_attach_classifies_process_exited() {
+    let source = include_str!("terminal_stream.rs");
+    let subscribe_body = function_body(source, "start_session_io_terminal_subscription");
+    assert!(
+        subscribe_body.contains("session_process_is_live")
+            && subscribe_body.contains("terminal_attach_failure_kind")
+            && subscribe_body.contains("emit_terminal_attach_failure"),
+        "attach enqueue failure must classify dead vs live session process"
+    );
+    assert!(
+        source.contains("TerminalAttachFailureKind::ProcessExited")
+            && source.contains("ClientControlFrame::ProcessExited"),
+        "dead sessions must emit ProcessExited rather than not_ready thrash"
+    );
+}
+
+#[test]
+pub(super) fn test_terminal_attach_pending_only_for_missing_sessions() {
+    let attach_source = include_str!("terminal_attach.rs");
+    let clients_source = include_str!("terminal_clients.rs");
+    let create_browser = function_body(attach_source, "create_browser_terminal_subscription");
+    let process_pending = function_body(attach_source, "process_pending_terminal_attaches");
+    let create_tui = function_body(clients_source, "create_tui_terminal_subscription");
+    let create_socket = function_body(clients_source, "create_socket_terminal_subscription");
+
+    for (name, body) in [
+        ("create_browser_terminal_subscription", create_browser),
+        ("create_tui_terminal_subscription", create_tui),
+        ("create_socket_terminal_subscription", create_socket),
+    ] {
+        assert!(
+            body.contains("should_queue_pending_terminal_attach"),
+            "{name} must gate pending attach on missing HandleCache sessions only"
+        );
+    }
+    assert!(
+        process_pending.contains("should_queue_pending_terminal_attach")
+            && process_pending.contains("Dropping pending attach"),
+        "process_pending must not requeue failed attaches for registered sessions"
+    );
+    let should_queue = function_body(attach_source, "should_queue_pending_terminal_attach");
+    assert!(
+        should_queue.contains("pending_reconnects"),
+        "pending attach must allow SessionIo reader reconnect windows"
+    );
+}
+
+#[test]
 pub(super) fn test_webrtc_recovery_session_backed_snapshot_uses_session_io_mailbox() {
     let source = include_str!("terminal_snapshot.rs");
     let body = function_body(source, "dispatch_webrtc_recovery_snapshot_requests");

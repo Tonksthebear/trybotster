@@ -694,8 +694,20 @@ export class HubRoute {
     }
   }
 
+  /**
+   * Whether peer reconnect / ensureConnected may (re)subscribe this route.
+   * Terminal routes override this after process_exited so dead sessions do not
+   * re-enter the hub attach path and thrash SessionIo.
+   */
+  shouldResubscribeOnPeerConnect() {
+    return true;
+  }
+
   async #ensureSubscribed({ replay = false } = {}) {
     if (this.#idle || this.#destroyed) return;
+    if (!this.shouldResubscribeOnPeerConnect()) {
+      return;
+    }
 
     if (this.subscriptionId) {
       this.#setupSubscriptionListeners();
@@ -732,17 +744,18 @@ export class HubRoute {
       return this.#subscriptionPending;
     }
 
-    this.#subscriptionPending = bridge.send("subscribe", {
+    const subscribePromise = bridge.send("subscribe", {
       hubId: this.getHubId(),
       channel: this.channelName(),
       params: this.channelParams(),
       subscriptionId,
     }).then(() => {
-      if (
-        this.#destroyed ||
-        generation !== this.#subscriptionGeneration ||
-        this.subscriptionId !== subscriptionId
-      ) {
+      // Stale attempt: a newer generation may have reclaimed the same stable
+      // terminal_* id. Do not unsubscribe/clear listeners for the new owner.
+      if (this.#destroyed || generation !== this.#subscriptionGeneration) {
+        return;
+      }
+      if (this.subscriptionId !== subscriptionId) {
         bridge.clearSubscriptionListeners(subscriptionId);
         bridge.send("unsubscribe", { subscriptionId }).catch(() => {});
         return;
@@ -756,6 +769,9 @@ export class HubRoute {
         this.emit("connected", this);
       }
     }).catch((error) => {
+      if (generation !== this.#subscriptionGeneration) {
+        return;
+      }
       if (this.subscriptionId === subscriptionId) {
         this.#clearSubscription();
       } else {
@@ -763,9 +779,14 @@ export class HubRoute {
       }
       throw error;
     }).finally(() => {
-      this.#subscriptionPending = null;
+      // Only clear pending if this attempt still owns it (soft re-subscribe
+      // may have replaced #subscriptionPending with a newer promise).
+      if (this.#subscriptionPending === subscribePromise) {
+        this.#subscriptionPending = null;
+      }
     });
 
+    this.#subscriptionPending = subscribePromise;
     return this.#subscriptionPending;
   }
 
@@ -797,6 +818,9 @@ export class HubRoute {
 
   #clearSubscription() {
     this.#subscriptionGeneration++;
+    // Drop in-flight subscribe so reacquire after soft process_exited does not
+    // await a stale promise that unsubscribes on generation mismatch.
+    this.#subscriptionPending = null;
     const subscriptionId = this.subscriptionId;
     this.subscriptionId = null;
     this.#resolvePeerProbe(false);

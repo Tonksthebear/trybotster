@@ -42,12 +42,71 @@ export class TerminalConnection extends HubRoute {
   // Tracks whether an authoritative snapshot was already replayed before
   // onOutput() attached. If so, buffered live output is stale by definition.
   #authoritativeSnapshotSeen = false;
+  // Permanent PTY death (not_found / process_exited with an exit code).
+  // Soft process_exited (exit_code null) drops the subscription but allows a
+  // fresh re-acquire after hub reader reconnect — hard-close was bricking
+  // re-clicks while the session was still recoverable.
+  #sessionClosed = false;
+  // Soft-exit latch for this subscription generation (idempotent soft close).
+  #softExitLatched = false;
   static #EARLY_OUTPUT_MAX_BYTES = 2 * 1024 * 1024;
   static #EARLY_OUTPUT_MAX_ITEMS = 512;
 
   constructor(key, options, manager) {
     super(key, options, manager);
     this.sessionUuid = options.sessionUuid;
+  }
+
+  /** @override HubRoute — permanently dead sessions must not re-attach. */
+  shouldResubscribeOnPeerConnect() {
+    return !this.#sessionClosed;
+  }
+
+  isSessionClosed() {
+    return this.#sessionClosed;
+  }
+
+  /**
+   * @param {object} message
+   * @param {{ permanent?: boolean }} [options]
+   */
+  #markSessionClosed(message = {}, { permanent = true } = {}) {
+    if (this.#sessionClosed) return;
+    if (!permanent && this.#softExitLatched) return;
+
+    if (permanent) {
+      this.#sessionClosed = true;
+    } else {
+      this.#softExitLatched = true;
+    }
+
+    this.#earlyOutputBuffer = [];
+    this.#earlyOutputBytes = 0;
+    this.#earlyBinarySnapshot = null;
+    // Soft re-attach must not treat the previous generation's snapshot as
+    // authoritative for the next onOutput wiring.
+    this.#authoritativeSnapshotSeen = false;
+    this.emit("processExited", {
+      session_uuid: this.sessionUuid,
+      exit_code: message.exit_code ?? message.exitCode ?? null,
+      permanent,
+      ...message,
+    });
+    this.emit("ptyClosed", {
+      session_uuid: this.sessionUuid,
+      permanent,
+      ...message,
+    });
+    // Drop the terminal subscription so peer reconnect does not replay attach
+    // on a permanently dead session, and so soft-close waits for re-acquire.
+    this.notifyIdle();
+  }
+
+  static #isPermanentProcessExit(message = {}) {
+    const code = message.exit_code ?? message.exitCode;
+    // Numeric exit codes (including 0) are real process death.
+    // null/undefined means SessionIo EOF / reader death — hub may reconnect.
+    return code !== null && code !== undefined;
   }
 
   // ========== Connection overrides ==========
@@ -101,8 +160,15 @@ export class TerminalConnection extends HubRoute {
         }
         break;
 
+      case "process_exited":
+        this.#markSessionClosed(message, {
+          permanent: TerminalConnection.#isPermanentProcessExit(message),
+        });
+        break;
+
       case "pty_closed":
-        this.emit("ptyClosed", message);
+        // Explicit PTY close is always permanent from the client view.
+        this.#markSessionClosed(message, { permanent: true });
         break;
 
       case "pty_error":
@@ -114,10 +180,25 @@ export class TerminalConnection extends HubRoute {
 
       case "terminal_attach":
         this.emit("terminalAttach", message);
+        if (message.state === "not_found") {
+          this.#markSessionClosed({ ...message, reason: "not_found" }, { permanent: true });
+          break;
+        }
+        if (message.state === "reconnecting" || message.state === "pending") {
+          // Recoverable: keep the route open so re-acquire / peer reconnect
+          // can attach once SessionIo is back.
+          this.emit("error", {
+            reason: "terminal_reconnecting",
+            message: "Terminal session is reconnecting.",
+          });
+          break;
+        }
         if (message.state === "not_ready") {
+          // Do not permanent-close: not_ready is a mailbox gap / reconnect race.
+          // Permanent death is process_exited (with code) or not_found.
           this.emit("error", {
             reason: "terminal_not_ready",
-            message: "Terminal session is not ready for input yet. Reconnecting session I/O...",
+            message: "Terminal session is not ready for input yet.",
           });
         }
         break;
@@ -130,14 +211,17 @@ export class TerminalConnection extends HubRoute {
   // ========== Terminal Commands ==========
 
   sendInput(data) {
+    if (this.#sessionClosed) return Promise.resolve();
     return this.sendBinaryPty(data);
   }
 
   sendFile(data, filename) {
+    if (this.#sessionClosed) return Promise.resolve();
     return this.sendBinaryFile(data, filename);
   }
 
   sendColorProfile(colors) {
+    if (this.#sessionClosed) return Promise.resolve();
     return this.sendTelemetry("terminal_color_profile", {
       session_uuid: this.sessionUuid,
       colors,
@@ -145,6 +229,7 @@ export class TerminalConnection extends HubRoute {
   }
 
   sendFocusChanged(focused) {
+    if (this.#sessionClosed) return Promise.resolve();
     return this.sendTelemetry("focus_changed", {
       session_uuid: this.sessionUuid,
       focused,
@@ -152,6 +237,7 @@ export class TerminalConnection extends HubRoute {
   }
 
   sendResize(cols, rows) {
+    if (this.#sessionClosed) return Promise.resolve();
     // Keep local geometry in sync so requestSnapshot() sends current bounds.
     this.options.cols = cols;
     this.options.rows = rows;
@@ -159,6 +245,7 @@ export class TerminalConnection extends HubRoute {
   }
 
   requestSnapshot(size = this.options) {
+    if (this.#sessionClosed) return Promise.resolve();
     return this.sendCommand("request_snapshot", {
       session_uuid: this.sessionUuid,
       rows: size.rows,
@@ -173,10 +260,26 @@ export class TerminalConnection extends HubRoute {
   }
 
   hasSubscription() {
-    return !!this.subscriptionId;
+    return !!this.subscriptionId && !this.#sessionClosed;
+  }
+
+  onProcessExited(callback) {
+    return this.on("processExited", callback);
+  }
+
+  /** @override HubRoute — clear soft-exit latch so remount can resubscribe. */
+  async reacquire() {
+    this.#softExitLatched = false;
+    this.#authoritativeSnapshotSeen = false;
+    this.#earlyOutputBuffer = [];
+    this.#earlyOutputBytes = 0;
+    this.#earlyBinarySnapshot = null;
+    return super.reacquire();
   }
 
   destroy() {
+    this.#sessionClosed = true;
+    this.#softExitLatched = false;
     this.#earlyOutputBuffer = [];
     this.#earlyOutputBytes = 0;
     this.#earlyBinarySnapshot = null;

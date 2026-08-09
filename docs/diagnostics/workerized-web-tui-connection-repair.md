@@ -7,7 +7,7 @@ Date: 2026-05-04
 ## Intent Coverage
 
 - Browser, TUI, and socket terminal attach paths keep the workerized architecture: Hub owns attach orchestration, `ClientWorker` owns subscription/input stream state, and Session I/O remains the session data plane.
-- Missing session-I/O sender registration is now observable to operators and users. Subscribed input with no sender emits a `terminal_attach` control frame with state `not_ready`, logs the drop, increments hub metrics through `client_worker.session_io_missing`, opens the TUI's existing error mode, and emits the browser terminal connection's existing `error` event with reason `terminal_not_ready`.
+- Missing session-I/O sender registration is now observable to operators and users. Subscribed input with no sender emits a `terminal_attach` control frame with state `not_ready`, logs the drop, increments hub metrics through `client_worker.session_io_missing`, opens the TUI's existing error mode, and emits the browser terminal connection's existing `error` event with reason `terminal_not_ready`. The user-facing message must not claim reconnect is in progress; permanent session death is delivered as `ProcessExited` on the SessionIo → ClientWorker path (including hard socket EOF).
 - The fixed first-attach snapshot sleeps and the resize bounce were removed cold turkey from the WebRTC initial attach, browser refresh snapshot, and shared TUI/socket terminal runtime paths. Regression coverage prevents reintroducing `thread::sleep` or the former `125ms` delay in those functions.
 
 ## Files Changed

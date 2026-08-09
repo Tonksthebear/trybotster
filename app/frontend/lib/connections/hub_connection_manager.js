@@ -45,6 +45,14 @@ class HubConnectionManagerSingleton {
     // Check for existing connection
     let entry = this.connections.get(key);
     if (entry) {
+      // Permanently closed terminal wrappers must not be reused — re-clicking a
+      // session after process_exited would otherwise no-op forever.
+      if (typeof entry.wrapper.isSessionClosed === "function" && entry.wrapper.isSessionClosed()) {
+        this.destroy(key);
+        entry = null;
+      }
+    }
+    if (entry) {
       // Refresh wrapper options so reacquire/subscription uses latest params
       // (e.g., terminal rows/cols after layout changes).
       entry.wrapper.options = { ...entry.wrapper.options, ...options };
@@ -72,11 +80,19 @@ class HubConnectionManagerSingleton {
       // Now it should exist in connections
       entry = this.connections.get(key);
       if (entry) {
-        entry.wrapper.options = { ...entry.wrapper.options, ...options };
-        entry.refCount++;
-        return entry.wrapper;
+        // Permanent close can land between create completion and waiter resume.
+        if (
+          typeof entry.wrapper.isSessionClosed === "function"
+          && entry.wrapper.isSessionClosed()
+        ) {
+          this.destroy(key);
+        } else {
+          entry.wrapper.options = { ...entry.wrapper.options, ...options };
+          entry.refCount++;
+          return entry.wrapper;
+        }
       }
-      // Fallback: pending creation failed, try creating again
+      // Fallback: pending creation failed or closed, try creating again
     }
 
     // Create new connection

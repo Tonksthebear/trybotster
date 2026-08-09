@@ -488,13 +488,93 @@ impl SessionIoRuntime {
         }
 
         self.flush_pending();
+        // Socket EOF / read error / protocol desync without FRAME_PROCESS_EXITED
+        // is still process death on the data plane. Vault: durable process-exit
+        // frames belong on the SessionIo → ClientWorker path, not hub-only.
         if !self.saw_process_exit {
-            let _ = self.hub_event_tx.send(HubEvent::SessionProcessExited {
-                session_uuid: self.session_uuid.clone(),
-                exit_code: None,
-            });
+            self.finish_process_exit(None);
         }
         self.reader_alive.store(false, Ordering::Release);
+    }
+
+    /// Deliver process exit to subscribed client workers, drop their session I/O
+    /// senders, and notify the hub.
+    ///
+    /// Must run for both clean `FRAME_PROCESS_EXITED` and hard socket death so
+    /// clients do not keep typing into a missing SessionIo mailbox (`not_ready`
+    /// spam / "Reconnecting session I/O..." modal after permanent death).
+    ///
+    /// Also notifies attach-in-flight clients waiting on `GetInitialSnapshot`
+    /// (pending Initial deliveries are not yet in `terminal_subscriptions`).
+    fn finish_process_exit(&mut self, exit_code: Option<i32>) {
+        self.saw_process_exit = true;
+
+        let mut notified: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        let notify_worker =
+            |worker: &crate::worker::client::ClientWorkerHandle,
+             session_uuid: &str,
+             exit_code: Option<i32>,
+             notified: &mut std::collections::HashSet<String>| {
+                // Dedup by client_id: one ProcessExited per worker even if
+                // both live-subscription and pending-initial share it.
+                let key = worker.client_id.to_string();
+                if !notified.insert(key) {
+                    return;
+                }
+                let _ = worker.try_send(crate::worker::client::ClientWorkerMessage::ControlFrame(
+                    crate::worker::client::ClientControlFrame::ProcessExited {
+                        session_uuid: session_uuid.to_string(),
+                        exit_code,
+                    },
+                ));
+                let _ = worker.try_send(
+                    crate::worker::client::ClientWorkerMessage::UnregisterSessionIoSender {
+                        session_uuid: session_uuid.to_string(),
+                    },
+                );
+            };
+
+        for subscription in self.current_terminal_subscriptions() {
+            notify_worker(
+                &subscription.worker,
+                &self.session_uuid,
+                exit_code,
+                &mut notified,
+            );
+        }
+
+        if let Ok(mut pending) = self.pending_snapshot_requests.lock() {
+            while let Some(request) = pending.pop_front() {
+                match request {
+                    PendingSnapshotRequest::Initial { delivery } => {
+                        notify_worker(
+                            &delivery.worker,
+                            &self.session_uuid,
+                            exit_code,
+                            &mut notified,
+                        );
+                    }
+                    PendingSnapshotRequest::Hub { request_id } => {
+                        // Drop hub-correlated snapshots; process is gone.
+                        log::debug!(
+                            "[session-io] dropping pending hub snapshot {request_id} on process exit"
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Ok(mut subscriptions) = self.terminal_subscriptions.lock() {
+            subscriptions.clear();
+        }
+        self.terminal_filter_buffers.clear();
+
+        let _ = self.hub_event_tx.send(HubEvent::SessionProcessExited {
+            session_uuid: self.session_uuid.clone(),
+            exit_code,
+        });
+        log::info!("[session-io] process exited (code={exit_code:?})");
     }
 
     fn handle_frame(&mut self, frame: Frame) -> bool {
@@ -552,18 +632,8 @@ impl SessionIoRuntime {
                     .ok()
                     .and_then(|v| v["exit_code"].as_i64())
                     .map(|c| c as i32);
-                self.saw_process_exit = true;
-                self.deliver_terminal_control(
-                    crate::worker::client::ClientControlFrame::ProcessExited {
-                        session_uuid: self.session_uuid.clone(),
-                        exit_code,
-                    },
-                );
-                let _ = self.hub_event_tx.send(HubEvent::SessionProcessExited {
-                    session_uuid: self.session_uuid.clone(),
-                    exit_code,
-                });
-                log::info!("[session-io] process exited (code={exit_code:?})");
+                // Shared death path: client fan-out + sender unregister + hub event.
+                self.finish_process_exit(exit_code);
             }
             FRAME_SNAPSHOT => {
                 self.flush_pending();
@@ -2632,6 +2702,241 @@ mod tests {
         match event {
             HubEvent::SessionProcessExited { exit_code, .. } => assert_eq!(exit_code, None),
             other => panic!("expected disconnect exit, got {other:?}"),
+        }
+    }
+
+    /// Attach-in-flight (pending Initial snapshot) must also receive death so
+    /// clients do not thrash not_ready after EOF before snapshot delivery.
+    #[test]
+    fn eof_notifies_pending_initial_snapshot_clients() {
+        let (writer, reader) = UnixStream::pair().expect("unix pair");
+        let (request_tx, _event_rx, _response_rx, mut hub_rx, alive) =
+            spawn_test_worker_with_requests(reader);
+        let (client_tx, mut client_rx) =
+            tokio_mpsc::channel::<crate::worker::client::ClientWorkerMessage>(8);
+        let worker = crate::worker::client::ClientWorkerHandle {
+            client_id: crate::client::ClientId::Socket("pending-client".to_string()),
+            tx: client_tx,
+        };
+
+        block_on_with_timeout(async {
+            request_tx
+                .send(SessionIoRequest::GetInitialSnapshot {
+                    delivery: crate::worker::session_io::TerminalInitialSnapshotDelivery {
+                        request_id: "pending-initial".to_string(),
+                        subscription_key: "pending-client:sess-test-io".to_string(),
+                        session_uuid: "sess-test-io".to_string(),
+                        subscription_id: "terminal_sess-test-io".to_string(),
+                        worker: worker.clone(),
+                        rows: 24,
+                        cols: 80,
+                        kitty_enabled: false,
+                        mode: None,
+                        payload_mode: crate::worker::session_io::TerminalSnapshotPayloadMode::Raw,
+                        confirm_subscription: false,
+                        live_subscription: Some(TerminalOutputSubscription {
+                            subscription_key: "pending-client:sess-test-io".to_string(),
+                            subscription_id: "terminal_sess-test-io".to_string(),
+                            worker,
+                            output_prefix: Vec::new(),
+                            filter: crate::worker::session_io::TerminalOutputFilter::None,
+                        }),
+                        attach_requested_at: None,
+                        client_worker_subscribed_at: None,
+                        session_io_snapshot_queued_at: None,
+                        session_io_accepted_at: None,
+                    },
+                })
+                .await
+                .expect("queue initial snapshot");
+        });
+        std::thread::sleep(Duration::from_millis(30));
+        drop(writer);
+
+        for _ in 0..50 {
+            if !alive.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut saw_process_exited = false;
+        let mut saw_unregister = false;
+        while let Ok(message) = client_rx.try_recv() {
+            match message {
+                crate::worker::client::ClientWorkerMessage::ControlFrame(
+                    crate::worker::client::ClientControlFrame::ProcessExited {
+                        session_uuid,
+                        exit_code: None,
+                    },
+                ) if session_uuid == "sess-test-io" => {
+                    saw_process_exited = true;
+                }
+                crate::worker::client::ClientWorkerMessage::UnregisterSessionIoSender {
+                    session_uuid,
+                } if session_uuid == "sess-test-io" => {
+                    saw_unregister = true;
+                }
+                other => panic!("unexpected client message after pending-initial EOF: {other:?}"),
+            }
+        }
+        assert!(
+            saw_process_exited,
+            "pending Initial attach must receive ProcessExited on EOF"
+        );
+        assert!(
+            saw_unregister,
+            "pending Initial attach must unregister SessionIo sender on EOF"
+        );
+        match hub_rx.try_recv().expect("hub exit") {
+            HubEvent::SessionProcessExited { exit_code, .. } => assert_eq!(exit_code, None),
+            other => panic!("expected disconnect exit, got {other:?}"),
+        }
+    }
+
+    /// Hard socket death must notify terminal client workers so they stop input
+    /// and do not thrash on `not_ready` after reconnect has already aborted.
+    #[test]
+    fn eof_without_process_exit_notifies_terminal_subscribers() {
+        let (writer, reader) = UnixStream::pair().expect("unix pair");
+        let (request_tx, _event_rx, _response_rx, mut hub_rx, alive) =
+            spawn_test_worker_with_requests(reader);
+        let (client_tx, mut client_rx) =
+            tokio_mpsc::channel::<crate::worker::client::ClientWorkerMessage>(8);
+
+        block_on_with_timeout(async {
+            request_tx
+                .send(SessionIoRequest::SubscribeTerminal {
+                    subscription: TerminalOutputSubscription {
+                        subscription_key: "client:sess-test-io".to_string(),
+                        subscription_id: "terminal_sess-test-io".to_string(),
+                        worker: crate::worker::client::ClientWorkerHandle {
+                            client_id: crate::client::ClientId::Socket("client".to_string()),
+                            tx: client_tx,
+                        },
+                        output_prefix: Vec::new(),
+                        filter: crate::worker::session_io::TerminalOutputFilter::None,
+                    },
+                })
+                .await
+                .expect("subscribe terminal");
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        drop(writer);
+
+        for _ in 0..50 {
+            if !alive.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut saw_process_exited = false;
+        let mut saw_unregister = false;
+        while let Ok(message) = client_rx.try_recv() {
+            match message {
+                crate::worker::client::ClientWorkerMessage::ControlFrame(
+                    crate::worker::client::ClientControlFrame::ProcessExited {
+                        session_uuid,
+                        exit_code: None,
+                    },
+                ) if session_uuid == "sess-test-io" => {
+                    saw_process_exited = true;
+                }
+                crate::worker::client::ClientWorkerMessage::UnregisterSessionIoSender {
+                    session_uuid,
+                } if session_uuid == "sess-test-io" => {
+                    saw_unregister = true;
+                }
+                other => panic!("unexpected client worker message after EOF: {other:?}"),
+            }
+        }
+        assert!(
+            saw_process_exited,
+            "EOF must deliver ProcessExited to terminal subscribers"
+        );
+        assert!(
+            saw_unregister,
+            "EOF must unregister SessionIo senders on terminal subscribers"
+        );
+
+        let event = hub_rx.try_recv().expect("disconnect exit");
+        match event {
+            HubEvent::SessionProcessExited { exit_code, .. } => assert_eq!(exit_code, None),
+            other => panic!("expected disconnect exit, got {other:?}"),
+        }
+    }
+
+    /// Clean FRAME_PROCESS_EXITED must also unregister session I/O senders so
+    /// post-exit keystrokes do not emit not_ready against a closed mailbox.
+    #[test]
+    fn process_exited_frame_unregisters_terminal_session_io_senders() {
+        let (mut writer, reader) = UnixStream::pair().expect("unix pair");
+        let (request_tx, _event_rx, _response_rx, mut hub_rx, alive) =
+            spawn_test_worker_with_requests(reader);
+        let (client_tx, mut client_rx) =
+            tokio_mpsc::channel::<crate::worker::client::ClientWorkerMessage>(8);
+
+        block_on_with_timeout(async {
+            request_tx
+                .send(SessionIoRequest::SubscribeTerminal {
+                    subscription: TerminalOutputSubscription {
+                        subscription_key: "client:sess-test-io".to_string(),
+                        subscription_id: "terminal_sess-test-io".to_string(),
+                        worker: crate::worker::client::ClientWorkerHandle {
+                            client_id: crate::client::ClientId::Socket("client".to_string()),
+                            tx: client_tx,
+                        },
+                        output_prefix: Vec::new(),
+                        filter: crate::worker::session_io::TerminalOutputFilter::None,
+                    },
+                })
+                .await
+                .expect("subscribe terminal");
+        });
+        std::thread::sleep(Duration::from_millis(20));
+
+        let frame = encode_json(FRAME_PROCESS_EXITED, &serde_json::json!({ "exit_code": 0 }))
+            .expect("encode exit frame");
+        writer.write_all(&frame).expect("write exit frame");
+        writer.shutdown(Shutdown::Both).expect("shutdown writer");
+
+        for _ in 0..50 {
+            if !alive.load(Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let mut saw_process_exited = false;
+        let mut saw_unregister = false;
+        while let Ok(message) = client_rx.try_recv() {
+            match message {
+                crate::worker::client::ClientWorkerMessage::ControlFrame(
+                    crate::worker::client::ClientControlFrame::ProcessExited {
+                        session_uuid,
+                        exit_code: Some(0),
+                    },
+                ) if session_uuid == "sess-test-io" => {
+                    saw_process_exited = true;
+                }
+                crate::worker::client::ClientWorkerMessage::UnregisterSessionIoSender {
+                    session_uuid,
+                } if session_uuid == "sess-test-io" => {
+                    saw_unregister = true;
+                }
+                other => panic!("unexpected client worker message after process exit: {other:?}"),
+            }
+        }
+        assert!(saw_process_exited, "clean exit must deliver ProcessExited");
+        assert!(
+            saw_unregister,
+            "clean exit must unregister SessionIo senders"
+        );
+
+        match recv_hub_event(&mut hub_rx) {
+            HubEvent::SessionProcessExited { exit_code, .. } => assert_eq!(exit_code, Some(0)),
+            other => panic!("expected process exit, got {other:?}"),
         }
     }
 

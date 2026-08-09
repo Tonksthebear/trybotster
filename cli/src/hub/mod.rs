@@ -117,6 +117,12 @@ impl PendingTerminalAttachRequest {
 /// Created when a client subscribes to a terminal session before the session
 /// is present in `HandleCache`. The Hub retries attach until either the session
 /// appears (`attached`) or the intent expires (`not_found`).
+///
+/// Pending is **not** a thrash retry for dead SessionIo zombies. When the
+/// session is registered, not reconnecting, and attach fails (dead process →
+/// `ProcessExited`), the failure is emitted once and the intent is dropped.
+/// Missing sessions and in-flight SessionIo reader reconnects may stay pending
+/// until attach succeeds or the intent expires (`not_found`).
 #[derive(Debug, Clone)]
 pub(crate) struct PendingTerminalAttach {
     /// Original terminal subscription request.

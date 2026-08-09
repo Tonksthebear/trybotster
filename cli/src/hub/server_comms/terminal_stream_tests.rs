@@ -1084,3 +1084,92 @@ pub(super) fn test_socket_shared_runtime_batches_outputs_but_filters_osc_queries
             "socket filtering must preserve per-output-chunk boundaries while stripping split OSC queries"
         );
 }
+
+#[test]
+pub(super) fn test_terminal_attach_failure_kind_classifies_dead_vs_live() {
+    use super::terminal_stream::TerminalAttachFailureKind;
+    use crate::hub::Hub;
+    use crate::session::connection::SessionIoRequestEnqueueError as E;
+
+    assert_eq!(
+        Hub::terminal_attach_failure_kind(
+            false,
+            false,
+            Some(E::ConnectionMissing),
+            Some(E::ConnectionMissing)
+        ),
+        TerminalAttachFailureKind::ProcessExited,
+        "dead process with connection missing must not surface as transient not_ready"
+    );
+    assert_eq!(
+        Hub::terminal_attach_failure_kind(
+            true,
+            false,
+            Some(E::ConnectionMissing),
+            Some(E::ConnectionMissing)
+        ),
+        TerminalAttachFailureKind::NotReady,
+        "live process with missing mailbox remains not_ready"
+    );
+    assert_eq!(
+        Hub::terminal_attach_failure_kind(
+            false,
+            true,
+            Some(E::ConnectionMissing),
+            Some(E::ConnectionMissing)
+        ),
+        TerminalAttachFailureKind::Reconnecting,
+        "hub reader reconnect must not permanent-close the client attach"
+    );
+    assert_eq!(
+        Hub::terminal_attach_failure_kind(false, false, Some(E::MailboxFull), None),
+        TerminalAttachFailureKind::NotReady,
+        "mailbox full is transient even if process liveness is false"
+    );
+    assert_eq!(
+        Hub::terminal_attach_failure_kind(
+            false,
+            false,
+            Some(E::ReaderMissing),
+            Some(E::ReaderMissing)
+        ),
+        TerminalAttachFailureKind::NotReady,
+        "reader not installed yet is a race, not permanent death"
+    );
+}
+
+#[test]
+pub(super) fn test_emit_terminal_attach_failure_process_exited_unregisters_sender() {
+    use super::terminal_stream::TerminalAttachFailureKind;
+    use crate::client::ClientId;
+    use crate::hub::Hub;
+    use crate::worker::client::{ClientControlFrame, ClientWorkerHandle, ClientWorkerMessage};
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let worker = ClientWorkerHandle {
+        client_id: ClientId::Socket("dead-attach".to_string()),
+        tx,
+    };
+
+    Hub::emit_terminal_attach_failure(
+        &worker,
+        "terminal_sess-dead",
+        "sess-dead",
+        TerminalAttachFailureKind::ProcessExited,
+    );
+
+    let first = rx.try_recv().expect("ProcessExited control frame");
+    assert!(matches!(
+        first,
+        ClientWorkerMessage::ControlFrame(ClientControlFrame::ProcessExited {
+            session_uuid,
+            exit_code: None,
+        }) if session_uuid == "sess-dead"
+    ));
+    let second = rx.try_recv().expect("UnregisterSessionIoSender");
+    assert!(matches!(
+        second,
+        ClientWorkerMessage::UnregisterSessionIoSender { session_uuid }
+            if session_uuid == "sess-dead"
+    ));
+}

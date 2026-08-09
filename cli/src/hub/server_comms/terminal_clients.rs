@@ -14,6 +14,20 @@ impl Hub {
             return;
         }
 
+        // Pending is for missing sessions or SessionIo reader reconnect.
+        if !self.should_queue_pending_terminal_attach(&req.session_uuid) {
+            log::debug!(
+                "[TUI] Not pending terminal attach for {} — session present but attach failed",
+                subscription_key
+            );
+            return;
+        }
+
+        let attach_state = if self.is_session_reconnect_pending(&req.session_uuid) {
+            "reconnecting"
+        } else {
+            "pending"
+        };
         if let Some(output_tx) = self.tui_output_tx.clone() {
             let _guard = self.tokio_runtime.enter();
             let worker = self.spawn_tui_control_worker_adapter(output_tx);
@@ -21,7 +35,7 @@ impl Hub {
                 &worker,
                 &req.subscription_id,
                 &req.session_uuid,
-                "pending",
+                attach_state,
             );
             self.terminal_client_workers
                 .insert(subscription_key.clone(), worker);
@@ -100,6 +114,20 @@ impl Hub {
             return;
         }
 
+        // Pending is for missing sessions or SessionIo reader reconnect.
+        if !self.should_queue_pending_terminal_attach(&req.session_uuid) {
+            log::debug!(
+                "[Socket] Not pending terminal attach for {} — session present but attach failed",
+                subscription_key
+            );
+            return;
+        }
+
+        let attach_state = if self.is_session_reconnect_pending(&req.session_uuid) {
+            "reconnecting"
+        } else {
+            "pending"
+        };
         if let Some(frame_tx) = self
             .socket_clients
             .get(&req.client_id)
@@ -111,7 +139,7 @@ impl Hub {
                 &worker,
                 &req.subscription_id,
                 &req.session_uuid,
-                "pending",
+                attach_state,
             );
             self.terminal_client_workers
                 .insert(subscription_key.clone(), worker);
