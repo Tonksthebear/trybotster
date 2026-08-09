@@ -785,6 +785,30 @@ mod tests {
         );
     }
 
+
+    /// Production dump: print → cursorSetHyperlink → increaseCapacity SEGV before pin.
+    #[test]
+    fn botster_vt_hyperlink_map_fixture_does_not_sigsegv() {
+        use std::process::Command;
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/vt_crash_hyperlink_map");
+        assert!(fixture.join("x.vtring").is_file(), "missing {}", fixture.display());
+        let bin = resolve_botster_bin_for_vt_replay();
+        assert!(bin.is_file(), "missing bin {}", bin.display());
+        let status = Command::new(&bin)
+            .args(["debug","vt-replay","--quiet","--rows","70","--cols","226"])
+            .arg(&fixture)
+            .status()
+            .expect("spawn");
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(sig) = status.signal() {
+                panic!("vt-replay died on signal {sig}");
+            }
+        }
+        assert!(status.success(), "got {status:?}");
+    }
+
 fn resolve_botster_bin_for_vt_replay() -> PathBuf {
         if let Some(p) = option_env!("CARGO_BIN_EXE_botster") {
             return PathBuf::from(p);
