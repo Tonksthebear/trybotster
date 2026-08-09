@@ -483,6 +483,47 @@ enum DebugCommands {
         #[arg(long)]
         hub: Option<String>,
     },
+    /// Replay a captured VT crash fixture through Ghostty (offline SIGSEGV repro).
+    ///
+    /// Pass a crash dump directory (contains `*.vtlast` / `*.vtring`) or a
+    /// single `.vtlast` file. Progress is printed to stderr before each
+    /// `process()` call so a native crash leaves a clear last line.
+    ///
+    /// Snapshot modes (`--snapshot`):
+    ///   none       pure VT (session death path; known SEGV on full ring)
+    ///   export     export GHOSTSNP after ring (session attach side effect)
+    ///   roundtrip  export+import in-place after ring, then last
+    ///   client     ring on A → export → import B → last on B (browser shape)
+    ///   after-chunks=N  roundtrip after N ring chunks
+    ///
+    /// Examples:
+    ///   botster debug vt-replay --rows 70 --cols 226 /tmp/botster-vt-min-repro/dir
+    ///   botster debug vt-replay --snapshot client --bootstrap-resize /tmp/botster-vt-min-repro/dir
+    VtReplay {
+        /// Crash dump directory, `.vtlast` file, or raw VT blob.
+        path: std::path::PathBuf,
+        /// Terminal rows (default 70 — matches recent browser attach paint).
+        #[arg(long, default_value_t = 70)]
+        rows: u16,
+        /// Terminal cols (default 226 — matches recent browser attach).
+        #[arg(long, default_value_t = 226)]
+        cols: u16,
+        /// Skip the rolling ring; feed only `.vtlast`.
+        #[arg(long)]
+        last_only: bool,
+        /// Disable mode_get polling after each write.
+        #[arg(long)]
+        no_mode_poll: bool,
+        /// Quiet stderr progress (not recommended for crash hunting).
+        #[arg(long)]
+        quiet: bool,
+        /// Snapshot phase: none|export|roundtrip|client|after-chunks=N
+        #[arg(long, default_value = "none")]
+        snapshot: String,
+        /// Start 24×80 then resize to target (spawn → attach shape).
+        #[arg(long)]
+        bootstrap_resize: bool,
+    },
 }
 
 /// Raise the process file descriptor limit to accommodate WebRTC connections.
@@ -818,6 +859,68 @@ fn run_attach() -> Result<()> {
 
     // pipe fds closed automatically by WakePipe drop
 
+    Ok(())
+}
+
+/// Offline Ghostty VT replay for crash fixtures (see `session::vt_replay`).
+fn run_debug_vt_replay(
+    path: &std::path::Path,
+    rows: u16,
+    cols: u16,
+    last_only: bool,
+    mode_poll: bool,
+    verbose: bool,
+    snapshot: &str,
+    bootstrap_resize: bool,
+) -> Result<()> {
+    use botster::session::{
+        parse_snapshot_phase, resolve_fixture_paths, run_vt_replay, VtReplayConfig,
+    };
+
+    let snapshot_phase = parse_snapshot_phase(snapshot)?;
+    let (ring_path, last_path) = resolve_fixture_paths(path)?;
+    if verbose {
+        eprintln!(
+            "vt-replay: input={} ring={:?} last={:?} rows={} cols={} last_only={} mode_poll={} snapshot={:?} bootstrap_resize={}",
+            path.display(),
+            ring_path,
+            last_path,
+            rows,
+            cols,
+            last_only,
+            mode_poll,
+            snapshot_phase,
+            bootstrap_resize
+        );
+    }
+    let report = run_vt_replay(&VtReplayConfig {
+        rows,
+        cols,
+        ring_path,
+        last_path,
+        mode_poll,
+        verbose,
+        last_only,
+        snapshot: snapshot_phase,
+        bootstrap_resize,
+    })?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "ok": true,
+            "process_calls": report.process_calls,
+            "ring_bytes": report.ring_bytes,
+            "ring_chunks": report.ring_chunks,
+            "last_bytes": report.last_bytes,
+            "mode_polls": report.mode_polls,
+            "snapshot_exports": report.snapshot_exports,
+            "snapshot_imports": report.snapshot_imports,
+            "last_snapshot_bytes": report.last_snapshot_bytes,
+            "snapshot_phase": report.snapshot_phase,
+            "rows": report.rows,
+            "cols": report.cols,
+        })
+    );
     Ok(())
 }
 
@@ -1289,6 +1392,27 @@ fn main() -> Result<()> {
         Commands::Debug { command } => match command {
             DebugCommands::Memory { hub } => {
                 run_debug_memory(hub.as_deref())?;
+            }
+            DebugCommands::VtReplay {
+                path,
+                rows,
+                cols,
+                last_only,
+                no_mode_poll,
+                quiet,
+                snapshot,
+                bootstrap_resize,
+            } => {
+                run_debug_vt_replay(
+                    &path,
+                    rows,
+                    cols,
+                    last_only,
+                    !no_mode_poll,
+                    !quiet,
+                    &snapshot,
+                    bootstrap_resize,
+                )?;
             }
         },
         Commands::Session {

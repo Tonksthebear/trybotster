@@ -33,9 +33,21 @@
 //! - No multiplexing (one socket, one session)
 
 pub mod connection;
+pub mod process_watch;
 pub mod protocol;
+pub mod vt_crash_dump;
+pub mod vt_replay;
 #[cfg(test)]
 mod tests;
+
+pub use process_watch::{SessionProcessRegistry, SessionReapStatus};
+pub use vt_crash_dump::{
+    signal_warrants_vt_dump, summarize_vt_crash_artifacts, VtCrashArtifactSummary, VtCrashDumper,
+};
+pub use vt_replay::{
+    parse_snapshot_phase, resolve_fixture_paths, run_vt_replay, SnapshotPhase, VtReplayConfig,
+    VtReplayReport,
+};
 
 use std::io::{self, Read, Write};
 use std::os::unix::io::{FromRawFd, RawFd};
@@ -621,10 +633,12 @@ fn run_session(
     let (output_tx, output_rx) = std::sync::mpsc::sync_channel::<SessionOutput>(256);
     let output_tx_child = output_tx.clone();
     let mode_poll = callback_flags.mode_poll;
+    let reader_uuid = session_uuid.to_string();
     let _reader_thread = thread::Builder::new()
         .name("session-reader".to_string())
         .spawn(move || {
             reader_loop(
+                reader_uuid,
                 master_fd,
                 parser_for_reader,
                 last_output_reader,
@@ -642,6 +656,7 @@ fn run_session(
 
     // Child-waiter thread: waits for child exit, sends FRAME_PROCESS_EXITED
     let shutdown_for_child = Arc::clone(&shutdown);
+    let child_uuid = session_uuid.to_string();
     let _child_thread = thread::Builder::new()
         .name("session-child-waiter".to_string())
         .spawn(move || {
@@ -654,6 +669,7 @@ fn run_session(
                 }
             };
             log::info!("[session] child exited (code={:?})", exit_code);
+            write_session_progress(&child_uuid, &format!("child_exited code={exit_code:?}"));
             flush_session_logs();
             // Latch before shutdown so the main loop can emit FRAME_PROCESS_EXITED
             // even if the sync channel is full of PTY output (try_send would drop).
@@ -842,6 +858,7 @@ fn run_session(
             Ok(n) => {
                 for frame in hub_decoder.feed(&read_buf[..n]) {
                     handle_hub_frame(
+                        session_uuid,
                         &frame,
                         &writer_tx,
                         &parser,
@@ -892,6 +909,15 @@ fn run_session(
         exit_reason,
         socket_existed,
         child_pid
+    );
+    write_session_progress(
+        session_uuid,
+        &format!(
+            "exiting reason={} last_hub_frame=0x{:02x} last_signal={}",
+            exit_reason,
+            LAST_HUB_FRAME_TYPE.load(Ordering::SeqCst),
+            LAST_SIGNAL.load(Ordering::SeqCst)
+        ),
     );
     log_session_death_breadcrumb(exit_reason);
     Ok(())
@@ -946,6 +972,7 @@ fn read_spawn_config(stream: &mut UnixStream, decoder: &mut FrameDecoder) -> Res
 
 /// Handle a single frame from the Hub.
 fn handle_hub_frame(
+    session_uuid: &str,
     frame: &Frame,
     writer_tx: &std::sync::mpsc::SyncSender<PtyWriteCommand>,
     parser: &Arc<Mutex<TerminalParser>>,
@@ -956,6 +983,17 @@ fn handle_hub_frame(
     shutdown: &AtomicBool,
 ) {
     LAST_HUB_FRAME_TYPE.store(frame.frame_type, Ordering::SeqCst);
+    // Control frames only — pty_input is too frequent for disk breadcrumbs.
+    if frame.frame_type != FRAME_PTY_INPUT {
+        write_session_progress(
+            session_uuid,
+            &format!(
+                "hub_frame=0x{:02x}({})",
+                frame.frame_type,
+                frame_type_name(frame.frame_type)
+            ),
+        );
+    }
     match frame.frame_type {
         FRAME_PTY_INPUT => {
             let probe_descriptions =
@@ -1001,6 +1039,7 @@ fn handle_hub_frame(
 
         FRAME_GET_SNAPSHOT => {
             // Single-call terminal snapshot: one opaque blob with everything.
+            write_session_progress(session_uuid, "before_snapshot_export");
             let snapshot = parser
                 .lock()
                 .map(|p| {
@@ -1021,6 +1060,10 @@ fn handle_hub_frame(
                     snapshot
                 })
                 .unwrap_or_default();
+            write_session_progress(
+                session_uuid,
+                &format!("after_snapshot_export bytes={}", snapshot.len()),
+            );
             let response = encode_frame(FRAME_SNAPSHOT, &snapshot);
             let _ = stream.write_all(&response);
         }
@@ -1047,7 +1090,12 @@ fn handle_hub_frame(
                         profile.colors.len(),
                         bg
                     );
+                    write_session_progress(
+                        session_uuid,
+                        &format!("before_color_profile colors={}", profile.colors.len()),
+                    );
                     parser.apply_color_cache_map(&profile.colors);
+                    write_session_progress(session_uuid, "after_color_profile");
                 }
             }
             Err(error) => {
@@ -1189,6 +1237,7 @@ fn live_mode_flags(parser: &TerminalParser) -> ModeFlags {
 /// OPT_DESKTOP_NOTIFICATION. OSC 133 prompt marks and dedicated kitty-keyboard
 /// change callbacks are upstream losses and are not synthesized.
 fn reader_loop(
+    session_uuid: String,
     fd: RawFd,
     parser: Arc<Mutex<TerminalParser>>,
     last_output_at: Arc<AtomicU64>,
@@ -1207,6 +1256,12 @@ fn reader_loop(
         .lock()
         .map(|p| live_mode_flags(&p))
         .unwrap_or_default();
+    let mut vt_dumper = vt_crash_dump::VtCrashDumper::new(session_uuid.clone());
+    if vt_dumper.enabled() {
+        log::info!(
+            "[session] VT crash dump enabled (disable with BOTSTER_SESSION_VT_DUMP=0)"
+        );
+    }
 
     loop {
         if shutdown.load(Ordering::Relaxed) {
@@ -1216,20 +1271,25 @@ fn reader_loop(
         match file.read(&mut buf) {
             Ok(0) => {
                 log::info!("[session] PTY reader got EOF");
+                write_session_progress(&session_uuid, "pty_reader_eof");
                 shutdown.store(true, Ordering::Release);
                 break;
             }
             Err(e) => {
                 log::warn!("[session] PTY read error: {e}");
+                write_session_progress(&session_uuid, &format!("pty_reader_error={e}"));
                 shutdown.store(true, Ordering::Release);
                 break;
             }
             Ok(n) => {
                 let data = &buf[..n];
+                // Persist last chunk + ring *before* Ghostty so SIGSEGV leaves repro bytes.
+                vt_dumper.record_before_vt_write(data);
 
                 // Feed parser — remaining ghostty callbacks fire during process()
                 if let Ok(mut p) = parser.lock() {
                     p.process(data);
+                    vt_dumper.record_after_vt_write(n);
 
                     // Title changed (flag set by ghostty callback)
                     if title_changed_flag.swap(false, Ordering::Acquire) {
@@ -1259,6 +1319,7 @@ fn reader_loop(
 
                     // Mode poll path (replaces mode_changed callback)
                     if mode_poll {
+                        vt_dumper.record_before_mode_poll();
                         let after = live_mode_flags(&p);
                         if let Some(changed) = mode_changed_delta(&last_modes, &after) {
                             if let Ok(frame) = encode_json(FRAME_MODE_CHANGED, &changed) {
@@ -1414,6 +1475,37 @@ pub fn session_socket_path(session_uuid: &str) -> Result<PathBuf> {
 pub fn session_pid_path(session_uuid: &str) -> Result<PathBuf> {
     let dir = sessions_socket_dir()?;
     Ok(dir.join(format!("{session_uuid}.pid")))
+}
+
+/// Progress breadcrumb path written by the session process for hard-death diagnosis.
+///
+/// Survives unclean exits better than the line-buffered log when the last write
+/// used a full `fs::write` replace. Not a substitute for hub-side OS reaping.
+pub fn session_progress_path(session_uuid: &str) -> Result<PathBuf> {
+    let dir = sessions_socket_dir()?;
+    Ok(dir.join(format!("{session_uuid}.last")))
+}
+
+/// Write a small progress breadcrumb next to the session socket.
+///
+/// Best-effort: failures are ignored so diagnostics never break the session.
+pub fn write_session_progress(session_uuid: &str, note: &str) {
+    let Ok(path) = session_progress_path(session_uuid) else {
+        return;
+    };
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("{ts} {note}\n");
+    let _ = std::fs::write(path, line);
+}
+
+/// Read the last progress breadcrumb if present.
+#[must_use]
+pub fn read_session_progress(session_uuid: &str) -> Option<String> {
+    let path = session_progress_path(session_uuid).ok()?;
+    std::fs::read_to_string(path).ok()
 }
 
 /// Process-owned recovery identity path for a specific session.
@@ -1580,14 +1672,44 @@ fn read_session_identity_file(session_uuid: &str) -> Result<Option<SessionIdenti
 
 fn pid_is_live(pid: u32) -> bool {
     let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    if rc == 0 {
-        return true;
+    if rc != 0 {
+        return matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(code) if code == libc::EPERM
+        );
     }
 
-    matches!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(code) if code == libc::EPERM
-    )
+    // kill(0) succeeds for zombies too. Zombies are not a live session
+    // transport — treat them as dead so soft-reconnect is not attempted.
+    !pid_is_zombie(pid)
+}
+
+/// Best-effort zombie detection so soft reconnect skips defunct PIDs.
+fn pid_is_zombie(pid: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // `ps -o state=` is reliable enough for hub policy; keep this out of
+        // the hot I/O path (only used on death classification).
+        let output = std::process::Command::new("ps")
+            .args(["-o", "state=", "-p", &pid.to_string()])
+            .output();
+        if let Ok(out) = output {
+            let state = String::from_utf8_lossy(&out.stdout);
+            return state.trim().starts_with('Z');
+        }
+        false
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let path = format!("/proc/{pid}/stat");
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            // Format: pid (comm) state ... — comm may contain spaces/parens.
+            if let Some(idx) = contents.rfind(") ") {
+                return contents[idx + 2..].starts_with('Z');
+            }
+        }
+        false
+    }
 }
 
 fn current_process_group_id() -> Option<u32> {

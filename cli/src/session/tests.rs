@@ -277,6 +277,7 @@ mod session_frame_tests {
         };
 
         handle_hub_frame(
+            "sess-test-color-profile",
             &decoded,
             &writer_tx,
             &parser,
@@ -336,6 +337,7 @@ mod session_frame_tests {
         };
 
         handle_hub_frame(
+            "sess-test-resize",
             &decoded,
             &writer_tx,
             &parser,
@@ -356,6 +358,7 @@ mod session_frame_tests {
 
         *current_dims.lock().expect("dims") = (37, 132);
         handle_hub_frame(
+            "sess-test-resize",
             &decoded,
             &writer_tx,
             &parser,
