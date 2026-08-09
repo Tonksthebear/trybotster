@@ -736,7 +736,56 @@ mod tests {
         );
     }
 
-    fn resolve_botster_bin_for_vt_replay() -> PathBuf {
+    
+    /// Unique truecolor SGR pressure used to SIGSEGV in manualStyleUpdate →
+    /// increaseCapacity(.styles). GREEN after silent style degrade pin.
+    #[test]
+    fn botster_vt_style_pressure_fixture_does_not_sigsegv() {
+        use std::process::Command;
+
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/vt_style_pressure");
+        assert!(
+            fixture.join("x.vtring").is_file(),
+            "missing style pressure fixture at {}",
+            fixture.display()
+        );
+
+        let bin = resolve_botster_bin_for_vt_replay();
+        assert!(
+            bin.is_file(),
+            "botster binary not found at {} — run `cargo build` in cli/ first",
+            bin.display()
+        );
+
+        let status = Command::new(&bin)
+            .args([
+                "debug",
+                "vt-replay",
+                "--quiet",
+                "--rows",
+                "70",
+                "--cols",
+                "226",
+            ])
+            .arg(&fixture)
+            .status()
+            .unwrap_or_else(|e| panic!("spawn {} debug vt-replay: {e}", bin.display()));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(sig) = status.signal() {
+                panic!("vt-replay died on signal {sig} (SEGV would be 11)");
+            }
+        }
+        assert!(
+            status.success(),
+            "vt-replay must exit 0 on style pressure fixture, got {status:?} (bin={})",
+            bin.display()
+        );
+    }
+
+fn resolve_botster_bin_for_vt_replay() -> PathBuf {
         if let Some(p) = option_env!("CARGO_BIN_EXE_botster") {
             return PathBuf::from(p);
         }
