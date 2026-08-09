@@ -16,18 +16,26 @@ impl Hub {
                     "[Session] Live session transport gone for '{}', aborting reconnect",
                     &session_uuid[..session_uuid.len().min(16)]
                 );
-                // Socket gone — session truly dead. Clean up and fire deferred exit.
-                self.pending_reconnects.remove(&session_uuid);
-                if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
-                    session_handle.pty().notify_process_exited(None);
+                // Socket/process gone — session truly dead. Reap if tracked and
+                // fire deferred permanent exit with any OS status we can get.
+                let mut exit_code = None;
+                let mut signal = None;
+                if let Some(status) = self
+                    .handle_cache
+                    .try_reap_session_process(&session_uuid)
+                    .or_else(|| self.handle_cache.wait_reap_session_process(&session_uuid))
+                {
+                    log::info!(
+                        "[Session] Reaped session process on reconnect abort: {}",
+                        status.summary()
+                    );
+                    exit_code = status.effective_exit_code();
+                    signal = status.signal;
                 }
-                let data = serde_json::json!({
-                    "session_uuid": session_uuid,
-                    "exit_code": null,
-                });
-                if let Err(e) = self.lua.fire_json_event("session_process_exited", &data) {
-                    log::error!("[Session] Failed to fire deferred session_process_exited: {e}");
-                }
+                let progress = crate::session::read_session_progress(&session_uuid);
+                let vt_artifacts = crate::session::summarize_vt_crash_artifacts(&session_uuid);
+                Self::log_vt_crash_artifacts(&session_uuid, signal, &vt_artifacts);
+                self.finalize_session_process_exit(session_uuid, exit_code, signal, progress);
                 return;
             }
         };

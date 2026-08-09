@@ -12,13 +12,56 @@ impl Hub {
             exit_code
         );
 
+        // Enrich bare socket-EOF deaths with OS wait status when this hub
+        // still owns the Child. Also skip soft-reconnect when the session
+        // process is already gone (zombie / missing identity).
+        let mut exit_code = exit_code;
+        let mut signal: Option<i32> = None;
+        let progress = crate::session::read_session_progress(&session_uuid);
+        // Snapshot VT crash files early — cleanup paths must not race us later.
+        let vt_artifacts = crate::session::summarize_vt_crash_artifacts(&session_uuid);
+
         if exit_code.is_none() {
-            if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
+            if let Some(status) = self.handle_cache.try_reap_session_process(&session_uuid) {
+                log::info!(
+                    "[Session] Reaped session process after EOF: {}",
+                    status.summary()
+                );
+                signal = status.signal;
+                exit_code = status.effective_exit_code();
+            } else if !crate::session::session_process_is_live(&session_uuid) {
+                // Process identity is dead (or socket gone). Blocking wait is
+                // safe for tracked children; recovered sessions yield None.
+                if let Some(status) = self.handle_cache.wait_reap_session_process(&session_uuid) {
+                    log::info!(
+                        "[Session] Wait-reaped dead session process: {}",
+                        status.summary()
+                    );
+                    signal = status.signal;
+                    exit_code = status.effective_exit_code();
+                } else {
+                    log::warn!(
+                        "[Session] Session process not live and not tracked for '{}'; permanent exit (exit=None)",
+                        &session_uuid[..session_uuid.len().min(16)]
+                    );
+                }
+                if let Some(ref breadcrumb) = progress {
+                    log::info!(
+                        "[Session] Last session progress breadcrumb for '{}': {}",
+                        &session_uuid[..session_uuid.len().min(16)],
+                        breadcrumb.trim()
+                    );
+                }
+                Self::log_vt_crash_artifacts(&session_uuid, signal, &vt_artifacts);
+                // Permanent death — do not soft-reconnect a corpse.
+                self.finalize_session_process_exit(session_uuid, exit_code, signal, progress);
+                return;
+            } else if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
                 let pty = session_handle.pty();
                 if pty.is_session_backed() {
                     let cleared = pty.clear_session_connection();
                     log::info!(
-                        "[Session] Reader died for '{}', cleared old connection={}, initiating reconnect",
+                        "[Session] Reader died for '{}', process still live, cleared old connection={}, initiating reconnect",
                         &session_uuid[..session_uuid.len().min(16)],
                         cleared
                     );
@@ -40,17 +83,109 @@ impl Hub {
                     return;
                 }
             }
+        } else {
+            // Clean FRAME_PROCESS_EXITED path: still reap to clear the watch.
+            if let Some(status) = self
+                .handle_cache
+                .try_reap_session_process(&session_uuid)
+                .or_else(|| self.handle_cache.wait_reap_session_process(&session_uuid))
+            {
+                log::debug!(
+                    "[Session] Reaped session process after clean exit frame: {}",
+                    status.summary()
+                );
+                if signal.is_none() {
+                    signal = status.signal;
+                }
+            }
         }
 
+        if let Some(ref breadcrumb) = progress {
+            log::info!(
+                "[Session] Last session progress breadcrumb for '{}': {}",
+                &session_uuid[..session_uuid.len().min(16)],
+                breadcrumb.trim()
+            );
+        }
+        Self::log_vt_crash_artifacts(&session_uuid, signal, &vt_artifacts);
+
+        self.finalize_session_process_exit(session_uuid, exit_code, signal, progress);
+    }
+
+    /// Log VT crash dump artifacts after a hard session death (SEGV/ABRT/etc.).
+    pub(super) fn log_vt_crash_artifacts(
+        session_uuid: &str,
+        signal: Option<i32>,
+        artifacts: &crate::session::VtCrashArtifactSummary,
+    ) {
+        if !crate::session::vt_crash_dump::signal_warrants_vt_dump(signal) {
+            // Still note paths on any death when meta exists — cheap and useful.
+            if artifacts.meta_body.is_none() && artifacts.last_chunk_len.is_none() {
+                return;
+            }
+        }
+        log::error!(
+            "[Session] VT crash artifacts for '{}' signal={:?} last_chunk_len={:?} ring_bytes={:?} \
+             vtlast={:?} vtmeta={:?} vtring={:?}",
+            &session_uuid[..session_uuid.len().min(16)],
+            signal,
+            artifacts.last_chunk_len,
+            artifacts.ring_bytes,
+            artifacts.vtlast_path,
+            artifacts.vtmeta_path,
+            artifacts.vtring_path
+        );
+        if let Some(ref hex) = artifacts.last_hex {
+            log::error!(
+                "[Session] VT last-chunk hex for '{}': {}",
+                &session_uuid[..session_uuid.len().min(16)],
+                hex
+            );
+        }
+        if let Some(ref meta) = artifacts.meta_body {
+            for line in meta.lines() {
+                log::error!(
+                    "[Session] VT meta '{}' {}",
+                    &session_uuid[..session_uuid.len().min(16)],
+                    line
+                );
+            }
+        }
+    }
+
+    /// Permanent session death: notify PTY subscribers and Lua.
+    pub(super) fn finalize_session_process_exit(
+        &mut self,
+        session_uuid: String,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+        progress: Option<String>,
+    ) {
+        self.pending_reconnects.remove(&session_uuid);
         self.cleanup_pending_session_io_snapshots_for_session(&session_uuid);
         self.cleanup_paste_files(&session_uuid);
         if let Some(session_handle) = self.handle_cache.get_session(&session_uuid) {
             session_handle.pty().notify_process_exited(exit_code);
         }
-        let data = serde_json::json!({
+
+        log::info!(
+            "[Session] Permanent process exit uuid='{}' exit={:?} signal={:?}",
+            session_uuid,
+            exit_code,
+            signal
+        );
+
+        let mut data = serde_json::json!({
             "session_uuid": session_uuid,
             "exit_code": exit_code,
         });
+        if let Some(sig) = signal {
+            data["signal"] = serde_json::json!(sig);
+        }
+        if let Some(progress) = progress {
+            data["progress"] = serde_json::json!(progress.trim());
+        }
+
         if let Err(e) = self.lua.fire_json_event("session_process_exited", &data) {
             log::error!("[Session] Failed to fire session_process_exited event: {e}");
         }

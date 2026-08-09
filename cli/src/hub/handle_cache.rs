@@ -30,9 +30,11 @@
 //! - HandleCache contains cloneable handles (shared across threads)
 
 use std::collections::HashMap;
+use std::process::Child;
 use std::sync::RwLock;
 
 use super::agent_handle::SessionHandle;
+use crate::session::{SessionProcessRegistry, SessionReapStatus};
 
 /// Thread-safe cache of session PTY handles and shared read-only data.
 ///
@@ -52,6 +54,7 @@ use super::agent_handle::SessionHandle;
 /// - **Session PTY handles**: Updated by Lua via `hub.register_session()` / `hub.unregister_session()`
 /// - **Worktrees**: Updated when Hub loads worktrees (menu open, session lifecycle)
 /// - **Connection URL**: Updated when Hub generates/refreshes the device key bundle
+/// - **Session OS children**: Tracked so hard deaths can be reaped for signal/exit
 #[derive(Debug, Default)]
 pub struct HandleCache {
     /// Session handles keyed by session UUID.
@@ -74,6 +77,12 @@ pub struct HandleCache {
     /// Hub updates this whenever the device key bundle changes (initialization,
     /// refresh, or show_connection_code action).
     connection_url: RwLock<Option<Result<String, String>>>,
+
+    /// OS process handles for session processes this hub spawned.
+    ///
+    /// Enables `wait`/`try_wait` on socket EOF so signal deaths are not
+    /// reported as bare `exit_code=None`.
+    session_processes: SessionProcessRegistry,
 }
 
 impl HandleCache {
@@ -85,7 +94,23 @@ impl HandleCache {
             order: RwLock::new(Vec::new()),
             worktrees: RwLock::new(Vec::new()),
             connection_url: RwLock::new(None),
+            session_processes: SessionProcessRegistry::new(),
         }
+    }
+
+    /// Track a session OS process spawned by this hub.
+    pub fn track_session_process(&self, session_uuid: impl Into<String>, child: Child) {
+        self.session_processes.track(session_uuid, child);
+    }
+
+    /// Non-blocking reap of a tracked session process.
+    pub fn try_reap_session_process(&self, session_uuid: &str) -> Option<SessionReapStatus> {
+        self.session_processes.try_reap(session_uuid)
+    }
+
+    /// Blocking wait/reap of a tracked session process.
+    pub fn wait_reap_session_process(&self, session_uuid: &str) -> Option<SessionReapStatus> {
+        self.session_processes.wait_reap(session_uuid)
     }
 
     /// Get session handle by UUID.
@@ -199,6 +224,15 @@ impl HandleCache {
         if removed {
             if let Ok(mut order) = self.order.write() {
                 order.retain(|u| u != uuid);
+            }
+            // Best-effort: clear any unreaped child watch for this UUID.
+            if let Some(status) = self.session_processes.try_reap(uuid) {
+                log::info!(
+                    "[HandleCache] reaped session process on remove: {}",
+                    status.summary()
+                );
+            } else {
+                self.session_processes.forget(uuid);
             }
         }
 

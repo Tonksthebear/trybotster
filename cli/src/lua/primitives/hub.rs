@@ -629,6 +629,7 @@ pub(crate) fn register(
     {
         let tx_spawn = hub_event_tx.clone();
         let cc_spawn = color_cache.clone();
+        let hc_spawn = handle_cache.clone();
         let spawn_session_fn = lua
             .create_function(move |_lua_ctx, (opts, session_uuid): (LuaTable, String)| {
                 use crate::session::connection::SessionConnection;
@@ -727,8 +728,12 @@ pub(crate) fn register(
                         .spawn()
                 } {
                     Ok(child) => {
+                        // Keep the Child so hard deaths can be reaped for
+                        // signal/exit status. setsid() still lets the process
+                        // survive hub restart; recovered sessions are not
+                        // tracked here (no Child) and fall back to identity.
                         ::log::info!("[Session] spawned session process (pid {})", child.id());
-                        std::mem::forget(child); // detach
+                        hc_spawn.track_session_process(session_uuid.clone(), child);
                     }
                     Err(e) => {
                         return Err(LuaError::runtime(format!(
