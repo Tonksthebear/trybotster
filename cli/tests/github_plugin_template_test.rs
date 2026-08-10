@@ -493,6 +493,7 @@ fn catalog_plugin_project_pipelines_template_catalog_entry_is_a_multi_file_plugi
             "plugins/project-pipelines/project_pipelines/mcp.lua",
             "plugins/project-pipelines/project_pipelines/notification_policy.lua",
             "plugins/project-pipelines/project_pipelines/repo.lua",
+            "plugins/project-pipelines/project_pipelines/stack_delivery.lua",
             "plugins/project-pipelines/project_pipelines/util.lua",
             "plugins/project-pipelines/project_pipelines/web/actions.lua",
             "plugins/project-pipelines/project_pipelines/web/screens/home.lua",
@@ -984,7 +985,7 @@ fn catalog_plugin_project_pipelines_entity_publish_snapshots_and_deltas_use_plug
         .from_value(value)
         .expect("project pipelines entities result json");
 
-    assert_eq!(result["registrations"].as_array().unwrap().len(), 18);
+    assert_eq!(result["registrations"].as_array().unwrap().len(), 19);
     assert!(result["registrations"]
         .as_array()
         .unwrap()
