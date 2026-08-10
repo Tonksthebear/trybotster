@@ -1081,6 +1081,249 @@ function M.delete_manual_ticket_session(params, context)
     return { ticket = ticket, session_uuid = session_uuid, removed = true, closed = session ~= nil }
 end
 
+local function shell_quote(value)
+    return "'" .. tostring(value):gsub("'", "'\\''") .. "'"
+end
+
+local function merged_ticket_location(context)
+    local merge_target = util.is_blank(context.base_branch) and "main" or tostring(context.base_branch)
+    if util.is_blank(context.merge_commit) then
+        return merge_target
+    end
+    return merge_target .. " at " .. tostring(context.merge_commit)
+end
+
+local function classify_merge_pull_status(data)
+    if data and data.success == true then
+        return "updated"
+    end
+    local combined = table.concat({
+        tostring(data and data.error or ""),
+        tostring(data and data.stdout or ""),
+        tostring(data and data.stderr or ""),
+        tostring(data and data.output or ""),
+    }, "\n")
+    if combined:find("__PROJECT_PIPELINES_PULL_CONFLICTS__", 1, true)
+        or combined:find("Automatic merge failed", 1, true)
+        or combined:find("would be overwritten by merge", 1, true)
+        or combined:find("CONFLICT (", 1, true) then
+        return "conflicted"
+    end
+    return "failed"
+end
+
+local function notify_merge_pull_result(context, data)
+    context = context or {}
+    data = data or {}
+    local pull_status = classify_merge_pull_status(data)
+    local location = merged_ticket_location(context)
+    local title = tostring(context.ticket_title or context.ticket_id or "Ticket")
+    local body
+    if pull_status == "updated" then
+        body = "Ticket “" .. title .. "” merged into " .. location
+            .. ". Your checkout was updated with git pull; existing local changes were preserved."
+    elseif pull_status == "conflicted" then
+        body = "Ticket “" .. title .. "” merged into " .. location
+            .. ", but git pull left merge conflicts in your checkout."
+    else
+        body = "Ticket “" .. title .. "” merged into " .. location
+            .. ", but git pull could not update your checkout because incoming changes conflict with existing local changes."
+        if not util.is_blank(data.error) then
+            body = body .. " Error: " .. tostring(data.error)
+        end
+    end
+
+    local delivered = false
+    if not util.is_blank(context.session_uuid) then
+        local ok = pcall(function()
+            Hub.get():notify(context.session_uuid, {
+                source = OWNER,
+                title = pull_status == "conflicted" and "Merged ticket has checkout conflicts"
+                    or (pull_status == "failed" and "Merged ticket checkout update failed" or "Pipeline ticket merged"),
+                body = body,
+                action = {
+                    kind = "ticket_merged",
+                    ticket_id = context.ticket_id,
+                    project_id = context.project_id,
+                    merge_commit = context.merge_commit,
+                    pr_url = context.pr_url,
+                    merge_summary = context.merge_summary,
+                    checkout_path = context.checkout_path,
+                    pull_status = pull_status,
+                },
+            })
+        end)
+        delivered = ok
+    end
+
+    repo.append_event("ticket.merge_source_pull_completed", {
+        run_id = context.run_id,
+        ticket_id = context.ticket_id,
+        payload = {
+            session_uuid = context.session_uuid,
+            scope = context.scope,
+            checkout_path = context.checkout_path,
+            base_branch = context.base_branch,
+            pull_status = pull_status,
+            error = data.error,
+            success = data.success == true,
+        },
+    })
+    if not util.is_blank(context.session_uuid) then
+        repo.append_event("ticket.merge_orchestrator_notified", {
+            run_id = context.run_id,
+            ticket_id = context.ticket_id,
+            payload = {
+                session_uuid = context.session_uuid,
+                scope = context.scope,
+                pull_status = pull_status,
+                delivered = delivered,
+            },
+        })
+    end
+    return { pull_status = pull_status, delivered = delivered }
+end
+
+local function merge_base_branch(run, attrs)
+    attrs = attrs or {}
+    if not util.is_blank(attrs.base_branch) then
+        return tostring(attrs.base_branch):gsub("^origin/", "")
+    end
+    if run and not util.is_blank(run.base_ref) then
+        local ref = tostring(run.base_ref):gsub("^origin/", "")
+        if not util.is_blank(ref) then
+            return ref
+        end
+    end
+    return "main"
+end
+
+local function session_checkout_path(session)
+    if not session then
+        return nil
+    end
+    local info = nil
+    if type(session.info) == "function" then
+        local ok, value = pcall(session.info, session)
+        if ok then info = value end
+    end
+    if type(info) ~= "table" then
+        return nil
+    end
+    if not util.is_blank(info.worktree_path) then
+        return info.worktree_path
+    end
+    if not util.is_blank(info.cwd) then
+        return info.cwd
+    end
+    if not util.is_blank(info.target_path) then
+        return info.target_path
+    end
+    return nil
+end
+
+--- After a ticket merge, attempt `git pull` in source checkouts so local trees
+-- pick up the merged base. Prefer the live question orchestrator checkout, and
+-- also try the ticket's resolved source target path when distinct.
+local function attempt_merge_upstream_pulls(ticket, run, attrs)
+    if not ticket then
+        return {}
+    end
+    attrs = attrs or {}
+    local base_branch = merge_base_branch(run, attrs)
+    local targets = {}
+    local seen = {}
+
+    local function add_target(path, session_uuid, scope)
+        if util.is_blank(path) then
+            return
+        end
+        local key = tostring(path)
+        if seen[key] then
+            return
+        end
+        seen[key] = true
+        targets[#targets + 1] = {
+            checkout_path = key,
+            session_uuid = session_uuid,
+            scope = scope,
+        }
+    end
+
+    local assignment, session = live_question_orchestrator(ticket.project_id)
+    if assignment and session then
+        add_target(session_checkout_path(session), assignment.session_uuid, assignment.scope or "orchestrator")
+    end
+    add_target(repo.resolve_target_path(ticket.target_id), assignment and assignment.session_uuid or nil, "source_target")
+
+    local results = {}
+    for _, target in ipairs(targets) do
+        local request_id = string.format(
+            "%s:%s:merge-source-pull:%s:%s",
+            OWNER,
+            ticket.id,
+            tostring(attrs.merge_commit or base_branch):gsub("[^%w._-]", "-"),
+            tostring(target.scope or "path"):gsub("[^%w._-]", "-")
+        )
+        local context = {
+            owner_plugin = OWNER,
+            operation = "merge_source_pull",
+            request_id = request_id,
+            session_uuid = target.session_uuid,
+            scope = target.scope,
+            checkout_path = target.checkout_path,
+            ticket_id = ticket.id,
+            ticket_title = ticket.title,
+            project_id = ticket.project_id,
+            run_id = run and run.id or nil,
+            merge_commit = attrs.merge_commit,
+            base_branch = base_branch,
+            pr_url = attrs.pr_url,
+            merge_summary = attrs.merge_summary or attrs.summary,
+        }
+        local branch_arg = shell_quote(base_branch)
+        local command = "pull_status=0; "
+            .. "GIT_TERMINAL_PROMPT=0 GIT_MERGE_AUTOEDIT=no "
+            .. "git pull --no-rebase --no-autostash --no-edit origin " .. branch_arg
+            .. " || pull_status=$?; "
+            .. "if [ \"$pull_status\" -ne 0 ]; then "
+            .. "conflicts=\"$(git diff --name-only --diff-filter=U 2>/dev/null)\"; "
+            .. "if [ -n \"$conflicts\" ]; then "
+            .. "printf '\\n__PROJECT_PIPELINES_PULL_CONFLICTS__\\n%s\\n' \"$conflicts\"; "
+            .. "fi; fi; exit \"$pull_status\""
+        local ok, result = pcall(function()
+            return invoke_run_command_gate{
+                request_id = request_id,
+                command = command,
+                cwd = target.checkout_path,
+                timeout_secs = 120,
+                context = context,
+            }
+        end)
+        if not ok then
+            notify_merge_pull_result(context, {
+                success = false,
+                error = tostring(result),
+            })
+            results[#results + 1] = { checkout_path = target.checkout_path, started = false, error = tostring(result) }
+        else
+            repo.append_event("ticket.merge_source_pull_started", {
+                run_id = context.run_id,
+                ticket_id = context.ticket_id,
+                payload = {
+                    request_id = request_id,
+                    session_uuid = context.session_uuid,
+                    scope = context.scope,
+                    checkout_path = target.checkout_path,
+                    base_branch = base_branch,
+                },
+            })
+            results[#results + 1] = { checkout_path = target.checkout_path, started = true, request_id = request_id }
+        end
+    end
+    return results
+end
+
 function M.close_ticket(ticket_id, attrs)
     util.assert_present(ticket_id, "ticket_id")
     attrs = attrs or {}
@@ -1141,8 +1384,25 @@ function M.close_ticket(ticket_id, attrs)
         pr_url = attrs.pr_url,
         merge_summary = attrs.merge_summary or attrs.summary,
     })
+
+    local merge_pulls = nil
+    if attrs.merge_confirmed == true then
+        local ok_pull, pull_result = pcall(attempt_merge_upstream_pulls, ticket, latest_run, attrs)
+        if ok_pull then
+            merge_pulls = pull_result
+        else
+            log.warn("[project-pipelines] merge source pull failed to start: " .. tostring(pull_result))
+            merge_pulls = { error = tostring(pull_result) }
+        end
+    end
+
     refresh_surfaces()
-    return { ticket = updated, closed_sessions = closed_sessions, errors = errors }
+    return {
+        ticket = updated,
+        closed_sessions = closed_sessions,
+        errors = errors,
+        merge_pulls = merge_pulls,
+    }
 end
 
 local function run_command_step(run, step)
@@ -1955,6 +2215,13 @@ end
 function M.handle_command_gate_completed(data)
     local context = data and data.context or {}
     if context.owner_plugin ~= OWNER then
+        return
+    end
+    if context.operation == "merge_source_pull" or context.operation == "merge_orchestrator_pull" then
+        notify_merge_pull_result(context, data)
+        return
+    end
+    if context.operation == "gitignore_hygiene" then
         return
     end
     local run_id = context.run_id

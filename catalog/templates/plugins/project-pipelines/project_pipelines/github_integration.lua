@@ -64,6 +64,7 @@ function M.handle_pr_merged(event)
             pr_url = event.pr_url or link.pr_url,
             merge_commit = event.merge_commit or link.merge_commit,
             merge_summary = merge_summary(event, link),
+            base_branch = event.base_branch or link.base_branch,
             source_event = "pr_merged",
         })
     end
