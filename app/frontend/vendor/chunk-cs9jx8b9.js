@@ -60578,22 +60578,46 @@ function bindPointerEvents(options) {
       return false;
     return inputHandler.isMouseActive();
   };
+  const applyTouchPan = (event, deltaPx) => {
+    if (!deltaPx)
+      return;
+    if (shouldRoutePointerToAppMouse(event.shiftKey) && inputHandler.isMouseActive()) {
+      const wheelLike = {
+        deltaY: -deltaPx,
+        deltaMode: 0,
+        shiftKey: event.shiftKey,
+        altKey: event.altKey,
+        ctrlKey: event.ctrlKey,
+        metaKey: event.metaKey,
+        clientX: event.clientX,
+        clientY: event.clientY,
+        button: 0
+      };
+      if (inputHandler.sendMouseEvent("wheel", wheelLike)) {
+        event.preventDefault();
+        return;
+      }
+    }
+    scrollViewportByLines(deltaPx / Math.max(1, getGridState().cellH) * 1.5);
+    event.preventDefault();
+  };
   canvas.style.touchAction = touchSelectionMode === "long-press" || touchSelectionMode === "drag" ? "none" : "pan-y pinch-zoom";
   const onPointerDown = (event) => {
-    if (shouldRoutePointerToAppMouse(event.shiftKey) && inputHandler.sendMouseEvent("down", event)) {
-      clearPendingDesktopSelection();
-      event.preventDefault();
-      canvas.setPointerCapture?.(event.pointerId);
-      return;
-    }
     if (isTouchPointer(event)) {
       if (event.button !== 0)
         return;
       const cell2 = normalizeSelectionCell2(positionToCell2(event));
       touchSelectionState.activePointerId = null;
       touchSelectionState.panPointerId = null;
-      if (touchSelectionMode === "off")
+      if (touchSelectionMode === "off") {
+        if (shouldRoutePointerToAppMouse(event.shiftKey) && inputHandler.isMouseActive()) {
+          event.preventDefault();
+          touchSelectionState.panPointerId = event.pointerId;
+          touchSelectionState.panLastY = event.clientY;
+          canvas.setPointerCapture?.(event.pointerId);
+        }
         return;
+      }
       if (touchSelectionMode === "drag") {
         event.preventDefault();
         beginSelectionDrag(cell2, event.pointerId);
@@ -60610,6 +60634,13 @@ function bindPointerEvents(options) {
       touchSelectionState.pendingTimer = setTimeout(() => {
         tryActivatePendingTouchSelection(event.pointerId);
       }, touchSelectionLongPressMs);
+      event.preventDefault();
+      return;
+    }
+    if (shouldRoutePointerToAppMouse(event.shiftKey) && inputHandler.sendMouseEvent("down", event)) {
+      clearPendingDesktopSelection();
+      event.preventDefault();
+      canvas.setPointerCapture?.(event.pointerId);
       return;
     }
     if (event.button !== 0)
@@ -60632,11 +60663,10 @@ function bindPointerEvents(options) {
           tryActivatePendingTouchSelection(event.pointerId);
         }
         if (touchSelectionState.pendingPointerId === event.pointerId) {
-          if (touchSelectionMode === "long-press" && touchSelectionState.panPointerId === event.pointerId) {
+          if ((touchSelectionMode === "long-press" || touchSelectionMode === "off") && touchSelectionState.panPointerId === event.pointerId) {
             const deltaPx = touchSelectionState.panLastY - event.clientY;
             touchSelectionState.panLastY = event.clientY;
-            scrollViewportByLines(deltaPx / Math.max(1, getGridState().cellH) * 1.5);
-            event.preventDefault();
+            applyTouchPan(event, deltaPx);
           }
           return;
         }
@@ -60650,11 +60680,10 @@ function bindPointerEvents(options) {
         markNeedsRender();
         return;
       }
-      if (touchSelectionMode === "long-press" && touchSelectionState.panPointerId === event.pointerId) {
+      if ((touchSelectionMode === "long-press" || touchSelectionMode === "off") && touchSelectionState.panPointerId === event.pointerId) {
         const deltaPx = touchSelectionState.panLastY - event.clientY;
         touchSelectionState.panLastY = event.clientY;
-        scrollViewportByLines(deltaPx / Math.max(1, getGridState().cellH) * 1.5);
-        event.preventDefault();
+        applyTouchPan(event, deltaPx);
       }
       return;
     }
