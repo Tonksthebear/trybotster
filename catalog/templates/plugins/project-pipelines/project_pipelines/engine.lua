@@ -429,23 +429,22 @@ local function spawn_step_agent(run, step, opts)
         return nil, "target_id is required before spawning agent steps"
     end
 
-    -- Last-line defense: refuse create_agent / re-prompt even if a caller
-    -- bypassed activation preflight. Primary gate remains activate/advance/retry.
-    local blocked = dependency_block(run, {
-        step_id = step.id,
-        run_step_id = run.current_run_step_id,
-        target_step_id = step.id,
-        source = "spawn_step_agent",
-    })
-    if blocked then
-        local names = {}
-        for _, entry in ipairs(blocked.unmet_dependencies) do
-            names[#names + 1] = (entry.depends_on_title or entry.depends_on_ticket_id)
-                .. " ("
-                .. tostring(entry.depends_on_status or entry.reason or "open")
-                .. ")"
+    -- Last-line defense for callers that already mutated state (retry) or that
+    -- skip activate preflight. Returns a structured dependency block (not a
+    -- plain string) so callers preserve reason=ticket_dependencies + ids.
+    -- activate_step runs this check before target side effects when
+    -- skip_dependency_check is not set; after side effects it passes
+    -- skip_dependency_check=true so a race cannot leave a half-activated target.
+    if opts.skip_dependency_check ~= true then
+        local blocked = dependency_block(run, {
+            step_id = step.id,
+            run_step_id = run.current_run_step_id,
+            target_step_id = step.id,
+            source = opts.dependency_source or "spawn_step_agent",
+        })
+        if blocked then
+            return nil, blocked
         end
-        return nil, "ticket dependencies must close before spawning: " .. table.concat(names, ", ")
     end
 
     local ticket = repo.get_ticket(run.ticket_id)
@@ -1580,14 +1579,30 @@ function M.activate_step(run, step, options)
     end
 
     options = options or {}
+    local source = options.source or "activate_step"
     local blocked = dependency_block(run, {
         step_id = run.current_step_id,
         run_step_id = run.current_run_step_id,
         target_step_id = step.id,
-        source = options.source or "activate_step",
+        source = source,
     })
     if blocked then
         return blocked
+    end
+
+    -- Final fail-closed check immediately before any target side effects so a
+    -- spawn-time dependency block cannot leave a visit, run pointer change,
+    -- step.activated event, or phase notification.
+    if step.kind == "agent" or step.kind == "command" then
+        blocked = dependency_block(run, {
+            step_id = run.current_step_id,
+            run_step_id = run.current_run_step_id,
+            target_step_id = step.id,
+            source = source,
+        })
+        if blocked then
+            return blocked
+        end
     end
 
     local now = util.now()
@@ -1618,8 +1633,20 @@ function M.activate_step(run, step, options)
     end
 
     if step.kind == "agent" then
-        local created, err = spawn_step_agent(repo.get_run(run.id), step, options.spawn_options)
+        local spawn_options = {}
+        for key, value in pairs(options.spawn_options or {}) do
+            spawn_options[key] = value
+        end
+        -- Deps already cleared immediately above; do not re-check after side
+        -- effects (that path would leave a half-activated target).
+        spawn_options.skip_dependency_check = true
+        local created, err = spawn_step_agent(repo.get_run(run.id), step, spawn_options)
         if err then
+            -- Structured dependency blocks should not reach here after the
+            -- pre-side-effect check; preserve them if a caller mis-wires spawn.
+            if type(err) == "table" and err.reason == "ticket_dependencies" then
+                return err
+            end
             repo.update_run(run.id, { status = "blocked" })
             repo.update_run_step_visit(visit.id, { status = "blocked" })
             repo.append_event("step.spawn_failed", {
@@ -1992,18 +2019,17 @@ function M.start_run(params)
     if util.is_blank(ticket.target_id) then
         error("ticket target_id is required before starting a run")
     end
-    -- Same authority as activate/advance/retry/spawn: unmet_ticket_dependencies
-    -- over normalized ticket_dependencies rows (not a divergent SQL filter).
+    -- Same authority as activate/advance/retry/spawn: unmet_ticket_dependencies.
+    -- Public MCP must receive a typed blocked result that names dependency ticket ids.
     local blockers = unmet_ticket_dependencies(params.ticket_id)
     if #blockers > 0 then
-        local names = {}
-        for _, blocker in ipairs(blockers) do
-            names[#names + 1] = (blocker.depends_on_title or blocker.depends_on_ticket_id)
-                .. " ("
-                .. tostring(blocker.depends_on_status or blocker.reason or "open")
-                .. ")"
-        end
-        error("ticket dependencies must close before starting a run: " .. table.concat(names, ", "))
+        return {
+            ok = false,
+            status = "blocked",
+            reason = "ticket_dependencies",
+            source = "start_run",
+            unmet_dependencies = blockers,
+        }
     end
     local pipeline = repo.get_pipeline(pipeline_id)
     if not pipeline then
@@ -2240,8 +2266,16 @@ function M.retry_step_agent(params, context)
         },
     })
 
-    local created, err = spawn_step_agent(repo.get_run(run.id), step)
+    local created, err = spawn_step_agent(repo.get_run(run.id), step, {
+        dependency_source = "retry_step_agent",
+    })
     if err then
+        if type(err) == "table" and err.reason == "ticket_dependencies" then
+            err.step = step
+            err.run = repo.get_run(run.id)
+            err.run_step = repo.get_run_step_visit(visit.id)
+            return err
+        end
         repo.update_run(run.id, { status = "blocked" })
         repo.update_run_step_visit(visit.id, { status = "blocked" })
         repo.append_event("step.spawn_failed", {

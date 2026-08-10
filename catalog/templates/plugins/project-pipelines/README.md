@@ -194,14 +194,17 @@ and ticket ids, title/status when available, an operator prompt, and either:
 The preflight runs before completing the source visit, emitting
 `step.completed` or an override event, creating the target visit, changing run
 pointers, notifying, resolving command execution, requesting a worktree or
-session, or spawning/linking an agent. When a residual second check still finds
-open blockers after the source visit was completed, advance returns top-level
-`ok = false` with `reason = "ticket_dependencies"` rather than a successful
-advance that nests a blocked activation. `start_run` raises
-`ticket dependencies must close before starting a run: ...` before creating the
-run (same shared helper). A final advance with no target step still completes the
-run and follows its merge policy; dependency gating applies to target-step
-activation, not run completion or merge.
+session, or spawning/linking an agent. Direct activation re-checks immediately
+before those target side effects so a dependency block cannot leave a half-
+activated target. When a residual second check still finds open blockers after
+the source visit was completed, advance returns top-level `ok = false` with
+`reason = "ticket_dependencies"` rather than a successful advance that nests a
+blocked activation. `start_run` returns the same typed blocked shape
+(`ok = false`, `status = "blocked"`, `reason = "ticket_dependencies"`,
+`unmet_dependencies` with each `depends_on_ticket_id`) and does not create a run.
+A final advance with no target step still completes the run and follows its merge
+policy; dependency gating applies to target-step activation, not run completion
+or merge.
 
 Closing or removing a dependency never activates work automatically. The
 operator must explicitly advance or retry again. A dependency added after the
