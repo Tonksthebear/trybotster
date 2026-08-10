@@ -11,12 +11,12 @@ local M = {}
 
 -- Bump when Plan / Plan Review ceremony text changes. Live hubs refresh only
 -- when botster_stack_delivery.version_label differs from this revision.
-local PROMPT_REVISION = "plan-loop-hygiene/2026-08-10.1"
+local PROMPT_REVISION = "plan-loop-hygiene/2026-08-10.2"
 local PIPELINE_ID = "botster_stack_delivery"
 local PLAN_STEP_ID = "botster_stack_plan"
 local PLAN_REVIEW_STEP_ID = "botster_stack_plan_review"
 
-local PLAN_PROMPT = [[You are the Plan agent for a repository-specific Botster Stack Delivery run.
+local PLAN_PROMPT = [=[You are the Plan agent for a repository-specific Botster Stack Delivery run.
 
 Start with project_pipelines_current_context. Resolve the ticket target_id to the authoritative target repository before planning; do not infer the repository from the process working directory.
 
@@ -85,9 +85,9 @@ If this ticket involves WebRTC/peer lifecycle, SessionIo/ClientWorker teardown, 
 - Record those answers in the plan artifact and gate evidence under playbooks/notes loaded and acceptance checks
 Do not load that note for ordinary UI, copy, docs-only, or single-field client tickets. Keep one Plan → Implement path; do not dual-pipeline for planner variety.
 
-Keep live Hub pin / charter live proof, request-race / SPA request-state proof, and independent base re-verification requirements intact. Do not weaken those product proofs for process hygiene.]]
+Keep live Hub pin / charter live proof, request-race / SPA request-state proof, and independent base re-verification requirements intact. Do not weaken those product proofs for process hygiene.]=]
 
-local PLAN_REVIEW_PROMPT = [[You are the Plan Review agent for a repository-specific Botster Stack Delivery run.
+local PLAN_REVIEW_PROMPT = [=[You are the Plan Review agent for a repository-specific Botster Stack Delivery run.
 
 Start with project_pipelines_current_context. Independently resolve target_id to the authoritative target repository and compare it with the planner's routing. Review the latest plan artifact and gate evidence.
 
@@ -141,7 +141,7 @@ Your output must include:
 - Severity class for each finding (product, process, or infra)
 
 ## Runtime-teardown class (when applicable)
-When the ticket matches runtime-teardown class, require [[botster runtime teardown lenses]] answers in the plan. Reject or changes_required if the plan only map-removes state, treats a terminal file as live proof, omits an ownership-creating late-message surface, allows unbounded control-plane hang on close, or leaves sibling sacrifice unstated and untested. Do not force teardown-lens fields on non-class tickets.]]
+When the ticket matches runtime-teardown class, require [[botster runtime teardown lenses]] answers in the plan. Reject or changes_required if the plan only map-removes state, treats a terminal file as live proof, omits an ownership-creating late-message surface, allows unbounded control-plane hang on close, or leaves sibling sacrifice unstated and untested. Do not force teardown-lens fields on non-class tickets.]=]
 
 function M.prompt_revision()
     return PROMPT_REVISION
