@@ -668,6 +668,11 @@ type GhosttySysLogFn = unsafe extern "C" fn(
 
 /// Callback invoked by ghostty's system logging. Routes through Rust's `log` crate.
 ///
+/// **Warn/info/debug are intentionally dropped.** Under dense agent TUI VT,
+/// Ghostty `log.warn` during `vt_write` (e.g. unimplemented CSI) goes through
+/// lib-vt `emitLog` + this callback and has EXC_BAD_ACCESS'd the session
+/// process (stack). Errors still surface for real failures.
+///
 /// # Safety
 /// Called from Ghostty with borrowed scope/message buffers valid only for the call.
 unsafe extern "C" fn ghostty_log_callback(
@@ -678,50 +683,32 @@ unsafe extern "C" fn ghostty_log_callback(
     message: *const u8,
     message_len: usize,
 ) {
+    // Drop non-errors: logging from inside vt_write has SEGV'd (Botster).
+    if !matches!(level, GhosttySysLogLevel::Error) {
+        return;
+    }
     // SAFETY: Ghostty guarantees scope/message are valid for this call.
     let msg = unsafe {
         if message.is_null() || message_len == 0 {
             ""
         } else {
-            std::str::from_utf8_unchecked(std::slice::from_raw_parts(message, message_len))
+            // Cap length so a pathological format cannot blow the host stack.
+            let len = message_len.min(512);
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(message, len))
         }
     };
     let scope = unsafe {
         if scope.is_null() || scope_len == 0 {
             ""
         } else {
-            std::str::from_utf8_unchecked(std::slice::from_raw_parts(scope, scope_len))
+            let len = scope_len.min(64);
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(scope, len))
         }
     };
-    match level {
-        GhosttySysLogLevel::Error => {
-            if scope.is_empty() {
-                log::error!(target: "ghostty", "{msg}");
-            } else {
-                log::error!(target: "ghostty", "[{scope}] {msg}");
-            }
-        }
-        GhosttySysLogLevel::Warning => {
-            if scope.is_empty() {
-                log::warn!(target: "ghostty", "{msg}");
-            } else {
-                log::warn!(target: "ghostty", "[{scope}] {msg}");
-            }
-        }
-        GhosttySysLogLevel::Info => {
-            if scope.is_empty() {
-                log::info!(target: "ghostty", "{msg}");
-            } else {
-                log::info!(target: "ghostty", "[{scope}] {msg}");
-            }
-        }
-        GhosttySysLogLevel::Debug => {
-            if scope.is_empty() {
-                log::debug!(target: "ghostty", "{msg}");
-            } else {
-                log::debug!(target: "ghostty", "[{scope}] {msg}");
-            }
-        }
+    if scope.is_empty() {
+        log::error!(target: "ghostty", "{msg}");
+    } else {
+        log::error!(target: "ghostty", "[{scope}] {msg}");
     }
 }
 
