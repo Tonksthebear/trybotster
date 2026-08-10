@@ -3544,6 +3544,11 @@ fn catalog_plugin_project_pipelines_start_run_blocks_open_dependencies() {
             package.loaded["project_pipelines.notification_policy"] = {{}}
             package.loaded["lib.agent"] = {{ get = function() return nil end }}
             package.loaded["lib.hub"] = {{ get = function() return {{}} end }}
+            local handlers = {{}}
+            mcp = {{
+              tool = function(name, _spec, handler) handlers[name] = handler end,
+              prompt = function() end,
+            }}
             package.loaded["project_pipelines.repo"] = {{
               prune_legacy_seed_data = function() end,
               get_ticket = function(id)
@@ -3568,16 +3573,34 @@ fn catalog_plugin_project_pipelines_start_run_blocks_open_dependencies() {
               get_pipeline = function()
                 error("dependency gating must run before pipeline lookup")
               end,
+              create_run = function()
+                error("start_run must not create a run while dependencies are open")
+              end,
             }}
+            package.loaded["lib.config_resolver"] = {{ list_agents = function() return {{}} end }}
 
-            local ok, err = pcall(require("project_pipelines.engine").start_run, {{
+            local engine_result = require("project_pipelines.engine").start_run({{
               ticket_id = "ticket-child",
               pipeline_id = "pipe-1",
               base_ref = "main",
             }})
+            assert(engine_result.ok == false)
+            assert(engine_result.status == "blocked")
+            assert(engine_result.reason == "ticket_dependencies")
+            assert(engine_result.source == "start_run")
+            assert(engine_result.unmet_dependencies[1].depends_on_ticket_id == "ticket-parent")
+            assert(engine_result.unmet_dependencies[1].depends_on_title == "Parent")
+            assert(engine_result.unmet_dependencies[1].reason == "open_ticket")
 
-            assert(ok == false)
-            assert(tostring(err):find("ticket dependencies must close before starting a run: Parent (open)", 1, true))
+            require("project_pipelines.mcp").register()
+            local mcp_result = handlers.project_pipelines_start_run({{
+              ticket_id = "ticket-child",
+              pipeline_id = "pipe-1",
+              base_ref = "main",
+            }}, {{}}).result
+            assert(mcp_result.ok == false)
+            assert(mcp_result.reason == "ticket_dependencies")
+            assert(mcp_result.unmet_dependencies[1].depends_on_ticket_id == "ticket-parent")
             return "ok"
             "#,
             plugin_dir = plugin_dir.display()
@@ -3990,18 +4013,25 @@ fn catalog_plugin_project_pipelines_mid_run_dependency_blocks_plan_review_to_imp
             assert(run.current_step_id == "implement")
             assert(create_agent_calls == 1)
 
-            -- Last-line spawn defense: dependency reopens after activation preflight cleared.
+            -- Pre-side-effect recheck: first activate preflight closed, second open.
+            -- Must not create a target visit, move run pointers, emit step.activated,
+            -- notify, or queue create_agent.
             dependency_status = "open"
-            dependency_calls = 0
             create_agent_calls = 0
             events = {{}}
             run.current_step_id = "plan_review"
             run.current_run_step_id = "visit-plan-review"
             visit_status = "active"
-            local call_count_before_spawn = 0
-            local original_ticket_deps
-            -- activate_step checks once; spawn_step_agent checks again (last-line).
-            -- Simulate TOCTOU by flipping open after the first check returns closed.
+            local created_visits = 0
+            local notification_calls = 0
+            package.loaded["project_pipelines.notification_policy"].notify_phase_transition = function()
+              notification_calls = notification_calls + 1
+            end
+            local original_create = package.loaded["project_pipelines.repo"].create_run_step_visit
+            package.loaded["project_pipelines.repo"].create_run_step_visit = function(...)
+              created_visits = created_visits + 1
+              return original_create(...)
+            end
             local phase = 0
             package.loaded["project_pipelines.repo"].ticket_dependencies = function(ticket_id)
               phase = phase + 1
@@ -4016,17 +4046,27 @@ fn catalog_plugin_project_pipelines_mid_run_dependency_blocks_plan_review_to_imp
                 }},
               }}
             end
-            -- Force package.loaded engine to re-read is not needed; repo table is shared.
             local toctou = engine.activate_step(run, steps.implement)
             assert(toctou.ok == false)
+            assert(toctou.reason == "ticket_dependencies")
+            assert(toctou.unmet_dependencies[1].depends_on_ticket_id == "ticket-kit")
             assert(create_agent_calls == 0)
-            local saw_spawn_block = false
+            assert(created_visits == 0)
+            assert(notification_calls == 0)
+            assert(run.current_step_id == "plan_review")
+            assert(run.current_run_step_id == "visit-plan-review")
+            local saw_activated = false
+            local saw_block = false
             for _, event in ipairs(events) do
-              if event.kind == "step.advance_blocked" and event.attrs.payload.source == "spawn_step_agent" then
-                saw_spawn_block = true
+              if event.kind == "step.activated" then saw_activated = true end
+              if event.kind == "step.advance_blocked" then
+                saw_block = true
+                assert(event.attrs.payload.reason == "ticket_dependencies")
+                assert(event.attrs.payload.unmet_dependencies[1].depends_on_ticket_id == "ticket-kit")
               end
             end
-            assert(saw_spawn_block == true)
+            assert(saw_activated == false)
+            assert(saw_block == true)
             return "ok"
             "#,
             plugin_dir = plugin_dir.display()
