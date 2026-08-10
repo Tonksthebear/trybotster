@@ -11,7 +11,9 @@
 -- let it drift and leaked a raw path into agent-facing context, where agents
 -- mistook it for their working directory. target_id is the sole stored handle.
 local db = plugin.db{
-    version = 10,
+    -- Dogfood DBs already sit at user_version 11 (prior local install drift).
+    -- Catalog must not declare below that; plugin.db refuses downgrades.
+    version = 11,
     migrations = {
         -- v9: drop the denormalized target_path columns. target_path is now
         -- fully derived from target_id at point of use. Guarded so it is a
@@ -54,6 +56,9 @@ local db = plugin.db{
             add_column_if_missing("pipelines", "archived_at", "integer")
             add_column_if_missing("pipelines", "replacement_pipeline_id", "text")
             add_column_if_missing("pipelines", "supersedes_pipeline_id", "text")
+        end,
+        -- v11: no schema change. Matches dogfood user_version already at 11.
+        [11] = function(_migration_db)
         end,
     },
     models = {
