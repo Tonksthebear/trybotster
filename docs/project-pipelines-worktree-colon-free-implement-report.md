@@ -163,4 +163,8 @@ Does not apply.
 
 ## Commit / PR
 
-Filled after commit and PR creation in gate evidence.
+| Field | Value |
+| --- | --- |
+| **Branch** | `project-pipelines/ticket_1786071999_889350` |
+| **Commit** | `ca9e3253` (plus any report-link follow-up) |
+| **PR** | https://github.com/Tonksthebear/trybotster/pull/208 |
