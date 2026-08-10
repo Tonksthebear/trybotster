@@ -963,6 +963,74 @@ mod tests {
         assert!(!path_component_safe("git@github.com:x/y").contains(':'));
     }
 
+    /// Production create path: SSH origin intermediate names still become colon-free
+    /// worktree directories after `path_component_safe` (macOS DYLD separator safety).
+    // Rust guideline compliant 2024-12 (M-DESIGN-FOR-AI / path safety proof)
+    #[test]
+    fn create_worktree_for_ssh_remote_path_has_no_colon() {
+        let temp_dir = TempDir::new().unwrap();
+        let repo_dir = temp_dir.path().join("src-repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_dir)
+                .output()
+                .expect("git command");
+            assert!(
+                output.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+
+        run(&["init"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test"]);
+        std::fs::write(repo_dir.join("README.md"), "ssh path proof").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-m", "init"]);
+        // SSH-style remote that previously produced `git@github.com:…` directory names.
+        run(&["remote", "add", "origin", "git@github.com:trybotster/botster-tui.git"]);
+
+        let worktree_base = temp_dir.path().join("sessions");
+        std::fs::create_dir_all(&worktree_base).unwrap();
+        let manager = WorktreeManager::new(worktree_base);
+        let branch = "project-pipelines-ticket_ssh_colon_proof";
+        let worktree_path = manager
+            .create_worktree_for_repo_root(&repo_dir, branch)
+            .expect("create worktree for SSH-origin repo");
+
+        let path_str = worktree_path.to_string_lossy();
+        assert!(
+            worktree_path.exists(),
+            "worktree should exist at {path_str}"
+        );
+        assert!(
+            !path_str.contains(':'),
+            "worktree path must not contain ':' (DYLD): {path_str}"
+        );
+        assert!(
+            !path_str.contains('@'),
+            "worktree path must not contain '@': {path_str}"
+        );
+        let file_name = worktree_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("utf-8 basename");
+        assert!(
+            file_name.contains("git-github.com-trybotster-botster-tui")
+                || file_name.contains("trybotster-botster-tui"),
+            "basename should derive from sanitized SSH remote identity: {file_name}"
+        );
+        assert!(
+            file_name.contains("project-pipelines-ticket_ssh_colon_proof"),
+            "basename should include sanitized branch: {file_name}"
+        );
+    }
+
     #[test]
     fn test_cleanup_nonexistent_worktree() {
         let temp_dir = TempDir::new().unwrap();
