@@ -4067,6 +4067,106 @@ fn catalog_plugin_project_pipelines_mid_run_dependency_blocks_plan_review_to_imp
             end
             assert(saw_activated == false)
             assert(saw_block == true)
+
+            -- Hostile phase flip on advance: first advance preflight closed,
+            -- activate pre-side-effect open. Source visit must stay active;
+            -- no step.completed, no target activation, no agent request.
+            phase = 0
+            events = {{}}
+            create_agent_calls = 0
+            created_visits = 0
+            notification_calls = 0
+            visit_status = "active"
+            run.current_step_id = "plan_review"
+            run.current_run_step_id = "visit-plan-review"
+            package.loaded["project_pipelines.repo"].ticket_dependencies = function(ticket_id)
+              phase = phase + 1
+              -- advance preflight closed; activate's checks open
+              local status = phase == 1 and "closed" or "open"
+              return {{
+                {{
+                  id = "dependency-kit",
+                  ticket_id = ticket_id,
+                  depends_on_ticket_id = "ticket-kit",
+                  depends_on_title = "Kit blocker",
+                  depends_on_status = status,
+                }},
+              }}
+            end
+            local advance_hostile = engine.request_step_advance({{
+              run_id = "run-live",
+              summary = "hostile phase flip during advance",
+            }}, {{}})
+            assert(advance_hostile.ok == false)
+            assert(advance_hostile.reason == "ticket_dependencies")
+            assert(advance_hostile.unmet_dependencies[1].depends_on_ticket_id == "ticket-kit")
+            assert(create_agent_calls == 0)
+            assert(created_visits == 0)
+            assert(notification_calls == 0)
+            assert(run.current_step_id == "plan_review")
+            assert(run.current_run_step_id == "visit-plan-review")
+            assert(visit_status == "active")
+            local saw_completed = false
+            saw_activated = false
+            for _, event in ipairs(events) do
+              if event.kind == "step.completed" then saw_completed = true end
+              if event.kind == "step.activated" then saw_activated = true end
+              if event.kind == "step.agent_requested" then
+                error("must not request target agent while dependency-blocked")
+              end
+            end
+            assert(saw_completed == false)
+            assert(saw_activated == false)
+
+            -- Hostile phase flip on retry: first check closed, second open.
+            -- No retry mutation, no retry event, no create_agent.
+            phase = 0
+            events = {{}}
+            create_agent_calls = 0
+            visit_status = "blocked"
+            run.status = "blocked"
+            run.current_step_id = "plan_review"
+            run.current_run_step_id = "visit-plan-review"
+            package.loaded["project_pipelines.repo"].get_run_step_visit = function(id)
+              return {{
+                id = id,
+                run_id = run.id,
+                step_id = "plan_review",
+                status = visit_status,
+                agent_session_uuid = "sess-dead",
+              }}
+            end
+            package.loaded["project_pipelines.repo"].ticket_dependencies = function(ticket_id)
+              phase = phase + 1
+              local status = phase == 1 and "closed" or "open"
+              return {{
+                {{
+                  id = "dependency-kit",
+                  ticket_id = ticket_id,
+                  depends_on_ticket_id = "ticket-kit",
+                  depends_on_title = "Kit blocker",
+                  depends_on_status = status,
+                }},
+              }}
+            end
+            local retry_hostile = engine.retry_step_agent({{
+              run_id = "run-live",
+              reason = "hostile phase flip during retry",
+            }}, {{}})
+            assert(retry_hostile.ok == false)
+            assert(retry_hostile.reason == "ticket_dependencies")
+            assert(retry_hostile.unmet_dependencies[1].depends_on_ticket_id == "ticket-kit")
+            assert(create_agent_calls == 0)
+            assert(run.status == "blocked")
+            assert(visit_status == "blocked")
+            local saw_retry_event = false
+            for _, event in ipairs(events) do
+              if event.kind == "step.agent_retry_requested" then saw_retry_event = true end
+              if event.kind == "step.agent_requested" then
+                error("must not request agent on dependency-blocked retry")
+              end
+            end
+            assert(saw_retry_event == false)
             return "ok"
             "#,
             plugin_dir = plugin_dir.display()
@@ -4112,6 +4212,9 @@ fn catalog_plugin_project_pipelines_step_advance_can_override_to_specific_step()
             }}
 
             package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() end,
+            }}
             package.loaded["project_pipelines.repo"] = {{
               ticket_session_uuids = function() return {{}} end,
               get_run = function(run_id)
@@ -4154,6 +4257,7 @@ fn catalog_plugin_project_pipelines_step_advance_can_override_to_specific_step()
               end,
               latest_step_session = function() return nil end,
               ticket_dependencies = function() return {{}} end,
+              ticket_session_uuids = function() return {{}} end,
             }}
             package.loaded["lib.agent"] = {{ get = function() return nil end }}
             package.loaded["lib.hub"] = {{
