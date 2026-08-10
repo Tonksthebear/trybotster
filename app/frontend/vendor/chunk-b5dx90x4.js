@@ -14704,11 +14704,17 @@ class MouseController {
       return this.sendMouse(code, col, row, pixel, false);
     }
     if (kind === "wheel") {
-      const delta = Math.sign(event.deltaY);
-      if (!delta)
+      const steps = wheelReportSteps(event);
+      if (steps === 0)
         return false;
-      const code = (delta < 0 ? 64 : 65) + mods;
-      return this.sendMouse(code, col, row, pixel, false);
+      const codeBase = steps < 0 ? 64 : 65;
+      const n = Math.abs(steps);
+      let sent = false;
+      for (let i = 0;i < n; i += 1) {
+        if (this.sendMouse(codeBase + mods, col, row, pixel, false))
+          sent = true;
+      }
+      return sent;
     }
     return false;
   }
@@ -14764,6 +14770,21 @@ class MouseController {
     this.sendReply(`\x1B[<${code};${col};${row}${suffix}`);
     return true;
   }
+}
+function wheelReportSteps(event, maxSteps = 8) {
+  const dy = event.deltaY;
+  if (!dy || !Number.isFinite(dy))
+    return 0;
+  const sign = dy < 0 ? -1 : 1;
+  let abs;
+  if (event.deltaMode === 1) {
+    abs = Math.max(1, Math.round(Math.abs(dy)));
+  } else if (event.deltaMode === 2) {
+    abs = Math.max(1, Math.round(Math.abs(dy) * 24));
+  } else {
+    abs = Math.max(1, Math.round(Math.abs(dy) / 40));
+  }
+  return sign * Math.min(abs, maxSteps);
 }
 
 // src/input/output/csi.ts
@@ -61147,32 +61168,36 @@ function createScrollbarRuntime(options) {
     const { cellH, rows } = getGridState();
     if (!cellH)
       return;
+    const maxLinesPerEvent = Math.max(4, Math.min(12, Math.floor((rows || 24) / 4) || 4));
     const isPrecision = event.deltaMode === 0;
     if (isPrecision) {
-      const precisionMultiplier = 2;
-      const adjustedPx = event.deltaY * precisionMultiplier;
-      const pendingPx = pendingPrecisionScrollPx + adjustedPx;
+      const pendingPx = pendingPrecisionScrollPx + event.deltaY;
       if (Math.abs(pendingPx) < cellH) {
         pendingPrecisionScrollPx = pendingPx;
         noteScrollActivity();
         return;
       }
-      const amount = pendingPx / cellH;
-      pendingPrecisionScrollPx = pendingPx - Math.trunc(amount) * cellH;
-      if (amount) {
-        scrollViewportByLines(Math.trunc(amount));
-      }
+      const rawLines = Math.trunc(pendingPx / cellH);
+      pendingPrecisionScrollPx = pendingPx - rawLines * cellH;
+      if (!rawLines)
+        return;
+      const sign2 = rawLines < 0 ? -1 : 1;
+      const lines = sign2 * Math.min(Math.abs(rawLines), maxLinesPerEvent);
+      scrollViewportByLines(lines);
       return;
     }
     pendingPrecisionScrollPx = 0;
     if (event.deltaMode === 1) {
-      const discreteMultiplier = 3;
-      const yoff = event.deltaY > 0 ? Math.max(event.deltaY, 1) : Math.min(event.deltaY, -1);
-      scrollViewportByLines(yoff * discreteMultiplier);
+      const raw2 = Math.round(event.deltaY) || (event.deltaY < 0 ? -1 : 1);
+      const sign2 = raw2 < 0 ? -1 : 1;
+      const lines = sign2 * Math.min(Math.abs(raw2) * 3, maxLinesPerEvent);
+      scrollViewportByLines(lines);
       return;
     }
     const pageLines = rows > 0 ? rows : 24;
-    scrollViewportByLines(event.deltaY * pageLines);
+    const raw = event.deltaY * pageLines;
+    const sign = raw < 0 ? -1 : 1;
+    scrollViewportByLines(sign * Math.min(Math.abs(raw), maxLinesPerEvent));
   };
   const setViewportScrollOffset = (nextOffset) => {
     const wasm = getWasm();
