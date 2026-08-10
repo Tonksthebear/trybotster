@@ -14543,13 +14543,18 @@ class MouseController {
   button = 0;
   flags = { 1000: false, 1002: false, 1003: false };
   x10Event = false;
+  pendingWheelPx = 0;
   sendReply;
   positionToCell;
   positionToPixel;
+  getCellHeight;
+  getRows;
   constructor(options) {
     this.sendReply = options.sendReply;
     this.positionToCell = options.positionToCell;
     this.positionToPixel = options.positionToPixel;
+    this.getCellHeight = options.getCellHeight ?? (() => 20);
+    this.getRows = options.getRows ?? (() => 24);
   }
   setReplySink(fn) {
     this.sendReply = fn;
@@ -14559,6 +14564,11 @@ class MouseController {
   }
   setPositionToPixel(fn) {
     this.positionToPixel = fn;
+  }
+  setCellMetrics(getCellHeight, getRows) {
+    this.getCellHeight = getCellHeight;
+    if (getRows)
+      this.getRows = getRows;
   }
   setMode(mode) {
     this.mode = mode;
@@ -14570,6 +14580,7 @@ class MouseController {
       this.enabled = false;
       this.format = "x10";
       this.motion = "none";
+      this.pendingWheelPx = 0;
     } else {
       this.enabled = this.x10Event || this.flags[1000] || this.flags[1002] || this.flags[1003];
       if (this.flags[1003])
@@ -14628,6 +14639,7 @@ class MouseController {
     this.enabled = false;
     this.pressed = false;
     this.button = 0;
+    this.pendingWheelPx = 0;
     const bit = (n) => (bits & 1 << n) !== 0;
     this.x10Event = bit(0);
     this.flags[1000] = bit(1);
@@ -14704,11 +14716,24 @@ class MouseController {
       return this.sendMouse(code, col, row, pixel, false);
     }
     if (kind === "wheel") {
-      const steps = wheelReportSteps(event);
-      if (steps === 0)
+      const cellH = Math.max(1, this.getCellHeight() || 20);
+      const rows = Math.max(1, this.getRows() || 24);
+      const dyPx = wheelDeltaPixels(event, cellH, rows);
+      if (!dyPx)
         return false;
-      const code = (steps < 0 ? 64 : 65) + mods;
-      return this.sendMouse(code, col, row, pixel, false);
+      this.pendingWheelPx += dyPx;
+      if (Math.abs(this.pendingWheelPx) < cellH) {
+        return true;
+      }
+      const amount = this.pendingWheelPx / cellH;
+      const rawSteps = Math.trunc(amount);
+      this.pendingWheelPx -= rawSteps * cellH;
+      if (!rawSteps)
+        return true;
+      const maxSteps = Math.max(1, Math.min(rows, 24));
+      const n = Math.min(Math.abs(rawSteps), maxSteps);
+      const code = (rawSteps < 0 ? 64 : 65) + mods;
+      return this.sendMouseRepeated(code, col, row, pixel, n);
     }
     return false;
   }
@@ -14736,40 +14761,61 @@ class MouseController {
     return mod;
   }
   sendMouse(code, col, row, pixel, release) {
+    const seq = this.encodeMouse(code, col, row, pixel, release);
+    if (!seq)
+      return false;
+    this.sendReply(seq);
+    return true;
+  }
+  sendMouseRepeated(code, col, row, pixel, count) {
+    if (count <= 0)
+      return false;
+    const one = this.encodeMouse(code, col, row, pixel, false);
+    if (!one)
+      return false;
+    if (count === 1) {
+      this.sendReply(one);
+      return true;
+    }
+    this.sendReply(one.repeat(count));
+    return true;
+  }
+  encodeMouse(code, col, row, pixel, release) {
     if (this.format === "x10") {
       if (col > 223 || row > 223)
-        return false;
+        return null;
       const cb = 32 + code;
       const cx = 32 + col;
       const cy = 32 + row;
-      this.sendReply(`\x1B[M${String.fromCharCode(cb, cx, cy)}`);
-      return true;
+      return `\x1B[M${String.fromCharCode(cb, cx, cy)}`;
     }
     if (this.format === "utf8") {
       const cb = String.fromCharCode(32 + code);
       const cx = String.fromCodePoint(32 + col);
       const cy = String.fromCodePoint(32 + row);
-      this.sendReply(`\x1B[M${cb}${cx}${cy}`);
-      return true;
+      return `\x1B[M${cb}${cx}${cy}`;
     }
     if (this.format === "urxvt") {
-      this.sendReply(`\x1B[${32 + code};${col};${row}M`);
-      return true;
+      return `\x1B[${32 + code};${col};${row}M`;
     }
     const suffix = release ? "m" : "M";
     if (this.format === "sgr_pixels" && pixel) {
-      this.sendReply(`\x1B[<${code};${pixel.x};${pixel.y}${suffix}`);
-      return true;
+      return `\x1B[<${code};${pixel.x};${pixel.y}${suffix}`;
     }
-    this.sendReply(`\x1B[<${code};${col};${row}${suffix}`);
-    return true;
+    return `\x1B[<${code};${col};${row}${suffix}`;
   }
 }
-function wheelReportSteps(event, _maxSteps = 1) {
+function wheelDeltaPixels(event, cellH, rows) {
   const dy = event.deltaY;
   if (!dy || !Number.isFinite(dy))
     return 0;
-  return dy < 0 ? -1 : 1;
+  const h = Math.max(1, cellH || 20);
+  const r = Math.max(1, rows || 24);
+  if (event.deltaMode === 1)
+    return dy * h;
+  if (event.deltaMode === 2)
+    return dy * r * h;
+  return dy;
 }
 
 // src/input/output/csi.ts
@@ -15352,7 +15398,9 @@ function createInputHandler(options = {}) {
   const mouse = new MouseController({
     sendReply: replySink,
     positionToCell,
-    positionToPixel: positionToPixel ?? undefined
+    positionToPixel: positionToPixel ?? undefined,
+    getCellHeight: options.getCellHeight,
+    getRows: options.getRows
   });
   const filter = new OutputFilter({
     getCursorPosition: cursorProvider,
@@ -67223,6 +67271,8 @@ function createResttyApp(options) {
     },
     positionToCell: positionToCell2,
     positionToPixel,
+    getCellHeight: () => Math.max(1, gridState.cellH || 20),
+    getRows: () => Math.max(1, gridState.rows || 24),
     getDefaultColors: () => ({
       fg: floatsToRgb(defaultFg),
       bg: floatsToRgb(defaultBg),
