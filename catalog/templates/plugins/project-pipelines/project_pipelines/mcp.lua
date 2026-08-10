@@ -128,7 +128,8 @@ local function list_agent_choices(target_id)
     if #choices == 0 then
         return {
             { name = "codex", label = "codex" },
-            { name = "claude", label = "claude" },
+            { name = "grok", label = "grok" },
+            { name = "fable", label = "fable" },
         }
     end
     table.sort(choices, function(a, b) return a.name < b.name end)
@@ -950,8 +951,64 @@ function M.register()
         return ok(engine.context_for(params.run_id, context.session_uuid))
     end)
 
+    tool("project_pipelines_claim_question_orchestrator", {
+        description = "Claim ownership of answering Project Pipelines questions from the calling agent session. Omit project_id to become the global fallback; provide it to own one project. This does not require the agent to belong to a ticket.",
+        input_schema = {
+            type = "object",
+            properties = {
+                project_id = { type = "string" },
+                replace = {
+                    type = "boolean",
+                    description = "Replace another active owner. Inactive owners are replaced automatically.",
+                },
+            },
+        },
+    }, function(params, context)
+        return ok(engine.claim_question_orchestrator(params, context))
+    end)
+
+    tool("project_pipelines_release_question_orchestrator", {
+        description = "Release the calling session's project-specific or global question-orchestrator claim.",
+        input_schema = {
+            type = "object",
+            properties = {
+                project_id = { type = "string" },
+                force = {
+                    type = "boolean",
+                    description = "Release even if another session owns the claim.",
+                },
+            },
+        },
+    }, function(params, context)
+        return ok(engine.release_question_orchestrator(params, context))
+    end)
+
+    tool("project_pipelines_question_orchestrator_status", {
+        description = "List project and global question-orchestrator assignments and whether each assigned session is currently active.",
+        input_schema = {
+            type = "object",
+            properties = {},
+        },
+    }, function(_params, _context)
+        return ok(engine.question_orchestrator_status())
+    end)
+
+    tool("project_pipelines_escalate_question", {
+        description = "Escalate an open question assigned to the calling orchestrator back to the human without answering it.",
+        input_schema = {
+            type = "object",
+            properties = {
+                question_id = { type = "string" },
+                reason = { type = "string" },
+            },
+            required = { "question_id" },
+        },
+    }, function(params, context)
+        return ok(engine.escalate_question(params, context))
+    end)
+
     tool("project_pipelines_ask_human", {
-        description = "Ask the human a durable pipeline question visible in the Project Pipelines sidebar.",
+        description = "Ask a durable pipeline question. It routes to the active project/global question orchestrator first and falls back to the human when none is active.",
         input_schema = {
             type = "object",
             properties = {
