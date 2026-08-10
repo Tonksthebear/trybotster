@@ -2159,36 +2159,73 @@ function M.request_step_advance(params, context)
         })
     end
 
-    if active_visit_id then
-        repo.update_run_step_visit(active_visit_id, { status = "done", completed_at = util.now() })
-    else
-        repo.update_run_step(run.id, step.id, { status = "done", completed_at = util.now() })
+    local function complete_source_visit()
+        if active_visit_id then
+            repo.update_run_step_visit(active_visit_id, { status = "done", completed_at = util.now() })
+        else
+            repo.update_run_step(run.id, step.id, { status = "done", completed_at = util.now() })
+        end
+        repo.append_event("step.completed", {
+            run_id = run.id,
+            ticket_id = run.ticket_id,
+            payload = {
+                step_id = step.id,
+                run_step_id = active_visit_id,
+                summary = params.summary,
+                evidence = params.evidence or {},
+            },
+        })
     end
-    repo.append_event("step.completed", {
-        run_id = run.id,
-        ticket_id = run.ticket_id,
-        payload = { step_id = step.id, run_step_id = active_visit_id, summary = params.summary, evidence = params.evidence or {} },
-    })
-    local updated = repo.get_run(run.id)
-    local activation = M.activate_step(updated, next_step)
-    -- Do not report top-level success when target activation is dependency-blocked
-    -- (TOCTOU after the preflight check, or any residual fail-closed path).
-    if activation and activation.ok == false and activation.reason == "ticket_dependencies" then
+
+    -- Target activation runs before source completion so a dependency block cannot
+    -- leave the source visit done while the target is refused.
+    if next_step then
+        local activation = M.activate_step(run, next_step)
+        if activation and activation.ok == false and activation.reason == "ticket_dependencies" then
+            return {
+                ok = false,
+                status = "blocked",
+                reason = "ticket_dependencies",
+                step = step,
+                next_step = next_step,
+                target_step = next_step,
+                source = activation.source or "activate_step",
+                unmet_dependencies = activation.unmet_dependencies,
+                activation = activation,
+                run = repo.get_run(run.id),
+            }
+        end
+        complete_source_visit()
+        if activation and activation.ok == false then
+            return {
+                ok = false,
+                status = activation.status or "blocked",
+                completed_step = step,
+                next_step = next_step,
+                activation = activation,
+                run = repo.get_run(run.id),
+                error = activation.error,
+            }
+        end
         return {
-            ok = false,
-            status = "blocked",
-            reason = "ticket_dependencies",
-            step = step,
+            ok = true,
             completed_step = step,
             next_step = next_step,
-            target_step = next_step,
-            source = activation.source or "activate_step",
-            unmet_dependencies = activation.unmet_dependencies,
             activation = activation,
             run = repo.get_run(run.id),
         }
     end
-    return { ok = true, completed_step = step, next_step = next_step, activation = activation, run = repo.get_run(run.id) }
+
+    -- Final advance (no target step): complete the run / merge path.
+    complete_source_visit()
+    local activation = M.activate_step(repo.get_run(run.id), nil)
+    return {
+        ok = true,
+        completed_step = step,
+        next_step = nil,
+        activation = activation,
+        run = repo.get_run(run.id),
+    }
 end
 
 function M.retry_step_agent(params, context)
@@ -2236,6 +2273,8 @@ function M.retry_step_agent(params, context)
         error("no run step visit found for current step")
     end
 
+    -- Final dependency decision covers the full retry transition before any
+    -- durable mutation (status flip, session clear, retry event, spawn).
     local blocked = dependency_block(run, {
         step_id = step.id,
         run_step_id = visit.id,
@@ -2248,6 +2287,23 @@ function M.retry_step_agent(params, context)
         blocked.run_step = visit
         return blocked
     end
+    blocked = dependency_block(run, {
+        step_id = step.id,
+        run_step_id = visit.id,
+        target_step_id = step.id,
+        source = "retry_step_agent",
+    })
+    if blocked then
+        blocked.step = step
+        blocked.run = run
+        blocked.run_step = visit
+        return blocked
+    end
+
+    local prior_status = run.status
+    local prior_visit_status = visit.status
+    local prior_session = visit.agent_session_uuid
+    local prior_started_at = visit.started_at
 
     repo.update_run(run.id, { status = "active", current_step_id = step.id, current_run_step_id = visit.id })
     repo.update_run_step_visit(visit.id, {
@@ -2266,22 +2322,27 @@ function M.retry_step_agent(params, context)
         },
     })
 
+    -- Deps already decided above; do not re-check after mutation (would leave
+    -- half-applied retry state without restoring source fields).
     local created, err = spawn_step_agent(repo.get_run(run.id), step, {
-        dependency_source = "retry_step_agent",
+        skip_dependency_check = true,
     })
     if err then
-        if type(err) == "table" and err.reason == "ticket_dependencies" then
-            err.step = step
-            err.run = repo.get_run(run.id)
-            err.run_step = repo.get_run_step_visit(visit.id)
-            return err
-        end
         repo.update_run(run.id, { status = "blocked" })
         repo.update_run_step_visit(visit.id, { status = "blocked" })
         repo.append_event("step.spawn_failed", {
             run_id = run.id,
             ticket_id = run.ticket_id,
-            payload = { step_id = step.id, run_step_id = visit.id, retry = true, error = err },
+            payload = {
+                step_id = step.id,
+                run_step_id = visit.id,
+                retry = true,
+                error = err,
+                prior_status = prior_status,
+                prior_visit_status = prior_visit_status,
+                prior_session = prior_session,
+                prior_started_at = prior_started_at,
+            },
         })
         return { ok = false, status = "blocked", run = repo.get_run(run.id), step = step, run_step = repo.get_run_step_visit(visit.id), error = err }
     end

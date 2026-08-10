@@ -191,15 +191,13 @@ and ticket ids, title/status when available, an operator prompt, and either:
 - `reason = "unavailable_ticket"` when the left-joined ticket or its status is
   unavailable.
 
-The preflight runs before completing the source visit, emitting
-`step.completed` or an override event, creating the target visit, changing run
-pointers, notifying, resolving command execution, requesting a worktree or
-session, or spawning/linking an agent. Direct activation re-checks immediately
-before those target side effects so a dependency block cannot leave a half-
-activated target. When a residual second check still finds open blockers after
-the source visit was completed, advance returns top-level `ok = false` with
-`reason = "ticket_dependencies"` rather than a successful advance that nests a
-blocked activation. `start_run` returns the same typed blocked shape
+The preflight decision covers the full transition before durable mutation.
+`request_step_advance` activates the target step before completing the source
+visit, so a dependency block leaves the source visit active and never emits
+`step.completed`. Direct activation re-checks immediately before target side
+effects (visit, run pointer, `step.activated`, notify, spawn). `retry_step_agent`
+makes the same decision twice immediately before retry mutations and does not
+re-check after those mutations. `start_run` returns the typed blocked shape
 (`ok = false`, `status = "blocked"`, `reason = "ticket_dependencies"`,
 `unmet_dependencies` with each `depends_on_ticket_id`) and does not create a run.
 A final advance with no target step still completes the run and follows its merge
