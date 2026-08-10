@@ -19,6 +19,33 @@ pub struct WorktreeManager {
     base_dir: PathBuf,
 }
 
+/// Sanitize a string for use as a single filesystem path component.
+///
+/// Replaces path separators and characters that break nested tools (notably
+/// `:` on macOS DYLD path lists when Cargo injects `target/deps`) with `-`.
+/// Collapses repeated dashes and trims leading/trailing dashes.
+// Rust guideline compliant 2024-12 (M-DOCUMENTED-MAGIC / path safety)
+pub fn path_component_safe(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for ch in name.chars() {
+        match ch {
+            '/' | '\\' | ':' | '@' | '|' | '<' | '>' | '*' | '?' | '"' => out.push('-'),
+            c if c.is_control() || c.is_whitespace() => out.push('-'),
+            c => out.push(c),
+        }
+    }
+    let collapsed = out
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if collapsed.is_empty() {
+        "repo".to_string()
+    } else {
+        collapsed
+    }
+}
+
 impl WorktreeManager {
     /// Creates a new worktree manager with the specified base directory.
     pub fn new(base_dir: PathBuf) -> Self {
@@ -177,8 +204,8 @@ impl WorktreeManager {
         base_ref: Option<&str>,
     ) -> Result<PathBuf> {
         let repo_name = repo_name_for_root(repo_path)?;
-        let repo_safe = repo_name.replace('/', "-");
-        let sanitized_branch = branch_name.replace('/', "-");
+        let repo_safe = path_component_safe(&repo_name);
+        let sanitized_branch = path_component_safe(branch_name);
         let worktree_path = self
             .base_dir
             .join(format!("{}-{}", repo_safe, sanitized_branch));
@@ -274,7 +301,7 @@ impl WorktreeManager {
 
     /// Creates or reuses a git worktree for the given repo and issue (clone from GitHub)
     pub fn create_worktree(&self, repo: &str, issue_number: u32) -> Result<PathBuf> {
-        let repo_safe = repo.replace('/', "-");
+        let repo_safe = path_component_safe(repo);
         fs::create_dir_all(&self.base_dir)?;
 
         let clone_dir = self.base_dir.join(&repo_safe);
@@ -380,7 +407,7 @@ impl WorktreeManager {
 
     /// Lists all existing worktrees for a repo
     pub fn list_worktrees(&self, repo: &str) -> Result<Vec<String>> {
-        let repo_safe = repo.replace('/', "-");
+        let repo_safe = path_component_safe(repo);
         let clone_dir = self.base_dir.join(&repo_safe);
 
         if !clone_dir.exists() {
@@ -403,7 +430,7 @@ impl WorktreeManager {
         issue_number: u32,
     ) -> Result<Option<(PathBuf, String)>> {
         let (repo_path, repo_name) = Self::detect_current_repo()?;
-        let repo_safe = repo_name.replace('/', "-");
+        let repo_safe = path_component_safe(&repo_name);
         let branch_name = format!("botster-issue-{}", issue_number);
         let worktree_path = self.base_dir.join(format!("{}-{}", repo_safe, branch_name));
 
@@ -458,7 +485,7 @@ impl WorktreeManager {
 
     /// Prunes all stale worktrees for a repo
     pub fn prune_stale_worktrees(&self, repo: &str) -> Result<()> {
-        let repo_safe = repo.replace('/', "-");
+        let repo_safe = path_component_safe(repo);
         let clone_dir = self.base_dir.join(&repo_safe);
 
         if clone_dir.exists() {
@@ -609,7 +636,7 @@ impl WorktreeManager {
         // Detect the current repo
         let (repo_path, repo_name) = Self::detect_current_repo()?;
 
-        let repo_safe = repo_name.replace('/', "-");
+        let repo_safe = path_component_safe(&repo_name);
         let branch_name = format!("botster-issue-{}", issue_number);
         let worktree_path = self
             .base_dir
@@ -920,6 +947,20 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let manager = WorktreeManager::new(temp_dir.path().to_path_buf());
         assert!(manager.base_dir.to_str().is_some());
+    }
+
+    #[test]
+    fn path_component_safe_strips_colon_and_at() {
+        // SSH-style remotes and owner/repo paths must not keep ':' (DYLD) or '@'.
+        assert_eq!(
+            path_component_safe("git@github.com:trybotster/botster-tui"),
+            "git-github.com-trybotster-botster-tui"
+        );
+        assert_eq!(
+            path_component_safe("owner/repo"),
+            "owner-repo"
+        );
+        assert!(!path_component_safe("git@github.com:x/y").contains(':'));
     }
 
     #[test]

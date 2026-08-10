@@ -187,8 +187,12 @@ impl Agent {
     /// Format: `{repo-safe}-{branch-name}` (slashes replaced with dashes).
     #[must_use]
     pub fn agent_id(&self) -> String {
-        let repo_safe = self.repo.replace('/', "-");
-        format!("{}-{}", repo_safe, self.branch_name.replace('/', "-"))
+        let repo_safe = crate::git::path_component_safe(&self.repo);
+        format!(
+            "{}-{}",
+            repo_safe,
+            crate::git::path_component_safe(&self.branch_name)
+        )
     }
 
     // =========================================================================
