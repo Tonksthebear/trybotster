@@ -174,12 +174,11 @@ Agents should call `project_pipelines_current_context` first. The context includ
 Agents submit evidence with `project_pipelines_submit_gate`, reviews with `project_pipelines_submit_review`, artifacts with `project_pipelines_add_artifact`, and move the run with `project_pipelines_request_step_advance`. If gates are not satisfied, advancement returns structured unmet gate prompts.
 
 Ticket ordering dependencies are an unconditional activation preflight. The
-engine reads the normalized rows returned by
-`repo.ticket_dependencies(ticket_id)` every time it advances to a target step,
-directly activates a step, returns PR review feedback to implementation, or
-retries the current agent step. Every referenced ticket must have
-`status = "closed"`; there is no step-level or forced-transition override for
-open dependencies.
+engine uses one shared helper over the normalized rows returned by
+`repo.ticket_dependencies(ticket_id)` for `start_run`, advance to a target step,
+direct activation, PR review reactivation, agent retry, and a last-line defense
+inside agent spawn. Every referenced ticket must have `status = "closed"`; there
+is no step-level or forced-transition override for open dependencies.
 
 A blocked attempt returns `ok = false`, `status = "blocked"`,
 `reason = "ticket_dependencies"`, and `unmet_dependencies`. It also appends one
@@ -195,10 +194,13 @@ and ticket ids, title/status when available, an operator prompt, and either:
 The preflight runs before completing the source visit, emitting
 `step.completed` or an override event, creating the target visit, changing run
 pointers, notifying, resolving command execution, requesting a worktree or
-session, or spawning/linking an agent. `start_run` keeps its earlier contract:
-it raises `ticket dependencies must close before starting a run: ...` before
-creating the run. A final advance with no target step still completes the run
-and follows its merge policy; dependency gating applies to target-step
+session, or spawning/linking an agent. When a residual second check still finds
+open blockers after the source visit was completed, advance returns top-level
+`ok = false` with `reason = "ticket_dependencies"` rather than a successful
+advance that nests a blocked activation. `start_run` raises
+`ticket dependencies must close before starting a run: ...` before creating the
+run (same shared helper). A final advance with no target step still completes the
+run and follows its merge policy; dependency gating applies to target-step
 activation, not run completion or merge.
 
 Closing or removing a dependency never activates work automatically. The
