@@ -227,6 +227,16 @@ local db = plugin.db{
             created_at = { "integer", required = true },
             updated_at = { "integer", required = true },
         },
+        -- Project-specific or global claim for who owns unanswered questions.
+        question_orchestrators = {
+            id = { "text", required = true, primary = true },
+            scope = { "text", required = true },
+            project_id = { "text" },
+            session_uuid = { "text", required = true },
+            session_label = { "text" },
+            claimed_at = { "integer", required = true },
+            updated_at = { "integer", required = true },
+        },
         checklists = {
             id = { "text", required = true, primary = true },
             scope = { "text", required = true },

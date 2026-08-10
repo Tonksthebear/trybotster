@@ -2334,7 +2334,7 @@ function M.update_question(question_id, attrs)
         error("question not found: " .. tostring(question_id))
     end
     local set = {}
-    for _, field in ipairs({ "status", "answer", "answered_by_session_uuid", "advisor_session_uuid" }) do
+    for _, field in ipairs({ "status", "answer", "answered_by_session_uuid", "advisor_session_uuid", "kind" }) do
         if attrs and attrs[field] ~= nil then
             set[field] = attrs[field]
         end
@@ -2361,6 +2361,104 @@ end
 
 function M.get_question(question_id)
     return db.questions:where{ id = question_id }
+end
+
+--- Return the claim for one project, or the global claim when project_id is blank.
+function M.get_question_orchestrator(project_id)
+    if not util.is_blank(project_id) then
+        return first(
+            "SELECT * FROM question_orchestrators WHERE scope = 'project' AND project_id = ? LIMIT 1",
+            project_id
+        )
+    end
+    return first(
+        "SELECT * FROM question_orchestrators WHERE scope = 'global' AND (project_id IS NULL OR project_id = '') LIMIT 1"
+    )
+end
+
+function M.list_question_orchestrators()
+    return rows("SELECT * FROM question_orchestrators ORDER BY claimed_at DESC, id ASC")
+end
+
+--- Claim project-scoped or global question ownership for a live session.
+-- attrs: project_id (nil = global), session_uuid, session_label, replace
+function M.claim_question_orchestrator(attrs)
+    attrs = attrs or {}
+    local session_uuid = util.assert_present(attrs.session_uuid, "session_uuid")
+    local project_id = attrs.project_id
+    local scope = util.is_blank(project_id) and "global" or "project"
+    if scope == "project" then
+        util.assert_present(project_id, "project_id")
+    else
+        project_id = nil
+    end
+    local now = util.now()
+    local current = M.get_question_orchestrator(project_id)
+    if current then
+        if current.session_uuid ~= session_uuid and attrs.replace ~= true then
+            error("question orchestrator already claimed by "
+                .. tostring(current.session_label or current.session_uuid))
+        end
+        db.question_orchestrators:update{
+            where = { id = current.id },
+            set = {
+                session_uuid = session_uuid,
+                session_label = attrs.session_label or current.session_label,
+                claimed_at = current.session_uuid == session_uuid and current.claimed_at or now,
+                updated_at = now,
+            },
+        }
+        local updated = db.question_orchestrators:where{ id = current.id }
+        M.append_event("question_orchestrator.claimed", {
+            payload = {
+                id = updated.id,
+                scope = updated.scope,
+                project_id = updated.project_id,
+                session_uuid = updated.session_uuid,
+                replaced = current.session_uuid ~= session_uuid,
+            },
+        })
+        return updated
+    end
+
+    local id = scope == "project" and ("project:" .. tostring(project_id)) or "global"
+    local row = {
+        id = id,
+        scope = scope,
+        project_id = project_id,
+        session_uuid = session_uuid,
+        session_label = attrs.session_label,
+        claimed_at = now,
+        updated_at = now,
+    }
+    db.question_orchestrators:insert(row)
+    M.append_event("question_orchestrator.claimed", {
+        payload = {
+            id = row.id,
+            scope = row.scope,
+            project_id = row.project_id,
+            session_uuid = row.session_uuid,
+            replaced = false,
+        },
+    })
+    return row
+end
+
+function M.release_question_orchestrator(project_id)
+    local current = M.get_question_orchestrator(project_id)
+    if not current then
+        return nil
+    end
+    db:eval("DELETE FROM question_orchestrators WHERE id = ?", current.id)
+    M.append_event("question_orchestrator.released", {
+        payload = {
+            id = current.id,
+            scope = current.scope,
+            project_id = current.project_id,
+            session_uuid = current.session_uuid,
+        },
+    })
+    return current
 end
 
 function M.ticket_questions(ticket_id, status)

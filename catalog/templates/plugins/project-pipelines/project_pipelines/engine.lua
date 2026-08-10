@@ -483,6 +483,134 @@ local function spawn_step_agent(run, step, opts)
     }, nil
 end
 
+local function live_question_orchestrator(project_id, excluded_session_uuid)
+    local candidates = {}
+    if not util.is_blank(project_id) then
+        candidates[#candidates + 1] = repo.get_question_orchestrator(project_id)
+    end
+    candidates[#candidates + 1] = repo.get_question_orchestrator(nil)
+    local first_assignment = nil
+    for _, assignment in ipairs(candidates) do
+        if assignment then
+            first_assignment = first_assignment or assignment
+            local session = assignment.session_uuid ~= excluded_session_uuid
+                and Agent.get(assignment.session_uuid) or nil
+            if session then
+                return assignment, session, first_assignment
+            end
+        end
+    end
+    return nil, nil, first_assignment
+end
+
+local function session_label(session, session_uuid)
+    if type(session) ~= "table" then
+        return session_uuid
+    end
+    local info = nil
+    if type(session.info) == "function" then
+        local ok, value = pcall(session.info, session)
+        if ok then info = value end
+    end
+    return session.label
+        or session.display_name
+        or session.name
+        or session.agent_name
+        or (type(info) == "table" and (info.label or info.display_name or info.name or info.agent_name))
+        or session_uuid
+end
+
+function M.claim_question_orchestrator(params, context)
+    params = params or {}
+    local session_uuid = context and context.session_uuid or params.session_uuid
+    util.assert_present(session_uuid, "calling session_uuid")
+    local session = Agent.get(session_uuid)
+    if not session then
+        error("calling agent session is not active: " .. tostring(session_uuid))
+    end
+
+    local current = repo.get_question_orchestrator(params.project_id)
+    local replace = params.replace == true
+    if current and current.session_uuid ~= session_uuid and not Agent.get(current.session_uuid) then
+        replace = true
+    end
+    local assignment = repo.claim_question_orchestrator{
+        project_id = params.project_id,
+        session_uuid = session_uuid,
+        session_label = session_label(session, session_uuid),
+        replace = replace,
+    }
+    refresh_surfaces(context)
+    return {
+        assignment = assignment,
+        scope = assignment.scope,
+        message = assignment.scope == "project"
+            and "This session now owns questions for project " .. tostring(assignment.project_id) .. "."
+            or "This session now owns globally unassigned Project Pipelines questions.",
+    }
+end
+
+function M.release_question_orchestrator(params, context)
+    params = params or {}
+    local session_uuid = context and context.session_uuid or params.session_uuid
+    util.assert_present(session_uuid, "calling session_uuid")
+    local assignment = repo.get_question_orchestrator(params.project_id)
+    if not assignment then
+        return { released = false, reason = "not_claimed" }
+    end
+    if assignment.session_uuid ~= session_uuid and params.force ~= true then
+        error("question orchestrator is owned by " .. tostring(assignment.session_label or assignment.session_uuid))
+    end
+    repo.release_question_orchestrator(params.project_id)
+    refresh_surfaces(context)
+    return { released = true, assignment = assignment }
+end
+
+function M.question_orchestrator_status()
+    local assignments = {}
+    for _, assignment in ipairs(repo.list_question_orchestrators()) do
+        assignment.active = Agent.get(assignment.session_uuid) ~= nil
+        assignments[#assignments + 1] = assignment
+    end
+    return assignments
+end
+
+function M.escalate_question(params, context)
+    params = params or {}
+    local question = repo.get_question(util.assert_present(params.question_id, "question_id"))
+    if not question then
+        error("question not found: " .. tostring(params.question_id))
+    end
+    if question.status ~= "open" then
+        error("question is not open: " .. tostring(question.status))
+    end
+    local session_uuid = context and context.session_uuid or params.session_uuid
+    local ticket = repo.get_ticket(question.ticket_id)
+    local run = question.run_id and repo.get_run(question.run_id) or nil
+    local updated = repo.update_question(question.id, {
+        kind = "human",
+        status = "open",
+    })
+    repo.append_event("question.escalated", {
+        run_id = question.run_id,
+        ticket_id = question.ticket_id,
+        payload = {
+            question_id = question.id,
+            reason = params.reason,
+            by_session_uuid = session_uuid,
+            previous_advisor_session_uuid = question.advisor_session_uuid,
+        },
+    })
+    notification_policy.notify_question_asked({
+        question = updated,
+        ticket = ticket,
+        run = run,
+        step_id = question.step_id,
+    })
+    refresh_surfaces(context)
+    return updated
+end
+
 function M.ask_human(params, context)
     local resolved = context_from_params(params or {}, context or {})
     local question = repo.create_question{
@@ -495,12 +623,69 @@ function M.ask_human(params, context)
         asked_by_session_uuid = resolved.session_uuid,
         blocking = params.blocking ~= false,
     }
-    notification_policy.notify_question_asked({
-        question = question,
-        ticket = resolved.ticket,
-        run = resolved.run,
-        step_id = resolved.step_id,
+    local assignment, orchestrator, attempted_assignment =
+        live_question_orchestrator(resolved.ticket.project_id, resolved.session_uuid)
+    local routed = false
+    local route_error = nil
+    if orchestrator and assignment.session_uuid ~= resolved.session_uuid then
+        local ok, err = pcall(function()
+            Hub.get():post(assignment.session_uuid, {
+                type = "task",
+                from_agent_id = OWNER,
+                from_label = "Project Pipelines",
+                payload = {
+                    question_id = question.id,
+                    ticket_id = question.ticket_id,
+                    run_id = question.run_id,
+                    project_id = resolved.ticket.project_id,
+                    question = question.question,
+                    instructions = table.concat({
+                        "You are the active Project Pipelines question orchestrator.",
+                        "Investigate this question using the ticket and run context, delegating to the context-owning ticket session when useful.",
+                        "Answer with project_pipelines_answer_question.",
+                        "If human judgment is required, call project_pipelines_escalate_question instead of guessing.",
+                    }, " "),
+                },
+            })
+            Hub.get():notify(assignment.session_uuid, {
+                source = OWNER,
+                title = "Pipeline question needs an answer",
+                body = tostring(resolved.ticket.title or resolved.ticket.id) .. ": " .. tostring(question.question),
+                action = {
+                    kind = "mcp_tool",
+                    name = "project_pipelines_get_ticket",
+                    params = { ticket_id = resolved.ticket.id },
+                },
+            })
+        end)
+        routed = ok
+        route_error = ok and nil or tostring(err)
+        if ok then
+            question = repo.update_question(question.id, {
+                advisor_session_uuid = assignment.session_uuid,
+            })
+        end
+    end
+    repo.append_event(routed and "question.orchestrator_routed" or "question.orchestrator_fallback", {
+        run_id = question.run_id,
+        ticket_id = question.ticket_id,
+        payload = {
+            question_id = question.id,
+            session_uuid = (assignment or attempted_assignment) and (assignment or attempted_assignment).session_uuid or nil,
+            scope = (assignment or attempted_assignment) and (assignment or attempted_assignment).scope or nil,
+            reason = not attempted_assignment and "unclaimed"
+                or (not orchestrator and "inactive_or_asking_session")
+                or route_error,
+        },
     })
+    if not routed then
+        notification_policy.notify_question_asked({
+            question = question,
+            ticket = resolved.ticket,
+            run = resolved.run,
+            step_id = resolved.step_id,
+        })
+    end
     refresh_surfaces()
     return question
 end
@@ -536,7 +721,7 @@ function M.ask_agent(params, context)
     local ok, created = pcall(function()
         return Hub.get():create_agent{
             request_id = request_id,
-            agent_name = params.agent_name or "claude",
+            agent_name = params.agent_name or "grok",
             issue_or_branch = ticket_branch_for(resolved.ticket, question.id),
             base_ref = resolved.run and resolved.run.base_ref or nil,
             base_target_path = resolved.run and resolved.run.base_target_path or nil,
