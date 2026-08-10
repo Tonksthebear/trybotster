@@ -14707,14 +14707,8 @@ class MouseController {
       const steps = wheelReportSteps(event);
       if (steps === 0)
         return false;
-      const codeBase = steps < 0 ? 64 : 65;
-      const n = Math.abs(steps);
-      let sent = false;
-      for (let i = 0;i < n; i += 1) {
-        if (this.sendMouse(codeBase + mods, col, row, pixel, false))
-          sent = true;
-      }
-      return sent;
+      const code = (steps < 0 ? 64 : 65) + mods;
+      return this.sendMouse(code, col, row, pixel, false);
     }
     return false;
   }
@@ -14771,20 +14765,11 @@ class MouseController {
     return true;
   }
 }
-function wheelReportSteps(event, maxSteps = 8) {
+function wheelReportSteps(event, _maxSteps = 1) {
   const dy = event.deltaY;
   if (!dy || !Number.isFinite(dy))
     return 0;
-  const sign = dy < 0 ? -1 : 1;
-  let abs;
-  if (event.deltaMode === 1) {
-    abs = Math.max(1, Math.round(Math.abs(dy)));
-  } else if (event.deltaMode === 2) {
-    abs = Math.max(1, Math.round(Math.abs(dy) * 24));
-  } else {
-    abs = Math.max(1, Math.round(Math.abs(dy) / 40));
-  }
-  return sign * Math.min(abs, maxSteps);
+  return dy < 0 ? -1 : 1;
 }
 
 // src/input/output/csi.ts
