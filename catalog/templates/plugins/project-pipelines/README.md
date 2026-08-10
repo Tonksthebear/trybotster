@@ -52,6 +52,18 @@ create reusable pipeline definitions explicitly through the GUI and MCP tools.
 Projects are the durable container for multi-phase or cross-target work; tickets
 remain one concrete unit of work in one spawn target.
 
+When a live hub already has `botster_stack_delivery`, plugin load refreshes the
+Plan and Plan Review prompts if `pipelines.version_label` differs from the
+catalog revision in `project_pipelines/stack_delivery.lua`. Operator-chosen
+`agent_name` values are preserved. No operator SQL is required for that refresh.
+
+## Worktree Hygiene
+
+On step activation and agent link, the engine restores a tracked `.gitignore`
+from `HEAD` only when the working copy is empty or missing. It never truncates
+`.gitignore`. Command gates that run under a path containing `:` set a
+colon-free `CARGO_TARGET_DIR` so macOS Cargo/DYLD path joining does not fail.
+
 Pipeline MCP CRUD:
 
 - `project_pipelines_create_pipeline`

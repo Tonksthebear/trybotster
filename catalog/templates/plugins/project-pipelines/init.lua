@@ -12,6 +12,7 @@ for _, module_name in ipairs({
     "project_pipelines.repo",
     "project_pipelines.entities",
     "project_pipelines.engine",
+    "project_pipelines.stack_delivery",
     "project_pipelines.github_integration",
     "project_pipelines.notification_policy",
     "project_pipelines.mcp",
@@ -30,6 +31,7 @@ end
 
 local repo = require("project_pipelines.repo")
 local engine = require("project_pipelines.engine")
+local stack_delivery = require("project_pipelines.stack_delivery")
 local github_integration = require("project_pipelines.github_integration")
 local notification_policy = require("project_pipelines.notification_policy")
 local mcp_tools = require("project_pipelines.mcp")
@@ -38,6 +40,12 @@ local surface = require("project_pipelines.web.surface")
 local M = {}
 
 repo.prune_legacy_seed_data()
+local ok_prompts, prompt_result = pcall(stack_delivery.reconcile)
+if ok_prompts and prompt_result and prompt_result.refreshed then
+    log.info("[project-pipelines] refreshed botster_stack_delivery prompts to " .. tostring(prompt_result.revision))
+elseif not ok_prompts then
+    log.warn("[project-pipelines] stack delivery prompt refresh failed: " .. tostring(prompt_result))
+end
 engine.register_entities()
 notification_policy.register()
 mcp_tools.register()
