@@ -3551,9 +3551,19 @@ fn catalog_plugin_project_pipelines_start_run_blocks_open_dependencies() {
                 return {{ id = id, title = "Child", target_id = "target-1" }}
               end,
               open_ticket_run = function() return nil end,
-              blocking_ticket_dependencies = function(ticket_id)
+              -- start_run uses the same unmet_ticket_dependencies authority as
+              -- activate/advance/retry/spawn (normalized ticket_dependencies rows).
+              ticket_dependencies = function(ticket_id)
                 assert(ticket_id == "ticket-child")
-                return {{ {{ ticket_id = "ticket-child", depends_on_ticket_id = "ticket-parent", depends_on_title = "Parent", depends_on_status = "open" }} }}
+                return {{
+                  {{
+                    id = "dependency-parent",
+                    ticket_id = "ticket-child",
+                    depends_on_ticket_id = "ticket-parent",
+                    depends_on_title = "Parent",
+                    depends_on_status = "open",
+                  }},
+                }}
               end,
               get_pipeline = function()
                 error("dependency gating must run before pipeline lookup")
@@ -3787,6 +3797,25 @@ fn catalog_plugin_project_pipelines_public_dependency_write_blocks_advance_befor
             assert(direct_command.ok == false and direct_command.target_step_id == "command")
             assert(mutation_calls == 0 and notification_calls == 0 and create_agent_calls == 0)
 
+            -- Mid-run dependency registration while past Plan: retry current agent also refuses.
+            reset_attempt("open")
+            local retry_blocked = handlers.project_pipelines_retry_step_agent({{
+              run_id = "run-child",
+              reason = "retry while open dependency",
+            }}, {{}}).result
+            assert(retry_blocked.ok == false)
+            assert(retry_blocked.reason == "ticket_dependencies")
+            assert(retry_blocked.source == "retry_step_agent")
+            assert(create_agent_calls == 0)
+            assert(run.current_step_id == "plan")
+            local saw_retry_block = false
+            for _, event in ipairs(events) do
+              if event.kind == "step.advance_blocked" and event.attrs.payload.source == "retry_step_agent" then
+                saw_retry_block = true
+              end
+            end
+            assert(saw_retry_block == true)
+
             reset_attempt("closed")
             local advanced = handlers.project_pipelines_request_step_advance({{ run_id = "run-child" }}, {{}}).result
             assert(advanced.ok == true)
@@ -3807,6 +3836,203 @@ fn catalog_plugin_project_pipelines_public_dependency_write_blocks_advance_befor
         ))
         .eval()
         .expect("public ticket dependency rows should gate production advance and direct activation paths");
+
+    assert_eq!(result, "ok");
+}
+
+// Rust guideline compliant 2024-12
+// Mid-run Plan Review → Implement sequence: open blocker refuses advance and spawn.
+#[test]
+fn catalog_plugin_project_pipelines_mid_run_dependency_blocks_plan_review_to_implement() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local dependency_status = "open"
+            local dependency_calls = 0
+            local create_agent_calls = 0
+            local events = {{}}
+            local visit_status = "active"
+            local run = {{
+              id = "run-live",
+              ticket_id = "ticket-consumer",
+              pipeline_id = "pipe-1",
+              target_id = "target-1",
+              status = "active",
+              current_step_id = "plan_review",
+              current_run_step_id = "visit-plan-review",
+            }}
+            local steps = {{
+              plan_review = {{
+                id = "plan_review",
+                pipeline_id = "pipe-1",
+                kind = "agent",
+                name = "Plan Review",
+                agent_name = "codex",
+              }},
+              implement = {{
+                id = "implement",
+                pipeline_id = "pipe-1",
+                kind = "agent",
+                name = "Implement",
+                agent_name = "codex",
+              }},
+            }}
+
+            package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              get_run = function(id) assert(id == "run-live"); return run end,
+              get_step = function(id) return steps[id] end,
+              get_ticket = function(id) return {{ id = id, title = id, target_id = "target-1" }} end,
+              step_gates = function() return {{}} end,
+              latest_review_for_run_step = function()
+                return {{ id = "review-1", verdict = "approved" }}
+              end,
+              next_step = function() return steps.implement end,
+              ticket_dependencies = function(ticket_id)
+                assert(ticket_id == "ticket-consumer")
+                dependency_calls = dependency_calls + 1
+                return {{
+                  {{
+                    id = "dependency-kit",
+                    ticket_id = ticket_id,
+                    depends_on_ticket_id = "ticket-kit",
+                    depends_on_title = "Kit blocker",
+                    depends_on_status = dependency_status,
+                  }},
+                }}
+              end,
+              append_event = function(kind, attrs)
+                events[#events + 1] = {{ kind = kind, attrs = attrs }}
+              end,
+              update_run_step_visit = function(id, attrs)
+                visit_status = attrs.status or visit_status
+                return {{ id = id, run_id = run.id, step_id = run.current_step_id, status = visit_status }}
+              end,
+              update_run_step = function() end,
+              create_run_step_visit = function(run_id, step_id, attrs)
+                run.current_step_id = step_id
+                run.current_run_step_id = "visit-implement"
+                return {{ id = "visit-implement", run_id = run_id, step_id = step_id, status = attrs.status, sequence = 2 }}
+              end,
+              update_run = function(id, attrs)
+                for key, value in pairs(attrs or {{}}) do run[key] = value end
+                return run
+              end,
+              get_run_step_visit = function(id)
+                return {{
+                  id = id,
+                  run_id = run.id,
+                  step_id = run.current_step_id,
+                  status = visit_status,
+                }}
+              end,
+              get_run_step = function(run_id, step_id)
+                return {{ id = "visit-" .. step_id, run_id = run_id, step_id = step_id, status = visit_status }}
+              end,
+              latest_step_session = function() return nil end,
+              list_pr_links = function() return {{}} end,
+              open_findings = function() return {{}} end,
+              ticket_session_uuids = function() return {{}} end,
+            }}
+            package.loaded["lib.agent"] = {{ get = function() return nil end }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  create_agent = function(_, opts)
+                    create_agent_calls = create_agent_calls + 1
+                    return {{ status = "queued", request_id = opts.request_id }}
+                  end,
+                }}
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+
+            -- Live failure sequence: Plan Review complete, open kit dependency, advance Implement.
+            local blocked = engine.request_step_advance({{
+              run_id = "run-live",
+              summary = "Plan Review approved",
+            }}, {{}})
+            assert(blocked.ok == false)
+            assert(blocked.reason == "ticket_dependencies")
+            assert(blocked.target_step_id == "implement" or blocked.target_step.id == "implement")
+            assert(create_agent_calls == 0)
+            assert(run.current_step_id == "plan_review")
+            assert(visit_status == "active")
+            assert(events[1].kind == "step.advance_blocked")
+            assert(events[1].attrs.payload.reason == "ticket_dependencies")
+            assert(events[1].attrs.payload.unmet_dependencies[1].depends_on_ticket_id == "ticket-kit")
+
+            local retry_blocked = engine.retry_step_agent({{
+              run_id = "run-live",
+              reason = "retry while kit open",
+            }}, {{}})
+            assert(retry_blocked.ok == false)
+            assert(retry_blocked.reason == "ticket_dependencies")
+            assert(create_agent_calls == 0)
+
+            dependency_status = "closed"
+            events = {{}}
+            local advanced = engine.request_step_advance({{
+              run_id = "run-live",
+              summary = "dependency closed; advance",
+            }}, {{}})
+            assert(advanced.ok == true)
+            assert(run.current_step_id == "implement")
+            assert(create_agent_calls == 1)
+
+            -- Last-line spawn defense: dependency reopens after activation preflight cleared.
+            dependency_status = "open"
+            dependency_calls = 0
+            create_agent_calls = 0
+            events = {{}}
+            run.current_step_id = "plan_review"
+            run.current_run_step_id = "visit-plan-review"
+            visit_status = "active"
+            local call_count_before_spawn = 0
+            local original_ticket_deps
+            -- activate_step checks once; spawn_step_agent checks again (last-line).
+            -- Simulate TOCTOU by flipping open after the first check returns closed.
+            local phase = 0
+            package.loaded["project_pipelines.repo"].ticket_dependencies = function(ticket_id)
+              phase = phase + 1
+              local status = phase == 1 and "closed" or "open"
+              return {{
+                {{
+                  id = "dependency-kit",
+                  ticket_id = ticket_id,
+                  depends_on_ticket_id = "ticket-kit",
+                  depends_on_title = "Kit blocker",
+                  depends_on_status = status,
+                }},
+              }}
+            end
+            -- Force package.loaded engine to re-read is not needed; repo table is shared.
+            local toctou = engine.activate_step(run, steps.implement)
+            assert(toctou.ok == false)
+            assert(create_agent_calls == 0)
+            local saw_spawn_block = false
+            for _, event in ipairs(events) do
+              if event.kind == "step.advance_blocked" and event.attrs.payload.source == "spawn_step_agent" then
+                saw_spawn_block = true
+              end
+            end
+            assert(saw_spawn_block == true)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("mid-run open dependencies must block Plan Review→Implement advance and last-line spawn");
 
     assert_eq!(result, "ok");
 }
