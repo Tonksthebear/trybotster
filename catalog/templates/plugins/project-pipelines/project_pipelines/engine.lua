@@ -90,6 +90,79 @@ local function live_ticket_worktree(ticket_id)
     return nil, nil, nil, nil
 end
 
+-- Invoke parent-owned command gates through the Hub facade. Workers do not
+-- expose hub.run_command_gate on the isolated global hub table.
+local function invoke_run_command_gate(opts)
+    local hub_obj = Hub.get()
+    if hub_obj and type(hub_obj.run_command_gate) == "function" then
+        return hub_obj:run_command_gate(opts)
+    end
+    if type(hub) == "table" and type(hub.run_command_gate) == "function" then
+        return hub.run_command_gate(opts)
+    end
+    error("run_command_gate unavailable: Hub facade and hub global are both nil")
+end
+
+-- Restore tracked .gitignore from HEAD only when the working copy is empty or
+-- missing while HEAD still has content. Never truncate. Never overwrite a
+-- non-empty intentional edit.
+local function ensure_gitignore_hygiene(cwd, context)
+    if util.is_blank(cwd) then
+        return
+    end
+    local request_id = string.format(
+        "%s:hygiene:gitignore:%s:%s",
+        OWNER,
+        tostring((context and context.run_id) or "none"),
+        tostring(os.time())
+    )
+    -- shell: restore only when tracked and working copy is empty/missing
+    local command = table.concat({
+        "if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then exit 0; fi",
+        "if ! git cat-file -e HEAD:.gitignore 2>/dev/null; then exit 0; fi",
+        "if [ ! -s .gitignore ]; then git checkout HEAD -- .gitignore; fi",
+    }, "; ")
+    local ok, err = pcall(function()
+        invoke_run_command_gate{
+            request_id = request_id,
+            command = command,
+            cwd = cwd,
+            timeout_secs = 30,
+            context = {
+                owner_plugin = OWNER,
+                operation = "gitignore_hygiene",
+                run_id = context and context.run_id or nil,
+                ticket_id = context and context.ticket_id or nil,
+            },
+        }
+    end)
+    if not ok then
+        log.warn("[project-pipelines] gitignore hygiene failed: " .. tostring(err))
+    end
+end
+
+local function cargo_target_dir_for(cwd)
+    if util.is_blank(cwd) or not tostring(cwd):find(":", 1, true) then
+        return nil
+    end
+    local tmp = os.getenv("TMPDIR") or os.getenv("TMP") or "/tmp"
+    local slug = tostring(cwd):gsub("[^%w]+", "-"):gsub("^%-", ""):gsub("%-$", "")
+    if #slug > 48 then
+        slug = slug:sub(1, 48)
+    end
+    if util.is_blank(slug) then
+        slug = "pipeline"
+    end
+    return tmp:gsub("/+$", "") .. "/botster-cargo-target/" .. slug
+end
+
+local function ensure_worktree_hygiene(cwd, context)
+    if util.is_blank(cwd) then
+        return
+    end
+    ensure_gitignore_hygiene(cwd, context)
+end
+
 local M = {}
 
 function M.register_entities()
@@ -905,9 +978,17 @@ local function run_command_step(run, step)
         return nil, "could not resolve a filesystem path for command step (target_id=" .. tostring(run.target_id) .. ")"
     end
 
+    ensure_worktree_hygiene(target_path, { run_id = run.id, ticket_id = run.ticket_id })
+
+    local env = nil
+    local cargo_target = cargo_target_dir_for(target_path)
+    if cargo_target then
+        env = { CARGO_TARGET_DIR = cargo_target }
+    end
+
     local request_id = string.format("%s:%s:%s:command:%s", OWNER, run.id, step.id, command_gate and command_gate.id or "step")
     local ok, result = pcall(function()
-        return hub.run_command_gate{
+        local opts = {
             request_id = request_id,
             command = command,
             cwd = target_path,
@@ -920,6 +1001,10 @@ local function run_command_step(run, step)
                 gate_id = command_gate and command_gate.id or nil,
             },
         }
+        if env then
+            opts.env = env
+        end
+        return invoke_run_command_gate(opts)
     end)
 
     if not ok then
@@ -928,7 +1013,12 @@ local function run_command_step(run, step)
     repo.append_event("step.command_started", {
         run_id = run.id,
         ticket_id = run.ticket_id,
-        payload = { step_id = step.id, command = command, request_id = request_id },
+        payload = {
+            step_id = step.id,
+            command = command,
+            request_id = request_id,
+            cargo_target_dir = cargo_target,
+        },
     })
     return result, nil
 end
@@ -1052,6 +1142,13 @@ function M.activate_step(run, step, options)
         step = step,
         run_step = visit,
     })
+
+    -- Hygiene on activation when a live ticket worktree already exists.
+    -- Never truncate .gitignore; restore from HEAD only when empty/missing.
+    local live_path = live_ticket_worktree(run.ticket_id)
+    if not util.is_blank(live_path) then
+        ensure_worktree_hygiene(live_path, { run_id = run.id, ticket_id = run.ticket_id })
+    end
 
     if step.kind == "agent" then
         local created, err = spawn_step_agent(repo.get_run(run.id), step, options.spawn_options)
@@ -1819,6 +1916,19 @@ function M.handle_agent_created(info)
             request_id = request_id,
         },
     })
+    local worktree_path = info.worktree_path or metadata.worktree_path
+    if util.is_blank(worktree_path) then
+        local session = Agent.get(session_uuid)
+        if session and session.info then
+            local ok, session_info = pcall(session.info, session)
+            if ok and session_info then
+                worktree_path = session_info.worktree_path
+            end
+        end
+    end
+    if not util.is_blank(worktree_path) then
+        ensure_worktree_hygiene(worktree_path, { run_id = run.id, ticket_id = run.ticket_id })
+    end
     refresh_surfaces()
 end
 
