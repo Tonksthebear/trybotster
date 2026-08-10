@@ -681,21 +681,55 @@ mod tests {
         );
     }
 
-    /// Subprocess regression: real Botster capture that used to exit 139 (SIGSEGV).
+    /// OSC-8 / long agent stream: `startHyperlink` → `increaseCapacity` SEGV class.
     ///
-    /// RED before silent-degrade pin; GREEN after vendor pin with no log on
-    /// page-pressure hyperlink drop. Does **not** soft-skip: missing fixture
-    /// or binary is a fail (reviewer false-green fix). Build the package bin
-    /// first (`cargo build` / `./test.sh`) so `target/debug/botster` exists;
-    /// lib tests do not set `CARGO_BIN_EXE_*`.
+    /// Fixture: `testdata/vt_crash_min` (original Botster capture).
+    /// See `testdata/README.md` failure class **A**.
     #[test]
     fn botster_vt_crash_min_fixture_does_not_sigsegv() {
+        assert_vt_replay_fixture_no_sigsegv("vt_crash_min", 70, 226);
+    }
+
+    /// Unique truecolor SGR: `manualStyleUpdate` → `increaseCapacity(.styles)`.
+    ///
+    /// Fixture: `testdata/vt_style_pressure` (synthetic ≥200 unique 38;2/48;2).
+    /// See `testdata/README.md` failure class **B**.
+    #[test]
+    fn botster_vt_style_pressure_fixture_does_not_sigsegv() {
+        assert_vt_replay_fixture_no_sigsegv("vt_style_pressure", 70, 226);
+    }
+
+    /// Production dump `sess-1786319046`: full stream that killed the session.
+    ///
+    /// Covers hyperlink-map paint pressure and the invalid multi-param CUP path
+    /// that hit `log.warn` → lib-vt `emitLog` stack blow. Prefer also keeping
+    /// the minimal **D** fixture green. See `testdata/README.md` classes **C**+**D**.
+    #[test]
+    fn botster_vt_hyperlink_map_fixture_does_not_sigsegv() {
+        assert_vt_replay_fixture_no_sigsegv("vt_crash_hyperlink_map", 70, 226);
+    }
+
+    /// Minimal **D**: after production ring state, only `56;6H` (completes
+    /// mid-CSI to invalid 3-param CUP → unfixed Ghostty `log.warn` SEGV).
+    ///
+    /// Fixture: `testdata/vt_invalid_cup`. Explicit gate for the emitLog stack
+    /// class so it is not buried inside the full production dump.
+    #[test]
+    fn botster_vt_invalid_cup_fixture_does_not_sigsegv() {
+        assert_vt_replay_fixture_no_sigsegv("vt_invalid_cup", 70, 226);
+    }
+
+    /// Shared gate: fixture dir under `testdata/<name>/` with `x.vtring` and/or
+    /// `x.vtlast`. Does **not** soft-skip missing fixture/bin (false-green fix).
+    fn assert_vt_replay_fixture_no_sigsegv(fixture_name: &str, rows: u16, cols: u16) {
         use std::process::Command;
 
-        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/vt_crash_min");
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("testdata")
+            .join(fixture_name);
         assert!(
-            fixture.join("x.vtring").is_file(),
-            "missing VT crash fixture at {} (commit cli/testdata/vt_crash_min)",
+            fixture.join("x.vtring").is_file() || fixture.join("x.vtlast").is_file(),
+            "missing VT fixture at {} (see cli/testdata/README.md)",
             fixture.display()
         );
 
@@ -713,9 +747,9 @@ mod tests {
                 "vt-replay",
                 "--quiet",
                 "--rows",
-                "70",
+                &rows.to_string(),
                 "--cols",
-                "226",
+                &cols.to_string(),
             ])
             .arg(&fixture)
             .status()
@@ -726,90 +760,20 @@ mod tests {
         {
             use std::os::unix::process::ExitStatusExt;
             if let Some(sig) = status.signal() {
-                panic!("vt-replay died on signal {sig} (SEGV would be 11)");
+                panic!(
+                    "fixture {fixture_name}: vt-replay died on signal {sig} (SEGV would be 11); \
+                     see cli/testdata/README.md"
+                );
             }
         }
         assert!(
             status.success(),
-            "vt-replay must exit 0 on min crash fixture, got {status:?} (bin={})",
+            "fixture {fixture_name}: vt-replay must exit 0, got {status:?} (bin={})",
             bin.display()
         );
     }
 
-    
-    /// Unique truecolor SGR pressure used to SIGSEGV in manualStyleUpdate →
-    /// increaseCapacity(.styles). GREEN after silent style degrade pin.
-    #[test]
-    fn botster_vt_style_pressure_fixture_does_not_sigsegv() {
-        use std::process::Command;
-
-        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/vt_style_pressure");
-        assert!(
-            fixture.join("x.vtring").is_file(),
-            "missing style pressure fixture at {}",
-            fixture.display()
-        );
-
-        let bin = resolve_botster_bin_for_vt_replay();
-        assert!(
-            bin.is_file(),
-            "botster binary not found at {} — run `cargo build` in cli/ first",
-            bin.display()
-        );
-
-        let status = Command::new(&bin)
-            .args([
-                "debug",
-                "vt-replay",
-                "--quiet",
-                "--rows",
-                "70",
-                "--cols",
-                "226",
-            ])
-            .arg(&fixture)
-            .status()
-            .unwrap_or_else(|e| panic!("spawn {} debug vt-replay: {e}", bin.display()));
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            if let Some(sig) = status.signal() {
-                panic!("vt-replay died on signal {sig} (SEGV would be 11)");
-            }
-        }
-        assert!(
-            status.success(),
-            "vt-replay must exit 0 on style pressure fixture, got {status:?} (bin={})",
-            bin.display()
-        );
-    }
-
-
-    /// Production dump: print → cursorSetHyperlink → increaseCapacity SEGV before pin.
-    #[test]
-    fn botster_vt_hyperlink_map_fixture_does_not_sigsegv() {
-        use std::process::Command;
-        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/vt_crash_hyperlink_map");
-        assert!(fixture.join("x.vtring").is_file(), "missing {}", fixture.display());
-        let bin = resolve_botster_bin_for_vt_replay();
-        assert!(bin.is_file(), "missing bin {}", bin.display());
-        let status = Command::new(&bin)
-            .args(["debug","vt-replay","--quiet","--rows","70","--cols","226"])
-            .arg(&fixture)
-            .status()
-            .expect("spawn");
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            if let Some(sig) = status.signal() {
-                panic!("vt-replay died on signal {sig}");
-            }
-        }
-        assert!(status.success(), "got {status:?}");
-    }
-
-fn resolve_botster_bin_for_vt_replay() -> PathBuf {
+    fn resolve_botster_bin_for_vt_replay() -> PathBuf {
         if let Some(p) = option_env!("CARGO_BIN_EXE_botster") {
             return PathBuf::from(p);
         }
