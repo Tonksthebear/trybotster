@@ -727,6 +727,54 @@ end
 
 local handle_delete_agent = handle_delete_session
 
+--- Delete a worktree that no live session owns.
+--
+-- `handle_delete_session` covers the normal case: a session dies and takes its
+-- worktree with it. This covers the leftover case. A worktree outlives its
+-- sessions whenever the hub restarts, whenever a session is deleted without the
+-- worktree flag, or whenever a plugin closes work long after its agents ended.
+-- Nothing then removes the directory, so it stays on disk forever.
+--
+-- Deletion itself runs in `worktree.delete`, which enforces the hard guards:
+-- the path must sit under the managed worktree base, and it must be a real
+-- worktree rather than a main repository. This function adds the one guard
+-- `worktree.delete` cannot make, because only the hub knows which sessions are
+-- alive: never remove a directory a running session still works in.
+--
+-- @param path string            Filesystem path of the worktree
+-- @param branch string          Branch name to delete with the worktree
+-- @return boolean               True when deletion was queued
+-- @return string|nil            Reason when deletion was refused
+local function handle_delete_worktree(path, branch)
+    if type(path) ~= "string" or path == "" then
+        return false, "worktree path is required"
+    end
+    if type(branch) ~= "string" then
+        branch = ""
+    end
+
+    for _, session in ipairs(Agent.list()) do
+        if session.worktree_path == path then
+            return false, string.format(
+                "session %s is still running in %s",
+                tostring(session.session_uuid), path)
+        end
+    end
+
+    if type(worktree) ~= "table" or type(worktree.delete) ~= "function" then
+        return false, "worktree primitive is unavailable on this runtime"
+    end
+
+    local ok, err = pcall(worktree.delete, path, branch)
+    if not ok then
+        return false, tostring(err)
+    end
+
+    hooks.notify("worktree_deleted", { path = path, branch = branch })
+    log.info(string.format("Deleted orphaned worktree %s (branch=%s)", path, branch))
+    return true, nil
+end
+
 -- Track event subscriptions for cleanup on hot-reload
 local _event_subs = {}
 
@@ -781,6 +829,7 @@ local M = {
     handle_delete_agent = handle_delete_agent,
     handle_create_accessory = handle_create_accessory,
     handle_delete_session = handle_delete_session,
+    handle_delete_worktree = handle_delete_worktree,
 }
 
 -- Lifecycle hooks for hot-reload

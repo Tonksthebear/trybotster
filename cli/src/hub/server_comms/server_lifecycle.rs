@@ -1,5 +1,9 @@
 use super::*;
 
+fn plaintext_connection_url(server_url: &str, server_hub_id: &str) -> String {
+    format!("{server_url}/hubs/{server_hub_id}")
+}
+
 impl Hub {
     pub(crate) fn register_hub_with_server(&mut self) {
         let botster_id = registration::register_hub_with_server(
@@ -105,7 +109,7 @@ impl Hub {
         let server_url = self.config.server_url.clone();
 
         if crate::env::is_encryption_disabled() {
-            let connection_url = format!("{server_url}/hubs/{server_hub_id}#no-encryption");
+            let connection_url = plaintext_connection_url(&server_url, &server_hub_id);
             if let Err(error) = crate::relay::write_connection_url(&local_id, &connection_url) {
                 log::warn!("Failed to write connection URL: {error}");
             }
@@ -119,5 +123,18 @@ impl Hub {
             &local_id,
             &server_url,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plaintext_connection_url;
+
+    #[test]
+    fn plaintext_connection_url_uses_the_standard_hub_route() {
+        assert_eq!(
+            plaintext_connection_url("https://example.test", "137"),
+            "https://example.test/hubs/137"
+        );
     }
 }

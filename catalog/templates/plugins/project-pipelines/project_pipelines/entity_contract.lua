@@ -81,7 +81,7 @@ M.home_screen = {
     {
         name = "prs_and_merge",
         source = "/" .. M.types.ticket,
-        where_fields = { "latest_run_status", "status" },
+        where_fields = { "latest_run_status", "open" },
         fields = {
             "has_latest_run",
             "has_merge_pr_url",
@@ -118,7 +118,7 @@ M.home_screen = {
     {
         name = "standalone_tickets",
         source = "/" .. M.types.ticket,
-        where_fields = { "standalone", "status" },
+        where_fields = { "standalone", "open" },
         fields = {
             "id",
             "latest_run_badge",

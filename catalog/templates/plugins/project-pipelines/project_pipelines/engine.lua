@@ -9,6 +9,7 @@ local repo = require("project_pipelines.repo")
 local util = require("project_pipelines.util")
 local entities = require("project_pipelines.entities")
 local notification_policy = require("project_pipelines.notification_policy")
+local worktree_cleanup = require("project_pipelines.worktree_cleanup")
 local Hub = require("lib.hub")
 local Agent = require("lib.agent")
 
@@ -1447,11 +1448,28 @@ function M.close_ticket(ticket_id, attrs)
         end
     end
 
+    -- Record the ticket's worktrees before closing its sessions. Closing a
+    -- session drops the session info that names its worktree, so a later lookup
+    -- would find nothing to clean up.
+    local ticket_worktrees = {}
+    if attrs.delete_worktrees ~= false then
+        local ok_list, listed = pcall(worktree_cleanup.ticket_worktrees, ticket_id)
+        if ok_list then
+            ticket_worktrees = listed
+        else
+            log.warn("[project-pipelines] could not list ticket worktrees: " .. tostring(listed))
+        end
+    end
+
+    -- Delete each session with its worktree. The hub skips the worktree while
+    -- another session still runs in it, so the last session out removes the
+    -- directory. The sweep below catches whatever this leaves behind.
+    local delete_worktree = attrs.delete_worktrees ~= false
     local closed_sessions = {}
     local errors = {}
     for _, session_uuid in ipairs(repo.ticket_session_uuids(ticket_id)) do
         local ok, result = pcall(function()
-            return Hub.get():delete_agent(session_uuid, false)
+            return Hub.get():delete_agent(session_uuid, delete_worktree)
         end)
         if ok then
             table.insert(closed_sessions, { session_uuid = session_uuid, result = result })
@@ -1497,12 +1515,30 @@ function M.close_ticket(ticket_id, attrs)
         end
     end
 
+    -- Remove whatever the session deletions left behind. A ticket keeps its
+    -- worktrees after its agents end, and a worktree is a full checkout with
+    -- build output and dependencies inside it. Run this last, so the merge
+    -- pulls above have already started in their own checkouts.
+    local worktrees = nil
+    if attrs.delete_worktrees ~= false then
+        local ok_clean, clean_result = pcall(worktree_cleanup.delete_for_ticket, ticket_id, {
+            worktrees = ticket_worktrees,
+        })
+        if ok_clean then
+            worktrees = clean_result
+        else
+            log.warn("[project-pipelines] worktree cleanup failed: " .. tostring(clean_result))
+            worktrees = { error = tostring(clean_result) }
+        end
+    end
+
     refresh_surfaces()
     return {
         ticket = updated,
         closed_sessions = closed_sessions,
         errors = errors,
         merge_pulls = merge_pulls,
+        worktrees = worktrees,
     }
 end
 

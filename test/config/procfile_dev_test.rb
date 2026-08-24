@@ -8,4 +8,11 @@ class ProcfileDevTest < ActiveSupport::TestCase
 
     refute_includes procfile, "cloudflared tunnel run dev-laptop"
   end
+
+  test "procfile dev uses digest-based vite assets by default" do
+    procfile = Rails.root.join("Procfile.dev").read
+
+    assert_includes procfile, "bin/vite build --watch"
+    assert_includes procfile, 'VITE_DEV_SERVER:-0'
+  end
 end

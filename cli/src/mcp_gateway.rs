@@ -8,6 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -129,10 +130,36 @@ enum SessionExit {
     HubDisconnected,
 }
 
+/// Hub replies for `tools_list` / `prompts_list` / `resource_templates_list`
+/// carry no `call_id`. Concurrent list requests therefore share one
+/// correlation key. FIFO waiters keep both callers instead of dropping
+/// the first oneshot (which the client reports as "Hub connection lost").
+type PendingWaiters = HashMap<String, VecDeque<oneshot::Sender<Result<Value, String>>>>;
+
+fn pending_push(
+    pending: &mut PendingWaiters,
+    key: String,
+    tx: oneshot::Sender<Result<Value, String>>,
+) {
+    pending.entry(key).or_default().push_back(tx);
+}
+
+fn pending_take(
+    pending: &mut PendingWaiters,
+    key: &str,
+) -> Option<oneshot::Sender<Result<Value, String>>> {
+    let queue = pending.get_mut(key)?;
+    let tx = queue.pop_front();
+    if queue.is_empty() {
+        pending.remove(key);
+    }
+    tx
+}
+
 /// Route a hub JSON message to the appropriate pending request or notification channel.
 fn handle_hub_message(
     msg: Value,
-    pending: &mut HashMap<String, oneshot::Sender<Result<Value, String>>>,
+    pending: &mut PendingWaiters,
     notification_tx: &mpsc::UnboundedSender<HubNotification>,
 ) {
     let msg_type = msg.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -143,7 +170,7 @@ fn handle_hub_message(
         }
 
         "tools_list" => {
-            if let Some(tx) = pending.remove("tools_list") {
+            if let Some(tx) = pending_take(pending, "tools_list") {
                 let _ = tx.send(Ok(msg));
             }
         }
@@ -151,14 +178,14 @@ fn handle_hub_message(
         "tool_result" => {
             let call_id = msg.get("call_id").and_then(|c| c.as_str()).unwrap_or("");
             if !call_id.is_empty() {
-                if let Some(tx) = pending.remove(call_id) {
+                if let Some(tx) = pending_take(pending, call_id) {
                     let _ = tx.send(Ok(msg));
                 }
             }
         }
 
         "prompts_list" => {
-            if let Some(tx) = pending.remove("prompts_list") {
+            if let Some(tx) = pending_take(pending, "prompts_list") {
                 let _ = tx.send(Ok(msg));
             }
         }
@@ -166,7 +193,7 @@ fn handle_hub_message(
         "prompt_result" => {
             let call_id = msg.get("call_id").and_then(|c| c.as_str()).unwrap_or("");
             if !call_id.is_empty() {
-                if let Some(tx) = pending.remove(call_id) {
+                if let Some(tx) = pending_take(pending, call_id) {
                     let _ = tx.send(Ok(msg));
                 }
             }
@@ -181,7 +208,7 @@ fn handle_hub_message(
         }
 
         "resource_templates_list" => {
-            if let Some(tx) = pending.remove("resource_templates_list") {
+            if let Some(tx) = pending_take(pending, "resource_templates_list") {
                 let _ = tx.send(Ok(msg));
             }
         }
@@ -189,7 +216,7 @@ fn handle_hub_message(
         "resource_result" => {
             let call_id = msg.get("call_id").and_then(|c| c.as_str()).unwrap_or("");
             if !call_id.is_empty() {
-                if let Some(tx) = pending.remove(call_id) {
+                if let Some(tx) = pending_take(pending, call_id) {
                     let _ = tx.send(Ok(msg));
                 }
             }
@@ -275,8 +302,8 @@ async fn run_hub_session(
         }
     });
 
-    // Pending requests: correlation key → oneshot sender
-    let mut pending: HashMap<String, oneshot::Sender<Result<Value, String>>> = HashMap::new();
+    // Pending requests: correlation key → FIFO oneshot waiters
+    let mut pending: PendingWaiters = HashMap::new();
 
     let exit = loop {
         tokio::select! {
@@ -286,11 +313,11 @@ async fn run_hub_session(
                 };
 
                 let key = req.key;
-                pending.insert(key.clone(), req.response_tx);
+                pending_push(&mut pending, key.clone(), req.response_tx);
 
                 if frame_tx.send(req.frame_data).is_err() {
                     // Hub writer dead — fail this request and break
-                    if let Some(tx) = pending.remove(&key) {
+                    if let Some(tx) = pending_take(&mut pending, &key) {
                         let _ = tx.send(Err("hub disconnected".to_string()));
                     }
                     break SessionExit::HubDisconnected;
@@ -310,8 +337,10 @@ async fn run_hub_session(
     read_task.abort();
 
     // Fail all pending requests on disconnect
-    for (_, tx) in pending.drain() {
-        let _ = tx.send(Err("hub disconnected — reconnecting".to_string()));
+    for (_, queue) in pending.drain() {
+        for tx in queue {
+            let _ = tx.send(Err("hub disconnected — reconnecting".to_string()));
+        }
     }
 
     exit
@@ -337,6 +366,10 @@ async fn connection_manager(
     connection_state: Arc<BridgeConnectionState>,
 ) {
     let mut attempts: u32 = 0;
+    // First connect is pull-based: the MCP client lists tools after
+    // initialize. Pushing list_changed there races with that tools/list
+    // (same hub correlation key) and the client sees "Hub connection lost".
+    let mut established_session = false;
     loop {
         if request_rx.is_closed() {
             return;
@@ -346,7 +379,8 @@ async fn connection_manager(
             Ok(s) => {
                 attempts = 0;
                 log::info!("[mcp-gateway] Connected to hub at {socket_path}");
-                if connection_state.set_connected().await {
+                let became_connected = connection_state.set_connected().await;
+                if became_connected && established_session {
                     notify_capability_lists_changed(&notification_tx);
                 }
                 s
@@ -367,17 +401,17 @@ async fn connection_manager(
 
         let exit =
             run_hub_session(stream, &mut request_rx, &notification_tx, &caller_context).await;
+        established_session = true;
 
         if matches!(exit, SessionExit::RequestChannelClosed) {
             return;
         }
 
-        if connection_state
+        // Do not notify on disconnect: a refresh against a dead bridge
+        // would clobber hub tools with the fallback list.
+        let _ = connection_state
             .set_disconnected(format!("hub socket {socket_path} disconnected"))
-            .await
-        {
-            notify_capability_lists_changed(&notification_tx);
-        }
+            .await;
 
         tokio::time::sleep(Duration::from_millis(RECONNECT_RETRY_MS)).await;
 
@@ -1334,10 +1368,91 @@ mod tests {
         .expect("manager should connect after socket appears");
         assert!(connected);
 
-        let first_notification = notification_rx
-            .recv()
+        let first_connect_notify = tokio::time::timeout(
+            Duration::from_millis(150),
+            notification_rx.recv(),
+        )
+        .await;
+        assert!(
+            first_connect_notify.is_err(),
+            "first connect must not push list_changed; the client pulls tools/list"
+        );
+
+        manager.abort();
+        accept_task.abort();
+    }
+
+    /// After a session has already run, reconnect pushes list_changed so
+    /// pull-based clients refresh hub tools.
+    #[tokio::test]
+    async fn test_connection_manager_notifies_on_reconnect() {
+        let temp_dir = tempfile::TempDir::new().expect("tempdir");
+        let socket_path = temp_dir.path().join("hub.sock");
+        let socket_path_string = socket_path.to_string_lossy().to_string();
+        let connection_state = BridgeConnectionState::pending(socket_path_string.clone());
+        let (_request_tx, request_rx) = mpsc::unbounded_channel::<BridgeRequest>();
+        let (notification_tx, mut notification_rx) = mpsc::unbounded_channel::<HubNotification>();
+
+        let manager_state = Arc::clone(&connection_state);
+        let manager_path = socket_path_string.clone();
+        let manager = tokio::spawn(async move {
+            connection_manager(
+                manager_path,
+                request_rx,
+                notification_tx,
+                BTreeMap::new(),
+                manager_state,
+            )
+            .await;
+        });
+
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind socket");
+        let (stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
             .await
-            .expect("connection should notify MCP client to refresh");
+            .expect("first accept")
+            .expect("accept bridge");
+        drop(stream);
+        drop(listener);
+        let _ = std::fs::remove_file(&socket_path);
+
+        let disconnected = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if !connection_state.is_connected() {
+                    break true;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("manager should mark disconnected after hub drop");
+        assert!(disconnected);
+
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("rebind socket");
+        let accept_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept reconnect");
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            drop(stream);
+        });
+
+        let reconnected = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if connection_state.is_connected() {
+                    break true;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("manager should reconnect after socket reappears");
+        assert!(reconnected);
+
+        let first_notification = tokio::time::timeout(
+            Duration::from_secs(2),
+            notification_rx.recv(),
+        )
+        .await
+        .expect("reconnect should notify MCP client to refresh")
+        .expect("notification channel open");
         assert!(matches!(
             first_notification,
             HubNotification::ToolsListChanged
@@ -1345,5 +1460,108 @@ mod tests {
 
         manager.abort();
         accept_task.abort();
+    }
+
+    /// Concurrent tools_list waiters share one hub key; FIFO must deliver
+    /// both replies instead of dropping the first oneshot.
+    #[tokio::test]
+    async fn test_concurrent_tools_list_does_not_drop_first_waiter() {
+        let (mcp_side, hub_side) = socket_pair();
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel::<BridgeRequest>();
+        let (notif_tx, _notif_rx) = mpsc::unbounded_channel::<HubNotification>();
+        let context = BTreeMap::new();
+
+        let hub_task = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (read_half, write_half) = hub_side.into_split();
+            let mut reader = tokio::io::BufReader::new(read_half);
+            let mut writer = tokio::io::BufWriter::new(write_half);
+            let mut decoder = FrameDecoder::new();
+            let mut buf = [0u8; 4096];
+            let mut tools_list_seen = 0u8;
+
+            loop {
+                match reader.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if let Ok(frames) = decoder.feed(&buf[..n]) {
+                            for frame in frames {
+                                if let Frame::Json(v) = frame {
+                                    let msg_type =
+                                        v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                                    if msg_type == "tools_list" {
+                                        tools_list_seen += 1;
+                                        if tools_list_seen < 2 {
+                                            continue;
+                                        }
+                                        for name in ["first_tool", "second_tool"] {
+                                            let response = Frame::Json(json!({
+                                                "subscriptionId": SUB_ID,
+                                                "type": "tools_list",
+                                                "tools": [{
+                                                    "name": name,
+                                                    "description": "A test tool",
+                                                    "input_schema": { "type": "object" }
+                                                }]
+                                            }));
+                                            let data = response.encode();
+                                            let _ = writer.write_all(&data).await;
+                                            let _ = writer.flush().await;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let session_handle = tokio::spawn(async move {
+            run_hub_session(mcp_side, &mut req_rx, &notif_tx, &context).await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let (first_tx, first_rx) = oneshot::channel();
+        let (second_tx, second_rx) = oneshot::channel();
+        let request_frame = Frame::Json(json!({
+            "subscriptionId": SUB_ID,
+            "type": "tools_list"
+        }));
+        req_tx
+            .send(BridgeRequest {
+                key: "tools_list".to_string(),
+                frame_data: request_frame.encode(),
+                response_tx: first_tx,
+            })
+            .expect("send first");
+        req_tx
+            .send(BridgeRequest {
+                key: "tools_list".to_string(),
+                frame_data: request_frame.encode(),
+                response_tx: second_tx,
+            })
+            .expect("send second");
+
+        let first = tokio::time::timeout(Duration::from_secs(5), first_rx)
+            .await
+            .expect("first waiter timed out")
+            .expect("first channel closed")
+            .expect("first hub error");
+        let second = tokio::time::timeout(Duration::from_secs(5), second_rx)
+            .await
+            .expect("second waiter timed out")
+            .expect("second channel closed")
+            .expect("second hub error");
+
+        let first_name = first["tools"][0]["name"].as_str();
+        let second_name = second["tools"][0]["name"].as_str();
+        assert_eq!(first_name, Some("first_tool"));
+        assert_eq!(second_name, Some("second_tool"));
+
+        drop(req_tx);
+        let _ = session_handle.await;
+        hub_task.abort();
     }
 }

@@ -1197,7 +1197,7 @@ impl Hub {
     /// Generate a connection URL and add a pairing bundle when encryption is enabled.
     ///
     /// Encrypted format: `{server_url}/hubs/{id}/pairing#{base32_binary_bundle}`
-    /// Plaintext format: `{server_url}/hubs/{id}#no-encryption`
+    /// Plaintext format: `{server_url}/hubs/{id}`
     ///
     /// On first call, this generates the PreKeyBundle (lazy initialization).
     /// Subsequent calls return the cached bundle unless it was used (in which

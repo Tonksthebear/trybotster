@@ -399,6 +399,10 @@ local function decorate_ticket_entity(entity, opts)
     entity.status_tone = view and view.status_tone and view.status_tone(entity.status) or "muted"
     entity.status_label = view and view.status_label and view.status_label(entity.status) or tostring(entity.status or "")
     entity.status_state = view and view.status_state and view.status_state(entity.status) or "neutral"
+    -- bind_list where matches exact field values. Ticket status becomes
+    -- active/blocked after a run starts, so lists that mean "not closed"
+    -- must filter on this boolean instead of status = "open".
+    entity.open = status_is_open(entity.status)
     entity.standalone = entity.project_id == nil or entity.project_id == ""
     entity.run_count = #runs
     entity.run_count_label = string.format("%d run%s", #runs, #runs == 1 and "" or "s")
@@ -1372,7 +1376,11 @@ local function ticket_detail(request, context)
         local where = type(request) == "table" and type(request.where) == "table" and request.where or {}
         local clauses = { VISIBLE_TICKET_WHERE }
         local params = {}
-        if not util.is_blank(where.status) then
+        if where.open == true then
+            clauses[#clauses + 1] = "COALESCE(t.status, 'open') != 'closed'"
+        elseif where.open == false then
+            clauses[#clauses + 1] = "COALESCE(t.status, 'open') = 'closed'"
+        elseif not util.is_blank(where.status) then
             clauses[#clauses + 1] = "COALESCE(t.status, 'open') = ?"
             params[#params + 1] = where.status
         end

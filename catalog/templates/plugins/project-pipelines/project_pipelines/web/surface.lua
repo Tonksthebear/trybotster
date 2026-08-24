@@ -147,7 +147,7 @@ local function render_sidebar()
     table.insert(children, ui.text{ text = "Tickets", size = "xs", weight = "semibold", tone = "muted" })
     table.insert(children, ui.bind_list{
         source = "/project-pipelines.ticket",
-        where = { status = "open", standalone = true },
+        where = { open = true, standalone = true },
         item_template = sidebar_ticket_template(),
     })
 

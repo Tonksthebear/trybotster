@@ -7,6 +7,7 @@
 
 local repo = require("project_pipelines.repo")
 local engine = require("project_pipelines.engine")
+local worktree_cleanup = require("project_pipelines.worktree_cleanup")
 local ConfigResolver = require("lib.config_resolver")
 
 local M = {}
@@ -714,6 +715,7 @@ function M.register()
                 merge_commit = { type = "string" },
                 pr_url = { type = "string" },
                 merge_summary = { type = "string" },
+                delete_worktrees = { type = "boolean", default = true },
             },
             required = { "ticket_id" },
         },
@@ -723,8 +725,35 @@ function M.register()
             merge_commit = params.merge_commit,
             pr_url = params.pr_url,
             merge_summary = params.merge_summary,
+            delete_worktrees = params.delete_worktrees ~= false,
             closed_by_session_uuid = context and context.session_uuid,
         }))
+    end)
+
+    tool("project_pipelines_cleanup_worktrees", {
+        description = "Delete the git worktrees of closed tickets, most recently closed first. Closing a ticket already does this; use this tool to reclaim worktrees left by tickets that closed earlier, or by a hub restart that interrupted a close. A worktree is a full checkout with build output and dependencies inside it, so each one can be gigabytes. The hub keeps any worktree a live session still runs in. The result reports `examined` and `remaining` so a capped sweep is visible. Pass dry_run=true to list what would be deleted.",
+        input_schema = {
+            type = "object",
+            properties = {
+                ticket_ids = {
+                    type = "array",
+                    items = { type = "string" },
+                    description = "Sweep only these tickets. Overrides limit.",
+                },
+                limit = {
+                    type = "integer",
+                    default = 40,
+                    description = "How many of the most recently closed tickets to examine. The sweep runs under a five-second handler timeout, so raise this in steps.",
+                },
+                dry_run = { type = "boolean", default = false },
+            },
+        },
+    }, function(params)
+        return ok(worktree_cleanup.sweep_closed_tickets{
+            ticket_ids = params.ticket_ids,
+            limit = params.limit,
+            dry_run = params.dry_run == true,
+        })
     end)
 
     tool("project_pipelines_add_ticket_dependency", {

@@ -176,7 +176,7 @@ describe("HubPeerConnection peer lost transitions", () => {
   })
 
   it("uses plaintext signaling and data after the health handshake disables encryption", async () => {
-    await transport.connectSignaling("hub-plain", "anon:tab", true)
+    await transport.connectSignaling("hub-plain", "anon:tab")
     const subscription = mocks.subscriptions.create.mock.results.at(-1).value
     subscription.received({
       type: "signal",
@@ -217,10 +217,26 @@ describe("HubPeerConnection peer lost transitions", () => {
     expect(mocks.bridge.decryptBinary).not.toHaveBeenCalled()
   })
 
+  it("replays plaintext mode when a route reuses the signaling connection", async () => {
+    await transport.connectSignaling("hub-plain", "anon:tab")
+    const subscription = mocks.subscriptions.create.mock.results.at(-1).value
+    subscription.received({
+      type: "signal",
+      envelope: { type: "transport_config", e2e_enabled: false },
+    })
+    const configs = []
+    transport.on("transport:config", (event) => configs.push(event))
+
+    await transport.connectSignaling("hub-plain", "anon:tab")
+    await flushPromises()
+
+    expect(configs).toContainEqual({ hubId: "hub-plain", e2e_enabled: false })
+  })
+
   it("requires fresh transport config after signaling reconnects", async () => {
     const configs = []
     transport.on("transport:config", (event) => configs.push(event))
-    await transport.connectSignaling("hub-config", "browser-identity", true)
+    await transport.connectSignaling("hub-config", "browser-identity")
     const subscription = mocks.subscriptions.create.mock.results.at(-1).value
 
     subscription.received({
@@ -235,7 +251,7 @@ describe("HubPeerConnection peer lost transitions", () => {
     ])
   })
 
-  it("rejects plaintext mode for a paired browser without explicit opt-in", async () => {
+  it("accepts plaintext mode from the live Hub", async () => {
     const configs = []
     transport.on("transport:config", (event) => configs.push(event))
     await transport.connectSignaling("hub-paired", "browser-identity")
@@ -246,16 +262,14 @@ describe("HubPeerConnection peer lost transitions", () => {
       envelope: { type: "transport_config", e2e_enabled: false },
     })
 
-    expect(configs.at(-1)).toEqual({
-      hubId: "hub-paired",
-      e2e_enabled: null,
-      error: "plaintext_opt_in_required",
-    })
-    expect(MockRTCPeerConnection.instances).toHaveLength(0)
+    expect(configs.at(-1)).toEqual({ hubId: "hub-paired", e2e_enabled: false })
+    await transport.connectPeer("hub-paired")
+    expect(MockRTCPeerConnection.instances).toHaveLength(1)
+    expect(mocks.bridge.encrypt).not.toHaveBeenCalled()
   })
 
   it("tears down the peer when a pending transport mode changes", async () => {
-    await transport.connectSignaling("hub-change", "browser-identity", true)
+    await transport.connectSignaling("hub-change", "browser-identity")
     const subscription = mocks.subscriptions.create.mock.results.at(-1).value
     subscription.received({
       type: "signal",

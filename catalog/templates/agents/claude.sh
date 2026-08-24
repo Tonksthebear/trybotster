@@ -1,29 +1,15 @@
 #!/bin/bash
 # @template Claude
-# @description Minimal agent session that launches Claude Code in a worktree
+# @description Launch Claude Code with the session prompt only
 # @category agents
 # @dest agents/claude/initialization
 # @scope device
-# @version 1.1.0
+# @version 1.2.0
 
 # Claude Agent initialization — runs when the agent PTY session starts.
 #
-# Sets up the worktree environment and launches Claude in acceptEdits mode.
-# Plugin/tool installation is handled by the external plugin marketplace, not
-# by this session initialization script.
+# Botster already sets the PTY cwd to the worktree. Do not mutate Claude
+# config, register MCP servers, rewrite project trust, or otherwise edit
+# shared Claude/workspace state from this script.
 
-# Uncomment if using mise
-# mise trust 2>/dev/null
-
-# Change to the worktree directory
-cd "$(botster context worktree_path)"
-
-# ---------------------------------------------------------------------------
-# Launch
-# ---------------------------------------------------------------------------
-
-echo "Botster agent initialized for branch: $(botster context branch_name)"
-echo "Worktree: $(botster context worktree_path)"
-echo "Agent definition: $(botster context session_dir)"
-
-claude --permission-mode acceptEdits "$(botster context prompt)"
+claude "$(botster context prompt)"

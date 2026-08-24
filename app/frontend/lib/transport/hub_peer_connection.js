@@ -176,14 +176,19 @@ class HubPeerConnection {
     }
   }
 
-  async connectSignaling(hubId, browserIdentity, allowPlaintext = false) {
+  async connectSignaling(hubId, browserIdentity) {
     this.#cancelGracePeriod(hubId)
 
     const existing = this.#connections.get(hubId)
     if (existing) {
-      existing.allowPlaintext ||= allowPlaintext
       this.#prefetchIceConfig(hubId, existing)
       this.#signalingClient.emitBrowserSocketStateForHub(hubId)
+      if (typeof existing.encryptionEnabled === "boolean") {
+        queueMicrotask(() => this.#emit("transport:config", {
+          hubId,
+          e2e_enabled: existing.encryptionEnabled,
+        }))
+      }
       if (existing.lastHealth) {
         queueMicrotask(() => this.#emit("health", { hubId, ...existing.lastHealth }))
       }
@@ -200,7 +205,6 @@ class HubPeerConnection {
       mode: ConnectionMode.UNKNOWN,
       hubId,
       browserIdentity,
-      allowPlaintext,
       subscriptions: new Map(),
       pendingCandidates: [],
       iceRestartAttempts: 0,
@@ -899,16 +903,6 @@ class HubPeerConnection {
       clearTimeout(conn.transportConfigTimer)
       conn.transportConfigTimer = null
       const nextEncryptionEnabled = data.envelope.e2e_enabled !== false
-      if (!nextEncryptionEnabled && !conn.allowPlaintext) {
-        conn.transportConfigPending = false
-        this.#emit("transport:config", {
-          hubId,
-          e2e_enabled: null,
-          error: "plaintext_opt_in_required",
-        })
-        return
-      }
-
       const previousEncryptionEnabled = conn.encryptionEnabled
       conn.transportConfigPending = false
       conn.encryptionEnabled = nextEncryptionEnabled

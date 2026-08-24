@@ -64,6 +64,46 @@ from `HEAD` only when the working copy is empty or missing. It never truncates
 `.gitignore`. Command gates that run under a path containing `:` set a
 colon-free `CARGO_TARGET_DIR` so macOS Cargo/DYLD path joining does not fail.
 
+### Worktree Deletion On Close
+
+Every ticket gets its own git worktree, which is a full checkout: it carries
+dependencies, build output, and caches. A ticket worktree reaches several
+gigabytes. Closing a ticket therefore deletes its worktrees.
+
+`project_pipelines_close_ticket` runs three steps:
+
+1. It lists the ticket's worktrees, before it closes any session. Closing a
+   session drops the information that names its worktree.
+2. It closes each ticket session with the worktree flag set. The hub keeps a
+   worktree while another session still runs in it, so the last session out
+   removes the directory.
+3. It deletes whatever the session closes left behind. This covers the ticket
+   whose agents ended earlier, or ended in a hub restart.
+
+Deletion runs `git worktree remove --force` and then `git branch -D`. The hub
+refuses to delete a path outside the managed worktree base, a path that is a
+main repository rather than a worktree, and a worktree a live session still
+uses. Pass `delete_worktrees=false` to close a ticket and keep its worktrees.
+
+`project_pipelines_cleanup_worktrees` deletes the worktrees of closed tickets,
+most recently closed first. Use it for tickets that closed before this behavior
+existed, and after a hub restart interrupted a close. Pass `dry_run=true` to list
+the worktrees the tool would delete. Pass `ticket_ids` for specific tickets.
+
+The sweep runs inside the plugin worker, which cancels a handler after five
+seconds, so it examines 40 tickets by default. The result reports `examined` and
+`remaining`, and the plugin logs the number it skipped. Raise `limit` in steps to
+reach further back.
+
+Finding a ticket's worktrees needs a session-to-workspace lookup, because
+`runs.workspace_id` is empty on almost every run. The lookup walks the workspace
+directories, which is one listing per workspace. Build it once with
+`worktree_cleanup.session_workspace_index()` and pass it as `index` when handling
+more than one ticket. Rebuilding it per ticket is what made the first sweep time
+out.
+
+Both paths append a `ticket.worktrees_deleted` event with the deleted paths.
+
 Pipeline MCP CRUD:
 
 - `project_pipelines_create_pipeline`
@@ -337,9 +377,11 @@ artifacts, events, pipeline steps, and pipeline gates use `ui.bind_list` /
 with `ui.bind_list{ where = { ... } }` instead of pre-rendering per-run or
 per-step collections into the tree snapshot. Overview sections also use scoped
 bindings for active runs, open questions, open projects, standalone tickets,
-and merge-ready tickets; those filter fields (`status`, `standalone`,
-`latest_run_status`, etc.) are explicit read-model fields and are supported by
-the matching `query` providers. `/project-pipelines.ticket` publishes
+and merge-ready tickets; those filter fields (`open`, `standalone`,
+`latest_run_status`, `status`, etc.) are explicit read-model fields and are supported by
+the matching `query` providers. Ticket lists that mean "not closed" filter on
+`open = true` because ticket `status` becomes `active` or `blocked` after a run
+starts. `/project-pipelines.ticket` publishes
 standalone and project-scoped tickets; standalone lists and project timelines
 filter the shared entity family in the view layer. Route scaffolding and form
 controls that depend on the current path or available actions still render

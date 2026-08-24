@@ -179,7 +179,6 @@ describe("HubRoute peer health probes", () => {
     route = null;
     mocks.bridge.reset();
     mocks.bridge.hasPairing.mockResolvedValue({ hasPairing: false });
-    window.location.hash = "#no-encryption";
     mocks.bridge.send.mockImplementation((type, payload) => {
       mocks.bridge.sendCalls.push([type, payload]);
       if (type === "connectSignaling") {
@@ -208,31 +207,10 @@ describe("HubRoute peer health probes", () => {
       {
         hubId: "hub-1",
         browserIdentity: expect.stringMatching(/^anon:/),
-        allowPlaintext: true,
       },
     ]);
     expect(mocks.bridge.sendCalls.some(([type]) => type === "connectPeer")).toBe(true);
     expect(mocks.bridge.hasSession).not.toHaveBeenCalled();
-  });
-
-  it("passes the Hub connection URL plaintext opt-in to the transport", async () => {
-    route.destroy();
-    route = null;
-    mocks.bridge.reset();
-    window.location.hash = "#no-encryption";
-
-    route = new TestHubRoute("hub-1", { hubId: "hub-1" }, manager);
-    await route.initialize();
-    await flushPromises();
-
-    expect(mocks.bridge.sendCalls).toContainEqual([
-      "connectSignaling",
-      {
-        hubId: "hub-1",
-        browserIdentity: expect.any(String),
-        allowPlaintext: true,
-      },
-    ]);
   });
 
   it("rebuilds after repeated missed encrypted pongs while local peer is open", async () => {

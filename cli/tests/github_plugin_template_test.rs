@@ -575,6 +575,7 @@ fn catalog_plugin_project_pipelines_template_catalog_entry_is_a_multi_file_plugi
             "plugins/project-pipelines/project_pipelines/web/screens/ticket.lua",
             "plugins/project-pipelines/project_pipelines/web/surface.lua",
             "plugins/project-pipelines/project_pipelines/web/ui.lua",
+            "plugins/project-pipelines/project_pipelines/worktree_cleanup.lua",
         ]
     );
 }

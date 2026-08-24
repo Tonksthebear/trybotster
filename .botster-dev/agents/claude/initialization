@@ -8,7 +8,7 @@
 
 # Claude Agent initialization — runs when the agent PTY session starts.
 #
-# Sets up the worktree environment and launches Claude in acceptEdits mode.
+# Sets up the worktree environment and launches Claude in Claude Code.
 # Plugin/tool installation is handled by the external plugin marketplace, not
 # by this session initialization script.
 
@@ -26,4 +26,4 @@ echo "Botster agent initialized for branch: $(botster context branch_name)"
 echo "Worktree: $(botster context worktree_path)"
 echo "Agent definition: $(botster context session_dir)"
 
-claude --permission-mode auto "$(botster context prompt)"
+claude "$(botster context prompt)"

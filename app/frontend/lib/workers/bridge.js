@@ -273,7 +273,6 @@ class WorkerBridge {
         return webrtcTransport.connectSignaling(
           params.hubId,
           params.browserIdentity,
-          params.allowPlaintext,
         )
       case "connectPeer":
         return webrtcTransport.connectPeer(params.hubId)

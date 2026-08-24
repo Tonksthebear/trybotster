@@ -156,6 +156,11 @@ local function copy_file(repo_root, worktree_path, relative_path)
     local src = repo_root .. "/" .. relative_path
     local dst = worktree_path .. "/" .. relative_path
 
+    if src == dst then
+        log.debug("[rails-worktree-lifecycle] Skipped same-file copy for " .. relative_path)
+        return
+    end
+
     if not fs.exists(src) then
         log.warn("[rails-worktree-lifecycle] Missing " .. relative_path .. " in " .. repo_root)
         return

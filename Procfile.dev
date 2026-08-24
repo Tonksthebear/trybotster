@@ -1,5 +1,7 @@
 web: bin/rails server -b 0.0.0.0 -p ${PORT:-3000}
 css: bin/rails tailwindcss:watch
 jobs: bin/jobs
-vite: bin/vite dev
+# Use digest-based files by default so remote browsers can keep valid cached assets.
+# Set VITE_DEV_SERVER=1 when frontend work needs Vite hot reload.
+vite: if [ "${VITE_DEV_SERVER:-0}" = "1" ]; then bin/vite dev; else bin/vite build --watch; fi
 mcp: bin/rails s -c mcp.ru -p 62770 -b 0.0.0.0 -P tmp/pids/mcp.pid

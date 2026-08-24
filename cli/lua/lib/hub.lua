@@ -1206,6 +1206,38 @@ function Hub:delete_agent(agent_id, delete_worktree)
     }, 30000)
 end
 
+--- Delete a worktree that no live session owns.
+-- Use this for worktrees left behind after their sessions ended. When a session
+-- still exists, prefer `Hub:delete_agent(agent_id, true)`, which closes the
+-- session and its worktree together.
+-- The hub refuses the deletion while any session still runs in the worktree.
+-- @param path string Filesystem path of the worktree
+-- @param branch string|nil Branch to delete with the worktree
+-- @return boolean deleted
+-- @return string|nil reason Reason when the hub refused the deletion
+function Hub:delete_worktree(path, branch)
+    local command = {
+        type = "delete_worktree",
+        path = path,
+        branch = branch or "",
+    }
+
+    local ok, response
+    if self._is_local then
+        ok, response = pcall(dispatch_local_command_response, command)
+    else
+        ok, response = pcall(dispatch_remote_command_response, self, command, 30000)
+    end
+
+    if not ok then
+        return false, tostring(response)
+    end
+    if type(response) == "table" and response.ok == false then
+        return false, response.error or "delete_worktree failed"
+    end
+    return true, nil
+end
+
 --- List sessions on the local hub.
 -- @return array of agent info tables
 function Hub:agent_list()

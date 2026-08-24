@@ -2,15 +2,8 @@
   "enableAllProjectMcpServers": true,
   "enabledMcpjsonServers": ["postgresql", "sequential-thinking"],
   "permissions": {
-    "allow": [
-      "Edit:*",
-      "Write:*",
-      "MultiEdit:*",
-      "NotebookEdit:*",
-      "Bash:*",
-      "Skill:*"
-    ],
-    "defaultMode": "acceptEdits"
+    "allow": [],
+    "defaultMode": "auto"
   },
   "hooks": {
     "Stop": [

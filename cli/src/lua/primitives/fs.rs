@@ -44,7 +44,10 @@
 //! - Success: `value, nil`
 //! - Failure: `nil, error_message`
 
-use std::path::Path;
+use std::{
+    io::{self, ErrorKind},
+    path::Path,
+};
 
 use anyhow::{anyhow, Result};
 use mlua::Lua;
@@ -132,7 +135,7 @@ pub fn register(lua: &Lua) -> Result<()> {
     // Copies a file from src to dst. Overwrites dst if it already exists.
     let copy_fn = lua
         .create_function(
-            |_, (src, dst): (String, String)| match std::fs::copy(&src, &dst) {
+            |_, (src, dst): (String, String)| match copy_file(&src, &dst) {
                 Ok(_) => Ok((Some(true), None::<String>)),
                 Err(e) => Ok((None::<bool>, Some(format!("Failed to copy file: {e}")))),
             },
@@ -508,6 +511,20 @@ pub fn register(lua: &Lua) -> Result<()> {
     Ok(())
 }
 
+fn copy_file(src: &str, dst: &str) -> io::Result<u64> {
+    let src_path = Path::new(src);
+    let dst_path = Path::new(dst);
+
+    if dst_path.exists() && std::fs::canonicalize(src_path)? == std::fs::canonicalize(dst_path)? {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "source and destination refer to the same file",
+        ));
+    }
+
+    std::fs::copy(src_path, dst_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -774,6 +791,28 @@ mod tests {
         assert_eq!(ok, Some(true));
         assert!(err.is_none());
         assert_eq!(std::fs::read_to_string(&dst).unwrap(), "copy me");
+    }
+
+    #[test]
+    fn test_copy_rejects_same_file_without_truncating_it() {
+        let lua = Lua::new();
+        register(&lua).expect("Should register fs primitives");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".gitignore");
+        std::fs::write(&path, "target/\n.env\n").unwrap();
+        let path_str = path.to_str().unwrap();
+
+        let (ok, err): (Option<bool>, Option<String>) = lua
+            .load(format!(r#"return fs.copy("{path_str}", "{path_str}")"#))
+            .eval()
+            .expect("fs.copy should return a normal Lua error tuple");
+
+        assert!(ok.is_none());
+        assert!(err
+            .expect("same-file copy should return an error")
+            .contains("source and destination refer to the same file"));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "target/\n.env\n");
     }
 
     #[test]

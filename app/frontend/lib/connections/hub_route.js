@@ -11,7 +11,6 @@ const SESSION_TIMEOUT_MS = 5000;
 const PEER_PROBE_TIMEOUT_MS = 1500;
 const PEER_PROBE_COOLDOWN_MS = 1000;
 const PEER_PROBE_MISSED_PONG_LIMIT = 3;
-const PLAINTEXT_OPT_IN_FRAGMENT = "#no-encryption";
 
 const HEALTH_STATUS_MAP = {
   offline: CliStatus.OFFLINE,
@@ -52,7 +51,6 @@ export class HubRoute {
     this.subscriptionId = null;
     this.identityKey = null;
     this.browserIdentity = null;
-    this.plaintextAllowed = window.location.hash === PLAINTEXT_OPT_IN_FRAGMENT;
     this.encryptionEnabled = null;
     this.state = ConnectionState.DISCONNECTED;
     this.browserSocketState = "disconnected";
@@ -377,14 +375,6 @@ export class HubRoute {
       }),
       bridge.on("transport:config", (event) => {
         if (event.hubId !== hubId) return;
-        if (event.error === "plaintext_opt_in_required") {
-          this.encryptionEnabled = null;
-          this.errorCode = event.error;
-          this.errorReason = "Open the no-encryption connection URL to allow plaintext transport";
-          this.lastError = this.errorReason;
-          this.emit("error", { reason: this.errorCode, message: this.errorReason });
-          return;
-        }
         if (typeof event.e2e_enabled !== "boolean") {
           this.encryptionEnabled = null;
           return;
@@ -518,7 +508,6 @@ export class HubRoute {
     const result = await bridge.send("connectSignaling", {
       hubId: this.getHubId(),
       browserIdentity: this.browserIdentity,
-      allowPlaintext: this.plaintextAllowed,
     });
 
     this.#hubConnected = true;

@@ -317,14 +317,19 @@ function M.register()
 
     action.on("project_pipelines.close_ticket", "project_pipelines.close_ticket", function(envelope, ctx)
         local payload = value_payload(envelope)
+        local message = "Ticket closed."
         if payload.ticket_id then
-            local ok, err = pcall(engine.close_ticket, payload.ticket_id, { merge_confirmed = payload.merge_confirmed == true })
+            local ok, result = pcall(engine.close_ticket, payload.ticket_id, { merge_confirmed = payload.merge_confirmed == true })
             refresh(ctx)
             if not ok then
-                return action.result{ ok = false, error = tostring(err) }
+                return action.result{ ok = false, error = tostring(result) }
+            end
+            local deleted = result and result.worktrees and result.worktrees.deleted
+            if type(deleted) == "table" and #deleted > 0 then
+                message = string.format("Ticket closed. Deleted %d worktree(s).", #deleted)
             end
         end
-        return action.result{ message = "Ticket closed." }
+        return action.result{ message = message }
     end)
 
     action.on("project_pipelines.update_dependency_draft", "project_pipelines.update_dependency_draft", function(envelope, ctx)

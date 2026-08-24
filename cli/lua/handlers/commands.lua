@@ -549,6 +549,26 @@ commands.register("delete_agent", function(client, sub_id, command)
     end
 end, { description = "Delete a session (agent or accessory, optionally with worktree)" })
 
+commands.register("delete_worktree", function(client, sub_id, command)
+    local path = command.path or command.worktree_path
+    local branch = command.branch or command.branch_name or ""
+
+    if not path or path == "" then
+        log.warn("delete_worktree missing path")
+        send_command_response(client, sub_id, command, { ok = false, error = "worktree path is required" })
+        return
+    end
+
+    local ok, err = require("handlers.agents").handle_delete_worktree(path, branch)
+    log.info(string.format("Delete worktree request: %s (ok=%s)", path, tostring(ok)))
+    send_command_response(client, sub_id, command, {
+        ok = ok == true,
+        path = path,
+        branch = branch,
+        error = err,
+    })
+end, { description = "Delete a worktree that no live session owns" })
+
 commands.register("execute_session_action", function(client, sub_id, command)
     local session_uuid = command.session_uuid
     local action_id = command.action_id

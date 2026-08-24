@@ -11,6 +11,7 @@ for _, module_name in ipairs({
     "project_pipelines.entity_contract",
     "project_pipelines.repo",
     "project_pipelines.entities",
+    "project_pipelines.worktree_cleanup",
     "project_pipelines.engine",
     "project_pipelines.stack_delivery",
     "project_pipelines.github_integration",

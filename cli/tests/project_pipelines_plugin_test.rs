@@ -884,6 +884,267 @@ fn catalog_plugin_project_pipelines_deletes_only_manual_ticket_sessions() {
 }
 
 #[test]
+fn catalog_plugin_project_pipelines_close_ticket_deletes_ticket_worktrees() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+    botster::lua::primitives::json::register(&lua).expect("register json");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            -- Two sessions share one worktree; a third holds its own. The live
+            -- session list is empty, so both worktrees are free to delete.
+            local WORKTREES = {{
+              ["sess-implementer"] = "/worktrees/ticket-1",
+              ["sess-reviewer"]    = "/worktrees/ticket-1",
+              ["sess-merge"]       = "/worktrees/ticket-1-merge",
+            }}
+
+            local deleted_agents = {{}}
+            local deleted_worktrees = {{}}
+            local appended = {{}}
+
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() end,
+              notify_question_asked = function() end,
+            }}
+            package.loaded["lib.agent"] = {{
+              get = function(session_uuid)
+                local path = WORKTREES[session_uuid]
+                if not path then return nil end
+                return {{
+                  info = function()
+                    return {{
+                      worktree_path = path,
+                      branch_name = "project-pipelines/ticket-1",
+                    }}
+                  end,
+                }}
+              end,
+              list = function() return {{}} end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  delete_agent = function(_, session_uuid, delete_worktree)
+                    deleted_agents[#deleted_agents + 1] = {{
+                      session_uuid = session_uuid,
+                      delete_worktree = delete_worktree,
+                    }}
+                    return "Delete requested"
+                  end,
+                  delete_worktree = function(_, path, branch)
+                    deleted_worktrees[#deleted_worktrees + 1] = {{ path = path, branch = branch }}
+                    return true, nil
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              get_ticket = function()
+                return {{ id = "ticket-1", title = "Ship", project_id = "project-1", target_id = "target-1" }}
+              end,
+              latest_ticket_run = function() return nil end,
+              ticket_session_uuids = function()
+                return {{ "sess-implementer", "sess-reviewer", "sess-merge" }}
+              end,
+              close_ticket = function() return {{ id = "ticket-1", status = "closed" }} end,
+              get_question_orchestrator = function() return nil end,
+              resolve_target_path = function() return "/repo/project" end,
+              append_event = function(kind, attrs)
+                appended[#appended + 1] = {{ kind = kind, attrs = attrs }}
+              end,
+            }}
+
+            -- Every recorded worktree still exists on disk.
+            _G.fs = {{ exists = function() return true end, list_dir = function() return nil end }}
+
+            local engine = require("project_pipelines.engine")
+            local result = engine.close_ticket("ticket-1", {{}})
+
+            assert(#deleted_agents == 3, "every ticket session must be closed")
+            for _, entry in ipairs(deleted_agents) do
+              assert(entry.delete_worktree == true, "sessions must close with their worktree")
+            end
+
+            -- Two sessions shared one worktree, so three sessions yield two paths.
+            assert(#deleted_worktrees == 2, "each distinct worktree is deleted once")
+            local paths = {{}}
+            for _, entry in ipairs(deleted_worktrees) do
+              paths[entry.path] = entry.branch
+            end
+            assert(paths["/worktrees/ticket-1"] == "project-pipelines/ticket-1")
+            assert(paths["/worktrees/ticket-1-merge"] == "project-pipelines/ticket-1")
+
+            assert(#result.worktrees.deleted == 2)
+            assert(#result.worktrees.failed == 0)
+
+            local recorded = nil
+            for _, entry in ipairs(appended) do
+              if entry.kind == "ticket.worktrees_deleted" then recorded = entry end
+            end
+            assert(recorded ~= nil, "closing a ticket must record its deleted worktrees")
+            assert(recorded.attrs.ticket_id == "ticket-1")
+            assert(recorded.attrs.payload.count == 2)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("closing a ticket should delete its worktrees");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_close_ticket_keeps_worktrees_when_asked() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+    botster::lua::primitives::json::register(&lua).expect("register json");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local deleted_agents = {{}}
+            local deleted_worktrees = 0
+
+            package.loaded["project_pipelines.entities"] = {{
+              register = function() end,
+              publish_snapshots = function() end,
+            }}
+            package.loaded["project_pipelines.notification_policy"] = {{
+              notify_phase_transition = function() end,
+              notify_question_asked = function() end,
+            }}
+            package.loaded["lib.agent"] = {{
+              get = function(session_uuid)
+                return {{
+                  info = function()
+                    return {{
+                      worktree_path = "/worktrees/ticket-1",
+                      branch_name = "project-pipelines/ticket-1",
+                    }}
+                  end,
+                }}
+              end,
+              list = function() return {{}} end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  delete_agent = function(_, session_uuid, delete_worktree)
+                    deleted_agents[#deleted_agents + 1] = {{
+                      session_uuid = session_uuid,
+                      delete_worktree = delete_worktree,
+                    }}
+                    return "Delete requested"
+                  end,
+                  delete_worktree = function()
+                    deleted_worktrees = deleted_worktrees + 1
+                    return true, nil
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              get_ticket = function()
+                return {{ id = "ticket-1", title = "Ship", project_id = "project-1", target_id = "target-1" }}
+              end,
+              latest_ticket_run = function() return nil end,
+              ticket_session_uuids = function() return {{ "sess-implementer" }} end,
+              close_ticket = function() return {{ id = "ticket-1", status = "closed" }} end,
+              get_question_orchestrator = function() return nil end,
+              resolve_target_path = function() return "/repo/project" end,
+              append_event = function() end,
+            }}
+            _G.fs = {{ exists = function() return true end, list_dir = function() return nil end }}
+
+            local engine = require("project_pipelines.engine")
+            local result = engine.close_ticket("ticket-1", {{ delete_worktrees = false }})
+
+            assert(#deleted_agents == 1)
+            assert(deleted_agents[1].delete_worktree == false, "the session must keep its worktree")
+            assert(deleted_worktrees == 0, "no worktree may be deleted")
+            assert(result.worktrees == nil)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("delete_worktrees=false should close a ticket and keep its worktrees");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_worktree_cleanup_keeps_occupied_worktrees() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+    botster::lua::primitives::json::register(&lua).expect("register json");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local deleted = {{}}
+
+            package.loaded["lib.agent"] = {{
+              get = function() return nil end,
+              -- A session unrelated to this ticket still runs in the worktree.
+              list = function()
+                return {{ {{ session_uuid = "sess-other", worktree_path = "/worktrees/ticket-1" }} }}
+              end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  delete_worktree = function(_, path)
+                    deleted[#deleted + 1] = path
+                    return true, nil
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              ticket_session_uuids = function() return {{}} end,
+              append_event = function() end,
+            }}
+            _G.fs = {{ exists = function() return true end, list_dir = function() return nil end }}
+
+            local cleanup = require("project_pipelines.worktree_cleanup")
+            local results = cleanup.delete_for_ticket("ticket-1", {{
+              worktrees = {{
+                {{ path = "/worktrees/ticket-1", branch = "project-pipelines/ticket-1", session_uuids = {{}} }},
+              }},
+            }})
+
+            assert(#deleted == 0, "an occupied worktree must survive")
+            assert(#results.deleted == 0)
+            assert(#results.skipped == 1)
+            assert(results.skipped[1].reason:find("sess-other", 1, true) ~= nil)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("cleanup should keep a worktree a live session still uses");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn catalog_plugin_project_pipelines_home_shows_linked_pr_records() {
     let root = project_root_dir().join("catalog/templates/plugins/project-pipelines");
     let home = std::fs::read_to_string(root.join("project_pipelines/web/screens/home.lua"))
@@ -893,7 +1154,7 @@ fn catalog_plugin_project_pipelines_home_shows_linked_pr_records() {
 
     assert!(
         home.contains(r#"source = "/project-pipelines.ticket""#)
-            && home.contains(r#"where = { status = "open", latest_run_status = "done" }"#),
+            && home.contains(r#"where = { open = true, latest_run_status = "done" }"#),
         "home PR rows should be driven by the ticket entity stream"
     );
     for binding in [
@@ -2924,10 +3185,21 @@ fn catalog_plugin_project_pipelines_registers_targeted_overview_hydration() {
             function db:eval(sql, param)
               local compact = normalize(sql)
               if compact:find("FROM tickets t LEFT JOIN projects p") then
-                return {{
-                  {{ id = "ticket-merge", title = "Ready", status = "open", project_id = "project-1", target_id = "target-1", created_at = 1 }},
+                local tickets = {{
+                  {{ id = "ticket-merge", title = "Ready", status = "active", project_id = "project-1", target_id = "target-1", created_at = 1 }},
                   {{ id = "ticket-standalone", title = "Standalone", status = "open", project_id = "", target_id = "target-1", created_at = 2 }},
                 }}
+                if compact:find("COALESCE%(t%.status, 'open'%) = %?") then
+                  local wanted = type(param) == "table" and param[1] or param
+                  local matched = {{}}
+                  for _, ticket in ipairs(tickets) do
+                    if ticket.status == wanted then
+                      matched[#matched + 1] = ticket
+                    end
+                  end
+                  return matched
+                end
+                return tickets
               end
               if compact == "SELECT * FROM runs WHERE status = ? ORDER BY updated_at DESC, created_at DESC, id DESC" then
                 return {{
@@ -2989,25 +3261,36 @@ fn catalog_plugin_project_pipelines_registers_targeted_overview_hydration() {
             local entities = require("project_pipelines.entities")
             entities.register()
 
-            local ticket_items = registered[entities.types.ticket].query({{ where = {{ status = "open", standalone = true }} }})
-            local merge_items = registered[entities.types.ticket].query({{ where = {{ status = "open", latest_run_status = "done" }} }})
+            local ticket_items = registered[entities.types.ticket].query({{ where = {{ open = true, standalone = true }} }})
+            local merge_items = registered[entities.types.ticket].query({{ where = {{ open = true, latest_run_status = "done" }} }})
+            local exact_open_merge = registered[entities.types.ticket].query({{ where = {{ status = "open", latest_run_status = "done" }} }})
             local run_items = registered[entities.types.run].query({{ where = {{ status = "active" }} }})
             local project_items = registered[entities.types.project].query({{ where = {{ status = "open" }} }})
             local question_items = registered[entities.types.question].query({{ where = {{ status = "open" }} }})
 
             local saw_standalone = false
             local saw_done = false
+            local saw_active_merge = false
             for _, item in ipairs(ticket_items) do
               if item.standalone == true then saw_standalone = true end
             end
             for _, item in ipairs(merge_items) do
               if item.latest_run_status == "done" then saw_done = true end
+              if item.id == "ticket-merge" and item.status == "active" and item.open == true then
+                saw_active_merge = true
+              end
             end
 
             assert(#ticket_items >= 1, "overview ticket scoped query should return working-set ticket rows")
             assert(saw_standalone, "ticket entities should expose standalone for EB scope filtering")
             assert(#merge_items >= 1, "overview merge scoped query should return decorated ticket rows")
             assert(saw_done, "ticket entities should expose latest_run_status for EB scope filtering")
+            assert(saw_active_merge, "merge query must include active tickets with a done latest run")
+            local exact_open_has_active = false
+            for _, item in ipairs(exact_open_merge) do
+              if item.id == "ticket-merge" then exact_open_has_active = true end
+            end
+            assert(not exact_open_has_active, "status=open hides active tickets that belong in the merge queue")
             assert(#run_items >= 1 and run_items[1].status == "active")
             assert(#project_items == 1 and project_items[1].status == "open")
             assert(#question_items == 1 and question_items[1].status == "open")
