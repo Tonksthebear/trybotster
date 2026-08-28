@@ -43,6 +43,21 @@
 
 local M = {}
 
+-- Matches the HTTP MCP outer dispatch bound in cli/src/mcp_http.rs.
+-- 110s handler cap leaves 10s for Hub completion before the 120s HTTP bound.
+local MCP_HANDLER_TIMEOUT_MAX_MS = 110000
+
+local function handler_timeout_ms(schema)
+    local timeout_ms = tonumber(schema and schema.timeout_ms) or 5000
+    if timeout_ms < 1 then
+        timeout_ms = 1
+    end
+    if timeout_ms > MCP_HANDLER_TIMEOUT_MAX_MS then
+        timeout_ms = MCP_HANDLER_TIMEOUT_MAX_MS
+    end
+    return timeout_ms
+end
+
 -- Internal tool registry: name -> { name, description, input_schema, handler, source, owner_plugin, proxy_id? }
 -- proxy_id is set for tools forwarded from a remote MCP server; handler is nil for these.
 local tools = {}
@@ -302,7 +317,7 @@ function M.tool(name, schema, handler)
         owner_plugin = owner_plugin,
         handler_id = owner_plugin and mcp_handler_id("tool", name) or nil,
         plugin_name = caller_plugin_name(),  -- nil = builtin (always available)
-        timeout_ms = schema.timeout_ms or 5000,
+        timeout_ms = handler_timeout_ms(schema),
     }
 
     if not _batch then
@@ -684,6 +699,33 @@ function M.call_tool(name, params, context, callback)
         return  -- async; result arrives via callback
     end
 
+    if tool.owner_plugin and callback then
+        local accepted, admission_error = require("lib.plugin_supervisor").invoke_async(
+            tool.owner_plugin,
+            "mcp_tool:" .. tostring(name),
+            tool.handler,
+            {
+                timeout_ms = tool.timeout_ms or 5000,
+                handler_kind = "mcp_tool",
+                handler_id = tool.handler_id or mcp_handler_id("tool", name),
+                payload = { name = name, params = params or {}, context = context or {} },
+            },
+            function(ok, result)
+                if not ok then
+                    callback(nil, tostring(result))
+                    return
+                end
+                callback(normalize_result(result), nil)
+            end,
+            params or {},
+            context or {})
+        if not accepted then
+            callback(nil, tostring(admission_error))
+            return
+        end
+        return admission_error
+    end
+
     local ok, result
     if tool.owner_plugin then
         ok, result = require("lib.plugin_supervisor").invoke(
@@ -950,7 +992,7 @@ function M.prompt(name, schema, handler)
         owner_plugin = owner_plugin,
         plugin_name = caller_plugin_name(),
         handler_id = owner_plugin and mcp_handler_id("prompt", name) or nil,
-        timeout_ms = schema.timeout_ms or 5000,
+        timeout_ms = handler_timeout_ms(schema),
     }
 
     if not _batch then
@@ -1008,13 +1050,56 @@ end
 -- @param args table Argument values from the MCP client (key = arg name)
 -- @param context table|nil Caller context; session_uuid scopes plugin prompts
 -- @return result table|nil, error string|nil
-function M.get_prompt(name, args, context)
+function M.get_prompt(name, args, context, callback)
     local prompt = prompts[name]
     if not prompt then
+        if callback then callback(nil, "Unknown prompt: " .. name) return end
         return nil, "Unknown prompt: " .. name
     end
     if not plugin_allowed_for_session(prompt.plugin_name, context and context.session_uuid) then
+        if callback then callback(nil, "Prompt not available for this session: " .. name) return end
         return nil, "Prompt not available for this session: " .. name
+    end
+
+    local function normalize_prompt(result)
+        if type(result) == "string" then
+            return {
+                description = prompt.description,
+                messages = {
+                    { role = "user", content = { type = "text", text = result } },
+                },
+            }, nil
+        elseif type(result) == "table" then
+            return result, nil
+        end
+        return nil, "mcp.get_prompt: handler returned unexpected type: " .. type(result)
+    end
+
+    if prompt.owner_plugin and callback then
+        local accepted, admission_error = require("lib.plugin_supervisor").invoke_async(
+            prompt.owner_plugin,
+            "mcp_prompt:" .. tostring(name),
+            prompt.handler,
+            {
+                timeout_ms = prompt.timeout_ms or 5000,
+                handler_kind = "mcp_prompt",
+                handler_id = prompt.handler_id or mcp_handler_id("prompt", name),
+                payload = { name = name, args = args or {}, context = context or {} },
+            },
+            function(ok, result)
+                if not ok then
+                    callback(nil, tostring(result))
+                    return
+                end
+                local normalized, normalize_error = normalize_prompt(result)
+                callback(normalized, normalize_error)
+            end,
+            args or {})
+        if not accepted then
+            callback(nil, tostring(admission_error))
+            return
+        end
+        return admission_error
     end
 
     local ok, result
@@ -1027,29 +1112,20 @@ function M.get_prompt(name, args, context)
                 timeout_ms = prompt.timeout_ms or 5000,
                 handler_kind = "mcp_prompt",
                 handler_id = prompt.handler_id or mcp_handler_id("prompt", name),
-                payload = { name = name, args = args or {} },
+                payload = { name = name, args = args or {}, context = context or {} },
             },
             args or {})
     else
         ok, result = pcall(prompt.handler, args or {})
     end
     if not ok then
+        if callback then callback(nil, tostring(result)) return end
         return nil, tostring(result)
     end
 
-    -- Normalize: plain string -> single user message
-    if type(result) == "string" then
-        return {
-            description = prompt.description,
-            messages = {
-                { role = "user", content = { type = "text", text = result } },
-            },
-        }
-    elseif type(result) == "table" then
-        return result
-    else
-        return nil, "mcp.get_prompt: handler returned unexpected type: " .. type(result)
-    end
+    local normalized, normalize_error = normalize_prompt(result)
+    if callback then callback(normalized, normalize_error) return end
+    return normalized, normalize_error
 end
 
 function M._invoke_prompt(handler_id, args)
@@ -1133,7 +1209,7 @@ function M.resource(uri_template, schema, handler)
         owner_plugin = owner_plugin,
         plugin_name = caller_plugin_name(),
         handler_id = owner_plugin and mcp_handler_id("resource", uri_template) or nil,
-        timeout_ms = schema.timeout_ms or 5000,
+        timeout_ms = handler_timeout_ms(schema),
         _pattern = pattern,
         _param_names = param_names,
     }
@@ -1283,6 +1359,49 @@ function M.read_resource(uri, context, callback)
         end)
 
         return  -- async; result arrives via callback
+    end
+
+    if matched_template.owner_plugin and callback then
+        local accepted, admission_error = require("lib.plugin_supervisor").invoke_async(
+            matched_template.owner_plugin,
+            "mcp_resource:" .. tostring(matched_template.uri_template),
+            matched_template.handler,
+            {
+                timeout_ms = matched_template.timeout_ms or 5000,
+                handler_kind = "mcp_resource",
+                handler_id = matched_template.handler_id or mcp_handler_id("resource", matched_template.uri_template),
+                payload = {
+                    uri = uri,
+                    uri_template = matched_template.uri_template,
+                    params = params or {},
+                    context = context or {},
+                },
+            },
+            function(ok, result)
+                if not ok then
+                    callback(nil, tostring(result))
+                    return
+                end
+                local contents
+                if type(result) == "table" and result[1] and result[1].uri then
+                    contents = result
+                elseif type(result) == "string" then
+                    contents = { { uri = uri, mimeType = matched_template.mimeType, text = result } }
+                elseif type(result) == "table" then
+                    contents = { { uri = uri, mimeType = matched_template.mimeType, text = json.encode(result) } }
+                else
+                    callback(nil, "Resource handler returned unsupported type: " .. type(result))
+                    return
+                end
+                callback(contents, nil)
+            end,
+            params or {},
+            context or {})
+        if not accepted then
+            callback(nil, tostring(admission_error))
+            return
+        end
+        return admission_error
     end
 
     local ok, result

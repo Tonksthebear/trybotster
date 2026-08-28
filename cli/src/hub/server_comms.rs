@@ -314,6 +314,14 @@ impl Hub {
                     request,
                 );
             }
+            HubEvent::PluginWorkerInvokeCompleted { request_id, result } => {
+                self.lua
+                    .fire_plugin_worker_invoke_completed(&request_id, result);
+            }
+            HubEvent::PluginWorkerInvokeCancel { request_id } => {
+                self.lua
+                    .fail_plugin_worker_invoke_callback(&request_id, "hub MCP dispatch timed out");
+            }
             HubEvent::LuaConnectionRequest(request) => {
                 self.handle_lua_connection_request_event(request);
             }

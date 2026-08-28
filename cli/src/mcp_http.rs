@@ -19,10 +19,11 @@
 
 // Rust guideline compliant 2026-08-23
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -73,11 +74,11 @@ const CALLER_TOKEN_BYTES: usize = 32;
 /// Largest accepted JSON-RPC body. Tool arguments stay well under this.
 const BODY_LIMIT: usize = 1024 * 1024;
 
-/// How long the HTTP layer waits for the Hub event loop to answer.
+/// How long the HTTP layer waits for one tool, prompt, or resource result.
 ///
-/// Tool calls can run for a long time. Match the stdio gateway timeout so a
-/// shared HTTP caller is not cut off sooner than a former per-session process.
-const HUB_DISPATCH_TIMEOUT: Duration = Duration::from_secs(86_400);
+/// Plugin handlers have shorter declared limits. This outer bound also covers
+/// remote proxies and prevents a lost completion from holding a request forever.
+const HUB_DISPATCH_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How long initialize and ping wait for the Hub event loop.
 const HUB_QUICK_TIMEOUT: Duration = Duration::from_secs(15);
@@ -108,6 +109,9 @@ pub const SOCKET_MCP_FALLBACK_REMOVAL: &str = "2026-10-01";
 /// A recovered live PTY reconnects well before two weeks. Tokens for
 /// sessions whose processes died while the Hub was down must not live forever.
 const MAX_CREDENTIAL_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// How often the listener removes services for revoked caller tokens.
+const REVOKED_SERVICE_SWEEP: Duration = Duration::from_secs(60);
 
 /// HTTP body type that can be a finished JSON reply or a live SSE stream.
 type McpHttpBody = UnsyncBoxBody<Bytes, Infallible>;
@@ -229,8 +233,86 @@ impl McpHttpReply {
     }
 }
 
-/// Oneshot used by the HTTP layer to receive a Hub MCP reply.
-pub struct McpHttpReplyTx(pub oneshot::Sender<McpHttpReply>);
+/// Cloneable one-shot used by the HTTP layer to receive one Hub MCP reply.
+#[derive(Clone)]
+pub struct McpHttpReplyTx {
+    sender: Arc<Mutex<Option<oneshot::Sender<McpHttpReply>>>>,
+    request_id: Arc<Mutex<Option<String>>>,
+    timed_out: Arc<AtomicBool>,
+    event_tx: Option<HubEventTx>,
+    canceled: Option<Arc<Mutex<HashSet<String>>>>,
+}
+
+impl McpHttpReplyTx {
+    fn new(sender: oneshot::Sender<McpHttpReply>) -> Self {
+        Self {
+            sender: Arc::new(Mutex::new(Some(sender))),
+            request_id: Arc::new(Mutex::new(None)),
+            timed_out: Arc::new(AtomicBool::new(false)),
+            event_tx: None,
+            canceled: None,
+        }
+    }
+
+    fn with_cancel_route(
+        mut self,
+        event_tx: HubEventTx,
+        canceled: Arc<Mutex<HashSet<String>>>,
+    ) -> Self {
+        self.event_tx = Some(event_tx);
+        self.canceled = Some(canceled);
+        self
+    }
+
+    fn send(&self, reply: McpHttpReply) -> bool {
+        self.sender
+            .lock()
+            .expect("MCP HTTP reply mutex poisoned")
+            .take()
+            .is_some_and(|sender| sender.send(reply).is_ok())
+    }
+
+    fn bind_request_id(&self, request_id: String) {
+        if self.timed_out.load(Ordering::Acquire) {
+            self.record_cancel(request_id);
+            return;
+        }
+        *self
+            .request_id
+            .lock()
+            .expect("MCP HTTP request id mutex poisoned") = Some(request_id);
+        if self.timed_out.load(Ordering::Acquire) {
+            if let Some(request_id) = self.take_request_id() {
+                self.record_cancel(request_id);
+            }
+        }
+    }
+
+    fn take_request_id(&self) -> Option<String> {
+        self.request_id
+            .lock()
+            .expect("MCP HTTP request id mutex poisoned")
+            .take()
+    }
+
+    fn mark_timed_out(&self) {
+        self.timed_out.store(true, Ordering::Release);
+    }
+
+    fn record_cancel(&self, request_id: String) {
+        if let Some(canceled) = &self.canceled {
+            canceled
+                .lock()
+                .expect("MCP cancel set mutex poisoned")
+                .insert(request_id.clone());
+        }
+        if let Some(event_tx) = &self.event_tx {
+            if let Err(error) = event_tx.send(HubEvent::PluginWorkerInvokeCancel { request_id }) {
+                log::warn!("MCP cancel was not admitted onto the Hub queue: {error}");
+            }
+        }
+    }
+}
 
 impl std::fmt::Debug for McpHttpReplyTx {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -599,7 +681,10 @@ impl McpHttpFanout {
 #[derive(Clone)]
 pub(crate) enum McpHttpDispatch {
     /// Production path: enqueue work on the Hub event loop.
-    Hub(HubEventTx),
+    Hub {
+        event_tx: HubEventTx,
+        canceled: Arc<Mutex<HashSet<String>>>,
+    },
     /// Test path: answer immediately without Lua.
     #[cfg_attr(
         not(test),
@@ -611,7 +696,7 @@ pub(crate) enum McpHttpDispatch {
 impl std::fmt::Debug for McpHttpDispatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Hub(_) => f.write_str("McpHttpDispatch::Hub"),
+            Self::Hub { .. } => f.write_str("McpHttpDispatch::Hub"),
             Self::Direct(_) => f.write_str("McpHttpDispatch::Direct"),
         }
     }
@@ -678,9 +763,14 @@ pub(crate) async fn bind_listener(
     });
 
     tokio::spawn(async move {
+        let mut revoked_service_sweep = tokio::time::interval(REVOKED_SERVICE_SWEEP);
+        revoked_service_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => break,
+                _ = revoked_service_sweep.tick() => {
+                    prune_revoked_services(&state).await;
+                }
                 accepted = listener.accept() => {
                     let Ok((stream, peer)) = accepted else {
                         break;
@@ -714,6 +804,24 @@ struct HttpState {
 }
 
 type CallerHttpService = StreamableHttpService<HttpMcpHandler, LocalSessionManager>;
+
+fn caller_session_manager() -> LocalSessionManager {
+    let mut manager = LocalSessionManager::default();
+    // Botster owns caller lifetime through the bearer token. The rmcp
+    // five-minute idle timeout would otherwise strand a live caller with
+    // a stale Mcp-Session-Id. Dropping the per-token service closes these
+    // sessions when Botster revokes the caller token.
+    manager.session_config.keep_alive = None;
+    manager
+}
+
+async fn prune_revoked_services(state: &HttpState) {
+    state
+        .services
+        .lock()
+        .await
+        .retain(|token, _| state.callers.authorize(token).is_some());
+}
 
 #[derive(Clone, Debug)]
 struct HttpMcpHandler {
@@ -989,7 +1097,7 @@ async fn handle_request_inner(
                 config.json_response = true;
                 StreamableHttpService::new(
                     move || Ok(handler.clone()),
-                    Arc::new(LocalSessionManager::default()),
+                    Arc::new(caller_session_manager()),
                     config,
                 )
             })
@@ -1013,14 +1121,16 @@ async fn dispatch_method(
             Ok(result) => Ok(McpHttpReply::result(result)),
             Err(message) => Ok(McpHttpReply::error(-32000, message)),
         },
-        McpHttpDispatch::Hub(event_tx) => {
+        McpHttpDispatch::Hub { event_tx, canceled } => {
             let (tx, rx) = oneshot::channel();
+            let reply =
+                McpHttpReplyTx::new(tx).with_cancel_route(event_tx.clone(), Arc::clone(canceled));
             event_tx
                 .send(HubEvent::McpHttpRequest {
                     caller,
                     method: method.to_string(),
                     params,
-                    reply: McpHttpReplyTx(tx),
+                    reply: reply.clone(),
                 })
                 .map_err(|_| "hub event loop is not accepting MCP requests".to_string())?;
             let timeout = match method {
@@ -1030,10 +1140,47 @@ async fn dispatch_method(
                 }
                 _ => HUB_QUICK_TIMEOUT,
             };
-            tokio::time::timeout(timeout, rx)
-                .await
-                .map_err(|_| "hub MCP dispatch timed out".to_string())?
-                .map_err(|_| "hub MCP dispatch dropped".to_string())
+            match tokio::time::timeout(timeout, rx).await {
+                Ok(Ok(reply)) => Ok(reply),
+                Ok(Err(_)) => Err("hub MCP dispatch dropped".to_string()),
+                Err(_) => {
+                    note_dispatch_timeout(event_tx, canceled, &reply).await;
+                    Err("hub MCP dispatch timed out".to_string())
+                }
+            }
+        }
+    }
+}
+
+async fn note_dispatch_timeout(
+    event_tx: &HubEventTx,
+    canceled: &Arc<Mutex<HashSet<String>>>,
+    reply: &McpHttpReplyTx,
+) {
+    reply.mark_timed_out();
+    let Some(request_id) = reply.take_request_id() else {
+        return;
+    };
+    canceled
+        .lock()
+        .expect("MCP cancel set mutex poisoned")
+        .insert(request_id.clone());
+    match tokio::time::timeout(
+        Duration::from_millis(250),
+        event_tx.send_async(HubEvent::PluginWorkerInvokeCancel {
+            request_id: request_id.clone(),
+        }),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            log::warn!("MCP cancel queue closed: {error}");
+        }
+        Err(_) => {
+            if let Err(error) = event_tx.send(HubEvent::PluginWorkerInvokeCancel { request_id }) {
+                log::warn!("MCP cancel was not admitted onto the Hub queue: {error}");
+            }
         }
     }
 }
@@ -1117,19 +1264,46 @@ fn write_private_file(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("private file path has no file name: {}", path.display()))?;
+    let mut random = [0_u8; 8];
+    rand::rng().fill_bytes(&mut random);
+    let temporary_path = path.with_file_name(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        encode_hex(&random)
+    ));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
-        .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
-    file.write_all(bytes)
-        .with_context(|| format!("write {}", path.display()))?;
-    let permissions = std::fs::Permissions::from_mode(0o600);
-    file.set_permissions(permissions)
-        .with_context(|| format!("chmod {}", path.display()))?;
-    Ok(())
+        .open(&temporary_path)
+        .with_context(|| format!("open {}", temporary_path.display()))?;
+    let write_result = (|| -> Result<()> {
+        file.write_all(bytes)
+            .with_context(|| format!("write {}", temporary_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync {}", temporary_path.display()))?;
+        let permissions = std::fs::Permissions::from_mode(0o600);
+        file.set_permissions(permissions)
+            .with_context(|| format!("chmod {}", temporary_path.display()))?;
+        drop(file);
+        std::fs::rename(&temporary_path, path).with_context(|| {
+            format!(
+                "replace {} with {}",
+                path.display(),
+                temporary_path.display()
+            )
+        })?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    write_result
 }
 
 fn origin_allowed(headers: &HeaderMap) -> bool {
@@ -1189,8 +1363,10 @@ pub fn dispatch_lua_mcp(
     params: Value,
     reply: McpHttpReplyTx,
 ) {
+    let error_reply = reply.clone();
     if let Err(error) = dispatch_lua_mcp_inner(lua, caller, method, params, reply) {
         log::warn!("[mcp-http] lua dispatch failed: {error}");
+        error_reply.send(McpHttpReply::error(-32000, error.to_string()));
     }
 }
 
@@ -1243,6 +1419,7 @@ fn dispatch_lua_mcp_inner(
             let call_tool: mlua::Function = mcp
                 .get("call_tool")
                 .map_err(|e| anyhow!("mcp.call_tool: {e}"))?;
+            let bound = reply.clone();
             let tx = Arc::new(Mutex::new(Some(reply)));
             let callback = lua
                 .create_function(move |lua, (content, err, is_error): (mlua::Value, mlua::Value, mlua::Value)| {
@@ -1250,7 +1427,7 @@ fn dispatch_lua_mcp_inner(
                         return Ok(());
                     };
                     if let Some(message) = err_string(&err) {
-                        let _ = reply.0.send(McpHttpReply::error(-32000, message));
+                        reply.send(McpHttpReply::error(-32000, message));
                         return Ok(());
                     }
                     let content = lua_to_json(lua, content).unwrap_or(json!([]));
@@ -1258,16 +1435,19 @@ fn dispatch_lua_mcp_inner(
                         mlua::Value::Boolean(flag) => flag,
                         _ => false,
                     };
-                    let _ = reply.0.send(McpHttpReply::result(json!({
+                    reply.send(McpHttpReply::result(json!({
                         "content": content,
                         "isError": is_error
                     })));
                     Ok(())
                 })
                 .map_err(|e| anyhow!("create tools/call callback: {e}"))?;
-            call_tool
-                .call::<()>((name, args, context, callback))
+            let admitted: Option<String> = call_tool
+                .call((name, args, context, callback))
                 .map_err(|e| anyhow!("mcp.call_tool: {e}"))?;
+            if let Some(request_id) = admitted.filter(|id| id.starts_with("plugin-worker-async-")) {
+                bound.bind_request_id(request_id);
+            }
         }
         "prompts/list" => {
             let list: mlua::Function = mcp
@@ -1282,26 +1462,41 @@ fn dispatch_lua_mcp_inner(
             let name = params
                 .get("name")
                 .and_then(Value::as_str)
-                .ok_or_else(|| anyhow!("prompts/get missing name"))?;
+                .ok_or_else(|| anyhow!("prompts/get missing name"))?
+                .to_string();
             let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
             let args = crate::lua::primitives::json::json_to_lua(lua, &arguments)
                 .map_err(|e| anyhow!("encode prompt arguments: {e}"))?;
             let get_prompt: mlua::Function = mcp
                 .get("get_prompt")
                 .map_err(|e| anyhow!("mcp.get_prompt: {e}"))?;
-            match get_prompt.call::<(mlua::Value, mlua::Value)>((name, args, context.clone())) {
-                Ok((result, err)) => {
+            let bound = reply.clone();
+            let tx = Arc::new(Mutex::new(Some(reply)));
+            let callback = lua
+                .create_function(move |lua, (result, err): (mlua::Value, mlua::Value)| {
+                    let Some(reply) = tx.lock().expect("mcp HTTP reply mutex").take() else {
+                        return Ok(());
+                    };
                     if let Some(message) = err_string(&err) {
-                        let _ = reply.0.send(McpHttpReply::error(-32000, message));
-                    } else {
-                        complete_result(lua, reply, lua_to_json(lua, result)?);
+                        reply.send(McpHttpReply::error(-32000, message));
+                        return Ok(());
                     }
-                }
-                Err(error) => {
-                    let _ = reply
-                        .0
-                        .send(McpHttpReply::error(-32000, format!("{error}")));
-                }
+                    match lua_to_json(lua, result) {
+                        Ok(result) => {
+                            reply.send(McpHttpReply::result(result));
+                        }
+                        Err(error) => {
+                            reply.send(McpHttpReply::error(-32000, error.to_string()));
+                        }
+                    }
+                    Ok(())
+                })
+                .map_err(|e| anyhow!("create prompts/get callback: {e}"))?;
+            let admitted: Option<String> = get_prompt
+                .call((name, args, context.clone(), callback))
+                .map_err(|e| anyhow!("mcp.get_prompt: {e}"))?;
+            if let Some(request_id) = admitted.filter(|id| id.starts_with("plugin-worker-async-")) {
+                bound.bind_request_id(request_id);
             }
         }
         "resources/templates/list" => {
@@ -1326,6 +1521,7 @@ fn dispatch_lua_mcp_inner(
             let read_resource: mlua::Function = mcp
                 .get("read_resource")
                 .map_err(|e| anyhow!("mcp.read_resource: {e}"))?;
+            let bound = reply.clone();
             let tx = Arc::new(Mutex::new(Some(reply)));
             let callback = lua
                 .create_function(move |lua, (contents, err): (mlua::Value, mlua::Value)| {
@@ -1333,22 +1529,23 @@ fn dispatch_lua_mcp_inner(
                         return Ok(());
                     };
                     if let Some(message) = err_string(&err) {
-                        let _ = reply.0.send(McpHttpReply::error(-32002, message));
+                        reply.send(McpHttpReply::error(-32002, message));
                         return Ok(());
                     }
                     let contents = lua_to_json(lua, contents).unwrap_or(json!([]));
-                    let _ = reply
-                        .0
-                        .send(McpHttpReply::result(json!({ "contents": contents })));
+                    reply.send(McpHttpReply::result(json!({ "contents": contents })));
                     Ok(())
                 })
                 .map_err(|e| anyhow!("create resources/read callback: {e}"))?;
-            read_resource
-                .call::<()>((uri, context, callback))
+            let admitted: Option<String> = read_resource
+                .call((uri, context, callback))
                 .map_err(|e| anyhow!("mcp.read_resource: {e}"))?;
+            if let Some(request_id) = admitted.filter(|id| id.starts_with("plugin-worker-async-")) {
+                bound.bind_request_id(request_id);
+            }
         }
         other => {
-            let _ = reply.0.send(McpHttpReply::error(
+            reply.send(McpHttpReply::error(
                 -32601,
                 format!("method not found: {other}"),
             ));
@@ -1386,7 +1583,7 @@ fn lookup_caller_context(
 }
 
 fn complete_result(lua: &mlua::Lua, reply: McpHttpReplyTx, value: Value) {
-    let _ = reply.0.send(McpHttpReply::result(value));
+    reply.send(McpHttpReply::result(value));
     let _ = lua;
 }
 
@@ -1449,8 +1646,14 @@ pub fn register_lua(
 
     let revoke_callers = callers.clone();
     let revoke_fn = lua
-        .create_function(move |_, session_uuid: String| {
+        .create_function(move |lua, session_uuid: String| {
             revoke_callers.revoke_session(&session_uuid);
+            if let Ok(fail) = lua
+                .globals()
+                .get::<mlua::Function>("__plugin_worker_fail_session_callbacks")
+            {
+                fail.call::<()>((session_uuid, "MCP caller credential revoked".to_string()))?;
+            }
             Ok(())
         })
         .map_err(|e| anyhow!("create hub.revoke_mcp_caller: {e}"))?;
@@ -1963,6 +2166,12 @@ mod tests {
     }
 
     #[test]
+    fn caller_session_lifetime_follows_botster_token_lifetime() {
+        let manager = caller_session_manager();
+        assert_eq!(manager.session_config.keep_alive, None);
+    }
+
+    #[test]
     fn issue_reuses_live_token_and_revokes_on_session_close() {
         let callers = McpCallerRegistry::new();
         callers.set_url("http://127.0.0.1:9/mcp");
@@ -2316,6 +2525,14 @@ mod tests {
         assert!(config.contains("\"type\": \"http\""));
         assert!(!config.contains("mcp-serve"));
         assert!(!config.contains("BOTSTER_SESSION_UUID"));
+        let session_lua = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("lua/lib/session.lua"),
+        )
+        .expect("session Lua source");
+        assert!(session_lua.contains("env.BOTSTER_DATA_DIR = self._data_dir"));
+        assert!(!session_lua.contains("env.BOTSTER_CONFIG_DIR = self._data_dir"));
+        assert!(session_lua.contains("return os.time()"));
+        assert!(!session_lua.contains("local now = os.clock()"));
         assert_eq!(SOCKET_MCP_FALLBACK_REMOVAL, "2026-10-01");
     }
 
@@ -2593,11 +2810,12 @@ mod tests {
                     list_prompts = function(session)
                         return {{ name = "prompt_" .. session }}
                     end,
-                    get_prompt = function(name, _, context)
+                    get_prompt = function(name, _, context, callback)
                         if name ~= "prompt_" .. context.session_uuid then
-                            return nil, "Prompt not available for this session: " .. name
+                            callback(nil, "Prompt not available for this session: " .. name)
+                            return
                         end
-                        return { description = context.session_name, messages = {} }, nil
+                        callback({ description = context.session_name, messages = {} }, nil)
                     end,
                     list_resource_templates = function(session)
                         return {{ uriTemplate = "botster://" .. session }}
@@ -2615,7 +2833,7 @@ mod tests {
 
     fn dispatch_reply(lua: &mlua::Lua, caller: &McpCaller, method: &str, params: Value) -> Value {
         let (tx, rx) = oneshot::channel();
-        dispatch_lua_mcp(lua, caller, method, params, McpHttpReplyTx(tx));
+        dispatch_lua_mcp(lua, caller, method, params, McpHttpReplyTx::new(tx));
         let reply = rx.blocking_recv().expect("dispatch reply");
         reply
             .result
@@ -2670,6 +2888,168 @@ mod tests {
             templates["resourceTemplates"][0]["uriTemplate"],
             "botster://sess-alice"
         );
+    }
+
+    #[test]
+    fn dispatch_timeout_cancel_does_not_wait_for_a_full_hub_queue() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        event_tx
+            .blocking_send(HubEvent::CleanupTick)
+            .expect("fill Hub event queue");
+        let hub_tx = HubEventTx::from(event_tx);
+        let canceled = Arc::new(Mutex::new(HashSet::new()));
+        let (tx, _rx) = oneshot::channel();
+        let reply =
+            McpHttpReplyTx::new(tx).with_cancel_route(hub_tx.clone(), Arc::clone(&canceled));
+        reply.bind_request_id("plugin-worker-async-timeout".to_string());
+        let started = Instant::now();
+        test_runtime().block_on(note_dispatch_timeout(&hub_tx, &canceled, &reply));
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "timeout cancel must not wait for Hub queue capacity"
+        );
+        assert!(canceled
+            .lock()
+            .expect("cancel set")
+            .contains("plugin-worker-async-timeout"));
+        assert!(matches!(event_rx.try_recv(), Ok(HubEvent::CleanupTick)));
+        reply.bind_request_id("plugin-worker-async-late".to_string());
+        assert!(canceled
+            .lock()
+            .expect("cancel set")
+            .contains("plugin-worker-async-late"));
+    }
+
+    #[test]
+    fn prompt_result_conversion_error_is_a_json_rpc_error() {
+        let lua = mlua::Lua::new();
+        lua.load(
+            r#"
+            package.preload["lib.mcp"] = function()
+                return {
+                    caller_context = function(session)
+                        return { session_uuid = session }
+                    end,
+                    get_prompt = function(_, _, _, callback)
+                        callback({ bad = function() end }, nil)
+                    end,
+                }
+            end
+            "#,
+        )
+        .exec()
+        .expect("stub converting prompt");
+        let caller = McpCaller::new("sess-alice", "hub-1");
+        let reply = dispatch_reply(
+            &lua,
+            &caller,
+            "prompts/get",
+            json!({ "name": "prompt_sess-alice", "arguments": {} }),
+        );
+        assert!(
+            reply.get("message").and_then(Value::as_str).is_some(),
+            "prompt conversion must surface a JSON-RPC error: {reply}"
+        );
+    }
+
+    #[test]
+    fn plugin_owned_http_tool_does_not_block_hub_dispatch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let init_path = temp.path().join("init.lua");
+        std::fs::write(
+            &init_path,
+            r#"
+            local mcp = require("lib.mcp")
+            mcp.tool("async_parent_probe", {
+                description = "Async parent probe",
+                input_schema = { type = "object", properties = {} },
+                timeout_ms = 2000,
+            }, function()
+                local response = plugin_worker_parent_hub.request({
+                    type = "async_mcp_probe",
+                }, 1000)
+                return response.value
+            end)
+            return {}
+            "#,
+        )
+        .expect("write plugin");
+
+        let mut runtime = crate::lua::LuaRuntime::new().expect("Lua runtime");
+        let lua_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua");
+        runtime
+            .update_package_path(&lua_path)
+            .expect("configure parent Lua path");
+        runtime
+            .lua()
+            .globals()
+            .set("_lua_base_path", lua_path.to_string_lossy().to_string())
+            .expect("configure worker Lua path");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        runtime.set_hub_event_tx(HubEventTx::from(event_tx), test_runtime().handle().clone());
+        runtime
+            .lua()
+            .load(format!(
+                r#"
+                local loader = require("hub.loader")
+                local ok, err = loader.load_plugin({init_path}, "async-mcp-plugin", {{ source = "device" }})
+                assert(ok, tostring(err))
+                "#,
+                init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+            ))
+            .exec()
+            .expect("load plugin");
+
+        test_runtime().block_on(async {
+            let caller = McpCaller::new("sess-async-mcp", "hub-1");
+            let (reply_tx, mut reply_rx) = oneshot::channel();
+            dispatch_lua_mcp(
+                runtime.lua(),
+                &caller,
+                "tools/call",
+                json!({ "name": "async_parent_probe", "arguments": {} }),
+                McpHttpReplyTx::new(reply_tx),
+            );
+            assert!(
+                matches!(
+                    reply_rx.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ),
+                "Hub dispatch must return before the worker parent request completes"
+            );
+
+            let parent_event = event_rx.recv().await.expect("worker parent request");
+            let HubEvent::PluginWorkerParentRequest(request) = parent_event else {
+                panic!("expected worker parent request, got {parent_event:?}");
+            };
+            match request {
+                crate::lua::primitives::plugin_worker::WorkerParentRequest::HubRequest {
+                    payload,
+                    response,
+                } => {
+                    assert_eq!(payload["type"], "async_mcp_probe");
+                    response
+                        .send(Ok(json!({ "value": "completed" })))
+                        .expect("send parent response");
+                }
+            }
+
+            let completion = tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+                .await
+                .expect("worker completion timeout")
+                .expect("worker completion event");
+            let HubEvent::PluginWorkerInvokeCompleted { request_id, result } = completion else {
+                panic!("expected worker completion, got {completion:?}");
+            };
+            runtime.fire_plugin_worker_invoke_completed(&request_id, result);
+
+            let reply = tokio::time::timeout(Duration::from_secs(1), reply_rx)
+                .await
+                .expect("HTTP reply timeout")
+                .expect("HTTP reply");
+            assert_eq!(reply.result.unwrap()["content"][0]["text"], "completed");
+        });
+        runtime.shutdown_plugin_workers("test_complete");
     }
 
     #[test]

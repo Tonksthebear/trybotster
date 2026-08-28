@@ -5,10 +5,11 @@
 //! routing/descriptor state; plugin-owned handler execution happens here.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -23,6 +24,118 @@ use crate::lua::LuaRuntime;
 use crate::worker::plugin::PLUGIN_WORKER_QUEUE;
 
 const LOAD_TIMEOUT: Duration = Duration::from_secs(5);
+const PARENT_EVENT_ADMISSION_TIMEOUT: Duration = Duration::from_millis(250);
+/// Upper bound for plugin worker handler time.
+///
+/// HTTP MCP dispatch waits 120 seconds. This leaves a 10 second margin so a
+/// timed-out handler can still admit its completion event before HTTP returns.
+const ASYNC_INVOKE_TIMEOUT_MAX_MS: u64 = 110_000;
+const SYNC_INVOKE_TIMEOUT_MAX_MS: u64 = 5_000;
+static NEXT_ASYNC_INVOKE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn clamp_invoke_timeout_ms(timeout_ms: u64) -> u64 {
+    timeout_ms.clamp(1, ASYNC_INVOKE_TIMEOUT_MAX_MS)
+}
+
+fn clamp_sync_invoke_timeout_ms(timeout_ms: u64) -> u64 {
+    timeout_ms.clamp(1, SYNC_INVOKE_TIMEOUT_MAX_MS)
+}
+
+fn admit_completion(
+    runtime: &tokio::runtime::Handle,
+    tx: HubEventTx,
+    request_id: String,
+    result: Result<serde_json::Value, String>,
+) {
+    if let Err(error) = runtime
+        .block_on(tx.send_async(HubEvent::PluginWorkerInvokeCompleted { request_id, result }))
+    {
+        log::warn!("plugin worker completion queue closed: {error}");
+    }
+}
+
+struct CompletionGuard {
+    request_id: String,
+    tx: HubEventTx,
+    runtime: tokio::runtime::Handle,
+    sent: bool,
+}
+
+impl CompletionGuard {
+    fn new(request_id: String, tx: HubEventTx, runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            request_id,
+            tx,
+            runtime,
+            sent: false,
+        }
+    }
+
+    fn send(&mut self, result: Result<serde_json::Value, String>) {
+        admit_completion(
+            &self.runtime,
+            self.tx.clone(),
+            self.request_id.clone(),
+            result,
+        );
+        self.sent = true;
+    }
+}
+
+impl Drop for CompletionGuard {
+    fn drop(&mut self) {
+        if self.sent {
+            return;
+        }
+        // try_send: Drop may run after the Tokio runtime is gone.
+        if let Err(error) = self.tx.send(HubEvent::PluginWorkerInvokeCompleted {
+            request_id: self.request_id.clone(),
+            result: Err("plugin worker exited".to_string()),
+        }) {
+            log::warn!("plugin worker exit completion not admitted: {error}");
+        }
+    }
+}
+
+fn remaining_handler_timeout_ms(deadline: Instant) -> Option<u64> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        None
+    } else {
+        Some(remaining.as_millis().max(1) as u64)
+    }
+}
+
+fn payload_session_uuid(payload: &serde_json::Value) -> Option<String> {
+    payload
+        .get("context")
+        .and_then(|context| context.get("session_uuid"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+struct ParentHubRouteGuard {
+    route_through_event_loop: Arc<AtomicBool>,
+    previous: bool,
+}
+
+impl ParentHubRouteGuard {
+    fn use_synchronous_fallback(route_through_event_loop: &Arc<AtomicBool>) -> Self {
+        let previous = route_through_event_loop.swap(false, Ordering::AcqRel);
+        Self {
+            route_through_event_loop: Arc::clone(route_through_event_loop),
+            previous,
+        }
+    }
+}
+
+impl Drop for ParentHubRouteGuard {
+    fn drop(&mut self) {
+        self.route_through_event_loop
+            .store(self.previous, Ordering::Release);
+    }
+}
 
 // Rust guideline compliant 2026-05 (ms-rust)
 // Updated for reviewer feedback (RAII Guard + zero-alloc accessor + thread guard).
@@ -106,16 +219,29 @@ fn lua_perf_enabled() -> bool {
         .unwrap_or(false)
 }
 
+struct AsyncCallback {
+    key: mlua::RegistryKey,
+    session_uuid: Option<String>,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct PluginWorkerRegistry {
     workers: Arc<Mutex<HashMap<String, PluginWorkerHandle>>>,
     hub_event_channel: Arc<Mutex<Option<(HubEventTx, tokio::runtime::Handle)>>>,
+    async_callbacks: Arc<Mutex<HashMap<String, AsyncCallback>>>,
+    canceled: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Clone)]
 struct PluginWorkerHandle {
     tx: mpsc::SyncSender<PluginWorkerRequest>,
     parent_rx: Arc<Mutex<mpsc::Receiver<WorkerParentRequest>>>,
+    admission: Arc<Mutex<PluginWorkerAdmission>>,
+}
+
+#[derive(Default)]
+struct PluginWorkerAdmission {
+    shutdown_reason: Option<String>,
 }
 
 enum PluginWorkerRequest {
@@ -126,6 +252,16 @@ enum PluginWorkerRequest {
         payload: serde_json::Value,
         timeout_ms: u64,
         response: mpsc::Sender<Result<serde_json::Value, String>>,
+    },
+    InvokeAsync {
+        kind: String,
+        id: String,
+        name: Option<String>,
+        payload: serde_json::Value,
+        deadline: Instant,
+        request_id: String,
+        completion_tx: HubEventTx,
+        completion_runtime: tokio::runtime::Handle,
     },
     Shutdown {
         reason: String,
@@ -266,8 +402,21 @@ pub(crate) fn register(lua: &Lua, registry: PluginWorkerRegistry) -> Result<()> 
                 let payload_json: serde_json::Value = lua.from_value(payload).map_err(|e| {
                     mlua::Error::external(format!("plugin worker payload conversion failed: {e}"))
                 })?;
+                if timeout_ms > SYNC_INVOKE_TIMEOUT_MAX_MS {
+                    log::warn!(
+                        "plugin worker sync invoke {id} timeout_ms={timeout_ms} clamped to {SYNC_INVOKE_TIMEOUT_MAX_MS}"
+                    );
+                }
                 let result = invoke_registry
-                    .invoke_with_lua(lua, &plugin_key, kind, id, name, payload_json, timeout_ms)
+                    .invoke_with_lua(
+                        lua,
+                        &plugin_key,
+                        kind,
+                        id,
+                        name,
+                        payload_json,
+                        clamp_sync_invoke_timeout_ms(timeout_ms),
+                    )
                     .map_err(mlua::Error::external)?;
                 json_to_lua(lua, &result)
             },
@@ -276,6 +425,54 @@ pub(crate) fn register(lua: &Lua, registry: PluginWorkerRegistry) -> Result<()> 
     lua.globals()
         .set("__plugin_worker_invoke", invoke_fn)
         .map_err(|e| anyhow!("set __plugin_worker_invoke: {e}"))?;
+
+    let invoke_async_registry = registry.clone();
+    let invoke_async_fn = lua
+        .create_function(
+            move |lua,
+                  (plugin_key, kind, id, name, payload, timeout_ms, callback): (
+                String,
+                String,
+                String,
+                Option<String>,
+                Value,
+                u64,
+                mlua::Function,
+            )| {
+                let payload_json: serde_json::Value = lua.from_value(payload).map_err(|e| {
+                    mlua::Error::external(format!(
+                        "plugin worker async payload conversion failed: {e}"
+                    ))
+                })?;
+                invoke_async_registry
+                    .invoke_async(
+                        lua,
+                        &plugin_key,
+                        kind,
+                        id,
+                        name,
+                        payload_json,
+                        timeout_ms,
+                        callback,
+                    )
+                    .map_err(mlua::Error::external)
+            },
+        )
+        .map_err(|e| anyhow!("create __plugin_worker_invoke_async: {e}"))?;
+    lua.globals()
+        .set("__plugin_worker_invoke_async", invoke_async_fn)
+        .map_err(|e| anyhow!("set __plugin_worker_invoke_async: {e}"))?;
+
+    let fail_session_registry = registry.clone();
+    let fail_session_fn = lua
+        .create_function(move |lua, (session_uuid, error): (String, String)| {
+            fail_session_registry.fail_async_callbacks_for_session(lua, &session_uuid, &error);
+            Ok(true)
+        })
+        .map_err(|e| anyhow!("create __plugin_worker_fail_session_callbacks: {e}"))?;
+    lua.globals()
+        .set("__plugin_worker_fail_session_callbacks", fail_session_fn)
+        .map_err(|e| anyhow!("set __plugin_worker_fail_session_callbacks: {e}"))?;
 
     let shutdown_registry = registry.clone();
     let shutdown_fn = lua
@@ -327,6 +524,7 @@ impl PluginWorkerRegistry {
         let (tx, rx) = mpsc::sync_channel(PLUGIN_WORKER_QUEUE.capacity);
         let (parent_tx, parent_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
+        let admission = Arc::new(Mutex::new(PluginWorkerAdmission::default()));
         let plugin_key = spec.plugin_key.clone();
         let hub_event_channel = self
             .hub_event_channel
@@ -334,6 +532,8 @@ impl PluginWorkerRegistry {
             .expect("PluginWorkerRegistry hub_event_channel mutex poisoned")
             .clone();
         let worker_event_tx = PluginWorkerEventTx::new(tx.clone());
+        let worker_admission = Arc::clone(&admission);
+        let worker_canceled = Arc::clone(&self.canceled);
         thread::Builder::new()
             .name(format!("plugin-worker-{plugin_key}"))
             .spawn(move || {
@@ -344,6 +544,8 @@ impl PluginWorkerRegistry {
                     parent_tx,
                     ready_tx,
                     hub_event_channel,
+                    worker_admission,
+                    worker_canceled,
                 )
             })
             .map_err(|e| anyhow!("spawn plugin worker: {e}"))?;
@@ -358,6 +560,7 @@ impl PluginWorkerRegistry {
                         PluginWorkerHandle {
                             tx,
                             parent_rx: Arc::new(Mutex::new(parent_rx)),
+                            admission,
                         },
                     );
                 Ok(())
@@ -388,6 +591,13 @@ impl PluginWorkerRegistry {
             .cloned()
             .ok_or_else(|| anyhow!("plugin worker not loaded: {plugin_key}"))?;
         let (response_tx, response_rx) = mpsc::channel();
+        let admission = handle
+            .admission
+            .lock()
+            .expect("PluginWorkerHandle admission mutex poisoned");
+        if let Some(reason) = &admission.shutdown_reason {
+            return Err(anyhow!("plugin worker is shutting down: {reason}"));
+        }
         handle
             .tx
             .try_send(PluginWorkerRequest::Invoke {
@@ -399,6 +609,7 @@ impl PluginWorkerRegistry {
                 response: response_tx,
             })
             .map_err(|e| anyhow!("plugin worker queue rejected invoke: {e}"))?;
+        drop(admission);
         let result = {
             let parent_rx = handle
                 .parent_rx
@@ -424,6 +635,207 @@ impl PluginWorkerRegistry {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn invoke_async(
+        &self,
+        lua: &Lua,
+        plugin_key: &str,
+        kind: String,
+        id: String,
+        name: Option<String>,
+        payload: serde_json::Value,
+        timeout_ms: u64,
+        callback: mlua::Function,
+    ) -> Result<String> {
+        let handle = self
+            .workers
+            .lock()
+            .expect("PluginWorkerRegistry mutex poisoned")
+            .get(plugin_key)
+            .cloned()
+            .ok_or_else(|| anyhow!("plugin worker not loaded: {plugin_key}"))?;
+        let (completion_tx, completion_runtime) = self
+            .hub_event_channel
+            .lock()
+            .expect("PluginWorkerRegistry hub_event_channel mutex poisoned")
+            .clone()
+            .ok_or_else(|| anyhow!("plugin worker Hub event channel is unavailable"))?;
+        let request_id = format!(
+            "plugin-worker-async-{}",
+            NEXT_ASYNC_INVOKE_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let timeout_ms = clamp_invoke_timeout_ms(timeout_ms);
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let session_uuid = payload_session_uuid(&payload);
+        let callback_key = lua
+            .create_registry_value(callback)
+            .map_err(|e| anyhow!("store plugin worker async callback: {e}"))?;
+        self.async_callbacks
+            .lock()
+            .expect("PluginWorkerRegistry async_callbacks mutex poisoned")
+            .insert(
+                request_id.clone(),
+                AsyncCallback {
+                    key: callback_key,
+                    session_uuid,
+                },
+            );
+        let admission = handle
+            .admission
+            .lock()
+            .expect("PluginWorkerHandle admission mutex poisoned");
+        if let Some(reason) = &admission.shutdown_reason {
+            self.drop_async_callback(lua, &request_id);
+            return Err(anyhow!("plugin worker is shutting down: {reason}"));
+        }
+        if let Err(error) = handle.tx.try_send(PluginWorkerRequest::InvokeAsync {
+            kind,
+            id,
+            name,
+            payload,
+            deadline,
+            request_id: request_id.clone(),
+            completion_tx,
+            completion_runtime,
+        }) {
+            self.drop_async_callback(lua, &request_id);
+            return Err(anyhow!(
+                "plugin worker queue rejected async invoke: {error}"
+            ));
+        }
+        drop(admission);
+        Ok(request_id)
+    }
+
+    fn drop_async_callback(&self, lua: &Lua, request_id: &str) {
+        if let Some(callback) = self
+            .async_callbacks
+            .lock()
+            .expect("PluginWorkerRegistry async_callbacks mutex poisoned")
+            .remove(request_id)
+        {
+            let _ = lua.remove_registry_value(callback.key);
+        }
+    }
+
+    pub(crate) fn fire_async_callback(
+        &self,
+        lua: &Lua,
+        request_id: &str,
+        result: Result<serde_json::Value, String>,
+    ) {
+        let callback = self
+            .async_callbacks
+            .lock()
+            .expect("PluginWorkerRegistry async_callbacks mutex poisoned")
+            .remove(request_id);
+        let Some(callback) = callback else {
+            self.canceled
+                .lock()
+                .expect("PluginWorkerRegistry canceled mutex poisoned")
+                .remove(request_id);
+            log::warn!("plugin worker completion for unknown request: {request_id}");
+            return;
+        };
+        Self::call_async_callback(lua, callback.key, result);
+    }
+
+    pub(crate) fn complete_async_invoke(
+        &self,
+        lua: &Lua,
+        request_id: &str,
+        result: Result<serde_json::Value, String>,
+    ) {
+        self.canceled
+            .lock()
+            .expect("PluginWorkerRegistry canceled mutex poisoned")
+            .remove(request_id);
+        self.fire_async_callback(lua, request_id, result);
+    }
+
+    pub(crate) fn fail_async_callbacks_for_session(
+        &self,
+        lua: &Lua,
+        session_uuid: &str,
+        error: &str,
+    ) {
+        let request_ids: Vec<String> = self
+            .async_callbacks
+            .lock()
+            .expect("PluginWorkerRegistry async_callbacks mutex poisoned")
+            .iter()
+            .filter_map(|(request_id, callback)| {
+                (callback.session_uuid.as_deref() == Some(session_uuid))
+                    .then_some(request_id.clone())
+            })
+            .collect();
+        {
+            let mut canceled = self
+                .canceled
+                .lock()
+                .expect("PluginWorkerRegistry canceled mutex poisoned");
+            for request_id in &request_ids {
+                canceled.insert(request_id.clone());
+            }
+        }
+        for request_id in request_ids {
+            self.fire_async_callback(lua, &request_id, Err(error.to_string()));
+        }
+    }
+
+    pub(crate) fn fail_all_async_callbacks(&self, lua: &Lua, error: &str) {
+        let request_ids: Vec<String> = self
+            .async_callbacks
+            .lock()
+            .expect("PluginWorkerRegistry async_callbacks mutex poisoned")
+            .keys()
+            .cloned()
+            .collect();
+        for request_id in request_ids {
+            self.fire_async_callback(lua, &request_id, Err(error.to_string()));
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_canceled(&self, request_id: &str) {
+        self.canceled
+            .lock()
+            .expect("PluginWorkerRegistry canceled mutex poisoned")
+            .insert(request_id.to_string());
+    }
+
+    pub(crate) fn canceled_ids(&self) -> Arc<Mutex<HashSet<String>>> {
+        Arc::clone(&self.canceled)
+    }
+
+    fn is_canceled(canceled: &Mutex<HashSet<String>>, request_id: &str) -> bool {
+        canceled
+            .lock()
+            .expect("PluginWorkerRegistry canceled mutex poisoned")
+            .contains(request_id)
+    }
+
+    fn call_async_callback(
+        lua: &Lua,
+        callback_key: mlua::RegistryKey,
+        result: Result<serde_json::Value, String>,
+    ) {
+        let callback_result: mlua::Result<()> = (|| {
+            let callback: mlua::Function = lua.registry_value(&callback_key)?;
+            match result {
+                Ok(value) => {
+                    let value = json_to_lua(lua, &value)?;
+                    callback.call((value, mlua::Value::Nil))
+                }
+                Err(error) => callback.call((mlua::Value::Nil, error)),
+            }
+        })();
+        if let Err(error) = callback_result {
+            log::warn!("plugin worker async callback failed: {error}");
+        }
+        let _ = lua.remove_registry_value(callback_key);
+    }
+
     fn shutdown(&self, plugin_key: &str, reason: &str) {
         let handle = self
             .workers
@@ -431,6 +843,11 @@ impl PluginWorkerRegistry {
             .expect("PluginWorkerRegistry mutex poisoned")
             .remove(plugin_key);
         if let Some(handle) = handle {
+            let mut admission = handle
+                .admission
+                .lock()
+                .expect("PluginWorkerHandle admission mutex poisoned");
+            admission.shutdown_reason = Some(reason.to_string());
             let _ = handle.tx.try_send(PluginWorkerRequest::Shutdown {
                 reason: reason.to_string(),
             });
@@ -445,6 +862,11 @@ impl PluginWorkerRegistry {
             .drain()
             .collect();
         for (plugin_key, handle) in handles {
+            let mut admission = handle
+                .admission
+                .lock()
+                .expect("PluginWorkerHandle admission mutex poisoned");
+            admission.shutdown_reason = Some(reason.to_string());
             let _ = handle.tx.try_send(PluginWorkerRequest::Shutdown {
                 reason: reason.to_string(),
             });
@@ -460,6 +882,8 @@ fn worker_loop(
     parent_tx: mpsc::Sender<WorkerParentRequest>,
     ready_tx: mpsc::Sender<Result<(), String>>,
     hub_event_channel: Option<(HubEventTx, tokio::runtime::Handle)>,
+    admission: Arc<Mutex<PluginWorkerAdmission>>,
+    canceled: Arc<Mutex<HashSet<String>>>,
 ) {
     let mut runtime = match LuaRuntime::new() {
         Ok(runtime) => runtime,
@@ -469,11 +893,21 @@ fn worker_loop(
         }
     };
     let parent_hub_event_tx = hub_event_channel.as_ref().map(|(tx, _)| tx.clone());
+    let parent_hub_event_runtime = hub_event_channel
+        .as_ref()
+        .map(|(_, runtime)| runtime.clone());
     if let Some((tx, tokio_handle)) = hub_event_channel {
         runtime.set_hub_event_tx(tx, tokio_handle);
     }
     runtime.set_plugin_worker_event_tx(worker_event_tx);
-    if let Err(err) = install_parent_hub_bridge(&runtime, parent_tx, parent_hub_event_tx) {
+    let parent_hub_event_ready = Arc::new(AtomicBool::new(false));
+    if let Err(err) = install_parent_hub_bridge(
+        &runtime,
+        parent_tx,
+        parent_hub_event_tx,
+        parent_hub_event_runtime,
+        Arc::clone(&parent_hub_event_ready),
+    ) {
         let _ = ready_tx.send(Err(format!("install parent hub bridge: {err}")));
         return;
     }
@@ -502,9 +936,19 @@ fn worker_loop(
         let _ = ready_tx.send(Err(err));
         return;
     }
+    parent_hub_event_ready.store(true, Ordering::Release);
     let _ = ready_tx.send(Ok(()));
 
     loop {
+        let shutdown_reason = admission
+            .lock()
+            .expect("PluginWorkerAdmission mutex poisoned")
+            .shutdown_reason
+            .clone();
+        if let Some(reason) = shutdown_reason {
+            fail_pending_worker_requests(&rx, &reason);
+            break;
+        }
         let request = match rx.recv() {
             Ok(request) => request,
             Err(_) => break,
@@ -521,6 +965,12 @@ fn worker_loop(
             } => {
                 let perf_started = lua_perf_enabled().then(Instant::now);
                 let _guard = enter_plugin_worker(&spec.plugin_key);
+                // The Hub waits for this synchronous invocation and services
+                // the fallback parent-request queue during that wait. Routing
+                // a parent request back through the Hub event queue here would
+                // deadlock the worker and the Hub until the invoke timeout.
+                let _parent_route_guard =
+                    ParentHubRouteGuard::use_synchronous_fallback(&parent_hub_event_ready);
                 let result =
                     invoke_in_worker(&runtime, &kind, &id, name.as_deref(), payload, timeout_ms);
                 if let Some(started) = perf_started {
@@ -535,12 +985,49 @@ fn worker_loop(
                 }
                 let _ = response.send(result);
             }
+            PluginWorkerRequest::InvokeAsync {
+                kind,
+                id,
+                name,
+                payload,
+                deadline,
+                request_id,
+                completion_tx,
+                completion_runtime,
+            } => {
+                let mut pending =
+                    CompletionGuard::new(request_id.clone(), completion_tx, completion_runtime);
+                if PluginWorkerRegistry::is_canceled(&canceled, &request_id) {
+                    pending.send(Err("plugin worker invoke canceled".to_string()));
+                    continue;
+                }
+                let Some(timeout_ms) = remaining_handler_timeout_ms(deadline) else {
+                    pending.send(Err("plugin worker invoke expired".to_string()));
+                    continue;
+                };
+                let perf_started = lua_perf_enabled().then(Instant::now);
+                let _guard = enter_plugin_worker(&spec.plugin_key);
+                let result =
+                    invoke_in_worker(&runtime, &kind, &id, name.as_deref(), payload, timeout_ms);
+                if let Some(started) = perf_started {
+                    log::info!(
+                        "[PERF][plugin_worker] plugin={} kind={} id={} phase=execute_async ok={} elapsed_ms={}",
+                        spec.plugin_key,
+                        kind,
+                        id,
+                        result.is_ok(),
+                        started.elapsed().as_millis()
+                    );
+                }
+                pending.send(result);
+            }
             PluginWorkerRequest::Shutdown { reason } => {
                 log::debug!(
                     "plugin worker {} shutting down: {}",
                     spec.plugin_key,
                     reason
                 );
+                fail_pending_worker_requests(&rx, &reason);
                 break;
             }
             PluginWorkerRequest::HttpResponse(response) => {
@@ -562,6 +1049,41 @@ fn worker_loop(
     }
 
     close_worker_plugin_databases(&runtime, &spec.plugin_key);
+}
+
+fn fail_pending_worker_requests(rx: &mpsc::Receiver<PluginWorkerRequest>, reason: &str) {
+    while let Ok(request) = rx.try_recv() {
+        let error = format!("plugin worker shutting down: {reason}");
+        match request {
+            PluginWorkerRequest::Invoke { response, .. } => {
+                let _ = response.send(Err(error));
+            }
+            PluginWorkerRequest::InvokeAsync {
+                request_id,
+                completion_tx,
+                completion_runtime,
+                ..
+            } => {
+                completion_runtime.spawn(async move {
+                    if let Err(send_error) = completion_tx
+                        .send_async(HubEvent::PluginWorkerInvokeCompleted {
+                            request_id,
+                            result: Err(error),
+                        })
+                        .await
+                    {
+                        log::warn!("plugin worker shutdown completion queue closed: {send_error}");
+                    }
+                });
+            }
+            PluginWorkerRequest::Shutdown { .. }
+            | PluginWorkerRequest::HttpResponse(_)
+            | PluginWorkerRequest::WebSocketEvent(_)
+            | PluginWorkerRequest::TimerFired { .. }
+            | PluginWorkerRequest::UserFileWatch { .. }
+            | PluginWorkerRequest::LocalWebhook(_) => {}
+        }
+    }
 }
 
 fn close_worker_plugin_databases(runtime: &LuaRuntime, plugin_key: &str) {
@@ -586,12 +1108,16 @@ fn install_parent_hub_bridge(
     runtime: &LuaRuntime,
     parent_tx: mpsc::Sender<WorkerParentRequest>,
     parent_hub_event_tx: Option<HubEventTx>,
+    parent_hub_event_runtime: Option<tokio::runtime::Handle>,
+    parent_hub_event_ready: Arc<AtomicBool>,
 ) -> Result<()> {
     let lua = runtime.lua();
     let bridge = lua
         .create_table()
         .map_err(|e| anyhow!("create plugin_worker_parent_hub table: {e}"))?;
     let request_tx = parent_tx.clone();
+    let request_event_tx = parent_hub_event_tx.clone();
+    let request_event_route = Arc::clone(&parent_hub_event_ready);
     let request_fn = lua
         .create_function(move |lua, (payload, timeout_ms): (Value, Option<u64>)| {
             let payload_json: serde_json::Value = lua.from_value(payload).map_err(|e| {
@@ -604,13 +1130,54 @@ fn install_parent_hub_bridge(
                 payload: payload_json,
                 response: response_tx,
             };
-            request_tx.send(request).map_err(|e| {
-                mlua::Error::external(format!(
-                    "plugin_worker_parent_hub.request: parent hub unavailable: {e}"
-                ))
-            })?;
             let timeout = Duration::from_millis(timeout_ms.unwrap_or(30_000).max(1));
-            match response_rx.recv_timeout(timeout) {
+            let deadline = Instant::now() + timeout;
+            if request_event_route.load(Ordering::Acquire)
+                && request_event_tx.is_some()
+                && parent_hub_event_runtime.is_some()
+            {
+                let tx = request_event_tx
+                    .as_ref()
+                    .expect("checked parent Hub event channel");
+                let runtime = parent_hub_event_runtime
+                    .as_ref()
+                    .expect("checked parent Hub event runtime");
+                let admission_timeout = timeout.min(PARENT_EVENT_ADMISSION_TIMEOUT);
+                match runtime.block_on(async {
+                    tokio::time::timeout(
+                        admission_timeout,
+                        tx.send_async(HubEvent::PluginWorkerParentRequest(request)),
+                    )
+                    .await
+                }) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        return Err(mlua::Error::external(format!(
+                            "plugin_worker_parent_hub.request: parent hub unavailable: {error}"
+                        )));
+                    }
+                    Err(_) => {
+                        return Err(mlua::Error::external(format!(
+                            "plugin_worker_parent_hub.request: admission timeout after {}ms",
+                            admission_timeout.as_millis()
+                        )));
+                    }
+                }
+            } else {
+                request_tx.send(request).map_err(|e| {
+                    mlua::Error::external(format!(
+                        "plugin_worker_parent_hub.request: parent hub unavailable: {e}"
+                    ))
+                })?;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(mlua::Error::external(format!(
+                    "plugin_worker_parent_hub.request: timeout after {}ms",
+                    timeout.as_millis()
+                )));
+            }
+            match response_rx.recv_timeout(remaining) {
                 Ok(Ok(response)) => json_to_lua(lua, &response),
                 Ok(Err(err)) => Err(mlua::Error::external(err)),
                 Err(mpsc::RecvTimeoutError::Timeout) => Err(mlua::Error::external(format!(
@@ -628,6 +1195,7 @@ fn install_parent_hub_bridge(
         .map_err(|e| anyhow!("set plugin_worker_parent_hub.request: {e}"))?;
     let enqueue_tx = parent_tx.clone();
     let enqueue_event_tx = parent_hub_event_tx.clone();
+    let enqueue_event_route = Arc::clone(&parent_hub_event_ready);
     let enqueue_fn = lua
         .create_function(move |lua, payload: Value| {
             let payload_json: serde_json::Value = lua.from_value(payload).map_err(|e| {
@@ -640,7 +1208,10 @@ fn install_parent_hub_bridge(
                 payload: payload_json,
                 response: response_tx,
             };
-            if let Some(tx) = &enqueue_event_tx {
+            if enqueue_event_route.load(Ordering::Acquire) && enqueue_event_tx.is_some() {
+                let tx = enqueue_event_tx
+                    .as_ref()
+                    .expect("checked parent Hub event channel");
                 tx.send(HubEvent::PluginWorkerParentRequest(request))
                     .map_err(|e| {
                         mlua::Error::external(format!(
@@ -1328,7 +1899,7 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_parent_hub_request_uses_hub_event_channel_when_available() {
+    fn enqueue_parent_hub_request_uses_fallback_when_sync_route_is_selected() {
         let runtime = LuaRuntime::new().expect("runtime");
         runtime
             .lua()
@@ -1348,8 +1919,14 @@ mod tests {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
         let hub_event_tx = HubEventTx::from(event_tx);
         let (fallback_tx, fallback_rx) = mpsc::channel();
-        install_parent_hub_bridge(&runtime, fallback_tx, Some(hub_event_tx))
-            .expect("install parent hub bridge");
+        install_parent_hub_bridge(
+            &runtime,
+            fallback_tx,
+            Some(hub_event_tx),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("install parent hub bridge");
 
         runtime
             .lua()
@@ -1371,16 +1948,11 @@ mod tests {
             .expect("enqueue parent request");
 
         assert!(
-            fallback_rx.try_recv().is_err(),
-            "production bridge should use the hub event loop, not the fallback queue"
+            event_rx.try_recv().is_err(),
+            "the synchronous route must not use the blocked Hub event loop"
         );
-        let event = event_rx.blocking_recv().expect("parent hub event");
-        match event {
-            HubEvent::PluginWorkerParentRequest(request) => {
-                service_parent_request(runtime.lua(), request);
-            }
-            other => panic!("expected plugin worker parent request, got {other:?}"),
-        }
+        let request = fallback_rx.try_recv().expect("fallback parent request");
+        service_parent_request(runtime.lua(), request);
 
         let status: String = runtime
             .lua()
@@ -1395,13 +1967,54 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_parent_hub_request_uses_event_channel_for_async_route() {
+        let runtime = LuaRuntime::new().expect("runtime");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let hub_event_tx = HubEventTx::from(event_tx);
+        let (fallback_tx, fallback_rx) = mpsc::channel();
+        install_parent_hub_bridge(
+            &runtime,
+            fallback_tx,
+            Some(hub_event_tx),
+            None,
+            Arc::new(AtomicBool::new(true)),
+        )
+        .expect("install parent hub bridge");
+
+        runtime
+            .lua()
+            .load(
+                r#"
+                assert(plugin_worker_parent_hub.enqueue({
+                  type = "hub_command",
+                  command = { type = "update_session" },
+                }))
+                "#,
+            )
+            .exec()
+            .expect("enqueue parent request");
+
+        assert!(fallback_rx.try_recv().is_err());
+        assert!(matches!(
+            event_rx.blocking_recv(),
+            Some(HubEvent::PluginWorkerParentRequest(_))
+        ));
+    }
+
+    #[test]
     fn blocking_parent_hub_request_keeps_load_wait_fallback_when_event_channel_exists() {
         let runtime = LuaRuntime::new().expect("runtime");
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
         let hub_event_tx = HubEventTx::from(event_tx);
         let (fallback_tx, fallback_rx) = mpsc::channel();
-        install_parent_hub_bridge(&runtime, fallback_tx, Some(hub_event_tx))
-            .expect("install parent hub bridge");
+        install_parent_hub_bridge(
+            &runtime,
+            fallback_tx,
+            Some(hub_event_tx),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("install parent hub bridge");
 
         let responder = std::thread::spawn(move || {
             let request = fallback_rx
@@ -1436,6 +2049,796 @@ mod tests {
         );
         responder.join().expect("responder thread");
         assert!(ok);
+    }
+
+    #[test]
+    fn blocking_parent_hub_request_uses_event_channel_after_worker_is_ready() {
+        let runtime = LuaRuntime::new().expect("runtime");
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let hub_event_tx = HubEventTx::from(event_tx);
+        let (fallback_tx, fallback_rx) = mpsc::channel();
+        install_parent_hub_bridge(
+            &runtime,
+            fallback_tx,
+            Some(hub_event_tx),
+            Some(tokio_runtime.handle().clone()),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .expect("install parent hub bridge");
+
+        let responder = std::thread::spawn(move || {
+            let event = event_rx.blocking_recv().expect("parent Hub event");
+            let HubEvent::PluginWorkerParentRequest(request) = event else {
+                panic!("expected plugin worker parent request, got {event:?}");
+            };
+            match request {
+                WorkerParentRequest::HubRequest { payload, response } => {
+                    assert_eq!(payload["type"], "get_agent_list");
+                    response
+                        .send(Ok(json!({ "result": { "ok": true } })))
+                        .expect("send event response");
+                }
+            }
+        });
+
+        let ok: bool = runtime
+            .lua()
+            .load(
+                r#"
+                local response = plugin_worker_parent_hub.request({
+                  type = "get_agent_list",
+                }, 1000)
+                return response.result.ok
+                "#,
+            )
+            .eval()
+            .expect("blocking request should receive event response");
+
+        assert!(
+            fallback_rx.try_recv().is_err(),
+            "ready workers must not depend on the load-wait fallback"
+        );
+        responder.join().expect("responder thread");
+        assert!(ok);
+    }
+
+    #[test]
+    fn blocking_parent_hub_request_waits_for_bounded_queue_admission() {
+        let runtime = LuaRuntime::new().expect("runtime");
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        event_tx
+            .blocking_send(HubEvent::CleanupTick)
+            .expect("fill Hub event queue");
+        let hub_event_tx = HubEventTx::from(event_tx);
+        let (fallback_tx, fallback_rx) = mpsc::channel();
+        install_parent_hub_bridge(
+            &runtime,
+            fallback_tx,
+            Some(hub_event_tx),
+            Some(tokio_runtime.handle().clone()),
+            Arc::new(AtomicBool::new(true)),
+        )
+        .expect("install parent hub bridge");
+
+        let responder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            assert!(matches!(
+                event_rx.blocking_recv(),
+                Some(HubEvent::CleanupTick)
+            ));
+            let event = event_rx.blocking_recv().expect("parent Hub event");
+            let HubEvent::PluginWorkerParentRequest(request) = event else {
+                panic!("expected plugin worker parent request, got {event:?}");
+            };
+            match request {
+                WorkerParentRequest::HubRequest { response, .. } => {
+                    response
+                        .send(Ok(json!({ "result": { "ok": true } })))
+                        .expect("send event response");
+                }
+            }
+        });
+
+        let ok: bool = runtime
+            .lua()
+            .load(
+                r#"
+                local response = plugin_worker_parent_hub.request({
+                  type = "get_agent_list",
+                }, 1000)
+                return response.result.ok
+                "#,
+            )
+            .eval()
+            .expect("request should wait for queue admission");
+
+        assert!(fallback_rx.try_recv().is_err());
+        responder.join().expect("responder thread");
+        assert!(ok);
+    }
+
+    #[test]
+    fn async_worker_invoke_admits_then_completes_through_hub_event() {
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let registry = PluginWorkerRegistry::default();
+        registry.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
+        let (worker_tx, worker_rx) = mpsc::sync_channel(1);
+        let (_parent_tx, parent_rx) = mpsc::channel();
+        registry.workers.lock().expect("worker registry").insert(
+            "test-plugin".to_string(),
+            PluginWorkerHandle {
+                tx: worker_tx,
+                parent_rx: Arc::new(Mutex::new(parent_rx)),
+                admission: Arc::new(Mutex::new(PluginWorkerAdmission::default())),
+            },
+        );
+        let lua = Lua::new();
+        register(&lua, registry.clone()).expect("register worker primitives");
+
+        let request_id: String = lua
+            .load(
+                r#"
+                return __plugin_worker_invoke_async(
+                  "test-plugin",
+                  "mcp_tool",
+                  "tool-id",
+                  "tool-name",
+                  { value = "queued" },
+                  5000,
+                  function(result, err)
+                    _G.async_result = result
+                    _G.async_error = err
+                  end)
+                "#,
+            )
+            .eval()
+            .expect("admit async invoke");
+        assert!(lua.globals().get::<Value>("async_result").unwrap().is_nil());
+
+        let request = worker_rx.try_recv().expect("worker request admitted");
+        let PluginWorkerRequest::InvokeAsync {
+            request_id: worker_request_id,
+            completion_tx,
+            ..
+        } = request
+        else {
+            panic!("expected async worker request");
+        };
+        assert_eq!(request_id, worker_request_id);
+
+        tokio_runtime.block_on(async {
+            completion_tx
+                .send_async(HubEvent::PluginWorkerInvokeCompleted {
+                    request_id: worker_request_id,
+                    result: Ok(json!({ "value": "complete" })),
+                })
+                .await
+                .expect("queue completion");
+        });
+        let event = event_rx.blocking_recv().expect("completion event");
+        let HubEvent::PluginWorkerInvokeCompleted { request_id, result } = event else {
+            panic!("expected plugin worker completion, got {event:?}");
+        };
+        registry.fire_async_callback(&lua, &request_id, result);
+
+        let value: String = lua
+            .load("return _G.async_result.value")
+            .eval()
+            .expect("async callback result");
+        assert_eq!(value, "complete");
+        assert!(lua.globals().get::<Value>("async_error").unwrap().is_nil());
+    }
+
+    #[test]
+    fn async_worker_completion_waits_for_bounded_queue_admission() {
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        event_tx
+            .blocking_send(HubEvent::CleanupTick)
+            .expect("fill Hub event queue");
+        let hub_event_tx = HubEventTx::from(event_tx);
+        let join = std::thread::spawn({
+            let hub_event_tx = hub_event_tx.clone();
+            let handle = tokio_runtime.handle().clone();
+            move || {
+                handle.block_on(
+                    hub_event_tx.send_async(HubEvent::PluginWorkerInvokeCompleted {
+                        request_id: "plugin-worker-async-wait".to_string(),
+                        result: Ok(json!({ "ok": true })),
+                    }),
+                )
+            }
+        });
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(
+            matches!(event_rx.try_recv(), Ok(HubEvent::CleanupTick)),
+            "the filler event must still occupy the bounded queue"
+        );
+        let event = event_rx.blocking_recv().expect("queued completion");
+        let HubEvent::PluginWorkerInvokeCompleted { request_id, .. } = event else {
+            panic!("expected completion, got {event:?}");
+        };
+        assert_eq!(request_id, "plugin-worker-async-wait");
+        join.join()
+            .expect("completion wait thread")
+            .expect("completion admitted");
+    }
+
+    #[test]
+    fn canceling_an_async_callback_removes_the_registry_key() {
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let registry = PluginWorkerRegistry::default();
+        registry.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
+        let (worker_tx, _worker_rx) = mpsc::sync_channel(1);
+        let (_parent_tx, parent_rx) = mpsc::channel();
+        registry.workers.lock().expect("worker registry").insert(
+            "test-plugin".to_string(),
+            PluginWorkerHandle {
+                tx: worker_tx,
+                parent_rx: Arc::new(Mutex::new(parent_rx)),
+                admission: Arc::new(Mutex::new(PluginWorkerAdmission::default())),
+            },
+        );
+        let lua = Lua::new();
+        register(&lua, registry.clone()).expect("register worker primitives");
+        let request_id: String = lua
+            .load(
+                r#"
+                return __plugin_worker_invoke_async(
+                  "test-plugin",
+                  "mcp_tool",
+                  "tool-id",
+                  "tool-name",
+                  { context = { session_uuid = "sess-timeout" } },
+                  5000,
+                  function(result, err)
+                    _G.cancel_error = err
+                  end)
+                "#,
+            )
+            .eval()
+            .expect("admit async invoke");
+        registry.mark_canceled(&request_id);
+        registry.fire_async_callback(
+            &lua,
+            &request_id,
+            Err("hub MCP dispatch timed out".to_string()),
+        );
+        let error: String = lua.globals().get("cancel_error").expect("cancel error");
+        assert_eq!(error, "hub MCP dispatch timed out");
+        assert!(PluginWorkerRegistry::is_canceled(
+            &registry.canceled,
+            &request_id
+        ));
+        assert!(registry
+            .async_callbacks
+            .lock()
+            .expect("callback registry")
+            .is_empty());
+    }
+
+    #[test]
+    fn shutdown_fails_in_flight_async_callbacks() {
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let registry = PluginWorkerRegistry::default();
+        registry.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
+        let (worker_tx, _worker_rx) = mpsc::sync_channel(1);
+        let (_parent_tx, parent_rx) = mpsc::channel();
+        registry.workers.lock().expect("worker registry").insert(
+            "test-plugin".to_string(),
+            PluginWorkerHandle {
+                tx: worker_tx,
+                parent_rx: Arc::new(Mutex::new(parent_rx)),
+                admission: Arc::new(Mutex::new(PluginWorkerAdmission::default())),
+            },
+        );
+        let lua = Lua::new();
+        register(&lua, registry.clone()).expect("register worker primitives");
+        lua.load(
+            r#"
+            __plugin_worker_invoke_async(
+              "test-plugin",
+              "mcp_tool",
+              "tool-id",
+              "tool-name",
+              {},
+              5000,
+              function(result, err)
+                _G.exit_error = err
+              end)
+            "#,
+        )
+        .exec()
+        .expect("admit async invoke");
+        registry.fail_all_async_callbacks(&lua, "plugin worker exited");
+        let error: String = lua.globals().get("exit_error").expect("exit error");
+        assert_eq!(error, "plugin worker exited");
+        assert!(registry
+            .async_callbacks
+            .lock()
+            .expect("callback registry")
+            .is_empty());
+    }
+
+    #[test]
+    fn session_revoke_fails_matching_async_callbacks() {
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let registry = PluginWorkerRegistry::default();
+        registry.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
+        let (worker_tx, _worker_rx) = mpsc::sync_channel(2);
+        let (_parent_tx, parent_rx) = mpsc::channel();
+        registry.workers.lock().expect("worker registry").insert(
+            "test-plugin".to_string(),
+            PluginWorkerHandle {
+                tx: worker_tx,
+                parent_rx: Arc::new(Mutex::new(parent_rx)),
+                admission: Arc::new(Mutex::new(PluginWorkerAdmission::default())),
+            },
+        );
+        let lua = Lua::new();
+        register(&lua, registry.clone()).expect("register worker primitives");
+        lua.load(
+            r#"
+            __plugin_worker_invoke_async(
+              "test-plugin",
+              "mcp_tool",
+              "tool-id",
+              "tool-name",
+              { context = { session_uuid = "sess-revoked" } },
+              5000,
+              function(result, err)
+                _G.revoke_error = err
+              end)
+            "#,
+        )
+        .exec()
+        .expect("admit async invoke");
+        registry.fail_async_callbacks_for_session(
+            &lua,
+            "sess-revoked",
+            "MCP caller credential revoked",
+        );
+        let error: String = lua.globals().get("revoke_error").expect("revoke error");
+        assert_eq!(error, "MCP caller credential revoked");
+        assert!(registry
+            .async_callbacks
+            .lock()
+            .expect("callback registry")
+            .is_empty());
+    }
+
+    #[test]
+    fn prompt_payload_session_revoke_fails_callback() {
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let registry = PluginWorkerRegistry::default();
+        registry.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
+        let (worker_tx, worker_rx) = mpsc::sync_channel(2);
+        let (_parent_tx, parent_rx) = mpsc::channel();
+        registry.workers.lock().expect("worker registry").insert(
+            "test-plugin".to_string(),
+            PluginWorkerHandle {
+                tx: worker_tx,
+                parent_rx: Arc::new(Mutex::new(parent_rx)),
+                admission: Arc::new(Mutex::new(PluginWorkerAdmission::default())),
+            },
+        );
+        let lua = Lua::new();
+        register(&lua, registry.clone()).expect("register worker primitives");
+        let request_id: String = lua
+            .load(
+                r#"
+                return __plugin_worker_invoke_async(
+                  "test-plugin",
+                  "mcp_prompt",
+                  "prompt-id",
+                  "prompt-name",
+                  {
+                    name = "prompt-name",
+                    args = {},
+                    context = { session_uuid = "sess-prompt" }
+                  },
+                  5000,
+                  function(result, err)
+                    _G.prompt_revoke_error = err
+                  end)
+                "#,
+            )
+            .eval()
+            .expect("admit prompt invoke");
+        registry.fail_async_callbacks_for_session(
+            &lua,
+            "sess-prompt",
+            "MCP caller credential revoked",
+        );
+        let error: String = lua
+            .globals()
+            .get("prompt_revoke_error")
+            .expect("prompt revoke error");
+        assert_eq!(error, "MCP caller credential revoked");
+        assert!(PluginWorkerRegistry::is_canceled(
+            &registry.canceled,
+            &request_id
+        ));
+        let request = worker_rx.try_recv().expect("queued prompt invoke");
+        assert!(matches!(request, PluginWorkerRequest::InvokeAsync { .. }));
+        assert!(registry
+            .async_callbacks
+            .lock()
+            .expect("callback registry")
+            .is_empty());
+    }
+
+    #[test]
+    fn queued_canceled_async_invoke_is_marked_before_execution() {
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        let registry = PluginWorkerRegistry::default();
+        registry.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
+        let (worker_tx, worker_rx) = mpsc::sync_channel(1);
+        let (_parent_tx, parent_rx) = mpsc::channel();
+        registry.workers.lock().expect("worker registry").insert(
+            "test-plugin".to_string(),
+            PluginWorkerHandle {
+                tx: worker_tx,
+                parent_rx: Arc::new(Mutex::new(parent_rx)),
+                admission: Arc::new(Mutex::new(PluginWorkerAdmission::default())),
+            },
+        );
+        let lua = Lua::new();
+        register(&lua, registry.clone()).expect("register worker primitives");
+        let request_id: String = lua
+            .load(
+                r#"
+                return __plugin_worker_invoke_async(
+                  "test-plugin",
+                  "mcp_tool",
+                  "tool-id",
+                  "tool-name",
+                  { context = { session_uuid = "sess-queued" } },
+                  5000,
+                  function() end)
+                "#,
+            )
+            .eval()
+            .expect("admit async invoke");
+        registry.mark_canceled(&request_id);
+        assert!(PluginWorkerRegistry::is_canceled(
+            &registry.canceled,
+            &request_id
+        ));
+        assert!(matches!(
+            worker_rx.try_recv(),
+            Ok(PluginWorkerRequest::InvokeAsync { .. })
+        ));
+    }
+
+    #[test]
+    fn remaining_handler_timeout_skips_expired_deadlines() {
+        assert!(remaining_handler_timeout_ms(Instant::now() - Duration::from_secs(1)).is_none());
+        assert!(
+            remaining_handler_timeout_ms(Instant::now() + Duration::from_secs(2)).unwrap() >= 1
+        );
+    }
+
+    #[test]
+    fn cancel_id_stays_until_completion_reaches_the_hub() {
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        event_tx
+            .blocking_send(HubEvent::CleanupTick)
+            .expect("fill Hub event queue");
+        let registry = PluginWorkerRegistry::default();
+        registry.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
+        let (worker_tx, _worker_rx) = mpsc::sync_channel(1);
+        let (_parent_tx, parent_rx) = mpsc::channel();
+        registry.workers.lock().expect("worker registry").insert(
+            "test-plugin".to_string(),
+            PluginWorkerHandle {
+                tx: worker_tx,
+                parent_rx: Arc::new(Mutex::new(parent_rx)),
+                admission: Arc::new(Mutex::new(PluginWorkerAdmission::default())),
+            },
+        );
+        let lua = Lua::new();
+        register(&lua, registry.clone()).expect("register worker primitives");
+        let request_id: String = lua
+            .load(
+                r#"
+                return __plugin_worker_invoke_async(
+                  "test-plugin",
+                  "mcp_tool",
+                  "tool-id",
+                  "tool-name",
+                  { context = { session_uuid = "sess-race" } },
+                  5000,
+                  function(result, err)
+                    _G.race_error = err
+                  end)
+                "#,
+            )
+            .eval()
+            .expect("admit async invoke");
+        registry.mark_canceled(&request_id);
+        registry.fire_async_callback(
+            &lua,
+            &request_id,
+            Err("hub MCP dispatch timed out".to_string()),
+        );
+        assert!(PluginWorkerRegistry::is_canceled(
+            &registry.canceled,
+            &request_id
+        ));
+        registry.mark_canceled(&request_id);
+        registry.complete_async_invoke(
+            &lua,
+            &request_id,
+            Err("plugin worker invoke canceled".to_string()),
+        );
+        assert!(!PluginWorkerRegistry::is_canceled(
+            &registry.canceled,
+            &request_id
+        ));
+        assert!(matches!(event_rx.try_recv(), Ok(HubEvent::CleanupTick)));
+    }
+
+    #[test]
+    fn worker_loop_skips_canceled_and_expired_invokes_before_handler() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("ran");
+        let init_path = temp.path().join("init.lua");
+        std::fs::write(
+            &init_path,
+            format!(
+                r#"
+                local mcp = require("lib.mcp")
+                mcp.tool("marker", {{
+                    description = "side effect",
+                    input_schema = {{ type = "object", properties = {{}} }},
+                    timeout_ms = 5000,
+                }}, function()
+                    local f = assert(io.open({marker}, "w"))
+                    f:write("ran")
+                    f:close()
+                    return "ran"
+                end)
+                return {{}}
+                "#,
+                marker = serde_json::to_string(&marker.to_string_lossy()).unwrap(),
+            ),
+        )
+        .expect("write plugin");
+
+        let mut runtime = LuaRuntime::new().expect("runtime");
+        let lua_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua");
+        runtime
+            .update_package_path(&lua_path)
+            .expect("configure Lua path");
+        runtime
+            .lua()
+            .globals()
+            .set("_lua_base_path", lua_path.to_string_lossy().to_string())
+            .expect("worker Lua path");
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        event_tx
+            .blocking_send(HubEvent::CleanupTick)
+            .expect("fill Hub event queue");
+        let hub_tx = HubEventTx::from(event_tx);
+        runtime.set_hub_event_tx(hub_tx.clone(), tokio_runtime.handle().clone());
+        runtime
+            .lua()
+            .load(format!(
+                r#"
+                local loader = require("hub.loader")
+                local ok, err = loader.load_plugin({init_path}, "loop-skip-plugin", {{ source = "device" }})
+                assert(ok, tostring(err))
+                "#,
+                init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+            ))
+            .exec()
+            .expect("load plugin");
+
+        let handle = runtime
+            .plugin_workers()
+            .workers
+            .lock()
+            .expect("workers")
+            .values()
+            .next()
+            .cloned()
+            .expect("worker handle");
+        let request_id = "plugin-worker-async-skip".to_string();
+        runtime.plugin_workers().mark_canceled(&request_id);
+        handle
+            .tx
+            .try_send(PluginWorkerRequest::InvokeAsync {
+                kind: "mcp_tool".to_string(),
+                id: "marker".to_string(),
+                name: Some("marker".to_string()),
+                payload: json!({}),
+                deadline: Instant::now() + Duration::from_secs(5),
+                request_id: request_id.clone(),
+                completion_tx: hub_tx.clone(),
+                completion_runtime: tokio_runtime.handle().clone(),
+            })
+            .expect("queue canceled invoke");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            PluginWorkerRegistry::is_canceled(&runtime.plugin_workers().canceled, &request_id),
+            "cancel id must remain while completion waits for Hub capacity"
+        );
+        assert!(
+            !marker.exists(),
+            "canceled handler must not run under completion backpressure"
+        );
+        assert!(matches!(
+            event_rx.blocking_recv(),
+            Some(HubEvent::CleanupTick)
+        ));
+        let event = event_rx.blocking_recv().expect("canceled completion");
+        let HubEvent::PluginWorkerInvokeCompleted {
+            request_id: completed_id,
+            result,
+        } = event
+        else {
+            panic!("expected completion, got {event:?}");
+        };
+        assert_eq!(completed_id, request_id);
+        assert!(
+            result.as_ref().unwrap_err().contains("canceled"),
+            "skip must report canceled, got {result:?}"
+        );
+        runtime.fire_plugin_worker_invoke_completed(&request_id, result);
+        assert!(!PluginWorkerRegistry::is_canceled(
+            &runtime.plugin_workers().canceled,
+            &request_id
+        ));
+
+        let expired_id = "plugin-worker-async-expired".to_string();
+        handle
+            .tx
+            .try_send(PluginWorkerRequest::InvokeAsync {
+                kind: "mcp_tool".to_string(),
+                id: "marker".to_string(),
+                name: Some("marker".to_string()),
+                payload: json!({}),
+                deadline: Instant::now() - Duration::from_secs(1),
+                request_id: expired_id.clone(),
+                completion_tx: hub_tx,
+                completion_runtime: tokio_runtime.handle().clone(),
+            })
+            .expect("queue expired invoke");
+        let event = event_rx.blocking_recv().expect("expired completion");
+        let HubEvent::PluginWorkerInvokeCompleted {
+            request_id: completed_id,
+            result,
+        } = event
+        else {
+            panic!("expected expired completion, got {event:?}");
+        };
+        assert_eq!(completed_id, expired_id);
+        assert!(
+            result.unwrap_err().contains("expired"),
+            "skip must report expired"
+        );
+        assert!(!marker.exists(), "expired handler must not run");
+        runtime.shutdown_plugin_workers("test_complete");
+    }
+
+    #[test]
+    fn worker_shutdown_fails_queued_async_invoke_and_removes_callback() {
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
+        let registry = PluginWorkerRegistry::default();
+        registry.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
+        let (worker_tx, worker_rx) = mpsc::sync_channel(2);
+        let (_parent_tx, parent_rx) = mpsc::channel();
+        registry.workers.lock().expect("worker registry").insert(
+            "test-plugin".to_string(),
+            PluginWorkerHandle {
+                tx: worker_tx,
+                parent_rx: Arc::new(Mutex::new(parent_rx)),
+                admission: Arc::new(Mutex::new(PluginWorkerAdmission::default())),
+            },
+        );
+        let lua = Lua::new();
+        register(&lua, registry.clone()).expect("register worker primitives");
+
+        let request_id: String = lua
+            .load(
+                r#"
+                return __plugin_worker_invoke_async(
+                  "test-plugin",
+                  "mcp_tool",
+                  "tool-id",
+                  "tool-name",
+                  {},
+                  5000,
+                  function(result, err)
+                    _G.shutdown_result = result
+                    _G.shutdown_error = err
+                  end)
+                "#,
+            )
+            .eval()
+            .expect("admit async invoke");
+        registry.shutdown("test-plugin", "reload");
+        fail_pending_worker_requests(&worker_rx, "reload");
+
+        let event = event_rx.blocking_recv().expect("shutdown completion event");
+        let HubEvent::PluginWorkerInvokeCompleted {
+            request_id: completed_id,
+            result,
+        } = event
+        else {
+            panic!("expected plugin worker completion, got {event:?}");
+        };
+        assert_eq!(request_id, completed_id);
+        registry.fire_async_callback(&lua, &completed_id, result);
+
+        let error: String = lua
+            .globals()
+            .get("shutdown_error")
+            .expect("shutdown callback error");
+        assert_eq!(error, "plugin worker shutting down: reload");
+        assert!(lua
+            .globals()
+            .get::<Value>("shutdown_result")
+            .unwrap()
+            .is_nil());
+        assert!(registry
+            .async_callbacks
+            .lock()
+            .expect("callback registry")
+            .is_empty());
+    }
+
+    #[test]
+    fn synchronous_async_fallback_reports_one_callback_and_successful_admission() {
+        let runtime = LuaRuntime::new().expect("runtime");
+        let lua_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua");
+        runtime
+            .update_package_path(&lua_path)
+            .expect("configure Lua path");
+
+        let (accepted, callback_count, callback_ok, callback_error): (bool, u64, bool, String) =
+            runtime
+                .lua()
+                .load(
+                    r#"
+                __plugin_worker_invoke_async = nil
+                __plugin_worker_invoke = nil
+                local supervisor = require("lib.plugin_supervisor")
+                local callback_count = 0
+                local callback_ok = true
+                local callback_error = nil
+                local accepted = supervisor.invoke_async(
+                  "test-plugin",
+                  "fallback",
+                  function() error("fallback failed") end,
+                  { handler_kind = "mcp_tool" },
+                  function(ok, result)
+                    callback_count = callback_count + 1
+                    callback_ok = ok
+                    callback_error = result
+                  end)
+                return accepted, callback_count, callback_ok, callback_error
+                "#,
+                )
+                .eval()
+                .expect("run async fallback");
+
+        assert!(accepted);
+        assert_eq!(callback_count, 1);
+        assert!(!callback_ok);
+        assert!(callback_error.contains("fallback failed"));
     }
 
     #[test]

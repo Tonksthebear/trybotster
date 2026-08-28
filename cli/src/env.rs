@@ -161,12 +161,21 @@ pub fn should_skip_keyring() -> bool {
     is_any_test()
 }
 
+/// Environment variable that selects runtime data storage.
+pub const BOTSTER_DATA_DIR_ENV: &str = "BOTSTER_DATA_DIR";
+
 /// Resolve the data directory (`~/.botster` or `~/.botster-dev`).
 ///
-/// Checks `BOTSTER_CONFIG_DIR` env var first, then falls back to
-/// `~/.{APP_NAME}` based on debug/release build.
+/// `BOTSTER_DATA_DIR` selects runtime state without changing device identity.
+/// Child sessions use it to reach Hub data without selecting a device.
+/// `BOTSTER_CONFIG_DIR` remains the device identity root. Isolated tests and
+/// explicit full-root overrides still use it. Do not start a Hub with only
+/// `BOTSTER_DATA_DIR` set.
 #[must_use]
 pub fn data_dir() -> Option<std::path::PathBuf> {
+    if let Ok(custom) = std::env::var(BOTSTER_DATA_DIR_ENV) {
+        return Some(std::path::PathBuf::from(custom));
+    }
     if let Ok(custom) = std::env::var("BOTSTER_CONFIG_DIR") {
         return Some(std::path::PathBuf::from(custom));
     }
@@ -276,6 +285,19 @@ mod tests {
 
     /// Serialize env-mutating tests to prevent BOTSTER_CONFIG_DIR races.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn runtime_data_override_does_not_require_a_config_override() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let runtime_dir = tempfile::TempDir::new().unwrap();
+        let config_dir = tempfile::TempDir::new().unwrap();
+        std::env::set_var(BOTSTER_DATA_DIR_ENV, runtime_dir.path());
+        std::env::set_var("BOTSTER_CONFIG_DIR", config_dir.path());
+        assert_eq!(runtime_dir.path(), data_dir().unwrap());
+        std::env::remove_var(BOTSTER_DATA_DIR_ENV);
+        assert_eq!(config_dir.path(), data_dir().unwrap());
+        std::env::remove_var("BOTSTER_CONFIG_DIR");
+    }
 
     /// session_manifest_path returns None when the workspaces dir doesn't exist.
     #[test]

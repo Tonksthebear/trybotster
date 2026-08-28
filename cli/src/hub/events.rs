@@ -194,6 +194,20 @@ pub(crate) enum HubEvent {
     /// Parent-hub operation requested by a plugin worker callback.
     PluginWorkerParentRequest(WorkerParentRequest),
 
+    /// A plugin worker finished an invocation that the Hub admitted without waiting.
+    PluginWorkerInvokeCompleted {
+        /// Identifier for the Lua callback stored by the parent runtime.
+        request_id: String,
+        /// Worker result or typed failure text.
+        result: Result<serde_json::Value, String>,
+    },
+
+    /// Cancel one admitted plugin worker callback after HTTP timeout.
+    PluginWorkerInvokeCancel {
+        /// Identifier for the Lua callback stored by the parent runtime.
+        request_id: String,
+    },
+
     /// Connection operation request from a Lua callback.
     LuaConnectionRequest(ConnectionRequest),
 
@@ -464,6 +478,8 @@ impl HubEvent {
             Self::LuaPtyRequest(_) => "lua_pty_request",
             Self::LuaHubRequest(_) => "lua_hub_request",
             Self::PluginWorkerParentRequest(_) => "plugin_worker_parent_request",
+            Self::PluginWorkerInvokeCompleted { .. } => "plugin_worker_invoke_completed",
+            Self::PluginWorkerInvokeCancel { .. } => "plugin_worker_invoke_cancel",
             Self::LuaConnectionRequest(_) => "lua_connection_request",
             Self::LuaWorktreeRequest(_) => "lua_worktree_request",
             Self::LuaActionCableRequest(_) => "lua_action_cable_request",
@@ -511,6 +527,8 @@ impl HubEvent {
             | Self::CleanupTick
             | Self::DropPendingSessionIoSnapshot { .. }
             | Self::PluginWorkerParentRequest(_)
+            | Self::PluginWorkerInvokeCompleted { .. }
+            | Self::PluginWorkerInvokeCancel { .. }
             | Self::SessionProcessExited { .. }
             | Self::SessionUnregistered { .. }
             | Self::SessionReconnectReady { .. }
@@ -1110,6 +1128,35 @@ impl HubEventTx {
                 self.clear_coalescing_key(coalescing_key.as_ref());
                 self.metrics.record_enqueue_failed(kind, bytes);
                 Err(mpsc::error::SendError(event))
+            }
+        }
+    }
+
+    /// Wait for bounded queue admission without blocking the producer thread.
+    ///
+    /// This path is for one-shot completion events that cannot be shed. The
+    /// caller must run this future on a Tokio runtime.
+    pub(crate) async fn send_async(
+        &self,
+        event: HubEvent,
+    ) -> Result<(), mpsc::error::SendError<HubEvent>> {
+        debug_assert!(
+            event.coalescing_key().is_none(),
+            "send_async does not manage coalescing keys"
+        );
+        let kind = event.kind();
+        let bytes = event.approx_size_bytes();
+        self.metrics.record_enqueue(kind, bytes);
+        let tx = if event.is_high_priority() {
+            &self.high_priority
+        } else {
+            &self.inner
+        };
+        match tx.send(event).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.metrics.record_enqueue_failed(kind, bytes);
+                Err(error)
             }
         }
     }

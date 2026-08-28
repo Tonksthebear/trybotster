@@ -36,6 +36,7 @@ end
 local proxy_cache = {
     loaded_at = 0,
     by_key = {},
+    by_uuid = {},
 }
 
 local function proxy_session_info(info)
@@ -64,10 +65,16 @@ local function proxy_session_info(info)
     return info
 end
 
+local function proxy_now()
+    -- Wall-clock seconds. os.clock is process CPU time and must not bound
+    -- session cache lifetime on an idle plugin worker.
+    return os.time()
+end
+
 local function proxy_session_list(opts)
     opts = opts or {}
     local key = opts.include_system and "include_system" or "default"
-    local now = os.clock()
+    local now = proxy_now()
     local cached = proxy_cache.by_key[key]
     if cached and (now - cached.loaded_at) <= 1 then
         return cached.list
@@ -83,6 +90,37 @@ local function proxy_session_list(opts)
         list = out,
     }
     return out
+end
+
+-- Exact worker-parent lookup. Agent.get must not list or serialize every
+-- session; a full list can exceed the 5000 ms plugin-worker hook deadline.
+local function proxy_session_get(session_uuid)
+    if type(session_uuid) ~= "string" or session_uuid == "" then
+        return nil
+    end
+
+    local now = proxy_now()
+    local cached = proxy_cache.by_uuid[session_uuid]
+    if cached and (now - cached.loaded_at) <= 1 then
+        return cached.session
+    end
+
+    local info = require("lib.hub").get():get_agent(session_uuid)
+    if type(info) ~= "table" then
+        proxy_cache.by_uuid[session_uuid] = nil
+        return nil
+    end
+    for uuid, entry in pairs(proxy_cache.by_uuid) do
+        if not entry or (now - (entry.loaded_at or 0)) > 1 then
+            proxy_cache.by_uuid[uuid] = nil
+        end
+    end
+    local session = proxy_session_info(info)
+    proxy_cache.by_uuid[session_uuid] = {
+        loaded_at = now,
+        session = session,
+    }
+    return session
 end
 
 -- Reserve forwarded ports from a high, non-common range and probe localhost
@@ -1233,10 +1271,10 @@ function Session:build_env(base_env)
             env.BOTSTER_MCP_TOKEN = creds.token
         end
     end
-    -- Ensure child processes (e.g., botster mcp-serve) use the same binary and
-    -- data directory as the hub, even if a different build is installed on PATH.
+    -- Ensure child processes use the Hub data directory without changing the
+    -- device identity configuration root.
     if self._data_dir then
-        env.BOTSTER_CONFIG_DIR = self._data_dir
+        env.BOTSTER_DATA_DIR = self._data_dir
     end
     -- Prepend the running binary's directory to PATH so `botster` resolves to
     -- the same binary the hub is running (debug vs release parity).
@@ -1343,12 +1381,7 @@ end
 -- @return Session subclass instance or nil
 function Session.get(session_uuid)
     if plugin_worker_hub_proxy_enabled() then
-        for _, sess in ipairs(proxy_session_list({ include_system = true })) do
-            if sess.session_uuid == session_uuid or sess.id == session_uuid then
-                return sess
-            end
-        end
-        return nil
+        return proxy_session_get(session_uuid)
     end
     return sessions[session_uuid]
 end

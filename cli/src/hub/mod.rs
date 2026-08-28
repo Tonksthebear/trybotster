@@ -956,7 +956,10 @@ impl Hub {
         match self.tokio_runtime.block_on(crate::mcp_http::bind_listener(
             self.mcp_callers.clone(),
             self.mcp_http_fanout.clone(),
-            crate::mcp_http::McpHttpDispatch::Hub(self.hub_event_tx.clone()),
+            crate::mcp_http::McpHttpDispatch::Hub {
+                event_tx: self.hub_event_tx.clone(),
+                canceled: self.lua.plugin_worker_canceled_ids(),
+            },
         )) {
             Ok(listener) => {
                 log::info!("Shared MCP HTTP listener ready at {}", listener.url());

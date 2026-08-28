@@ -606,9 +606,12 @@ fn hub_get_defaults_to_parent_hub_inside_plugin_worker() {
 
             local seen = {{}}
             plugin_worker_parent_hub = {{
-              request = function(command)
+              request = function()
+                error("worker create_agent must not wait for a parent response")
+              end,
+              enqueue = function(command)
                 seen.command = command
-                return {{ result = {{ ok = true, status = "queued", request_id = command.command.request_id }} }}
+                return true
               end,
             }}
 
@@ -655,6 +658,144 @@ fn hub_get_defaults_to_parent_hub_inside_plugin_worker() {
 }
 
 #[test]
+fn worker_boundary_post_and_notify_enqueue_without_waiting() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let dir = lua_src_dir();
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{dir}/?.lua;{dir}/?/init.lua;" .. package.path
+
+            _plugin_worker_parent_hub_id = "hub-parent"
+            hub = {{ hub_id = function() return "plugin-worker:workflow" end }}
+            events = {{ emit = function() end }}
+
+            local enqueued = {{}}
+            plugin_worker_parent_hub = {{
+              request = function(payload)
+                error("worker message must not wait for a parent response: " .. tostring(payload.type))
+              end,
+              enqueue = function(payload)
+                enqueued[#enqueued + 1] = payload
+                return true
+              end,
+            }}
+
+            package.loaded["hub.state"] = {{
+              class = function(_)
+                local cls = {{}}
+                cls.__index = cls
+                return cls
+              end,
+              get = function(_, default) return default end,
+            }}
+            package.loaded["lib.agent"] = {{
+              list = function() error("worker Hub.get() must not use local Agent") end,
+              all_info = function() return {{}} end,
+            }}
+            package.loaded["lib.internal_client"] = {{
+              dispatch = function() error("worker Hub.get() must not dispatch locally") end,
+            }}
+
+            local Hub = require("lib.hub")
+            local posted = Hub.get():post("sess-1", {{
+              type = "task",
+              payload = {{ instructions = "continue" }},
+              from_agent_id = "workflow",
+            }})
+            local notified = Hub.get():notify("sess-1", {{
+              source = "workflow",
+              title = "Pipeline step returned",
+            }})
+
+            assert(posted.status == "queued")
+            assert(type(posted.msg_id) == "string" and posted.msg_id ~= "")
+            assert(notified.status == "queued")
+            assert(#enqueued == 2)
+            assert(enqueued[1].type == "post_message")
+            assert(enqueued[1].msg_id == posted.msg_id)
+            assert(enqueued[1].payload.instructions == "continue")
+            assert(enqueued[2].type == "send_message")
+            assert(enqueued[2].text:match("Pipeline step returned"))
+            return "ok"
+            "#,
+            dir = dir.display()
+        ))
+        .eval()
+        .expect("worker messages should enqueue without waiting");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn worker_parent_post_keeps_the_worker_generated_message_id() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let dir = lua_src_dir();
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{dir}/?.lua;{dir}/?/init.lua;" .. package.path
+
+            hub = {{ hub_id = function() return "hub-parent" end }}
+            events = {{ emit = function() end }}
+
+            local sent = nil
+            local agent = {{
+              session_uuid = "sess-1",
+              session_type = "agent",
+              _inbox = {{}},
+              session = {{
+                send_message = function(_, text) sent = text end,
+              }},
+            }}
+            package.loaded["hub.state"] = {{
+              class = function(_)
+                local cls = {{}}
+                cls.__index = cls
+                return cls
+              end,
+              get = function(_, default) return default end,
+            }}
+            package.loaded["lib.agent"] = {{
+              get = function(id) if id == "sess-1" then return agent end end,
+              list = function() return {{ agent }} end,
+              all_info = function() return {{}} end,
+            }}
+            package.loaded["lib.internal_client"] = {{
+              dispatch = function() error("post_message must not use command dispatch") end,
+            }}
+
+            local Hub = require("lib.hub")
+            local response = Hub._handle_worker_parent_request({{
+              type = "post_message",
+              msg_id = "msg-worker-1",
+              agent_id = "sess-1",
+              msg_type = "task",
+              payload = {{ instructions = "continue" }},
+              from_agent_id = "workflow",
+            }})
+
+            assert(response.result.status == "delivered")
+            assert(response.result.msg_id == "msg-worker-1")
+            assert(#agent._inbox == 1)
+            assert(agent._inbox[1].msg_id == "msg-worker-1")
+            assert(agent._inbox[1].payload.instructions == "continue")
+            assert(sent:match("receive_messages"))
+            return "ok"
+            "#,
+            dir = dir.display()
+        ))
+        .eval()
+        .expect("parent post should keep the worker message id");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn worker_boundary_hub_mutations_proxy_to_parent_command_queue() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");
@@ -673,10 +814,7 @@ fn worker_boundary_hub_mutations_proxy_to_parent_command_queue() {
             local enqueued = {{}}
             plugin_worker_parent_hub = {{
               request = function(command)
-                assert(command.type == "hub_command")
-                assert(command.command.type ~= "update_session", "update_session must enqueue without blocking")
-                seen[#seen + 1] = command.command
-                return {{ result = {{ ok = true, status = "queued", request_id = command.command.request_id }} }}
+                error("worker mutation must not wait for a parent response: " .. tostring(command.type))
               end,
               enqueue = function(command)
                 assert(command.type == "hub_command")
@@ -704,6 +842,16 @@ fn worker_boundary_hub_mutations_proxy_to_parent_command_queue() {
 
             local Hub = require("lib.hub")
             local h = Hub.get()
+            local created = h:create_agent({{
+              request_id = "req-agent",
+              issue_or_branch = "main",
+              prompt = "work",
+              agent_name = "codex",
+            }})
+            local accessory = h:create_accessory({{
+              request_id = "req-accessory",
+              accessory_name = "terminal",
+            }})
             h:update_session("sess-1", {{
               label = "Updated",
               plugin_state = {{ cloudflare_hosted_preview = {{ status = "starting" }} }},
@@ -713,21 +861,27 @@ fn worker_boundary_hub_mutations_proxy_to_parent_command_queue() {
             h:entity_upsert("workflow.item", {{ id = "item-1" }}, {{ owner_plugin = "workflow" }})
             h:delete_agent("sess-1", false)
 
-            assert(#enqueued == 1)
-            assert(enqueued[1].type == "update_session")
-            assert(enqueued[1].agent_id == "sess-1")
-            assert(enqueued[1].plugin_state.cloudflare_hosted_preview.status == "starting")
-            assert(#seen == 4)
-            assert(seen[1].type == "move_agent_workspace")
-            assert(seen[1].agent_id == "sess-1")
-            assert(seen[1].workspace_id == "workspace-2")
-            assert(seen[2].type == "rename_workspace")
-            assert(seen[2].workspace_id == "workspace-2")
-            assert(seen[3].type == "plugin_entity_publish")
-            assert(seen[3].op == "upsert")
-            assert(seen[3].owner_plugin == "workflow")
-            assert(seen[4].type == "delete_agent")
-            assert(seen[4].agent_id == "sess-1")
+            assert(created.status == "queued")
+            assert(created.request_id == "req-agent")
+            assert(accessory.status == "queued")
+            assert(accessory.request_id == "req-accessory")
+            assert(#enqueued == 7)
+            assert(enqueued[1].type == "create_agent")
+            assert(enqueued[2].type == "create_accessory")
+            assert(enqueued[3].type == "update_session")
+            assert(enqueued[3].agent_id == "sess-1")
+            assert(enqueued[3].plugin_state.cloudflare_hosted_preview.status == "starting")
+            assert(enqueued[4].type == "move_agent_workspace")
+            assert(enqueued[4].agent_id == "sess-1")
+            assert(enqueued[4].workspace_id == "workspace-2")
+            assert(enqueued[5].type == "rename_workspace")
+            assert(enqueued[5].workspace_id == "workspace-2")
+            assert(enqueued[6].type == "plugin_entity_publish")
+            assert(enqueued[6].op == "upsert")
+            assert(enqueued[6].owner_plugin == "workflow")
+            assert(enqueued[7].type == "delete_agent")
+            assert(enqueued[7].agent_id == "sess-1")
+            assert(#seen == 0)
             return "ok"
             "#,
             dir = dir.display()
@@ -971,24 +1125,27 @@ fn agent_session_lookups_proxy_to_parent_hub_inside_plugin_worker() {
             hub = {{ hub_id = function() return "plugin-worker:vault" end }}
             events = {{ emit = function() end }}
             local request_count = 0
+            local request_types = {{}}
+            local worker = {{
+              id = "sess-worker",
+              session_uuid = "sess-worker",
+              session_type = "agent",
+              label = "Knowledge Worker",
+              workspace_name = "Vault",
+              target_path = "/Users/jasonconigliari/knowledge",
+              metadata = {{ owner_plugin = "knowledge-inbox-pipeline" }},
+              status = "running",
+            }}
             plugin_worker_parent_hub = {{
               request = function(command)
                 request_count = request_count + 1
+                request_types[#request_types + 1] = command.type
                 if command.type == "get_agent_list" then
-                  return {{
-                    result = {{
-                      {{
-                        id = "sess-worker",
-                        session_uuid = "sess-worker",
-                        session_type = "agent",
-                        label = "Knowledge Worker",
-                        workspace_name = "Vault",
-                        target_path = "/Users/jasonconigliari/knowledge",
-                        metadata = {{ owner_plugin = "knowledge-inbox-pipeline" }},
-                        status = "running",
-                      }},
-                    }},
-                  }}
+                  return {{ result = {{ worker }} }}
+                end
+                if command.type == "get_agent" then
+                  assert(command.session_uuid == "sess-worker")
+                  return {{ result = worker }}
                 end
                 error("unexpected command " .. tostring(command.type))
               end,
@@ -1011,13 +1168,146 @@ fn agent_session_lookups_proxy_to_parent_hub_inside_plugin_worker() {
             assert(#list == 1)
             assert(found and found:info().session_uuid == "sess-worker")
             assert(#by_meta == 1)
-            assert(request_count == 1, "expected cached parent list lookup, got " .. tostring(request_count))
+            assert(request_types[1] == "get_agent_list")
+            assert(request_types[2] == "get_agent")
+            assert(request_count == 2, "expected list plus exact get, got " .. tostring(request_count))
             return "ok"
             "#,
             dir = dir.display()
         ))
         .eval()
         .expect("worker Agent/Session lookups should proxy to parent hub");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn agent_get_uses_exact_parent_lookup_with_hundreds_of_sessions() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let dir = lua_src_dir();
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{dir}/?.lua;{dir}/?/init.lua;" .. package.path
+
+            _plugin_worker_parent_hub_id = "hub-parent"
+            hub = {{ hub_id = function() return "plugin-worker:vault" end }}
+            events = {{ emit = function() end }}
+            local listed = 0
+            plugin_worker_parent_hub = {{
+              request = function(command)
+                if command.type == "get_agent_list" then
+                  listed = listed + 1
+                  error("Agent.get must not list sessions")
+                end
+                if command.type == "get_agent" then
+                  if command.session_uuid ~= "sess-target" then
+                    return {{ result = nil }}
+                  end
+                  return {{
+                    result = {{
+                      id = "sess-target",
+                      session_uuid = "sess-target",
+                      status = "running",
+                      metadata = {{}},
+                    }},
+                  }}
+                end
+                error("unexpected command " .. tostring(command.type))
+              end,
+            }}
+            package.loaded["hub.state"] = {{
+              class = function(_)
+                local cls = {{}}
+                cls.__index = cls
+                return cls
+              end,
+              get = function(_, default) return default end,
+            }}
+
+            local Agent = require("lib.agent")
+            local found = Agent.get("sess-target")
+            local missing = Agent.get("sess-missing")
+            assert(found and found:info().session_uuid == "sess-target")
+            assert(missing == nil)
+            assert(listed == 0)
+            return "ok"
+            "#,
+            dir = dir.display()
+        ))
+        .eval()
+        .expect("Agent.get should use an exact parent session lookup");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn worker_parent_get_agent_serializes_one_session() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let dir = lua_src_dir();
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{dir}/?.lua;{dir}/?/init.lua;" .. package.path
+
+            hub = {{ hub_id = function() return "hub-local" end }}
+            events = {{ emit = function() end }}
+            package.loaded["hub.state"] = {{
+              class = function(_)
+                local cls = {{}}
+                cls.__index = cls
+                return cls
+              end,
+              get = function(_, default) return default end,
+            }}
+            local listed = 0
+            package.loaded["lib.agent"] = {{
+              all_info = function()
+                listed = listed + 1
+                error("get_agent must not serialize all sessions")
+              end,
+              get = function(session_uuid)
+                if session_uuid == "sess-one" then
+                  return {{
+                    info = function()
+                      return {{ session_uuid = "sess-one", label = "one" }}
+                    end,
+                  }}
+                end
+                return nil
+              end,
+            }}
+            package.loaded["lib.internal_client"] = {{ dispatch = function() error("unused") end }}
+            package.loaded["lib.worker_parent_command_queue"] = {{
+              is_queued_command = function() return false end,
+              ack = function(command) return command end,
+              enqueue = function() end,
+            }}
+
+            local Hub = require("lib.hub")
+            local found = Hub._handle_worker_parent_request({{
+              type = "get_agent",
+              session_uuid = "sess-one",
+            }})
+            local missing = Hub._handle_worker_parent_request({{
+              type = "get_agent",
+              session_uuid = "sess-missing",
+            }})
+            local invalid = Hub._handle_worker_parent_request({{ type = "get_agent" }})
+            assert(found.result.session_uuid == "sess-one")
+            assert(missing.result == nil)
+            assert(invalid.error:find("session_uuid", 1, true))
+            assert(listed == 0)
+            return "ok"
+            "#,
+            dir = dir.display()
+        ))
+        .eval()
+        .expect("parent get_agent should serialize one session");
 
     assert_eq!(result, "ok");
 }

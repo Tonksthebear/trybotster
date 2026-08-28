@@ -48,7 +48,7 @@ end
 local function build_envelope(from_hub_id, from_agent_id, opts)
     local expires_in = opts.expires_in or 3600  -- 1 hour default
     return {
-        msg_id     = generate_msg_id(),
+        msg_id     = opts.msg_id or generate_msg_id(),
         type       = opts.type or "message",
         reply_to   = opts.reply_to,
         from       = { hub_id = from_hub_id, agent_id = from_agent_id },
@@ -171,6 +171,19 @@ local function dispatch_remote_command_response(self, command, timeout_ms)
     return response
 end
 
+local function enqueue_worker_parent_command(self, command)
+    if not (in_plugin_worker and self._is_worker_parent) then
+        return nil
+    end
+
+    command.request_id = command.request_id or generate_msg_id()
+    remote_enqueue(self, {
+        type = "hub_command",
+        command = command,
+    })
+    return WorkerParentCommandQueue.ack(command)
+end
+
 local function loading_plugin_name()
     local display_name = rawget(_G, "_loading_plugin_display_name")
     if type(display_name) == "string" and display_name ~= "" then return display_name end
@@ -253,6 +266,25 @@ function Hub._handle_worker_parent_request(payload)
         return { result = Agent.all_info(payload.opts or {}) }
     end
 
+    if kind == "get_agent" then
+        local session_uuid = payload.session_uuid or payload.agent_id
+        if type(session_uuid) ~= "string" or session_uuid == "" then
+            return { error = "worker parent hub get_agent requires session_uuid" }
+        end
+        local agent = Agent.get(session_uuid)
+        if not agent then
+            return { result = nil }
+        end
+        if type(agent.info) == "function" then
+            local ok, info = pcall(agent.info, agent)
+            if ok then
+                return { result = info }
+            end
+            return { error = tostring(info) }
+        end
+        return { result = agent }
+    end
+
     if kind == "list_workspaces" then
         return { result = local_hub:list_workspaces() }
     end
@@ -295,6 +327,7 @@ function Hub._handle_worker_parent_request(payload)
     if kind == "post_message" then
         return {
             result = local_hub:post(payload.agent_id, {
+                msg_id = payload.msg_id,
                 type = payload.msg_type,
                 payload = payload.payload,
                 reply_to = payload.reply_to,
@@ -530,6 +563,16 @@ function Hub:notify(agent_id, opts)
         return { status = "delivered" }
     end
 
+    if self._is_worker_parent then
+        remote_enqueue(self, {
+            type = "send_message",
+            agent_id = agent_id,
+            session = opts.session or "agent",
+            text = text,
+        })
+        return { status = "queued" }
+    end
+
     self:send_message(agent_id, text, opts.session or "agent")
     return { status = "delivered" }
 end
@@ -582,6 +625,23 @@ function Hub:post(agent_id, opts)
         log.warn(string.format("Hub:post: inbox written for %s but no PTY session, no doorbell",
             agent_id))
         return { msg_id = envelope.msg_id, status = "inbox_only" }
+    end
+
+    if self._is_worker_parent then
+        local msg_id = opts.msg_id or generate_msg_id()
+        remote_enqueue(self, {
+            type          = "post_message",
+            msg_id        = msg_id,
+            agent_id      = agent_id,
+            msg_type      = msg_type,
+            payload       = opts.payload,
+            reply_to      = opts.reply_to,
+            expires_in    = opts.expires_in,
+            session       = opts.session or "agent",
+            from_hub_id   = self_id,
+            from_agent_id = opts.from_agent_id or "unknown",
+        })
+        return { msg_id = msg_id, status = "queued" }
     end
 
     -- Remote hub: RPC to target hub which handles inbox write and doorbell
@@ -747,6 +807,10 @@ function Hub:create_agent(issue_or_branch, prompt, agent_name, workspace_id, wor
         }
     end
 
+    if self._is_worker_parent then
+        return enqueue_worker_parent_command(self, command)
+    end
+
     return dispatch_remote_command_response(self, command, 60000)
 end
 
@@ -796,6 +860,10 @@ function Hub:create_accessory(opts)
             session_uuid = response.session_uuid,
             id = response.id or response.session_uuid,
         }
+    end
+
+    if self._is_worker_parent then
+        return enqueue_worker_parent_command(self, command)
     end
 
     return dispatch_remote_command_response(self, command, 30000)
@@ -851,6 +919,9 @@ function Hub:command(command, timeout_ms)
     end
     if self._is_local then
         return dispatch_local_command_response(command)
+    end
+    if self._is_worker_parent and WorkerParentCommandQueue.is_queued_command(command) then
+        return enqueue_worker_parent_command(self, command)
     end
     return dispatch_remote_command_response(self, command, timeout_ms or 10000)
 end
@@ -913,6 +984,44 @@ function Hub:list_agents(opts)
     return result.result or {}
 end
 
+--- Lookup one session by UUID without listing the hub session set.
+-- Local: registry get. Remote / plugin worker: exact parent request.
+-- @param session_uuid string Session UUID
+-- @return table|nil Session info table
+function Hub:get_agent(session_uuid)
+    if type(session_uuid) ~= "string" or session_uuid == "" then
+        return nil
+    end
+
+    if self._is_local then
+        local agent = Agent.get(session_uuid)
+        if not agent then
+            return nil
+        end
+        if type(agent.info) == "function" then
+            local ok, info = pcall(agent.info, agent)
+            if ok then
+                return info
+            end
+            error(info)
+        end
+        return agent
+    end
+
+    -- Stay under the 5000 ms plugin-worker hook deadline. Exact lookup is a
+    -- single registry get on the parent Hub, not a full session list.
+    local result = remote_request(self, {
+        type = "get_agent",
+        session_uuid = session_uuid,
+    }, 4000)
+
+    if result.error then
+        error(string.format("Hub:get_agent remote error: %s", result.error))
+    end
+
+    return result.result
+end
+
 --- Publish an authoritative plugin entity snapshot.
 -- Plugins must register their entity type first with `lib.entity_broadcast`
 -- so reconnect snapshots have a source of truth. `entity_type` must be
@@ -925,13 +1034,17 @@ end
 function Hub:entity_snapshot(entity_type, items, opts)
     opts = opts or {}
     if not self._is_local then
-        return dispatch_remote_command_response(self, {
+        local command = {
             type = "plugin_entity_publish",
             op = "snapshot",
             entity_type = entity_type,
             items = items,
             owner_plugin = opts.owner_plugin or owner_plugin_from_opts(opts),
-        }, 10000)
+        }
+        if self._is_worker_parent then
+            return enqueue_worker_parent_command(self, command)
+        end
+        return dispatch_remote_command_response(self, command, 10000)
     end
 
     local eb = ensure_local_entity_publish_api(self, "entity_snapshot")
@@ -948,13 +1061,17 @@ end
 function Hub:entity_upsert(entity_type, entity, opts)
     opts = opts or {}
     if not self._is_local then
-        return dispatch_remote_command_response(self, {
+        local command = {
             type = "plugin_entity_publish",
             op = "upsert",
             entity_type = entity_type,
             entity = entity,
             owner_plugin = opts.owner_plugin or owner_plugin_from_opts(opts),
-        }, 10000)
+        }
+        if self._is_worker_parent then
+            return enqueue_worker_parent_command(self, command)
+        end
+        return dispatch_remote_command_response(self, command, 10000)
     end
 
     local eb = ensure_local_entity_publish_api(self, "entity_upsert")
@@ -976,14 +1093,18 @@ end
 function Hub:entity_patch(entity_type, id, fields, opts)
     opts = opts or {}
     if not self._is_local then
-        return dispatch_remote_command_response(self, {
+        local command = {
             type = "plugin_entity_publish",
             op = "patch",
             entity_type = entity_type,
             id = id,
             fields = fields,
             owner_plugin = opts.owner_plugin or owner_plugin_from_opts(opts),
-        }, 10000)
+        }
+        if self._is_worker_parent then
+            return enqueue_worker_parent_command(self, command)
+        end
+        return dispatch_remote_command_response(self, command, 10000)
     end
 
     local eb = ensure_local_entity_publish_api(self, "entity_patch")
@@ -1006,13 +1127,17 @@ end
 function Hub:entity_remove(entity_type, id, opts)
     opts = opts or {}
     if not self._is_local then
-        return dispatch_remote_command_response(self, {
+        local command = {
             type = "plugin_entity_publish",
             op = "remove",
             entity_type = entity_type,
             id = id,
             owner_plugin = opts.owner_plugin or owner_plugin_from_opts(opts),
-        }, 10000)
+        }
+        if self._is_worker_parent then
+            return enqueue_worker_parent_command(self, command)
+        end
+        return dispatch_remote_command_response(self, command, 10000)
     end
 
     local eb = ensure_local_entity_publish_api(self, "entity_remove")
@@ -1065,12 +1190,21 @@ function Hub:rename_workspace(workspace_id, new_name)
         }
     end
 
-    local response = dispatch_remote_command_response(self, {
+    local command = {
         type = "rename_workspace",
         workspace_id = workspace_id,
         new_name = new_name,
-    }, 10000)
+    }
+    local response
+    if self._is_worker_parent then
+        response = enqueue_worker_parent_command(self, command)
+    else
+        response = dispatch_remote_command_response(self, command, 10000)
+    end
     return {
+        ok = response.ok,
+        status = response.status,
+        request_id = response.request_id,
         workspace_id = response.workspace_id or workspace_id,
         name = response.name or new_name,
     }
@@ -1104,12 +1238,16 @@ function Hub:move_agent_workspace(agent_id, workspace_id, workspace_name)
         }
     end
 
-    return dispatch_remote_command_response(self, {
+    local command = {
         type = "move_agent_workspace",
         agent_id = agent_id,
         workspace_id = workspace_id,
         workspace_name = workspace_name,
-    }, 10000)
+    }
+    if self._is_worker_parent then
+        return enqueue_worker_parent_command(self, command)
+    end
+    return dispatch_remote_command_response(self, command, 10000)
 end
 
 --- Update a session's label or task on this hub.
@@ -1150,18 +1288,11 @@ function Hub:update_session(agent_id, fields)
         surface = fields.surface,
     }
 
-    if in_plugin_worker and self._is_worker_parent then
-        remote_enqueue(self, {
-            type = "hub_command",
-            command = command,
-        })
-        return {
-            ok = true,
-            status = "queued",
-            request_id = command.request_id,
-            session_uuid = agent_id,
-            id = agent_id,
-        }
+    if self._is_worker_parent then
+        local response = enqueue_worker_parent_command(self, command)
+        response.session_uuid = agent_id
+        response.id = agent_id
+        return response
     end
 
     return dispatch_remote_command_response(self, command, 10000)
@@ -1199,11 +1330,15 @@ function Hub:delete_agent(agent_id, delete_worktree)
         return "Delete requested: " .. resolved_id
     end
 
-    return dispatch_remote_command_response(self, {
+    local command = {
         type = "delete_agent",
         agent_id = agent_id,
         delete_worktree = delete_worktree or false,
-    }, 30000)
+    }
+    if self._is_worker_parent then
+        return enqueue_worker_parent_command(self, command)
+    end
+    return dispatch_remote_command_response(self, command, 30000)
 end
 
 --- List sessions on the local hub.

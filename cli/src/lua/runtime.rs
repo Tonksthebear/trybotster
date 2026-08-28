@@ -745,7 +745,43 @@ impl LuaRuntime {
     /// parent Tokio runtime. They must be asked to exit before that runtime is
     /// dropped, otherwise runtime shutdown waits on their blocking watch tasks.
     pub fn shutdown_plugin_workers(&mut self, reason: &str) {
+        self.plugin_worker_registry
+            .fail_all_async_callbacks(&self.lua, reason);
         self.plugin_worker_registry.shutdown_all(reason);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn plugin_workers(&self) -> &crate::lua::primitives::PluginWorkerRegistry {
+        &self.plugin_worker_registry
+    }
+
+    /// Shared cancel set for HTTP MCP timeouts and worker skip checks.
+    pub(crate) fn plugin_worker_canceled_ids(
+        &self,
+    ) -> std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> {
+        self.plugin_worker_registry.canceled_ids()
+    }
+
+    /// Deliver one admitted plugin worker completion on the Hub Lua thread.
+    pub(crate) fn fire_plugin_worker_invoke_completed(
+        &self,
+        request_id: &str,
+        result: Result<serde_json::Value, String>,
+    ) {
+        self.plugin_worker_registry
+            .complete_async_invoke(&self.lua, request_id, result);
+    }
+
+    /// Fail a stored callback without clearing the shared cancel marker.
+    ///
+    /// The worker may still be queued. The completion event owns cancel-set
+    /// cleanup.
+    pub(crate) fn fail_plugin_worker_invoke_callback(&self, request_id: &str, error: &str) {
+        self.plugin_worker_registry.fire_async_callback(
+            &self.lua,
+            request_id,
+            Err(error.to_string()),
+        );
     }
 
     /// Stop all local webhook listener routes owned by this runtime.

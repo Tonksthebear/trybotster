@@ -157,4 +157,50 @@ function M.invoke(plugin_key, label, fn, opts, ...)
     return true, table.unpack(returns, 2, returns.n)
 end
 
+function M.invoke_async(plugin_key, label, fn, opts, callback, ...)
+    assert(type(fn) == "function", "plugin_supervisor.invoke_async: fn must be a function")
+    assert(type(callback) == "function", "plugin_supervisor.invoke_async: callback must be a function")
+    opts = opts or {}
+    local timeout_ms = tonumber(opts.timeout_ms) or DEFAULT_TIMEOUT_MS
+    local has_plugin_owner = type(plugin_key) == "string" and plugin_key ~= ""
+
+    if has_plugin_owner and type(__plugin_worker_invoke_async) == "function" and opts.handler_kind then
+        local accepted, request_or_error = pcall(
+            __plugin_worker_invoke_async,
+            plugin_key,
+            opts.handler_kind,
+            opts.handler_id or label,
+            opts.handler_name,
+            opts.payload or {},
+            timeout_ms,
+            function(result, err)
+                if err ~= nil then
+                    local message = tostring(err)
+                    if log and log.warn then
+                        log.warn(string.format(
+                            "plugin %s %s failed: %s",
+                            tostring(plugin_key), tostring(label or "handler"), message))
+                    end
+                    callback(false, message)
+                    return
+                end
+                callback(true, result)
+            end)
+        if not accepted then
+            local message = tostring(request_or_error)
+            if log and log.warn then
+                log.warn(string.format(
+                    "plugin %s %s admission failed: %s",
+                    tostring(plugin_key), tostring(label or "handler"), message))
+            end
+            return false, message
+        end
+        return true, request_or_error
+    end
+
+    local ok, result = M.invoke(plugin_key, label, fn, opts, ...)
+    callback(ok, result)
+    return true
+end
+
 return M
