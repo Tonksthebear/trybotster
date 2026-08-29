@@ -564,12 +564,20 @@ function Hub:notify(agent_id, opts)
     end
 
     if self._is_worker_parent then
-        remote_enqueue(self, {
+        local command = {
             type = "send_message",
             agent_id = agent_id,
             session = opts.session or "agent",
             text = text,
-        })
+        }
+        if opts.wait then
+            local result = remote_request(self, command, 4000)
+            if result.error then
+                error(string.format("Hub:notify remote error: %s", result.error))
+            end
+            return result.result or { status = "delivered" }
+        end
+        remote_enqueue(self, command)
         return { status = "queued" }
     end
 
@@ -606,8 +614,14 @@ function Hub:post(agent_id, opts)
         -- Build envelope — hub injects msg_id and timestamps
         local envelope = build_envelope(self.id, opts.from_agent_id or "unknown", opts)
 
-        -- Write to inbox directly
+        -- Write to inbox directly. Same msg_id is a no-op so retries cannot
+        -- double-deliver one pipeline prompt.
         agent._inbox = agent._inbox or {}
+        for _, existing in ipairs(agent._inbox) do
+            if existing.msg_id and existing.msg_id == envelope.msg_id then
+                return { msg_id = envelope.msg_id, status = "duplicate" }
+            end
+        end
         table.insert(agent._inbox, envelope)
 
         -- PTY doorbell — minimal trigger line only, payload stays in inbox
@@ -629,7 +643,7 @@ function Hub:post(agent_id, opts)
 
     if self._is_worker_parent then
         local msg_id = opts.msg_id or generate_msg_id()
-        remote_enqueue(self, {
+        local command = {
             type          = "post_message",
             msg_id        = msg_id,
             agent_id      = agent_id,
@@ -640,7 +654,17 @@ function Hub:post(agent_id, opts)
             session       = opts.session or "agent",
             from_hub_id   = self_id,
             from_agent_id = opts.from_agent_id or "unknown",
-        })
+        }
+        -- Pipeline prompt delivery waits for the parent inbox write. A queued
+        -- ack is not delivery; wait stays under the 5000 ms hook deadline.
+        if opts.wait then
+            local result = remote_request(self, command, 4000)
+            if result.error then
+                error(string.format("Hub:post remote error: %s", result.error))
+            end
+            return result.result or { msg_id = msg_id, status = "delivered" }
+        end
+        remote_enqueue(self, command)
         return { msg_id = msg_id, status = "queued" }
     end
 

@@ -2048,6 +2048,7 @@ function M.create_run_step_visit(run_id, step_id, attrs)
         sequence = attrs.sequence or M.next_run_step_sequence(run_id),
         status = attrs.status or "active",
         agent_session_uuid = attrs.agent_session_uuid,
+        agent_request_id = attrs.agent_request_id,
         started_at = attrs.started_at or now,
         completed_at = attrs.completed_at,
         created_at = now,
@@ -2067,6 +2068,194 @@ function M.latest_step_session(run_id, step_id)
                    WHERE run_id = ? AND step_id = ? AND agent_session_uuid IS NOT NULL AND agent_session_uuid != ''
                    ORDER BY COALESCE(sequence, 0) DESC, created_at DESC, id DESC
                    LIMIT 1]], run_id, step_id)
+end
+
+local AGENT_NOTIFICATION_LIMIT = 50
+
+function M.agent_notification_delivery_key(run_step_id, kind)
+    return tostring(run_step_id or "") .. ":" .. tostring(kind or "step_prompt")
+end
+
+function M.get_agent_notification_by_key(delivery_key)
+    if util.is_blank(delivery_key) then
+        return nil
+    end
+    return first("SELECT * FROM agent_notifications WHERE delivery_key = ? LIMIT 1", delivery_key)
+end
+
+function M.upsert_agent_notification(attrs)
+    attrs = attrs or {}
+    util.assert_present(attrs.run_id, "run_id")
+    util.assert_present(attrs.run_step_id, "run_step_id")
+    util.assert_present(attrs.step_id, "step_id")
+    local kind = attrs.kind or "step_prompt"
+    local delivery_key = attrs.delivery_key or M.agent_notification_delivery_key(attrs.run_step_id, kind)
+    local existing = M.get_agent_notification_by_key(delivery_key)
+    local now = util.now()
+    if existing and existing.status == "delivered" and attrs.status == "pending" and attrs.force ~= true then
+        return existing
+    end
+    if existing then
+        local set = {
+            session_uuid = attrs.session_uuid or existing.session_uuid,
+            request_id = attrs.request_id or existing.request_id,
+            kind = kind,
+            status = attrs.status or existing.status or "pending",
+            title = attrs.title or existing.title,
+            body = attrs.body or existing.body,
+            instructions = attrs.instructions or existing.instructions,
+            msg_id = attrs.msg_id or existing.msg_id,
+            last_error = attrs.last_error,
+            attempt_count = attrs.attempt_count or existing.attempt_count,
+            updated_at = now,
+            delivered_at = attrs.delivered_at or existing.delivered_at,
+        }
+        db.agent_notifications:update{ where = { id = existing.id }, set = set }
+        return M.get_agent_notification_by_key(delivery_key)
+    end
+    local row = {
+        id = attrs.id or util.id("agent_note"),
+        delivery_key = delivery_key,
+        run_id = attrs.run_id,
+        run_step_id = attrs.run_step_id,
+        ticket_id = attrs.ticket_id,
+        step_id = attrs.step_id,
+        session_uuid = attrs.session_uuid,
+        request_id = attrs.request_id,
+        kind = kind,
+        status = attrs.status or "pending",
+        title = attrs.title,
+        body = attrs.body,
+        instructions = attrs.instructions,
+        msg_id = attrs.msg_id,
+        last_error = attrs.last_error,
+        attempt_count = attrs.attempt_count or 0,
+        created_at = now,
+        updated_at = now,
+        delivered_at = attrs.delivered_at,
+    }
+    db.agent_notifications:insert(row)
+    return row
+end
+
+function M.mark_agent_notification_delivered(delivery_key_or_id)
+    local row = M.get_agent_notification_by_key(delivery_key_or_id)
+        or db.agent_notifications:where{ id = delivery_key_or_id }
+    if not row then
+        return nil
+    end
+    local now = util.now()
+    db.agent_notifications:update{
+        where = { id = row.id },
+        set = {
+            status = "delivered",
+            last_error = nil,
+            updated_at = now,
+            delivered_at = now,
+        },
+    }
+    return db.agent_notifications:where{ id = row.id }
+end
+
+function M.pending_agent_notifications(limit)
+    local cap = math.max(1, math.min(math.floor(tonumber(limit) or AGENT_NOTIFICATION_LIMIT), AGENT_NOTIFICATION_LIMIT))
+    -- Spawn ledger rows stay `pending` until the visit links. They must not
+    -- fill this LIMIT-50 retry window or step_prompt rows never retry.
+    return rows([[SELECT * FROM agent_notifications
+                  WHERE status = 'pending'
+                    AND kind = 'step_prompt'
+                  ORDER BY created_at ASC, id ASC
+                  LIMIT ?]], cap)
+end
+
+function M.unrouted_active_agent_visits(limit)
+    local cap = math.max(1, math.min(math.floor(tonumber(limit) or AGENT_NOTIFICATION_LIMIT), AGENT_NOTIFICATION_LIMIT))
+    return rows([[SELECT rs.*
+                  FROM run_steps rs
+                  JOIN runs r ON r.current_run_step_id = rs.id
+                  JOIN pipeline_steps ps ON ps.id = rs.step_id
+                  WHERE r.status IN ('active', 'blocked')
+                    AND rs.status = 'active'
+                    AND ps.kind = 'agent'
+                    AND (rs.agent_session_uuid IS NULL OR rs.agent_session_uuid = '')
+                    AND (rs.agent_request_id IS NULL OR rs.agent_request_id = '')
+                  ORDER BY rs.created_at ASC, rs.id ASC
+                  LIMIT ?]], cap)
+end
+
+function M.unlinked_spawn_visits(limit)
+    local cap = math.max(1, math.min(math.floor(tonumber(limit) or AGENT_NOTIFICATION_LIMIT), AGENT_NOTIFICATION_LIMIT))
+    return rows([[SELECT rs.*
+                  FROM run_steps rs
+                  JOIN runs r ON r.current_run_step_id = rs.id
+                  JOIN pipeline_steps ps ON ps.id = rs.step_id
+                  WHERE r.status IN ('active', 'blocked')
+                    AND rs.status = 'active'
+                    AND ps.kind = 'agent'
+                    AND (rs.agent_session_uuid IS NULL OR rs.agent_session_uuid = '')
+                    AND rs.agent_request_id IS NOT NULL
+                    AND rs.agent_request_id != ''
+                  ORDER BY rs.created_at ASC, rs.id ASC
+                  LIMIT ?]], cap)
+end
+
+function M.transition_run_step(spec)
+    spec = spec or {}
+    util.assert_present(spec.run_id, "run_id")
+    util.assert_present(spec.target_step_id, "target_step_id")
+    return with_transaction(function()
+        local now = util.now()
+        if spec.complete_visit_id then
+            M.update_run_step_visit(spec.complete_visit_id, { status = "done", completed_at = now })
+            M.append_event("step.completed", {
+                run_id = spec.run_id,
+                ticket_id = spec.ticket_id,
+                payload = spec.completed_payload or {
+                    step_id = spec.complete_step_id,
+                    run_step_id = spec.complete_visit_id,
+                },
+            })
+        elseif spec.complete_step_id then
+            M.update_run_step(spec.run_id, spec.complete_step_id, { status = "done", completed_at = now })
+            M.append_event("step.completed", {
+                run_id = spec.run_id,
+                ticket_id = spec.ticket_id,
+                payload = spec.completed_payload or { step_id = spec.complete_step_id },
+            })
+        end
+        local visit = M.create_run_step_visit(spec.run_id, spec.target_step_id, {
+            status = "active",
+            started_at = now,
+            agent_session_uuid = spec.agent_session_uuid,
+            agent_request_id = spec.agent_request_id,
+        })
+        local run = M.update_run(spec.run_id, {
+            status = "active",
+            current_step_id = spec.target_step_id,
+            current_run_step_id = visit.id,
+        })
+        local activation_payload = spec.activation_payload or {}
+        activation_payload.step_id = spec.target_step_id
+        activation_payload.run_step_id = visit.id
+        activation_payload.sequence = visit.sequence
+        activation_payload.agent_session_uuid = spec.agent_session_uuid
+        activation_payload.agent_request_id = spec.agent_request_id
+        M.append_event("step.activated", {
+            run_id = spec.run_id,
+            ticket_id = spec.ticket_id,
+            payload = activation_payload,
+        })
+        local notification = nil
+        if spec.notification then
+            spec.notification.run_id = spec.run_id
+            spec.notification.run_step_id = visit.id
+            spec.notification.step_id = spec.target_step_id
+            spec.notification.msg_id = spec.notification.msg_id
+                or ("msg_pipeline_" .. tostring(visit.id) .. "_step_prompt")
+            notification = M.upsert_agent_notification(spec.notification)
+        end
+        return { visit = visit, run = run, notification = notification }
+    end)
 end
 
 function M.latest_review_for_run_step(run_step_id)

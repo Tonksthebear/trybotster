@@ -99,6 +99,7 @@ if hooks and hooks.on then
         if not ok then
             log.warn("[project-pipelines] agent_created handler failed: " .. tostring(err))
         end
+        pcall(engine.reconcile_pending_agent_notifications)
     end)
     hooks.on("agent_lifecycle", "project_pipelines.agent_lifecycle", function(info)
         local ok, err = pcall(engine.handle_agent_lifecycle, info)
@@ -108,7 +109,20 @@ if hooks and hooks.on then
     end)
 end
 
-pcall(engine.reconcile_agent_sessions)
+pcall(function()
+    engine.reconcile_agent_sessions({ full = true })
+end)
+
+if timer and type(timer.every) == "function" then
+    -- Retry pending prompts after a parent write timeout without waiting for
+    -- reload. 30 s is longer than the 5 s hook and shorter than operator wait.
+    if _G.__project_pipelines_notify_timer and type(timer.cancel) == "function" then
+        pcall(timer.cancel, _G.__project_pipelines_notify_timer)
+    end
+    _G.__project_pipelines_notify_timer = timer.every(30, function()
+        pcall(engine.reconcile_agent_sessions)
+    end)
+end
 
 log.info("[project-pipelines] loaded")
 

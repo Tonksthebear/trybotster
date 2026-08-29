@@ -435,6 +435,63 @@ fn execute_fn_rolls_back_on_error() {
 }
 
 #[test]
+fn timed_out_transaction_rolls_back_and_connection_remains_usable() {
+    let _lock = lock_env();
+    let tmp = TempDir::new().unwrap();
+    set_config_dir(tmp.path());
+    let lua = new_test_lua();
+    botster::lua::primitives::hook_timeout::register(&lua).expect("register hook timeout");
+    set_loading_plugin(&lua, "timeout-tx");
+
+    let (timed_out, rolled_back, later_begin_ok): (bool, bool, bool) = lua
+        .load(
+            r#"
+            local db = plugin.db{
+                memory = true,
+                version = 1,
+                models = {
+                    counters = {
+                        id = true,
+                        name = { 'text', required = true },
+                    },
+                },
+            }
+
+            local ok = __hook_timed_pcall(function()
+                db:execute(function(self)
+                    self.counters:insert{ name = 'should_rollback' }
+                    while true do end
+                end)
+            end, 40)
+
+            local rows = db.counters:get{}
+            local later_ok = pcall(function()
+                db:execute(function(self)
+                    self.counters:insert{ name = 'after_timeout' }
+                end)
+            end)
+            local after = db.counters:get{}
+            local later_begin_ok = later_ok
+                and #after == 1
+                and after[1].name == 'after_timeout'
+            return not ok, #rows == 0, later_begin_ok
+            "#,
+        )
+        .eval()
+        .expect("timeout during db:execute(fn) must roll back");
+
+    assert!(timed_out, "the inner loop must exceed the hook deadline");
+    assert!(
+        rolled_back,
+        "hook timeout inside db:execute(fn) must ROLLBACK"
+    );
+    assert!(
+        later_begin_ok,
+        "BEGIN after a timed-out transaction must succeed"
+    );
+}
+
+#[test]
 fn failed_table_write_rolls_back_and_connection_remains_usable() {
     let _lock = lock_env();
     let tmp = TempDir::new().unwrap();
@@ -577,7 +634,10 @@ fn failed_transaction_commit_rolls_back_and_connection_remains_usable() {
         .eval()
         .expect("recover after failed transaction commit");
 
-    assert!(commit_failed, "the deferred foreign key must reject the commit");
+    assert!(
+        commit_failed,
+        "the deferred foreign key must reject the commit"
+    );
     assert!(
         later_transaction_works,
         "a failed commit must not leave an open transaction"
@@ -620,7 +680,10 @@ fn nested_table_update_insert_uses_the_outer_transaction() {
         .eval()
         .expect("nested update insert");
 
-    assert!(update_worked, "the update fallback must support a nested insert");
+    assert!(
+        update_worked,
+        "the update fallback must support a nested insert"
+    );
     assert_eq!(row_name, "created by update");
 }
 
@@ -1669,4 +1732,151 @@ fn adding_required_column_without_default_errors_clearly() {
         msg.contains("cannot add required column") && msg.contains("b") && msg.contains("default"),
         "required-without-default message missing expected content: {msg}"
     );
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_db_v12_upgrade_from_seeded_v11() {
+    let _lock = lock_env();
+    let tmp = TempDir::new().unwrap();
+    set_config_dir(tmp.path());
+    let lua = new_test_lua();
+    set_loading_plugin(&lua, "project-pipelines");
+
+    let plugin_dir = cli_manifest_dir()
+        .parent()
+        .expect("cli parent")
+        .join("catalog/templates/plugins/project-pipelines");
+    let plugin_path = plugin_dir.display();
+
+    lua.load(format!(
+        r#"
+        package.path = "{plugin_path}/?.lua;{plugin_path}/?/init.lua;" .. package.path
+        local seed = plugin.db{{
+          version = 11,
+          models = {{
+            run_steps = {{
+              id = {{ "text", required = true, primary = true }},
+              run_id = {{ "text", required = true }},
+              step_id = {{ "text", required = true }},
+              status = {{ "text", required = true }},
+              agent_session_uuid = {{ "text" }},
+              created_at = {{ "integer", required = true }},
+              updated_at = {{ "integer", required = true }},
+            }},
+          }},
+        }}
+        assert(seed:eval("PRAGMA user_version")[1].user_version == 11)
+        local cols = seed:eval("PRAGMA table_info(run_steps)")
+        for _, col in ipairs(cols) do
+          assert(col.name ~= "agent_request_id")
+        end
+        local tables = seed:eval("SELECT name FROM sqlite_master WHERE type='table' AND name='agent_notifications'")
+        assert(type(tables) ~= "table" or #tables == 0)
+        require("lib.plugin_db")._reset_for_tests()
+        require("lib.plugin_db").install()
+        package.loaded["project_pipelines.db"] = nil
+        local db = require("project_pipelines.db")
+        assert(db:eval("PRAGMA user_version")[1].user_version == 12)
+        local found_request = false
+        for _, col in ipairs(db:eval("PRAGMA table_info(run_steps)")) do
+          if col.name == "agent_request_id" then found_request = true end
+        end
+        assert(found_request)
+        local notes = db:eval("SELECT name FROM sqlite_master WHERE type='table' AND name='agent_notifications'")
+        assert(type(notes) == "table" and #notes == 1)
+        db.agent_notifications:insert{{
+          id = "note-1",
+          delivery_key = "visit-1:step_prompt",
+          run_id = "run-1",
+          run_step_id = "visit-1",
+          step_id = "implement",
+          kind = "step_prompt",
+          status = "pending",
+          created_at = 1,
+          updated_at = 1,
+        }}
+        local ok, err = pcall(function()
+          db.agent_notifications:insert{{
+            id = "note-2",
+            delivery_key = "visit-1:step_prompt",
+            run_id = "run-1",
+            run_step_id = "visit-1",
+            step_id = "implement",
+            kind = "step_prompt",
+            status = "pending",
+            created_at = 1,
+            updated_at = 1,
+          }}
+        end)
+        assert(ok == false)
+        assert(tostring(err):lower():find("unique", 1, true) or tostring(err):lower():find("constraint", 1, true))
+        return "ok"
+        "#,
+        plugin_path = plugin_path
+    ))
+    .eval::<String>()
+    .expect("v11 Project Pipelines databases should upgrade to v12");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_pending_notifications_skip_spawn_rows() {
+    let _lock = lock_env();
+    let tmp = TempDir::new().unwrap();
+    set_config_dir(tmp.path());
+    let lua = new_test_lua();
+    set_loading_plugin(&lua, "project-pipelines");
+
+    let plugin_dir = cli_manifest_dir()
+        .parent()
+        .expect("cli parent")
+        .join("catalog/templates/plugins/project-pipelines");
+    let plugin_path = plugin_dir.display();
+
+    lua.load(format!(
+        r#"
+        package.path = "{plugin_path}/?.lua;{plugin_path}/?/init.lua;" .. package.path
+        package.loaded["project_pipelines.entities"] = {{
+          register = function() end,
+          publish_snapshots = function() end,
+          publish = function() end,
+        }}
+        local db = require("project_pipelines.db")
+        for i = 1, 51 do
+          db.agent_notifications:insert{{
+            id = "spawn-" .. i,
+            delivery_key = "visit-" .. i .. ":spawn",
+            run_id = "run-1",
+            run_step_id = "visit-" .. i,
+            step_id = "implement",
+            kind = "spawn",
+            status = "pending",
+            attempt_count = 1,
+            created_at = i,
+            updated_at = i,
+          }}
+        end
+        db.agent_notifications:insert{{
+          id = "prompt-1",
+          delivery_key = "visit-step:step_prompt",
+          run_id = "run-1",
+          run_step_id = "visit-step",
+          step_id = "implement",
+          session_uuid = "sess-impl",
+          kind = "step_prompt",
+          status = "pending",
+          attempt_count = 0,
+          created_at = 100,
+          updated_at = 100,
+        }}
+        local repo = require("project_pipelines.repo")
+        local pending = repo.pending_agent_notifications()
+        assert(#pending == 1, "spawn rows must not fill the pending retry window")
+        assert(pending[1].kind == "step_prompt")
+        assert(pending[1].id == "prompt-1")
+        return "ok"
+        "#,
+        plugin_path = plugin_path
+    ))
+    .eval::<String>()
+    .expect("pending_agent_notifications must ignore spawn ledger rows");
 }

@@ -29,6 +29,22 @@ local sqlite_db_class = require("sqlite.db")
 local sqlite_defs = require("sqlite.defs")
 local hub_state = require("hub.state")
 
+-- One C sqlite3_exec for ROLLBACK. After a hook timeout, Lua wrapping around
+-- class execute can exceed INSTRUCTIONS_PER_CHECK and raise again before the
+-- cleanup grace window finishes. exec_stmt burns no Lua instructions inside C.
+local function rollback_conn(conn_ptr)
+    if conn_ptr == nil then
+        error("plugin.db: ROLLBACK failed: missing connection", 0)
+    end
+    local code = sqlite_defs.exec_stmt(conn_ptr, "ROLLBACK")
+    if code ~= sqlite_defs.flags.ok then
+        error(string.format(
+            "plugin.db: ROLLBACK failed: %s",
+            sqlite_defs.last_errmsg(conn_ptr)
+        ), 0)
+    end
+end
+
 -- Patch `sqlite.defs.wrap_stmts` once at module load. Upstream's implementation
 -- wraps its callback in bare BEGIN/COMMIT without checking either statement or
 -- rolling back after a callback error. A failed statement can therefore leave
@@ -74,7 +90,7 @@ if not rawget(sqlite_defs, "__plugin_db_wrap_patched") then
         local results = table.pack(pcall(fn))
         if not results[1] then
             local callback_error = results[2]
-            local rollback_ok, rollback_error = pcall(execute_control, "ROLLBACK")
+            local rollback_ok, rollback_error = pcall(rollback_conn, conn_ptr)
             if not rollback_ok then
                 error(string.format(
                     "%s; rollback also failed: %s",
@@ -87,7 +103,7 @@ if not rawget(sqlite_defs, "__plugin_db_wrap_patched") then
 
         local commit_ok, commit_error = pcall(execute_control, "COMMIT")
         if not commit_ok then
-            local rollback_ok, rollback_error = pcall(execute_control, "ROLLBACK")
+            local rollback_ok, rollback_error = pcall(rollback_conn, conn_ptr)
             if not rollback_ok then
                 error(string.format(
                     "%s; rollback also failed: %s",
@@ -453,7 +469,7 @@ local function run_migrations(db, plugin_name, spec, current, target)
         USER_TX_SET[ptr_key] = nil
 
         if not ok then
-            pcall(function() db:eval("ROLLBACK") end)
+            pcall(rollback_conn, db.conn)
             error(string.format(
                 "plugin.db: plugin '%s' migration %d (v%d -> v%d) failed: %s\nTransaction rolled back. Database remains at v%d.\nFix the migration function and reload the plugin.",
                 plugin_name, i, i - 1, i, tostring(err), i - 1
@@ -547,7 +563,7 @@ local function wrap_db(raw_db, spec)
                 local commit_ok, commit_error = pcall(class_execute, self, "COMMIT")
                 USER_TX_SET[ptr_key] = nil
                 if not commit_ok then
-                    local rollback_ok, rollback_error = pcall(class_execute, self, "ROLLBACK")
+                    local rollback_ok, rollback_error = pcall(rollback_conn, self.conn)
                     if not rollback_ok then
                         error(string.format(
                             "%s; rollback also failed: %s",
@@ -561,7 +577,7 @@ local function wrap_db(raw_db, spec)
             end
 
             local callback_error = results[2]
-            local rollback_ok, rollback_error = pcall(class_execute, self, "ROLLBACK")
+            local rollback_ok, rollback_error = pcall(rollback_conn, self.conn)
             USER_TX_SET[ptr_key] = nil
             if not rollback_ok then
                 error(string.format(

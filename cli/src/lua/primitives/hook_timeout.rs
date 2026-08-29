@@ -32,6 +32,16 @@
 //! The `jit` table does not exist on PUC Lua, so the toggle is a no-op
 //! there.
 //!
+//! # Timeout cleanup
+//!
+//! The first deadline raise is a Lua error that `pcall` can catch. Plugin
+//! `db:execute(fn)` does that, then issues `ROLLBACK`. The VM hook stays
+//! armed until the outer `__hook_timed_pcall` returns, so a second raise
+//! would abort rollback and leave SQLite inside an open transaction.
+//! After the first raise, the same frame allows a short cleanup window
+//! (`CLEANUP_GRACE`) before it raises again. The 5000 ms plugin-worker
+//! budget is unchanged.
+//!
 //! # Limitations
 //!
 //! The watchdog fires only on Lua VM instruction boundaries. A callback
@@ -55,11 +65,28 @@ use mlua::{Function, HookTriggers, IntoLuaMulti, Lua, MultiValue, Value, VmState
 /// adding negligible overhead to fast-path hooks.
 const INSTRUCTIONS_PER_CHECK: u32 = 10_000;
 
+/// Wall time Lua `pcall` error handlers may run after the first timeout raise.
+///
+/// 250 ms covers a local SQLite `ROLLBACK` plus more than
+/// [`INSTRUCTIONS_PER_CHECK`] Lua cleanup instructions. Raising the plugin
+/// worker hook timeout (5000 ms) is out of scope; this window is only for
+/// cleanup after the original deadline already fired.
+const CLEANUP_GRACE: Duration = Duration::from_millis(250);
+
+/// One `__hook_timed_pcall` frame on this thread.
+struct DeadlineFrame {
+    deadline: Instant,
+    timeout_ms: u64,
+    /// Set on the first timeout raise. Later hook fires `Continue` until
+    /// this instant, then raise again if cleanup itself hangs.
+    cleanup_until: Option<Instant>,
+}
+
 thread_local! {
-    /// Stack of (deadline, timeout_ms) entries — one per active `hook_timed_pcall`
-    /// frame on this thread. The VM hook reads `last()` to find the current
+    /// Stack of deadline frames — one per active `hook_timed_pcall` frame
+    /// on this thread. The VM hook reads `last()` to find the current
     /// (innermost) deadline. Nested frames share the same installed hook.
-    static DEADLINE_STACK: RefCell<Vec<(Instant, u64)>> = const { RefCell::new(Vec::new()) };
+    static DEADLINE_STACK: RefCell<Vec<DeadlineFrame>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Register `__hook_timed_pcall` as a Lua global.
@@ -96,7 +123,11 @@ fn hook_timed_pcall(
     let was_outermost = DEADLINE_STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
         let empty = stack.is_empty();
-        stack.push((deadline, timeout_ms));
+        stack.push(DeadlineFrame {
+            deadline,
+            timeout_ms,
+            cleanup_until: None,
+        });
         empty
     });
 
@@ -104,15 +135,27 @@ fn hook_timed_pcall(
         let triggers = HookTriggers::new().every_nth_instruction(INSTRUCTIONS_PER_CHECK);
         lua.set_hook(triggers, |_lua, _debug| {
             DEADLINE_STACK.with(|stack| {
-                let stack = stack.borrow();
-                if let Some(&(deadline, timeout_ms)) = stack.last() {
-                    if Instant::now() > deadline {
+                let mut stack = stack.borrow_mut();
+                let Some(frame) = stack.last_mut() else {
+                    return Ok(VmState::Continue);
+                };
+                let now = Instant::now();
+                if now <= frame.deadline {
+                    return Ok(VmState::Continue);
+                }
+                let timeout_ms = frame.timeout_ms;
+                if let Some(cleanup_until) = frame.cleanup_until {
+                    if now > cleanup_until {
                         return Err(mlua::Error::RuntimeError(format!(
                             "hook timeout: {timeout_ms}ms exceeded"
                         )));
                     }
+                    return Ok(VmState::Continue);
                 }
-                Ok(VmState::Continue)
+                frame.cleanup_until = Some(now + CLEANUP_GRACE);
+                Err(mlua::Error::RuntimeError(format!(
+                    "hook timeout: {timeout_ms}ms exceeded"
+                )))
             })
         });
     }
@@ -313,5 +356,43 @@ mod tests {
             !ok,
             "deadline hook must fire inside a JIT-compiled trace (or a no-op on PUC Lua)"
         );
+    }
+
+    /// After the first timeout raise, `pcall` cleanup that burns more than
+    /// [`INSTRUCTIONS_PER_CHECK`] instructions must finish. Plugin
+    /// `db:execute(fn)` relies on this so SQLite `ROLLBACK` is not aborted
+    /// by a second timeout raise.
+    #[test]
+    fn pcall_cleanup_after_timeout_completes_past_instruction_check() {
+        let lua = Lua::new();
+        register(&lua).expect("register primitive");
+
+        let (ok, result): (bool, i64) = lua
+            .load(
+                r#"
+                return __hook_timed_pcall(function()
+                    local inner_ok = pcall(function()
+                        while true do end
+                    end)
+                    assert(not inner_ok, "inner loop should time out")
+                    local n = 0
+                    for i = 1, 50000 do
+                        n = n + (i % 7)
+                    end
+                    return n
+                end, 30)
+            "#,
+            )
+            .eval()
+            .expect("timed pcall returns after cleanup");
+
+        assert!(ok, "pcall cleanup after timeout must complete");
+        assert!(result > 0, "cleanup loop must run to completion");
+        DEADLINE_STACK.with(|stack| {
+            assert!(
+                stack.borrow().is_empty(),
+                "deadline stack must be empty after cleanup returns"
+            );
+        });
     }
 }

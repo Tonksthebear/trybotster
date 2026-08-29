@@ -28,6 +28,13 @@ The plugin is intentionally split across modules:
 - `project_pipelines/web/ui.lua` contains shared UI helpers.
 - `project_pipelines/util.lua` contains shared helpers.
 
+## Agent Routing
+
+Step activation looks up one existing session by UUID, or stores a spawn
+`request_id`, before the target visit becomes current. Agent prompt delivery is
+a pending notification that reload and restart can retry. A hook timeout must
+not leave an active visit without a session UUID or request id.
+
 ## Concepts
 
 - Ticket: durable work item.

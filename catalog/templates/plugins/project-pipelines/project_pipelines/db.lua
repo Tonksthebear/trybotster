@@ -13,7 +13,7 @@
 local db = plugin.db{
     -- Dogfood DBs already sit at user_version 11 (prior local install drift).
     -- Catalog must not declare below that; plugin.db refuses downgrades.
-    version = 11,
+    version = 12,
     migrations = {
         -- v9: drop the denormalized target_path columns. target_path is now
         -- fully derived from target_id at point of use. Guarded so it is a
@@ -59,6 +59,11 @@ local db = plugin.db{
         end,
         -- v11: no schema change. Matches dogfood user_version already at 11.
         [11] = function(_migration_db)
+        end,
+        -- v12: exact agent-route recovery. Additive reconcile also creates
+        -- `agent_notifications` and nullable `run_steps.agent_request_id`.
+        -- This step only records the version for seeded upgrades.
+        [12] = function(_migration_db)
         end,
     },
     models = {
@@ -156,6 +161,7 @@ local db = plugin.db{
             sequence = { "integer" },
             status = { "text", required = true },
             agent_session_uuid = { "text" },
+            agent_request_id = { "text" },
             started_at = { "integer" },
             completed_at = { "integer" },
             created_at = { "integer", required = true },
@@ -275,6 +281,29 @@ local db = plugin.db{
             updated_at = { "integer", required = true },
             merged_at = { "integer" },
         },
+        -- Pending/delivered agent prompt notices. Nullable new columns on
+        -- existing tables cannot carry UNIQUE; this new table can.
+        agent_notifications = {
+            id = { "text", required = true, primary = true },
+            delivery_key = { "text", required = true },
+            run_id = { "text", required = true },
+            run_step_id = { "text", required = true },
+            ticket_id = { "text" },
+            step_id = { "text", required = true },
+            session_uuid = { "text" },
+            request_id = { "text" },
+            kind = { "text", required = true },
+            status = { "text", required = true },
+            title = { "text" },
+            body = { "text" },
+            instructions = { "text" },
+            msg_id = { "text" },
+            last_error = { "text" },
+            attempt_count = { "integer" },
+            created_at = { "integer", required = true },
+            updated_at = { "integer", required = true },
+            delivered_at = { "integer" },
+        },
         events = {
             id = { "text", required = true, primary = true },
             run_id = { "text" },
@@ -301,6 +330,10 @@ local indexes = {
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_run_steps_run ON run_steps(run_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_run_steps_run_sequence ON run_steps(run_id, sequence)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_run_steps_session ON run_steps(agent_session_uuid, status)",
+    "CREATE INDEX IF NOT EXISTS idx_project_pipelines_run_steps_request ON run_steps(agent_request_id, status)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_project_pipelines_agent_notifications_delivery_key ON agent_notifications(delivery_key)",
+    "CREATE INDEX IF NOT EXISTS idx_project_pipelines_agent_notifications_status ON agent_notifications(status, updated_at)",
+    "CREATE INDEX IF NOT EXISTS idx_project_pipelines_agent_notifications_run_step ON agent_notifications(run_step_id, status)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_gate_results_run_gate ON gate_results(run_id, gate_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_gate_results_run_step ON gate_results(run_step_id, gate_id, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_project_pipelines_gate_results_run_step_created ON gate_results(run_step_id, created_at)",

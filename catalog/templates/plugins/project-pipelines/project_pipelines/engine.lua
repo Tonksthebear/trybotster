@@ -420,6 +420,290 @@ local function dependency_block(run, attrs)
     }
 end
 
+local function step_agent_request_id(run, step)
+    return string.format("%s:%s:%s:agent", OWNER, run.id, step.id)
+end
+
+local function role_prompt_for(run, step, opts)
+    opts = opts or {}
+    local ticket = repo.get_ticket(run.ticket_id)
+    local role_prompt = table.concat({
+        "You are running a Botster project pipeline step.",
+        "Pipeline step: " .. step.name .. " (" .. step.id .. ")",
+        "Ticket: " .. (ticket and ticket.title or run.ticket_id),
+        "Role instructions: " .. (step.prompt or ""),
+        "Use the project_pipelines_current_context MCP tool to inspect ticket, run, gates, reviews, artifacts, findings, questions, and question answers.",
+        "Use Project Pipelines checklists to prove workflow discipline. Vault checklists should record which vault/project notes constrained the work, convention conflicts or none, verification evidence, and whether durable knowledge was captured.",
+        "State assumptions explicitly in artifacts/reviews. If the ticket has multiple plausible meanings or you would need to ignore/waive part of it, ask a human question instead of choosing silently.",
+        "Prefer the smallest surgical change that satisfies the ticket intent. Do not add speculative abstractions, optional configurability, broad refactors, or adjacent cleanup unless the ticket requires them.",
+        "Define and preserve verifiable success criteria. Every changed line should trace to the ticket intent, a required convention, or cleanup made necessary by your own change.",
+        "Prove the actual runtime or user path changed. Evidence that code exists is not enough; identify where the production entry point uses the new behavior, or document why the ticket is intentionally scaffold-only.",
+        "If you need human help, call project_pipelines_ask_human with a concise blocking question, then wait for a Project Pipelines notification and call project_pipelines_receive_question_answers.",
+        "If you need another agent's opinion, call project_pipelines_ask_agent with the specific question and context you want reviewed, then wait for a Project Pipelines notification and call project_pipelines_receive_question_answers.",
+        "When work is ready for advancement, submit the required gate evidence with project_pipelines_submit_gate, then call project_pipelines_request_step_advance.",
+        "If you are reviewing, check correctness, regressions, architecture fit, missing tests, documentation gaps, overcomplication, hidden assumptions, dead code, deprecated code paths, and unwired implementation. Do not accept pre-existing failures as a blanket excuse; require exact evidence that a failure is unrelated or send the work back. Call project_pipelines_submit_review with findings or approval.",
+    }, "\n\n")
+    if not util.is_blank(opts.extra_prompt) then
+        role_prompt = role_prompt .. "\n\n" .. github_forwarded(opts.extra_prompt)
+    end
+    return role_prompt, ticket
+end
+
+-- Resolve the live session or spawn request before the visit becomes active.
+-- A later parent timeout must not create an unassigned current visit.
+local function resolve_agent_route(run, step)
+    local existing = repo.latest_step_session(run.id, step.id)
+    local session_uuid = existing and existing.agent_session_uuid or nil
+    local request_id = step_agent_request_id(run, step)
+    if util.is_blank(session_uuid) then
+        return {
+            reused = false,
+            session_uuid = nil,
+            request_id = request_id,
+        }
+    end
+    local ok, session = pcall(Agent.get, session_uuid)
+    if not ok then
+        return {
+            reused = false,
+            session_uuid = session_uuid,
+            request_id = request_id,
+            lookup_error = tostring(session),
+        }
+    end
+    if session then
+        return {
+            reused = true,
+            session_uuid = session_uuid,
+            request_id = request_id,
+        }
+    end
+    return {
+        reused = false,
+        session_uuid = nil,
+        request_id = request_id,
+    }
+end
+
+local function persist_pending_agent_notification(run, step, visit, route, opts)
+    opts = opts or {}
+    if not route or not route.reused or util.is_blank(route.session_uuid) then
+        return nil
+    end
+    local prompt, ticket = opts.prompt, opts.ticket
+    if not prompt then
+        prompt, ticket = role_prompt_for(run, step, opts)
+    end
+    return repo.upsert_agent_notification{
+        run_id = run.id,
+        run_step_id = visit.id,
+        ticket_id = run.ticket_id,
+        step_id = step.id,
+        session_uuid = route.session_uuid,
+        request_id = route.request_id,
+        kind = "step_prompt",
+        status = "pending",
+        force = opts.force == true,
+        title = opts.notification_title or "Pipeline step returned",
+        body = opts.notification_body or ("Ticket " .. tostring(ticket and ticket.title or run.ticket_id) .. " is back at " .. tostring(step.name) .. "."),
+        instructions = prompt,
+        msg_id = "msg_pipeline_" .. tostring(visit.id) .. "_step_prompt",
+    }
+end
+
+local function accepted_post_status(status)
+    return status == "delivered" or status == "inbox_only" or status == "duplicate"
+end
+
+local function deliver_pending_agent_notification(row, opts)
+    opts = opts or {}
+    if not row or util.is_blank(row.session_uuid) then
+        return nil, "notification has no session_uuid"
+    end
+    if row.status == "delivered" and opts.force ~= true then
+        return row, nil
+    end
+    local ok, posted = pcall(function()
+        local result = Hub.get():post(row.session_uuid, {
+            wait = true,
+            msg_id = row.msg_id,
+            type = "task",
+            from_agent_id = OWNER,
+            from_label = "Project Pipelines",
+            payload = {
+                run_id = row.run_id,
+                ticket_id = row.ticket_id,
+                step_id = row.step_id,
+                instructions = row.instructions,
+            },
+        })
+        if type(result) ~= "table" or not accepted_post_status(result.status) then
+            error("post status " .. tostring(result and result.status))
+        end
+        return result
+    end)
+    if not ok then
+        repo.upsert_agent_notification{
+            delivery_key = row.delivery_key,
+            run_id = row.run_id,
+            run_step_id = row.run_step_id,
+            ticket_id = row.ticket_id,
+            step_id = row.step_id,
+            session_uuid = row.session_uuid,
+            request_id = row.request_id,
+            kind = row.kind or "step_prompt",
+            status = "pending",
+            title = row.title,
+            body = row.body,
+            instructions = row.instructions,
+            msg_id = row.msg_id,
+            last_error = tostring(posted),
+            attempt_count = (tonumber(row.attempt_count) or 0) + 1,
+        }
+        repo.append_event("step.agent_prompted", {
+            run_id = row.run_id,
+            ticket_id = row.ticket_id,
+            payload = {
+                step_id = row.step_id,
+                run_step_id = row.run_step_id,
+                session_uuid = row.session_uuid,
+                delivered = false,
+                error = tostring(posted),
+                source_event = opts.source_event,
+            },
+        })
+        return nil, tostring(posted)
+    end
+
+    local session_uuid = row.session_uuid
+    local title = row.title or "Pipeline step returned"
+    local body = row.body
+    row = repo.mark_agent_notification_delivered(row.delivery_key or row.id) or row
+    local notify_ok, notify_err = pcall(function()
+        Hub.get():notify(session_uuid, {
+            wait = true,
+            source = OWNER,
+            title = title,
+            body = body,
+            action = {
+                kind = "mcp_tool",
+                name = "project_pipelines_current_context",
+                params = { run_id = row.run_id },
+            },
+        })
+    end)
+    if not notify_ok then
+        log.warn("[project-pipelines] notify after accepted post failed: " .. tostring(notify_err))
+        repo.upsert_agent_notification{
+            delivery_key = row.delivery_key,
+            run_id = row.run_id,
+            run_step_id = row.run_step_id,
+            ticket_id = row.ticket_id,
+            step_id = row.step_id,
+            session_uuid = row.session_uuid,
+            request_id = row.request_id,
+            kind = row.kind or "step_prompt",
+            status = "delivered",
+            force = true,
+            title = row.title,
+            body = row.body,
+            instructions = row.instructions,
+            msg_id = row.msg_id,
+            last_error = tostring(notify_err),
+            attempt_count = (tonumber(row.attempt_count) or 0) + 1,
+            delivered_at = row.delivered_at or util.now(),
+        }
+    end
+    repo.append_event("step.agent_prompted", {
+        run_id = row.run_id,
+        ticket_id = row.ticket_id,
+        payload = {
+            step_id = row.step_id,
+            run_step_id = row.run_step_id,
+            session_uuid = row.session_uuid,
+            delivered = true,
+            duplicate = posted and posted.status == "duplicate",
+            notify_error = notify_ok and nil or tostring(notify_err),
+            source_event = opts.source_event,
+        },
+    })
+    return row, nil
+end
+
+local function spawn_new_step_agent(run, step, opts, route)
+    opts = opts or {}
+    local prompt, ticket = opts.prompt, opts.ticket
+    if not prompt then
+        prompt, ticket = role_prompt_for(run, step, opts)
+    end
+    local request_id = route and route.request_id or step_agent_request_id(run, step)
+    local ok, created = pcall(function()
+        return Hub.get():create_agent{
+            request_id = request_id,
+            agent_name = step.agent_name,
+            issue_or_branch = agent_branch_for(ticket, run, step),
+            base_ref = run.base_ref,
+            base_target_path = run.base_target_path,
+            target_id = run.target_id,
+            workspace_id = run.workspace_id,
+            workspace_name = run.workspace_name or ticket_workspace_name(ticket, run.id),
+            label = step.name .. " - " .. (ticket and ticket.title or run.id),
+            prompt = prompt,
+            metadata = {
+                owner_plugin = OWNER,
+                visibility = "plugin",
+                surface = SURFACE,
+                ticket_id = run.ticket_id,
+                run_id = run.id,
+                step_id = step.id,
+                run_step_id = opts.visit and opts.visit.id or nil,
+                pipeline_id = run.pipeline_id,
+                base_ticket_id = run.base_ticket_id,
+                base_run_id = run.base_run_id,
+                base_ref = run.base_ref,
+                base_target_path = run.base_target_path,
+                role = step.id,
+            },
+        }
+    end)
+
+    if not ok then
+        return nil, tostring(created)
+    end
+
+    if opts.visit then
+        local spawn_key = repo.agent_notification_delivery_key(opts.visit.id, "spawn")
+        local existing = repo.get_agent_notification_by_key(spawn_key)
+        repo.upsert_agent_notification{
+            delivery_key = spawn_key,
+            run_id = run.id,
+            run_step_id = opts.visit.id,
+            ticket_id = run.ticket_id,
+            step_id = step.id,
+            request_id = request_id,
+            kind = "spawn",
+            status = "pending",
+            force = true,
+            attempt_count = (existing and tonumber(existing.attempt_count) or 0) + 1,
+        }
+    end
+    repo.append_event("step.agent_requested", {
+        run_id = run.id,
+        ticket_id = run.ticket_id,
+        payload = {
+            step_id = step.id,
+            agent_name = step.agent_name,
+            request_id = request_id,
+            status = created and created.status or "queued",
+        },
+    })
+    return {
+        ok = true,
+        request_id = request_id,
+        status = created and created.status or "queued",
+    }, nil
+end
+
 local function spawn_step_agent(run, step, opts)
     opts = opts or {}
     if util.is_blank(step.agent_name) then
@@ -447,119 +731,32 @@ local function spawn_step_agent(run, step, opts)
         end
     end
 
-    local ticket = repo.get_ticket(run.ticket_id)
-    local current_visit = run.current_run_step_id and repo.get_run_step_visit(run.current_run_step_id) or nil
-    local existing = repo.latest_step_session(run.id, step.id)
-    local role_prompt = table.concat({
-        "You are running a Botster project pipeline step.",
-        "Pipeline step: " .. step.name .. " (" .. step.id .. ")",
-        "Ticket: " .. (ticket and ticket.title or run.ticket_id),
-        "Role instructions: " .. (step.prompt or ""),
-        "Use the project_pipelines_current_context MCP tool to inspect ticket, run, gates, reviews, artifacts, findings, questions, and question answers.",
-        "Use Project Pipelines checklists to prove workflow discipline. Vault checklists should record which vault/project notes constrained the work, convention conflicts or none, verification evidence, and whether durable knowledge was captured.",
-        "State assumptions explicitly in artifacts/reviews. If the ticket has multiple plausible meanings or you would need to ignore/waive part of it, ask a human question instead of choosing silently.",
-        "Prefer the smallest surgical change that satisfies the ticket intent. Do not add speculative abstractions, optional configurability, broad refactors, or adjacent cleanup unless the ticket requires them.",
-        "Define and preserve verifiable success criteria. Every changed line should trace to the ticket intent, a required convention, or cleanup made necessary by your own change.",
-        "Prove the actual runtime or user path changed. Evidence that code exists is not enough; identify where the production entry point uses the new behavior, or document why the ticket is intentionally scaffold-only.",
-        "If you need human help, call project_pipelines_ask_human with a concise blocking question, then wait for a Project Pipelines notification and call project_pipelines_receive_question_answers.",
-        "If you need another agent's opinion, call project_pipelines_ask_agent with the specific question and context you want reviewed, then wait for a Project Pipelines notification and call project_pipelines_receive_question_answers.",
-        "When work is ready for advancement, submit the required gate evidence with project_pipelines_submit_gate, then call project_pipelines_request_step_advance.",
-        "If you are reviewing, check correctness, regressions, architecture fit, missing tests, documentation gaps, overcomplication, hidden assumptions, dead code, deprecated code paths, and unwired implementation. Do not accept pre-existing failures as a blanket excuse; require exact evidence that a failure is unrelated or send the work back. Call project_pipelines_submit_review with findings or approval.",
-    }, "\n\n")
-    if not util.is_blank(opts.extra_prompt) then
-        role_prompt = role_prompt .. "\n\n" .. github_forwarded(opts.extra_prompt)
+    local route = opts.route
+    if not route then
+        route = resolve_agent_route(run, step)
     end
-
-    if existing and existing.agent_session_uuid and Agent.get(existing.agent_session_uuid) then
-        local ok, err = pcall(function()
-            Hub.get():post(existing.agent_session_uuid, {
-                type = "task",
-                from_agent_id = OWNER,
-                from_label = "Project Pipelines",
-                payload = {
-                    run_id = run.id,
-                    ticket_id = run.ticket_id,
-                    step_id = step.id,
-                    instructions = role_prompt,
-                },
-            })
-            Hub.get():notify(existing.agent_session_uuid, {
-                source = OWNER,
-                title = opts.notification_title or "Pipeline step returned",
-                body = opts.notification_body or ("Ticket " .. tostring(ticket and ticket.title or run.ticket_id) .. " is back at " .. tostring(step.name) .. "."),
-                action = {
-                    kind = "mcp_tool",
-                    name = "project_pipelines_current_context",
-                    params = { run_id = run.id },
-                },
-            })
-        end)
-        repo.append_event("step.agent_prompted", {
-            run_id = run.id,
-            ticket_id = run.ticket_id,
-            payload = {
-                step_id = step.id,
-                session_uuid = existing.agent_session_uuid,
-                delivered = ok,
-                error = ok and nil or tostring(err),
-                source_event = opts.source_event,
-            },
-        })
-        if current_visit then
-            repo.update_run_step_visit(current_visit.id, { agent_session_uuid = existing.agent_session_uuid })
+    local current_visit = opts.visit
+        or (run.current_run_step_id and repo.get_run_step_visit(run.current_run_step_id))
+        or nil
+    if route.lookup_error then
+        return nil, route.lookup_error
+    end
+    if route.reused then
+        if current_visit and util.is_blank(current_visit.agent_session_uuid) then
+            repo.update_run_step_visit(current_visit.id, { agent_session_uuid = route.session_uuid })
         end
-        return { session_uuid = existing.agent_session_uuid, reused = true }, nil
+        local pending = opts.notification
+        if not pending then
+            pending = persist_pending_agent_notification(run, step, current_visit or { id = run.current_run_step_id }, route, opts)
+        end
+        local delivered, err = deliver_pending_agent_notification(pending, opts)
+        if not delivered then
+            return { session_uuid = route.session_uuid, reused = true, delivered = false, error = err }, nil
+        end
+        return { session_uuid = route.session_uuid, reused = true }, nil
     end
 
-    local request_id = string.format("%s:%s:%s:agent", OWNER, run.id, step.id)
-    local ok, created = pcall(function()
-        return Hub.get():create_agent{
-            request_id = request_id,
-            agent_name = step.agent_name,
-            issue_or_branch = agent_branch_for(ticket, run, step),
-            base_ref = run.base_ref,
-            base_target_path = run.base_target_path,
-            target_id = run.target_id,
-            workspace_id = run.workspace_id,
-            workspace_name = run.workspace_name or ticket_workspace_name(ticket, run.id),
-            label = step.name .. " - " .. (ticket and ticket.title or run.id),
-            prompt = role_prompt,
-            metadata = {
-                owner_plugin = OWNER,
-                visibility = "plugin",
-                surface = SURFACE,
-                ticket_id = run.ticket_id,
-                run_id = run.id,
-                step_id = step.id,
-                pipeline_id = run.pipeline_id,
-                base_ticket_id = run.base_ticket_id,
-                base_run_id = run.base_run_id,
-                base_ref = run.base_ref,
-                base_target_path = run.base_target_path,
-                role = step.id,
-            },
-        }
-    end)
-
-    if not ok then
-        return nil, tostring(created)
-    end
-
-    repo.append_event("step.agent_requested", {
-        run_id = run.id,
-        ticket_id = run.ticket_id,
-        payload = {
-            step_id = step.id,
-            agent_name = step.agent_name,
-            request_id = request_id,
-            status = created and created.status or "queued",
-        },
-    })
-    return {
-        ok = true,
-        request_id = request_id,
-        status = created and created.status or "queued",
-    }, nil
+    return spawn_new_step_agent(run, step, opts, route)
 end
 
 local function live_question_orchestrator(project_id, excluded_session_uuid)
@@ -1627,18 +1824,69 @@ function M.activate_step(run, step, options)
         end
     end
 
-    local now = util.now()
-    local visit = repo.create_run_step_visit(run.id, step.id, { status = "active", started_at = now })
-    repo.update_run(run.id, { status = "active", current_step_id = step.id, current_run_step_id = visit.id })
-    local activation_payload = { step_id = step.id, run_step_id = visit.id, sequence = visit.sequence, kind = step.kind, name = step.name }
+    local route = nil
+    if step.kind == "agent" then
+        if util.is_blank(step.agent_name) then
+            return { ok = false, status = "blocked", error = "step has no agent_name" }
+        end
+        if util.is_blank(run.target_id) then
+            return { ok = false, status = "blocked", error = "target_id is required before spawning agent steps" }
+        end
+        -- Exact session lookup happens before the visit is current so a hook
+        -- timeout cannot leave an unassigned active step.
+        route = resolve_agent_route(run, step)
+        if route.lookup_error then
+            error(route.lookup_error)
+        end
+    end
+
+    local spawn_options = {}
+    for key, value in pairs(options.spawn_options or {}) do
+        spawn_options[key] = value
+    end
+    local notification_spec = nil
+    if route and route.reused then
+        local prompt, ticket = role_prompt_for(run, step, spawn_options)
+        spawn_options.prompt = prompt
+        spawn_options.ticket = ticket
+        notification_spec = {
+            ticket_id = run.ticket_id,
+            session_uuid = route.session_uuid,
+            request_id = route.request_id,
+            kind = "step_prompt",
+            status = "pending",
+            title = spawn_options.notification_title or "Pipeline step returned",
+            body = spawn_options.notification_body or ("Ticket " .. tostring(ticket and ticket.title or run.ticket_id) .. " is back at " .. tostring(step.name) .. "."),
+            instructions = prompt,
+        }
+    end
+
+    local activation_payload = {
+        kind = step.kind,
+        name = step.name,
+    }
     for key, value in pairs(options.activation_payload or {}) do
         activation_payload[key] = value
     end
-    repo.append_event("step.activated", {
+    local committed = repo.transition_run_step{
         run_id = run.id,
         ticket_id = run.ticket_id,
-        payload = activation_payload,
-    })
+        target_step_id = step.id,
+        complete_visit_id = options.complete_source_visit_id,
+        complete_step_id = options.complete_source_step and options.complete_source_step.id or nil,
+        completed_payload = {
+            step_id = options.complete_source_step and options.complete_source_step.id or run.current_step_id,
+            run_step_id = options.complete_source_visit_id,
+            summary = options.summary,
+            evidence = options.evidence or {},
+        },
+        agent_session_uuid = route and route.session_uuid or nil,
+        agent_request_id = route and route.request_id or nil,
+        activation_payload = activation_payload,
+        notification = notification_spec,
+    }
+    local visit = committed.visit
+    spawn_options.notification = committed.notification
     notification_policy.notify_phase_transition({
         run_id = run.id,
         ticket_id = run.ticket_id,
@@ -1655,13 +1903,11 @@ function M.activate_step(run, step, options)
     end
 
     if step.kind == "agent" then
-        local spawn_options = {}
-        for key, value in pairs(options.spawn_options or {}) do
-            spawn_options[key] = value
-        end
         -- Deps already cleared immediately above; do not re-check after side
         -- effects (that path would leave a half-activated target).
         spawn_options.skip_dependency_check = true
+        spawn_options.route = route
+        spawn_options.visit = visit
         local created, err = spawn_step_agent(repo.get_run(run.id), step, spawn_options)
         if err then
             -- Structured dependency blocks should not reach here after the
@@ -2238,28 +2484,16 @@ function M.request_step_advance(params, context)
         })
     end
 
-    local function complete_source_visit()
-        if active_visit_id then
-            repo.update_run_step_visit(active_visit_id, { status = "done", completed_at = util.now() })
-        else
-            repo.update_run_step(run.id, step.id, { status = "done", completed_at = util.now() })
-        end
-        repo.append_event("step.completed", {
-            run_id = run.id,
-            ticket_id = run.ticket_id,
-            payload = {
-                step_id = step.id,
-                run_step_id = active_visit_id,
-                summary = params.summary,
-                evidence = params.evidence or {},
-            },
-        })
-    end
-
-    -- Target activation runs before source completion so a dependency block cannot
-    -- leave the source visit done while the target is refused.
+    -- Target routing is resolved inside activate_step before the visit is
+    -- current. Source completion is part of that same durable transition so a
+    -- later notification timeout cannot leave two active visits.
     if next_step then
-        local activation = M.activate_step(run, next_step)
+        local activation = M.activate_step(run, next_step, {
+            complete_source_visit_id = active_visit_id,
+            complete_source_step = step,
+            summary = params.summary,
+            evidence = params.evidence or {},
+        })
         if activation and activation.ok == false and activation.reason == "ticket_dependencies" then
             return {
                 ok = false,
@@ -2274,7 +2508,6 @@ function M.request_step_advance(params, context)
                 run = repo.get_run(run.id),
             }
         end
-        complete_source_visit()
         if activation and activation.ok == false then
             return {
                 ok = false,
@@ -2296,7 +2529,21 @@ function M.request_step_advance(params, context)
     end
 
     -- Final advance (no target step): complete the run / merge path.
-    complete_source_visit()
+    if active_visit_id then
+        repo.update_run_step_visit(active_visit_id, { status = "done", completed_at = util.now() })
+    else
+        repo.update_run_step(run.id, step.id, { status = "done", completed_at = util.now() })
+    end
+    repo.append_event("step.completed", {
+        run_id = run.id,
+        ticket_id = run.ticket_id,
+        payload = {
+            step_id = step.id,
+            run_step_id = active_visit_id,
+            summary = params.summary,
+            evidence = params.evidence or {},
+        },
+    })
     local activation = M.activate_step(repo.get_run(run.id), nil)
     return {
         ok = true,
@@ -2384,6 +2631,11 @@ function M.retry_step_agent(params, context)
     local prior_session = visit.agent_session_uuid
     local prior_started_at = visit.started_at
 
+    local route = resolve_agent_route(run, step)
+    if route.lookup_error then
+        return { ok = false, status = run.status, run = run, step = step, run_step = visit, error = route.lookup_error }
+    end
+
     repo.update_run(run.id, { status = "active", current_step_id = step.id, current_run_step_id = visit.id })
     repo.update_run_step_visit(visit.id, {
         status = "active",
@@ -2405,6 +2657,9 @@ function M.retry_step_agent(params, context)
     -- half-applied retry state without restoring source fields).
     local created, err = spawn_step_agent(repo.get_run(run.id), step, {
         skip_dependency_check = true,
+        route = route,
+        visit = visit,
+        force = true,
     })
     if err then
         repo.update_run(run.id, { status = "blocked" })
@@ -2538,6 +2793,13 @@ function M.handle_command_gate_completed(data)
     end
 end
 
+local function mark_visit_spawn_delivered(visit_id)
+    if util.is_blank(visit_id) then
+        return
+    end
+    repo.mark_agent_notification_delivered(repo.agent_notification_delivery_key(visit_id, "spawn"))
+end
+
 function M.handle_agent_created(info)
     local metadata = info and info.metadata or {}
     local request_id = info and (info.request_id or metadata.request_id)
@@ -2615,21 +2877,47 @@ function M.handle_agent_created(info)
     end
 
     local run_step = nil
-    if run.current_run_step_id then
-        run_step = repo.get_run_step_visit(run.current_run_step_id)
-    end
-    if not run_step or run_step.step_id ~= step_id then
-        run_step = repo.get_run_step(run_id, step_id)
+    if not util.is_blank(metadata.run_step_id) then
+        run_step = repo.get_run_step_visit(metadata.run_step_id)
+        if not run_step or run_step.run_id ~= run.id then
+            return
+        end
+    else
+        if run.current_run_step_id then
+            run_step = repo.get_run_step_visit(run.current_run_step_id)
+        end
+        if not run_step or run_step.step_id ~= step_id then
+            run_step = repo.get_run_step(run_id, step_id)
+        end
     end
     if not run_step then
         return
     end
+    if not util.is_blank(metadata.run_step_id) then
+        if run_step.id ~= metadata.run_step_id then
+            return
+        end
+    end
     if run_step.agent_session_uuid == session_uuid then
+        mark_visit_spawn_delivered(run_step.id)
         return
+    end
+    if run_step.status == "blocked" then
+        return
+    end
+    if not util.is_blank(run_step.agent_session_uuid) and run_step.agent_session_uuid ~= session_uuid then
+        local live_ok, live = pcall(Agent.get, run_step.agent_session_uuid)
+        if not live_ok then
+            return
+        end
+        if live then
+            return
+        end
     end
 
     if run_step.id then
         repo.update_run_step_visit(run_step.id, { agent_session_uuid = session_uuid })
+        mark_visit_spawn_delivered(run_step.id)
     else
         repo.update_run_step(run.id, step_id, { agent_session_uuid = session_uuid })
     end
@@ -2698,19 +2986,185 @@ function M.handle_agent_lifecycle(info)
     refresh_surfaces()
 end
 
-function M.reconcile_agent_sessions()
-    local ok, HubModule = pcall(require, "lib.hub")
-    if not ok or not HubModule or not HubModule.get then
+-- How long an active spawn visit may wait for Hub:create_agent before one
+-- re-issue. Worktree creation on a large repo can exceed 60 s.
+local SPAWN_REQUEST_GRACE_SECS = 300
+local SPAWN_MAX_ATTEMPTS = 2
+
+local function recover_unrouted_visit(visit)
+    if not visit then
         return
     end
-    local hub = HubModule.get()
-    if not hub or type(hub.list_owned_sessions) ~= "function" then
+    local run = repo.get_run(visit.run_id)
+    local step = run and repo.get_step(visit.step_id) or nil
+    if not run or not step or step.kind ~= "agent" then
         return
     end
-    local sessions = hub:list_owned_sessions(OWNER) or {}
-    for _, session in ipairs(sessions) do
-        M.handle_agent_created(session)
+    local route = resolve_agent_route(run, step)
+    if route.lookup_error then
+        log.warn("[project-pipelines] unrouted visit lookup failed: " .. tostring(route.lookup_error))
+        return
     end
+    if route.reused then
+        repo.update_run_step_visit(visit.id, {
+            agent_session_uuid = route.session_uuid,
+            agent_request_id = route.request_id,
+        })
+        persist_pending_agent_notification(run, step, visit, route, {})
+        return
+    end
+    repo.update_run(run.id, { status = "blocked" })
+    repo.update_run_step_visit(visit.id, { status = "blocked" })
+    repo.append_event("step.spawn_failed", {
+        run_id = run.id,
+        ticket_id = run.ticket_id,
+        payload = {
+            step_id = step.id,
+            run_step_id = visit.id,
+            error = "unassigned active agent visit after routing timeout",
+            recovered = false,
+        },
+    })
+end
+
+local function session_matches_visit(session, visit)
+    if not session or not visit then
+        return false
+    end
+    local metadata = session.metadata or {}
+    if not util.is_blank(metadata.run_step_id) then
+        return metadata.run_step_id == visit.id
+    end
+    local request_id = session.request_id or metadata.request_id
+    if request_id and request_id == visit.agent_request_id then
+        return true
+    end
+    return metadata.run_id == visit.run_id and metadata.step_id == visit.step_id
+end
+
+local function spawn_failed_for_request(run, request_id)
+    for _, event in ipairs(repo.run_events(run.id, 50) or {}) do
+        if event.kind == "step.agent_lifecycle" then
+            local payload = util.decode(event.payload, {})
+            if payload.request_id == request_id and payload.status == "failed" then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function fail_unlinked_spawn(run, step, visit, err)
+    repo.update_run(run.id, { status = "blocked" })
+    repo.update_run_step_visit(visit.id, { status = "blocked" })
+    repo.append_event("step.spawn_failed", {
+        run_id = run.id,
+        ticket_id = run.ticket_id,
+        payload = {
+            step_id = step.id,
+            run_step_id = visit.id,
+            request_id = visit.agent_request_id,
+            error = err,
+            recovered = false,
+        },
+    })
+end
+
+local function recover_unlinked_spawn(visit, owned_sessions)
+    if not visit then
+        return
+    end
+    local run = repo.get_run(visit.run_id)
+    local step = run and repo.get_step(visit.step_id) or nil
+    if not run or not step then
+        return
+    end
+    for _, session in ipairs(owned_sessions or {}) do
+        if session_matches_visit(session, visit) then
+            M.handle_agent_created(session)
+            return
+        end
+    end
+    if spawn_failed_for_request(run, visit.agent_request_id) then
+        fail_unlinked_spawn(run, step, visit, "spawn request failed")
+        return
+    end
+    local spawn_key = repo.agent_notification_delivery_key(visit.id, "spawn")
+    local spawn_row = repo.get_agent_notification_by_key(spawn_key)
+    local attempts = 0
+    local last_at = tonumber(visit.created_at) or 0
+    local attempt_exists = false
+    if spawn_row then
+        attempts = tonumber(spawn_row.attempt_count) or 0
+        last_at = tonumber(spawn_row.updated_at) or last_at
+        attempt_exists = true
+    elseif not util.is_blank(visit.agent_request_id) then
+        -- create_agent returned, but the spawn-row upsert did not. Count the
+        -- in-flight request as attempt 1 and wait out the grace window.
+        attempts = 1
+        attempt_exists = true
+    end
+    if attempt_exists and (util.now() - last_at) < SPAWN_REQUEST_GRACE_SECS then
+        return
+    end
+    if attempts >= SPAWN_MAX_ATTEMPTS then
+        fail_unlinked_spawn(run, step, visit, "spawn request exhausted")
+        return
+    end
+    local created, err = spawn_new_step_agent(run, step, { visit = visit }, {
+        request_id = visit.agent_request_id,
+    })
+    if err then
+        fail_unlinked_spawn(run, step, visit, err)
+    end
+    return created
+end
+
+function M.reconcile_pending_agent_notifications()
+    local delivered, failed, skipped = 0, 0, 0
+    for _, row in ipairs(repo.pending_agent_notifications() or {}) do
+        if util.is_blank(row.session_uuid) then
+            skipped = skipped + 1
+        else
+            local ok_row, err = deliver_pending_agent_notification(row, { source_event = "reconcile" })
+            if ok_row then
+                delivered = delivered + 1
+            else
+                failed = failed + 1
+                log.warn("[project-pipelines] pending agent notification retry failed: " .. tostring(err))
+            end
+        end
+    end
+    return { delivered = delivered, failed = failed, skipped = skipped }
+end
+
+function M.reconcile_agent_sessions(opts)
+    opts = opts or {}
+    local unrouted = repo.unrouted_active_agent_visits() or {}
+    local unlinked = repo.unlinked_spawn_visits() or {}
+    local owned = {}
+    local need_sessions = opts.full == true or #unrouted > 0 or #unlinked > 0
+    if need_sessions then
+        local ok, HubModule = pcall(require, "lib.hub")
+        if ok and HubModule and HubModule.get then
+            local hub = HubModule.get()
+            if hub and type(hub.list_owned_sessions) == "function" then
+                owned = hub:list_owned_sessions(OWNER) or {}
+                if opts.full == true then
+                    for _, session in ipairs(owned) do
+                        pcall(M.handle_agent_created, session)
+                    end
+                end
+            end
+        end
+    end
+    for _, visit in ipairs(unrouted) do
+        pcall(recover_unrouted_visit, visit)
+    end
+    for _, visit in ipairs(unlinked) do
+        pcall(recover_unlinked_spawn, visit, owned)
+    end
+    pcall(M.reconcile_pending_agent_notifications)
 end
 
 function M.refresh_surfaces(ctx)

@@ -1313,6 +1313,84 @@ fn worker_parent_get_agent_serializes_one_session() {
 }
 
 #[test]
+fn hub_post_skips_duplicate_msg_id_and_wait_uses_parent_request() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let dir = lua_src_dir();
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{dir}/?.lua;{dir}/?/init.lua;" .. package.path
+
+            _plugin_worker_parent_hub_id = "hub-parent"
+            hub = {{ hub_id = function() return "plugin-worker:vault" end }}
+            events = {{ emit = function() end }}
+            local requests = {{}}
+            plugin_worker_parent_hub = {{
+              request = function(command)
+                requests[#requests + 1] = command
+                if command.type == "post_message" then
+                  return {{ result = {{ msg_id = command.msg_id, status = "delivered" }} }}
+                end
+                error("unexpected " .. tostring(command.type))
+              end,
+              enqueue = function()
+                error("wait path must not enqueue")
+              end,
+            }}
+            package.loaded["hub.state"] = {{
+              class = function(_)
+                local cls = {{}}
+                cls.__index = cls
+                return cls
+              end,
+              get = function(_, default) return default end,
+            }}
+            package.loaded["lib.agent"] = {{
+              get = function(id)
+                return {{
+                  session_type = "agent",
+                  session = {{ send_message = function() end }},
+                  _inbox = {{{{ msg_id = "msg-dup" }}}},
+                }}
+              end,
+              all_info = function() return {{}} end,
+            }}
+            package.loaded["lib.internal_client"] = {{ dispatch = function() error("unused") end }}
+            package.loaded["lib.worker_parent_command_queue"] = {{
+              is_queued_command = function() return false end,
+              ack = function(command) return command end,
+              enqueue = function() end,
+            }}
+
+            local Hub = require("lib.hub")
+            local local_hub = {{
+              _is_local = true,
+              id = "hub-local",
+              post = Hub.post,
+            }}
+            setmetatable(local_hub, Hub)
+            local dup = local_hub:post("sess-one", {{ msg_id = "msg-dup", payload = {{}} }})
+            assert(dup.status == "duplicate")
+
+            _G._plugin_worker_parent_hub_id = "hub-parent"
+            local worker = Hub.get()
+            local posted = worker:post("sess-one", {{ wait = true, msg_id = "msg-wait", payload = {{ n = 1 }} }})
+            assert(posted.status == "delivered")
+            assert(requests[1].type == "post_message")
+            assert(requests[1].msg_id == "msg-wait")
+            return "ok"
+            "#,
+            dir = dir.display()
+        ))
+        .eval()
+        .expect("Hub:post should dedupe msg_id and wait through parent request");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
 fn hub_proxy_uses_parent_bridge_inside_plugin_worker() {
     let lua = Lua::new();
     log::register(&lua).expect("register log");

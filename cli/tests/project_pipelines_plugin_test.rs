@@ -1535,9 +1535,11 @@ fn catalog_plugin_project_pipelines_falls_back_to_existing_implementer_when_no_m
                 return {{
                   post = function(_, session_uuid, message)
                     posted = {{ session_uuid = session_uuid, message = message }}
+                    return {{ msg_id = message.msg_id, status = "delivered" }}
                   end,
                   notify = function(_, session_uuid, notification)
                     notified = {{ session_uuid = session_uuid, notification = notification }}
+                    return {{ status = "delivered" }}
                   end,
                   create_agent = function()
                     error("spawn unavailable")
@@ -1599,10 +1601,29 @@ fn catalog_plugin_project_pipelines_falls_back_to_existing_implementer_when_no_m
               create_run_step_visit = function(run_id, step_id, attrs)
                 assert(run_id == "run-1")
                 assert(step_id == "impl")
-                local visit = {{ id = "visit-2", run_id = run_id, step_id = step_id, status = attrs.status, sequence = 2 }}
+                local visit = {{ id = "visit-2", run_id = run_id, step_id = step_id, status = attrs.status, sequence = 2, agent_session_uuid = attrs.agent_session_uuid, agent_request_id = attrs.agent_request_id }}
                 visit_status = attrs.status
                 visits[#visits + 1] = visit
                 return visit
+              end,
+              transition_run_step = function(spec)
+                local visit = package.loaded["project_pipelines.repo"].create_run_step_visit(spec.run_id, spec.target_step_id, {{
+                  status = "active",
+                  agent_session_uuid = spec.agent_session_uuid,
+                  agent_request_id = spec.agent_request_id,
+                }})
+                package.loaded["project_pipelines.repo"].update_run(spec.run_id, {{
+                  status = "active",
+                  current_step_id = spec.target_step_id,
+                  current_run_step_id = visit.id,
+                }})
+                package.loaded["project_pipelines.repo"].append_event("step.activated", {{ payload = spec.activation_payload }})
+                local notification = spec.notification
+                if notification then
+                  notification.run_step_id = visit.id
+                  notification.delivery_key = visit.id .. ":step_prompt"
+                end
+                return {{ visit = visit, run = {{ id = spec.run_id }}, notification = notification }}
               end,
               update_run = function(run_id, attrs)
                 assert(run_id == "run-1")
@@ -1624,6 +1645,16 @@ fn catalog_plugin_project_pipelines_falls_back_to_existing_implementer_when_no_m
                 assert(run_id == "run-1")
                 assert(step_id == "impl")
                 return {{ id = "visit-1", agent_session_uuid = "sess-impl" }}
+              end,
+              agent_notification_delivery_key = function(id, kind) return id .. ":" .. kind end,
+              get_agent_notification_by_key = function() return nil end,
+              upsert_agent_notification = function(attrs)
+                attrs.delivery_key = attrs.delivery_key or ((attrs.run_step_id or "visit-2") .. ":" .. (attrs.kind or "step_prompt"))
+                attrs.status = attrs.status or "pending"
+                return attrs
+              end,
+              mark_agent_notification_delivered = function(_, key)
+                return {{ status = "delivered", delivery_key = key, run_id = "run-1", run_step_id = "visit-2", step_id = "impl", session_uuid = "sess-impl" }}
               end,
               update_run_step_visit = function(run_step_id, attrs)
                 assert(run_step_id == "visit-2")
@@ -3762,8 +3793,22 @@ fn catalog_plugin_project_pipelines_start_run_queues_agent_and_links_later_by_re
                   step_id = step_id,
                   status = attrs.status,
                   sequence = 1,
+                  agent_request_id = attrs.agent_request_id,
                 }}
                 return visit
+              end,
+              transition_run_step = function(spec)
+                local created = package.loaded["project_pipelines.repo"].create_run_step_visit(spec.run_id, spec.target_step_id, {{
+                  status = "active",
+                  agent_request_id = spec.agent_request_id,
+                }})
+                package.loaded["project_pipelines.repo"].update_run(spec.run_id, {{
+                  status = "active",
+                  current_step_id = spec.target_step_id,
+                  current_run_step_id = created.id,
+                }})
+                package.loaded["project_pipelines.repo"].append_event("step.activated", {{ payload = spec.activation_payload }})
+                return {{ visit = created, run = run, notification = spec.notification }}
               end,
               update_run = function(run_id, attrs)
                 assert(run_id == "run-1")
@@ -3781,6 +3826,12 @@ fn catalog_plugin_project_pipelines_start_run_queues_agent_and_links_later_by_re
                 return visit
               end,
               latest_step_session = function() return nil end,
+              agent_notification_delivery_key = function(id, kind) return id .. ":" .. kind end,
+              get_agent_notification_by_key = function() return nil end,
+              upsert_agent_notification = function(attrs) return attrs end,
+              mark_agent_notification_delivered = function(key)
+                return {{ delivery_key = key, status = "delivered" }}
+              end,
               append_event = function(kind, event)
                 events[#events + 1] = {{ kind = kind, event = event }}
               end,
@@ -3900,6 +3951,15 @@ fn catalog_plugin_project_pipelines_start_run_threads_stacked_base_metadata() {
               end,
               next_step = function() return step end,
               create_run_step_visit = function() return {{ id = "visit-2", sequence = 1 }} end,
+              transition_run_step = function(spec)
+                local visit = package.loaded["project_pipelines.repo"].create_run_step_visit()
+                package.loaded["project_pipelines.repo"].update_run(spec.run_id, {{
+                  status = "active",
+                  current_step_id = spec.target_step_id,
+                  current_run_step_id = visit.id,
+                }})
+                return {{ visit = visit, run = run, notification = spec.notification }}
+              end,
               update_run = function(_run_id, attrs)
                 for key, value in pairs(attrs or {{}}) do run[key] = value end
                 return run
@@ -3907,6 +3967,10 @@ fn catalog_plugin_project_pipelines_start_run_threads_stacked_base_metadata() {
               get_run = function() return run end,
               get_run_step_visit = function() return {{ id = "visit-2" }} end,
               latest_step_session = function() return nil end,
+              agent_notification_delivery_key = function(id, kind) return id .. ":" .. kind end,
+              get_agent_notification_by_key = function() return nil end,
+              upsert_agent_notification = function(attrs) return attrs end,
+              mark_agent_notification_delivered = function() end,
               append_event = function() end,
             }}
 
@@ -3994,6 +4058,15 @@ fn catalog_plugin_project_pipelines_start_run_explicit_base_ref_does_not_stack_o
               end,
               next_step = function() return step end,
               create_run_step_visit = function() return {{ id = "visit-child", sequence = 1 }} end,
+              transition_run_step = function(spec)
+                local visit = package.loaded["project_pipelines.repo"].create_run_step_visit()
+                package.loaded["project_pipelines.repo"].update_run(spec.run_id, {{
+                  status = "active",
+                  current_step_id = spec.target_step_id,
+                  current_run_step_id = visit.id,
+                }})
+                return {{ visit = visit, run = run, notification = spec.notification }}
+              end,
               update_run = function(_run_id, attrs)
                 for key, value in pairs(attrs or {{}}) do run[key] = value end
                 return run
@@ -4001,6 +4074,10 @@ fn catalog_plugin_project_pipelines_start_run_explicit_base_ref_does_not_stack_o
               get_run = function() return run end,
               get_run_step_visit = function() return {{ id = "visit-child" }} end,
               latest_step_session = function() return nil end,
+              agent_notification_delivery_key = function(id, kind) return id .. ":" .. kind end,
+              get_agent_notification_by_key = function() return nil end,
+              upsert_agent_notification = function(attrs) return attrs end,
+              mark_agent_notification_delivered = function() end,
               append_event = function() end,
               latest_ticket_run = function()
                 error("closed dependencies must not infer stacked base runs")
@@ -4193,6 +4270,25 @@ fn catalog_plugin_project_pipelines_public_dependency_write_blocks_advance_befor
                 mutation_calls = mutation_calls + 1
                 assert(run_id == "run-child")
                 return {{ id = "visit-implement", run_id = run_id, step_id = step_id, status = attrs.status, sequence = 2 }}
+              end,
+              transition_run_step = function(spec)
+                mutation_calls = mutation_calls + 1
+                if spec.complete_visit_id then
+                  package.loaded["project_pipelines.repo"].update_run_step_visit(spec.complete_visit_id, {{ status = "done" }})
+                  package.loaded["project_pipelines.repo"].append_event("step.completed", spec)
+                end
+                local visit = package.loaded["project_pipelines.repo"].create_run_step_visit(spec.run_id, spec.target_step_id, {{
+                  status = "active",
+                  agent_session_uuid = spec.agent_session_uuid,
+                  agent_request_id = spec.agent_request_id,
+                }})
+                local updated = package.loaded["project_pipelines.repo"].update_run(spec.run_id, {{
+                  status = "active",
+                  current_step_id = spec.target_step_id,
+                  current_run_step_id = visit.id,
+                }})
+                package.loaded["project_pipelines.repo"].append_event("step.activated", {{ payload = spec.activation_payload }})
+                return {{ visit = visit, run = updated, notification = spec.notification }}
               end,
               update_run = function(id, attrs)
                 mutation_calls = mutation_calls + 1
@@ -4397,6 +4493,24 @@ fn catalog_plugin_project_pipelines_step_advance_can_override_to_specific_step()
                 assert(attrs.status == "active")
                 return {{ id = "visit-implement", run_id = run_id, step_id = step_id, sequence = 2, status = "active" }}
               end,
+              transition_run_step = function(spec)
+                if spec.complete_visit_id then
+                  package.loaded["project_pipelines.repo"].update_run_step_visit(spec.complete_visit_id, {{ status = "done" }})
+                  package.loaded["project_pipelines.repo"].append_event("step.completed", spec)
+                end
+                local visit = package.loaded["project_pipelines.repo"].create_run_step_visit(spec.run_id, spec.target_step_id, {{
+                  status = "active",
+                  agent_session_uuid = spec.agent_session_uuid,
+                  agent_request_id = spec.agent_request_id,
+                }})
+                local updated = package.loaded["project_pipelines.repo"].update_run(spec.run_id, {{
+                  status = "active",
+                  current_step_id = spec.target_step_id,
+                  current_run_step_id = visit.id,
+                }})
+                package.loaded["project_pipelines.repo"].append_event("step.activated", {{ payload = spec.activation_payload }})
+                return {{ visit = visit, run = updated, notification = spec.notification }}
+              end,
               update_run = function(run_id, attrs)
                 assert(run_id == "run-verify")
                 for key, value in pairs(attrs or {{}}) do run[key] = value end
@@ -4408,6 +4522,10 @@ fn catalog_plugin_project_pipelines_step_advance_can_override_to_specific_step()
               end,
               latest_step_session = function() return nil end,
               ticket_dependencies = function() return {{}} end,
+              agent_notification_delivery_key = function(id, kind) return id .. ":" .. kind end,
+              get_agent_notification_by_key = function() return nil end,
+              upsert_agent_notification = function(attrs) return attrs end,
+              mark_agent_notification_delivered = function() end,
             }}
             package.loaded["lib.agent"] = {{ get = function() return nil end }}
             package.loaded["lib.hub"] = {{
@@ -4534,6 +4652,16 @@ fn catalog_plugin_project_pipelines_retry_step_agent_requeues_current_visit() {
               append_event = function(kind, event)
                 events[#events + 1] = {{ kind = kind, event = event }}
               end,
+              agent_notification_delivery_key = function(id, kind) return id .. ":" .. kind end,
+              get_agent_notification_by_key = function() return nil end,
+              upsert_agent_notification = function(attrs)
+                attrs.delivery_key = attrs.run_step_id .. ":" .. (attrs.kind or "step_prompt")
+                attrs.status = "pending"
+                return attrs
+              end,
+              mark_agent_notification_delivered = function(_, key)
+                return {{ status = "delivered", delivery_key = key, run_id = "run-verify", run_step_id = "visit-verify", step_id = "verify", session_uuid = "sess-live" }}
+              end,
             }}
             package.loaded["lib.agent"] = {{
               get = function(session_uuid)
@@ -4548,10 +4676,12 @@ fn catalog_plugin_project_pipelines_retry_step_agent_requeues_current_visit() {
                     assert(session_uuid == "sess-live")
                     assert(message.payload.step_id == "verify")
                     post_calls = post_calls + 1
+                    return {{ msg_id = message.msg_id, status = "delivered" }}
                   end,
                   notify = function(_, session_uuid)
                     assert(session_uuid == "sess-live")
                     notify_calls = notify_calls + 1
+                    return {{ status = "delivered" }}
                   end,
                   create_agent = function(_, opts)
                     create_agent_calls = create_agent_calls + 1
@@ -4849,7 +4979,9 @@ fn catalog_plugin_project_pipelines_db_v10_migration_adds_nullable_pipeline_colu
             log = {{ warn = function() end }}
 
             require("project_pipelines.db")
-            assert(spec.version == 11)
+            assert(spec.version == 12)
+            assert(spec.models.run_steps.agent_request_id ~= nil)
+            assert(spec.models.agent_notifications ~= nil)
             for _, column in ipairs({{ "version_label", "archived_at", "replacement_pipeline_id", "supersedes_pipeline_id" }}) do
               assert(spec.models.pipelines[column] ~= nil, "fresh model missing " .. column)
             end
@@ -4962,7 +5094,9 @@ fn catalog_plugin_project_pipelines_archive_schema_and_allowlists_are_wired() {
         std::fs::read_to_string(root.join("project_pipelines/entity_contract.lua"))
             .expect("read project pipelines entity contract");
 
-    assert!(db.contains("version = 11"));
+    assert!(db.contains("version = 12"));
+    assert!(db.contains("agent_notifications"));
+    assert!(db.contains("agent_request_id"));
     for column in [
         "version_label",
         "archived_at",
@@ -5121,6 +5255,1056 @@ fn catalog_plugin_project_pipelines_start_run_rejects_archived_pipelines() {
         ))
         .eval()
         .expect("project pipelines start_run should reject archived pipelines");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_step_activation_persists_route_before_notification() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local visits = {{}}
+            local notifications = {{}}
+            local events = {{}}
+            local posted = {{}}
+            local notified = {{}}
+            local fail_notify = true
+            local run = {{
+              id = "run-1",
+              ticket_id = "ticket-1",
+              pipeline_id = "pipe-1",
+              target_id = "target-1",
+              status = "active",
+              current_step_id = "review",
+              current_run_step_id = "visit-review",
+            }}
+            visits["visit-review"] = {{
+              id = "visit-review",
+              run_id = "run-1",
+              step_id = "review",
+              status = "active",
+              agent_session_uuid = "sess-review",
+            }}
+            local steps = {{
+              review = {{ id = "review", kind = "agent", name = "Review", agent_name = "grok" }},
+              implement = {{ id = "implement", kind = "agent", name = "Implement", agent_name = "grok" }},
+            }}
+
+            local function copy(row)
+              local out = {{}}
+              for k, v in pairs(row or {{}}) do out[k] = v end
+              return out
+            end
+
+            package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
+            package.loaded["project_pipelines.notification_policy"] = {{ notify_phase_transition = function() end }}
+            package.loaded["lib.agent"] = {{
+              get = function(session_uuid)
+                if session_uuid == "sess-impl" then
+                  return {{ info = function() return {{ session_uuid = session_uuid }} end }}
+                end
+                return nil
+              end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  post = function(_, session_uuid, message)
+                    if fail_notify then error("injected notification failure") end
+                    posted[#posted + 1] = {{ session_uuid = session_uuid, message = message }}
+                    return {{ msg_id = message.msg_id, status = "delivered" }}
+                  end,
+                  notify = function(_, session_uuid, notification)
+                    if fail_notify then error("injected notification failure") end
+                    notified[#notified + 1] = {{ session_uuid = session_uuid, notification = notification }}
+                    return {{ status = "delivered" }}
+                  end,
+                  create_agent = function()
+                    error("reuse path must not spawn")
+                  end,
+                  list_owned_sessions = function() return {{{{ session_uuid = "sess-impl", request_id = "project-pipelines:run-1:implement:agent", metadata = {{ run_id = "run-1", step_id = "implement" }} }}}} end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              get_run = function() return run end,
+              get_step = function(id) return steps[id] end,
+              get_ticket = function() return {{ id = "ticket-1", title = "Routing" }} end,
+              get_pipeline = function() return {{ id = "pipe-1", merge_policy = "direct" }} end,
+              ticket_dependencies = function() return {{}} end,
+              ticket_session_uuids = function() return {{}} end,
+              step_gates = function() return {{}} end,
+              latest_review_for_run_step = function() return nil end,
+              next_step = function() return steps.implement end,
+              get_run_step_visit = function(id) return visits[id] end,
+              latest_step_session = function(_, step_id)
+                if step_id == "implement" then
+                  return {{ id = "visit-old", agent_session_uuid = "sess-impl" }}
+                end
+              end,
+              create_run_step_visit = function(run_id, step_id, attrs)
+                assert(attrs.agent_session_uuid == "sess-impl", "visit must store the live session before notify")
+                assert(attrs.agent_request_id == "project-pipelines:run-1:implement:agent")
+                local visit = {{
+                  id = "visit-implement",
+                  run_id = run_id,
+                  step_id = step_id,
+                  status = attrs.status,
+                  agent_session_uuid = attrs.agent_session_uuid,
+                  agent_request_id = attrs.agent_request_id,
+                }}
+                visits[visit.id] = visit
+                return visit
+              end,
+              update_run_step_visit = function(id, attrs)
+                local visit = visits[id]
+                for k, v in pairs(attrs or {{}}) do visit[k] = v end
+                return visit
+              end,
+              update_run = function(_, attrs)
+                for k, v in pairs(attrs or {{}}) do run[k] = v end
+                return run
+              end,
+              append_event = function(kind, event)
+                events[#events + 1] = {{ kind = kind, event = event }}
+              end,
+              upsert_agent_notification = function(attrs)
+                local key = attrs.delivery_key or (attrs.run_step_id .. ":" .. (attrs.kind or "step_prompt"))
+                local existing = notifications[key]
+                if existing and existing.status == "delivered" and attrs.status == "pending" and attrs.force ~= true then
+                  return copy(existing)
+                end
+                local row = existing or {{}}
+                for k, v in pairs(attrs) do row[k] = v end
+                row.delivery_key = key
+                row.id = row.id or "note-1"
+                row.attempt_count = attrs.attempt_count or row.attempt_count or 0
+                notifications[key] = row
+                return copy(row)
+              end,
+              get_agent_notification_by_key = function(key)
+                return notifications[key] and copy(notifications[key]) or nil
+              end,
+              agent_notification_delivery_key = function(id, kind) return id .. ":" .. kind end,
+              mark_agent_notification_delivered = function(key)
+                local row = notifications[key]
+                if row then
+                  row.status = "delivered"
+                  row.delivered_at = 1
+                end
+                return row and copy(row) or nil
+              end,
+              pending_agent_notifications = function()
+                local out = {{}}
+                for _, row in pairs(notifications) do
+                  if row.status == "pending" then out[#out + 1] = copy(row) end
+                end
+                return out
+              end,
+              unrouted_active_agent_visits = function() return {{}} end,
+              unlinked_spawn_visits = function() return {{}} end,
+              transition_run_step = function(spec)
+                if spec.complete_visit_id then
+                  package.loaded["project_pipelines.repo"].update_run_step_visit(spec.complete_visit_id, {{ status = "done" }})
+                  package.loaded["project_pipelines.repo"].append_event("step.completed", spec.completed_payload)
+                end
+                local visit = package.loaded["project_pipelines.repo"].create_run_step_visit(spec.run_id, spec.target_step_id, {{
+                  status = "active",
+                  agent_session_uuid = spec.agent_session_uuid,
+                  agent_request_id = spec.agent_request_id,
+                }})
+                local updated = package.loaded["project_pipelines.repo"].update_run(spec.run_id, {{
+                  status = "active",
+                  current_step_id = spec.target_step_id,
+                  current_run_step_id = visit.id,
+                }})
+                package.loaded["project_pipelines.repo"].append_event("step.activated", spec.activation_payload)
+                local notification = spec.notification
+                if notification then
+                  notification.run_step_id = visit.id
+                  notification.msg_id = "msg_pipeline_" .. visit.id .. "_step_prompt"
+                  notification = package.loaded["project_pipelines.repo"].upsert_agent_notification(notification)
+                end
+                return {{ visit = visit, run = updated, notification = notification }}
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            local first = engine.request_step_advance({{ run_id = "run-1", summary = "advance" }}, {{}})
+            assert(first.ok == true)
+            assert(visits["visit-review"].status == "done")
+            assert(visits["visit-implement"].agent_session_uuid == "sess-impl")
+            assert(run.current_run_step_id == "visit-implement")
+            assert(#posted == 0 and #notified == 0)
+            local pending = package.loaded["project_pipelines.repo"].pending_agent_notifications()
+            assert(#pending == 1)
+            assert(pending[1].session_uuid == "sess-impl")
+            assert(pending[1].status == "pending")
+
+            fail_notify = false
+            local retry = engine.reconcile_pending_agent_notifications()
+            assert(retry.delivered == 1)
+            assert(#posted == 1 and #notified == 1)
+            assert(posted[1].message.msg_id == "msg_pipeline_visit-implement_step_prompt")
+
+            local duplicate = engine.reconcile_pending_agent_notifications()
+            assert(duplicate.delivered == 0)
+            assert(#posted == 1 and #notified == 1)
+
+            engine.reconcile_agent_sessions()
+            assert(#posted == 1 and #notified == 1)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("step activation should persist routing before notification and reconcile retries");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_unrouted_visits_recover_or_fail_closed() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local visits = {{
+              ["visit-recover"] = {{
+                id = "visit-recover",
+                run_id = "run-1",
+                step_id = "implement",
+                status = "active",
+                agent_session_uuid = "",
+                agent_request_id = "",
+              }},
+              ["visit-fail"] = {{
+                id = "visit-fail",
+                run_id = "run-2",
+                step_id = "implement",
+                status = "active",
+                agent_session_uuid = "",
+                agent_request_id = "",
+              }},
+            }}
+            local runs = {{
+              ["run-1"] = {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipe-1", status = "active", current_run_step_id = "visit-recover" }},
+              ["run-2"] = {{ id = "run-2", ticket_id = "ticket-2", pipeline_id = "pipe-1", status = "active", current_run_step_id = "visit-fail" }},
+            }}
+            local notifications = {{}}
+            local events = {{}}
+
+            package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
+            package.loaded["project_pipelines.notification_policy"] = {{ notify_phase_transition = function() end }}
+            package.loaded["lib.agent"] = {{
+              get = function(session_uuid)
+                return session_uuid == "sess-impl" and {{ info = function() return {{ session_uuid = session_uuid }} end }} or nil
+              end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  post = function(_, session_uuid, message)
+                    return {{ msg_id = message and message.msg_id, status = "delivered" }}
+                  end,
+                  notify = function()
+                    return {{ status = "delivered" }}
+                  end,
+                  list_owned_sessions = function() return {{}} end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              get_run = function(id) return runs[id] end,
+              get_step = function() return {{ id = "implement", kind = "agent", name = "Implement", agent_name = "grok" }} end,
+              get_ticket = function(id) return {{ id = id, title = id }} end,
+              latest_step_session = function(run_id)
+                if run_id == "run-1" then
+                  return {{ agent_session_uuid = "sess-impl" }}
+                end
+              end,
+              update_run_step_visit = function(id, attrs)
+                for k, v in pairs(attrs or {{}}) do visits[id][k] = v end
+                return visits[id]
+              end,
+              update_run = function(id, attrs)
+                for k, v in pairs(attrs or {{}}) do runs[id][k] = v end
+                return runs[id]
+              end,
+              append_event = function(kind, event)
+                events[#events + 1] = {{ kind = kind, event = event }}
+              end,
+              agent_notification_delivery_key = function(id, kind) return id .. ":" .. kind end,
+              get_agent_notification_by_key = function() return nil end,
+              upsert_agent_notification = function(attrs)
+                notifications[#notifications + 1] = attrs
+                attrs.delivery_key = attrs.run_step_id .. ":" .. (attrs.kind or "step_prompt")
+                return attrs
+              end,
+              pending_agent_notifications = function() return notifications end,
+              mark_agent_notification_delivered = function() end,
+              unrouted_active_agent_visits = function()
+                return {{ visits["visit-recover"], visits["visit-fail"] }}
+              end,
+              unlinked_spawn_visits = function() return {{}} end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            engine.reconcile_agent_sessions()
+            assert(visits["visit-recover"].agent_session_uuid == "sess-impl")
+            assert(visits["visit-fail"].status == "blocked")
+            assert(runs["run-2"].status == "blocked")
+            local saw_fail = false
+            for _, event in ipairs(events) do
+              if event.kind == "step.spawn_failed" then saw_fail = true end
+            end
+            assert(saw_fail)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("unrouted active visits should recover a live session or fail closed");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_transition_rolls_back_when_visit_insert_fails() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local source = {{ id = "visit-review", run_id = "run-1", step_id = "review", status = "active" }}
+            local run = {{ id = "run-1", ticket_id = "ticket-1", status = "active", current_step_id = "review", current_run_step_id = "visit-review" }}
+            local events = {{}}
+            local notes = {{}}
+            local snapshot = {{ status = source.status, current = run.current_run_step_id }}
+
+            json = {{ encode = function() return "{{}}" end, decode = function() return {{}} end }}
+            package.loaded["project_pipelines.entities"] = {{ types = {{}}, upsert = function() end }}
+            package.loaded["project_pipelines.db"] = {{
+              execute = function(_, fn)
+                local ok, value = pcall(fn)
+                if not ok then
+                  source.status = snapshot.status
+                  run.current_run_step_id = snapshot.current
+                  events = {{}}
+                  notes = {{}}
+                  error(value)
+                end
+                return value
+              end,
+              eval = function(_, sql)
+                if tostring(sql):find("MAX%(sequence%)") then return {{{{ sequence = 1 }}}} end
+                return {{}}
+              end,
+              run_steps = {{
+                update = function() source.status = "done" end,
+                where = function() return source end,
+              }},
+              runs = {{
+                update = function() end,
+                where = function() return run end,
+              }},
+              tickets = {{ where = function() return {{ id = "ticket-1" }} end }},
+              events = {{ insert = function(_, row) events[#events + 1] = row end }},
+              agent_notifications = {{ insert = function(_, row) notes[#notes + 1] = row end }},
+            }}
+
+            local repo = require("project_pipelines.repo")
+            local original_create = repo.create_run_step_visit
+            repo.create_run_step_visit = function()
+              error("injected visit failure")
+            end
+            local ok, err = pcall(repo.transition_run_step, {{
+              run_id = "run-1",
+              ticket_id = "ticket-1",
+              target_step_id = "implement",
+              complete_visit_id = "visit-review",
+              complete_step_id = "review",
+            }})
+            repo.create_run_step_visit = original_create
+            assert(ok == false)
+            assert(tostring(err):find("injected visit failure", 1, true))
+            assert(source.status == "active")
+            assert(run.current_run_step_id == "visit-review")
+            assert(#events == 0)
+            assert(#notes == 0)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("failed visit insert should roll the source visit back");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_unlinked_spawn_visits_reuse_request_id() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local create_ids = {{}}
+            local events = {{}}
+            local spawn_row = {{ attempt_count = 1, updated_at = os.time() - 301, kind = "spawn" }}
+            local visit = {{
+              id = "visit-spawn",
+              run_id = "run-1",
+              step_id = "implement",
+              status = "active",
+              agent_session_uuid = "",
+              agent_request_id = "project-pipelines:run-1:implement:agent",
+              created_at = 1,
+            }}
+            local run = {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipe-1", status = "active", current_run_step_id = "visit-spawn", target_id = "target-1" }}
+            package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
+            package.loaded["project_pipelines.notification_policy"] = {{ notify_phase_transition = function() end }}
+            package.loaded["lib.agent"] = {{ get = function() return nil end }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  list_owned_sessions = function() return {{}} end,
+                  create_agent = function(_, opts)
+                    create_ids[#create_ids + 1] = opts.request_id
+                    assert(opts.metadata.run_step_id == "visit-spawn")
+                    return {{ status = "queued", request_id = opts.request_id }}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              get_run = function() return run end,
+              get_step = function() return {{ id = "implement", kind = "agent", name = "Implement", agent_name = "grok" }} end,
+              get_ticket = function() return {{ id = "ticket-1", title = "Ticket" }} end,
+              latest_step_session = function() return nil end,
+              unrouted_active_agent_visits = function() return {{}} end,
+              unlinked_spawn_visits = function()
+                if visit.status ~= "active" then return {{}} end
+                return {{ visit }}
+              end,
+              pending_agent_notifications = function() return {{}} end,
+              run_events = function() return {{}} end,
+              agent_notification_delivery_key = function(id, kind) return id .. ":" .. kind end,
+              get_agent_notification_by_key = function() return spawn_row end,
+              upsert_agent_notification = function(attrs)
+                spawn_row.attempt_count = attrs.attempt_count
+                spawn_row.updated_at = os.time()
+                return spawn_row
+              end,
+              mark_agent_notification_delivered = function()
+                spawn_row.status = "delivered"
+                return spawn_row
+              end,
+              append_event = function(kind, event)
+                events[#events + 1] = {{ kind = kind, event = event }}
+              end,
+              update_run = function(_, attrs)
+                for k, v in pairs(attrs or {{}}) do run[k] = v end
+                return run
+              end,
+              update_run_step_visit = function(_, attrs)
+                for k, v in pairs(attrs or {{}}) do visit[k] = v end
+                return visit
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            engine.reconcile_agent_sessions()
+            assert(#create_ids == 1)
+            assert(create_ids[1] == "project-pipelines:run-1:implement:agent")
+            assert(spawn_row.attempt_count == 2)
+            assert(visit.status == "active")
+            engine.reconcile_agent_sessions()
+            assert(#create_ids == 1)
+            assert(visit.status == "active")
+            spawn_row.updated_at = os.time() - 301
+            engine.reconcile_agent_sessions()
+            assert(#create_ids == 1)
+            assert(visit.status == "blocked")
+            local saw_fail = false
+            for _, event in ipairs(events) do
+              if event.kind == "step.spawn_failed" then saw_fail = true end
+            end
+            assert(saw_fail)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("unlinked spawn visits should re-issue the same request_id");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_missing_spawn_row_waits_out_visit_grace() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local create_ids = {{}}
+            local spawn_row = nil
+            local visit = {{
+              id = "visit-spawn",
+              run_id = "run-1",
+              step_id = "implement",
+              status = "active",
+              agent_session_uuid = "",
+              agent_request_id = "project-pipelines:run-1:implement:agent",
+              created_at = os.time(),
+            }}
+            local run = {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipe-1", status = "active", current_run_step_id = "visit-spawn", target_id = "target-1" }}
+            package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
+            package.loaded["project_pipelines.notification_policy"] = {{ notify_phase_transition = function() end }}
+            package.loaded["lib.agent"] = {{ get = function() return nil end }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  list_owned_sessions = function() return {{}} end,
+                  create_agent = function(_, opts)
+                    create_ids[#create_ids + 1] = opts.request_id
+                    return {{ status = "queued", request_id = opts.request_id }}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              get_run = function() return run end,
+              get_step = function() return {{ id = "implement", kind = "agent", name = "Implement", agent_name = "grok" }} end,
+              get_ticket = function() return {{ id = "ticket-1", title = "Ticket" }} end,
+              latest_step_session = function() return nil end,
+              unrouted_active_agent_visits = function() return {{}} end,
+              unlinked_spawn_visits = function()
+                if visit.status ~= "active" then return {{}} end
+                return {{ visit }}
+              end,
+              pending_agent_notifications = function() return {{}} end,
+              run_events = function() return {{}} end,
+              agent_notification_delivery_key = function(id, kind) return id .. ":" .. kind end,
+              get_agent_notification_by_key = function() return spawn_row end,
+              upsert_agent_notification = function(attrs)
+                spawn_row = spawn_row or {{}}
+                for k, v in pairs(attrs or {{}}) do spawn_row[k] = v end
+                spawn_row.updated_at = os.time()
+                return spawn_row
+              end,
+              mark_agent_notification_delivered = function()
+                if spawn_row then spawn_row.status = "delivered" end
+                return spawn_row
+              end,
+              append_event = function() end,
+              update_run = function(_, attrs)
+                for k, v in pairs(attrs or {{}}) do run[k] = v end
+                return run
+              end,
+              update_run_step_visit = function(_, attrs)
+                for k, v in pairs(attrs or {{}}) do visit[k] = v end
+                return visit
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            engine.reconcile_agent_sessions()
+            assert(#create_ids == 0)
+            assert(visit.status == "active")
+            visit.created_at = os.time() - 301
+            engine.reconcile_agent_sessions()
+            assert(#create_ids == 1)
+            assert(visit.status == "active")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("a missing spawn row must wait out visit.created_at grace before re-issue");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_lookup_error_does_not_block_unrouted_visit() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local visit = {{
+              id = "visit-1",
+              run_id = "run-1",
+              step_id = "implement",
+              status = "active",
+              agent_session_uuid = "",
+              agent_request_id = "",
+            }}
+            local run = {{ id = "run-1", ticket_id = "ticket-1", pipeline_id = "pipe-1", status = "active", current_run_step_id = "visit-1" }}
+            package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
+            package.loaded["project_pipelines.notification_policy"] = {{ notify_phase_transition = function() end }}
+            package.loaded["lib.agent"] = {{
+              get = function() error("owner loop stall") end,
+            }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{ list_owned_sessions = function() return {{}} end }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              get_run = function() return run end,
+              get_step = function() return {{ id = "implement", kind = "agent", name = "Implement", agent_name = "grok" }} end,
+              latest_step_session = function() return {{ agent_session_uuid = "sess-impl" }} end,
+              unrouted_active_agent_visits = function() return {{ visit }} end,
+              unlinked_spawn_visits = function() return {{}} end,
+              pending_agent_notifications = function() return {{}} end,
+              agent_notification_delivery_key = function(id, kind) return id .. ":" .. kind end,
+              get_agent_notification_by_key = function() return nil end,
+              upsert_agent_notification = function(attrs) return attrs end,
+              mark_agent_notification_delivered = function() end,
+              update_run = function() error("must not block") end,
+              update_run_step_visit = function() error("must not block") end,
+              append_event = function() error("must not block") end,
+            }}
+
+            require("project_pipelines.engine").reconcile_agent_sessions()
+            assert(visit.status == "active")
+            assert(run.status == "active")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("a lookup error must not fail-close an unrouted visit");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_links_only_matching_run_step_id() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local linked = {{}}
+            local visit = {{
+              id = "visit-current",
+              run_id = "run-1",
+              step_id = "implement",
+              status = "active",
+              agent_session_uuid = "",
+              agent_request_id = "project-pipelines:run-1:implement:agent",
+            }}
+            local run = {{ id = "run-1", ticket_id = "ticket-1", status = "active", current_run_step_id = "visit-current" }}
+            local visits = {{ ["visit-current"] = visit, ["visit-old"] = {{ id = "visit-old", run_id = "run-1", step_id = "implement" }} }}
+            package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
+            package.loaded["project_pipelines.notification_policy"] = {{ notify_phase_transition = function() end }}
+            package.loaded["lib.agent"] = {{ get = function() return {{}} end }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  list_owned_sessions = function()
+                    return {{
+                      {{ session_uuid = "sess-old", request_id = "project-pipelines:run-1:implement:agent", metadata = {{ run_id = "run-1", step_id = "implement", run_step_id = "visit-old" }} }},
+                      {{ session_uuid = "sess-new", request_id = "project-pipelines:run-1:implement:agent", metadata = {{ run_id = "run-1", step_id = "implement", run_step_id = "visit-current" }} }},
+                    }}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              get_run = function() return run end,
+              get_step = function() return {{ id = "implement", kind = "agent" }} end,
+              get_run_step_visit = function(id) return visits[id] end,
+              unrouted_active_agent_visits = function() return {{}} end,
+              unlinked_spawn_visits = function() return {{ visit }} end,
+              pending_agent_notifications = function() return {{}} end,
+              run_events = function() return {{}} end,
+              agent_notification_delivery_key = function(id, kind) return id .. ":" .. kind end,
+              get_agent_notification_by_key = function() return {{ attempt_count = 1, updated_at = os.time() }} end,
+              upsert_agent_notification = function(attrs) return attrs end,
+              mark_agent_notification_delivered = function(key)
+                return {{ delivery_key = key, status = "delivered" }}
+              end,
+              append_event = function(kind, event)
+                if kind == "step.agent_linked" then linked[#linked + 1] = event.payload.session_uuid end
+              end,
+              update_run_step_visit = function(id, attrs)
+                for k, v in pairs(attrs or {{}}) do visits[id][k] = v end
+                return visits[id]
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            engine.reconcile_agent_sessions()
+            engine.reconcile_agent_sessions()
+            assert(visit.agent_session_uuid == "sess-new")
+            assert(#linked == 1)
+            assert(linked[1] == "sess-new")
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("only the session whose run_step_id matches the visit should link");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_notify_failure_after_post_does_not_redeliver() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local posts = 0
+            local row = {{
+              id = "note-1",
+              delivery_key = "visit-1:step_prompt",
+              run_id = "run-1",
+              run_step_id = "visit-1",
+              ticket_id = "ticket-1",
+              step_id = "implement",
+              session_uuid = "sess-impl",
+              kind = "step_prompt",
+              status = "pending",
+              attempt_count = 0,
+              msg_id = "msg-1",
+              instructions = "go",
+            }}
+            package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
+            package.loaded["project_pipelines.notification_policy"] = {{ notify_phase_transition = function() end }}
+            package.loaded["lib.agent"] = {{ get = function() return {{}} end }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  post = function()
+                    posts = posts + 1
+                    return {{ msg_id = "msg-1", status = "delivered" }}
+                  end,
+                  notify = function()
+                    error("notify failed")
+                  end,
+                  list_owned_sessions = function() return {{}} end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              unrouted_active_agent_visits = function() return {{}} end,
+              unlinked_spawn_visits = function() return {{}} end,
+              pending_agent_notifications = function()
+                if row.status == "pending" then return {{ row }} end
+                return {{}}
+              end,
+              agent_notification_delivery_key = function(id, kind) return id .. ":" .. kind end,
+              get_agent_notification_by_key = function() return nil end,
+              mark_agent_notification_delivered = function()
+                row.status = "delivered"
+                row.attempt_count = (row.attempt_count or 0) + 1
+                return row
+              end,
+              upsert_agent_notification = function(attrs)
+                for k, v in pairs(attrs or {{}}) do row[k] = v end
+                return row
+              end,
+              append_event = function() end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            engine.reconcile_agent_sessions()
+            assert(row.status == "delivered")
+            assert(posts == 1)
+            engine.reconcile_agent_sessions()
+            assert(posts == 1)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("accepted post must not redeliver after notify failure");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_timer_reconcile_skips_owned_session_list() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local lists = 0
+            package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
+            package.loaded["project_pipelines.notification_policy"] = {{ notify_phase_transition = function() end }}
+            package.loaded["lib.agent"] = {{ get = function() return nil end }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  list_owned_sessions = function()
+                    lists = lists + 1
+                    return {{}}
+                  end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              unrouted_active_agent_visits = function() return {{}} end,
+              unlinked_spawn_visits = function() return {{}} end,
+              pending_agent_notifications = function() return {{}} end,
+              agent_notification_delivery_key = function(id, kind) return id .. ":" .. kind end,
+              get_agent_notification_by_key = function() return nil end,
+              upsert_agent_notification = function(attrs) return attrs end,
+              mark_agent_notification_delivered = function() end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            engine.reconcile_agent_sessions()
+            assert(lists == 0)
+            engine.reconcile_agent_sessions({{ full = true }})
+            assert(lists == 1)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("timer reconcile must not list owned sessions when nothing is unrouted");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_spawn_rows_do_not_starve_step_prompt_retry() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local notes = {{}}
+            for i = 1, 51 do
+              notes[#notes + 1] = {{
+                id = "spawn-" .. i,
+                delivery_key = "visit-" .. i .. ":spawn",
+                kind = "spawn",
+                status = "pending",
+                session_uuid = "",
+                created_at = i,
+              }}
+            end
+            local prompt = {{
+              id = "prompt-1",
+              delivery_key = "visit-step:step_prompt",
+              run_id = "run-1",
+              run_step_id = "visit-step",
+              ticket_id = "ticket-1",
+              step_id = "implement",
+              session_uuid = "sess-impl",
+              kind = "step_prompt",
+              status = "pending",
+              attempt_count = 0,
+              msg_id = "msg-1",
+              instructions = "go",
+              title = "Pipeline step returned",
+              body = "continue",
+              created_at = 100,
+            }}
+            notes[#notes + 1] = prompt
+            local posts = 0
+            package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
+            package.loaded["project_pipelines.notification_policy"] = {{ notify_phase_transition = function() end }}
+            package.loaded["lib.agent"] = {{ get = function() return {{}} end }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{
+                  post = function()
+                    posts = posts + 1
+                    return {{ msg_id = "msg-1", status = "delivered" }}
+                  end,
+                  notify = function() return {{ status = "delivered" }} end,
+                  list_owned_sessions = function() return {{}} end,
+                }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              unrouted_active_agent_visits = function() return {{}} end,
+              unlinked_spawn_visits = function() return {{}} end,
+              pending_agent_notifications = function()
+                local out = {{}}
+                for _, row in ipairs(notes) do
+                  if row.status == "pending" and row.kind == "step_prompt" then
+                    out[#out + 1] = row
+                    if #out >= 50 then break end
+                  end
+                end
+                return out
+              end,
+              agent_notification_delivery_key = function(id, kind) return id .. ":" .. kind end,
+              get_agent_notification_by_key = function() return nil end,
+              mark_agent_notification_delivered = function(key)
+                for _, row in ipairs(notes) do
+                  if row.delivery_key == key or row.id == key then
+                    row.status = "delivered"
+                    return row
+                  end
+                end
+              end,
+              upsert_agent_notification = function(attrs)
+                for k, v in pairs(attrs or {{}}) do prompt[k] = v end
+                return prompt
+              end,
+              append_event = function() end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            local result = engine.reconcile_pending_agent_notifications()
+            assert(posts == 1)
+            assert(prompt.status == "delivered")
+            assert(result.delivered == 1)
+            assert(result.skipped == 0)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("51 pending spawn rows must not starve a pending step_prompt retry");
+
+    assert_eq!(result, "ok");
+}
+
+#[test]
+fn catalog_plugin_project_pipelines_handle_agent_created_marks_spawn_delivered() {
+    let lua = Lua::new();
+    log::register(&lua).expect("register log");
+
+    let plugin_dir = project_root_dir().join("catalog/templates/plugins/project-pipelines");
+    let result: String = lua
+        .load(format!(
+            r#"
+            package.path = "{plugin_dir}/?.lua;{plugin_dir}/?/init.lua;" .. package.path
+
+            local visit = {{
+              id = "visit-spawn",
+              run_id = "run-1",
+              step_id = "implement",
+              status = "active",
+              agent_session_uuid = "",
+              agent_request_id = "project-pipelines:run-1:implement:agent",
+            }}
+            local run = {{ id = "run-1", ticket_id = "ticket-1", status = "active", current_run_step_id = "visit-spawn" }}
+            local spawn_row = {{
+              delivery_key = "visit-spawn:spawn",
+              kind = "spawn",
+              status = "pending",
+              attempt_count = 1,
+            }}
+            local marked = {{}}
+            package.loaded["project_pipelines.entities"] = {{ register = function() end, publish_snapshots = function() end }}
+            package.loaded["project_pipelines.notification_policy"] = {{ notify_phase_transition = function() end }}
+            package.loaded["lib.agent"] = {{ get = function() return {{}} end }}
+            package.loaded["lib.hub"] = {{
+              get = function()
+                return {{ list_owned_sessions = function() return {{}} end }}
+              end,
+            }}
+            package.loaded["project_pipelines.repo"] = {{
+              get_run = function() return run end,
+              get_run_step_visit = function() return visit end,
+              agent_notification_delivery_key = function(id, kind) return id .. ":" .. kind end,
+              mark_agent_notification_delivered = function(key)
+                marked[#marked + 1] = key
+                if key == spawn_row.delivery_key then
+                  spawn_row.status = "delivered"
+                end
+                return spawn_row
+              end,
+              append_event = function() end,
+              update_run_step_visit = function(_, attrs)
+                for k, v in pairs(attrs or {{}}) do visit[k] = v end
+                return visit
+              end,
+            }}
+
+            local engine = require("project_pipelines.engine")
+            engine.handle_agent_created({{
+              session_uuid = "sess-new",
+              request_id = "project-pipelines:run-1:implement:agent",
+              metadata = {{ run_id = "run-1", step_id = "implement", run_step_id = "visit-spawn" }},
+            }})
+            assert(visit.agent_session_uuid == "sess-new")
+            assert(spawn_row.status == "delivered")
+            assert(#marked == 1)
+            assert(marked[1] == "visit-spawn:spawn")
+            engine.handle_agent_created({{
+              session_uuid = "sess-new",
+              request_id = "project-pipelines:run-1:implement:agent",
+              metadata = {{ run_id = "run-1", step_id = "implement", run_step_id = "visit-spawn" }},
+            }})
+            assert(spawn_row.status == "delivered")
+            assert(#marked == 2)
+            visit.status = "blocked"
+            visit.agent_session_uuid = ""
+            spawn_row.status = "pending"
+            engine.handle_agent_created({{
+              session_uuid = "sess-late",
+              request_id = "project-pipelines:run-1:implement:agent",
+              metadata = {{ run_id = "run-1", step_id = "implement", run_step_id = "visit-spawn" }},
+            }})
+            assert(visit.agent_session_uuid == "")
+            assert(visit.status == "blocked")
+            assert(#marked == 2)
+            return "ok"
+            "#,
+            plugin_dir = plugin_dir.display()
+        ))
+        .eval()
+        .expect("linking a visit must mark the spawn ledger row delivered");
 
     assert_eq!(result, "ok");
 }
