@@ -425,19 +425,17 @@ pub(crate) fn fire_single_ac_message(
             // plugin worker threads by worker_loop. Using it from the hub event
             // loop would be the architectural mistake the bypass-leak assert
             // is designed to catch.
-            let invoke: mlua::Function = lua.globals().get("__plugin_worker_invoke")?;
             let payload = lua.create_table()?;
             payload.set("channel_id", channel_id)?;
             payload.set("message", lua_msg.clone())?;
-
-            invoke.call::<mlua::Value>((
-                owner.clone(),
-                "ac_message".to_string(),
-                handler_id.clone().unwrap_or_else(|| channel_id.to_string()),
-                mlua::Value::Nil,
-                payload,
-                5000u64,
-            ))?;
+            super::plugin_worker::invoke_plugin_handler_async(
+                lua,
+                owner,
+                "ac_message",
+                handler_id.as_deref().unwrap_or(channel_id),
+                mlua::Value::Table(payload),
+                5000,
+            )?;
         } else {
             // Platform / non-plugin path.
             // Critical bypass-leak guard: if we ever see an active worker context here,

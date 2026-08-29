@@ -405,9 +405,6 @@ fn plugin_worker_session_get_can_resolve_system_connector_sessions() {
             local all_info_calls = {{}}
             local Hub = require("lib.hub")
             Hub._handle_worker_parent_request = function(payload)
-                assert(payload.type == "get_agent_list", tostring(payload.type))
-                local opts = payload.opts or {{}}
-                all_info_calls[#all_info_calls + 1] = opts
                 local rows = {{
                     {{
                         session_uuid = "parent-session",
@@ -425,6 +422,18 @@ fn plugin_worker_session_get_can_resolve_system_connector_sessions() {
                         }},
                     }},
                 }}
+                if payload.type == "get_agent" then
+                    all_info_calls[#all_info_calls + 1] = {{ include_system = true, session_uuid = payload.session_uuid }}
+                    for _, row in ipairs(rows) do
+                        if row.session_uuid == payload.session_uuid then
+                            return {{ result = row }}
+                        end
+                    end
+                    return {{ result = nil }}
+                end
+                assert(payload.type == "get_agent_list", tostring(payload.type))
+                local opts = payload.opts or {{}}
+                all_info_calls[#all_info_calls + 1] = opts
                 return {{ result = rows }}
             end
 
@@ -765,6 +774,13 @@ fn plugin_owned_surface_route_runs_in_plugin_worker_vm() {
                 tree.props.text:match("^worker:worker%-surface%-plugin:42:/hubs/hub%-test/worker_surface/item/42:botster%-plugin%-asset://worker%-surface%-plugin:graph%?v="),
                 tostring(tree.props.text)
             )
+            require("lib.plugin_assets")._register({{
+                id = "worker-surface-plugin:graph",
+                name = "graph",
+                plugin_name = "worker-surface-plugin",
+                path = {asset_path},
+                content_type = "text/html",
+            }})
             local result, read_err = require("lib.plugin_assets").read("worker-surface-plugin:graph")
             assert(result ~= nil, tostring(read_err))
             assert(result.content == "<html>worker graph</html>", tostring(result and result.content))
@@ -772,6 +788,7 @@ fn plugin_owned_surface_route_runs_in_plugin_worker_vm() {
             return true
             "#,
             init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+            asset_path = serde_json::to_string(&asset_path.to_string_lossy()).unwrap(),
         ))
         .eval::<bool>()
         .unwrap();
@@ -1786,4 +1803,153 @@ fn plugin_owned_mcp_handlers_run_in_plugin_worker_vm() {
         ))
         .eval::<bool>()
         .unwrap();
+}
+
+#[test]
+fn plugin_worker_mcp_burst_does_not_block_surface_render() {
+    // SAFETY: Isolated worker test must resolve repository Lua modules.
+    unsafe {
+        std::env::set_var(
+            "BOTSTER_LUA_PATH",
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua"),
+        )
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let plugin_dir = tmp.path().join("iso-plugin");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    let init_path = plugin_dir.join("init.lua");
+    fs::write(
+        &init_path,
+        r#"
+        local mcp = require("lib.mcp")
+        local surfaces = require("lib.surfaces")
+
+        mcp.tool("slow_burst", {
+            description = "Slow MCP handler",
+            input_schema = { type = "object", properties = {} },
+            timeout_ms = 5000,
+        }, function()
+            local until_clock = os.clock() + 0.12
+            while os.clock() < until_clock do end
+            return { ok = true }
+        end)
+
+        surfaces.register("iso_surface", {
+            label = "Iso",
+            timeout_ms = 2000,
+            routes = {
+                {
+                    path = "/",
+                    render = function()
+                        return { type = "text", props = { text = "fast" } }
+                    end,
+                },
+            },
+        })
+
+        return {}
+        "#,
+    )
+    .unwrap();
+
+    let runtime = LuaRuntime::new().unwrap();
+    let elapsed_ms: i64 = runtime
+        .lua()
+        .load(format!(
+            r#"
+            local loader = require("hub.loader")
+            local ok, err = loader.load_plugin({init_path}, "iso-plugin", {{ source = "device" }})
+            assert(ok, tostring(err))
+
+            local mcp = require("lib.mcp")
+            local surfaces = require("lib.surfaces")
+            for _ = 1, 8 do
+                mcp.call_tool("slow_burst", {{}}, {{}}, function() end)
+            end
+            local started = os.clock()
+            local tree = surfaces.render_node("iso_surface", {{ path = "/", params = {{}} }})
+            local elapsed_ms = math.floor((os.clock() - started) * 1000)
+            assert(tree, "surface must render")
+            assert(elapsed_ms < 500, "surface waited " .. tostring(elapsed_ms) .. "ms behind MCP burst")
+            return elapsed_ms
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval()
+        .unwrap();
+
+    assert!(
+        elapsed_ms < 500,
+        "surface render must not wait for the full MCP burst, elapsed_ms={elapsed_ms}"
+    );
+}
+
+#[test]
+fn plugin_worker_mcp_burst_does_not_block_event_handler() {
+    // SAFETY: Isolated worker test must resolve repository Lua modules.
+    unsafe {
+        std::env::set_var(
+            "BOTSTER_LUA_PATH",
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua"),
+        )
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let plugin_dir = tmp.path().join("iso-event-plugin");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    let init_path = plugin_dir.join("init.lua");
+    fs::write(
+        &init_path,
+        r#"
+        local mcp = require("lib.mcp")
+
+        mcp.tool("slow_burst", {
+            description = "Slow MCP handler",
+            input_schema = { type = "object", properties = {} },
+            timeout_ms = 5000,
+        }, function()
+            local until_clock = os.clock() + 0.12
+            while os.clock() < until_clock do end
+            return { ok = true }
+        end)
+
+        events.on("iso_event", function()
+            return true
+        end)
+
+        return {}
+        "#,
+    )
+    .unwrap();
+
+    let runtime = LuaRuntime::new().unwrap();
+    let elapsed_ms: i64 = runtime
+        .lua()
+        .load(format!(
+            r#"
+            local loader = require("hub.loader")
+            local ok, err = loader.load_plugin({init_path}, "iso-event-plugin", {{ source = "device" }})
+            assert(ok, tostring(err))
+
+            local mcp = require("lib.mcp")
+            for _ = 1, 8 do
+                mcp.call_tool("slow_burst", {{}}, {{}}, function() end)
+            end
+            local started = os.clock()
+            local count = events.emit("iso_event", {{}})
+            local elapsed_ms = math.floor((os.clock() - started) * 1000)
+            assert(count == 1, tostring(count))
+            assert(elapsed_ms < 500, "event waited " .. tostring(elapsed_ms) .. "ms behind MCP burst")
+            return elapsed_ms
+            "#,
+            init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+        ))
+        .eval()
+        .unwrap();
+
+    assert!(
+        elapsed_ms < 500,
+        "event handler must not wait for the full MCP burst, elapsed_ms={elapsed_ms}"
+    );
 }

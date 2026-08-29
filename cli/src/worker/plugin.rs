@@ -12,7 +12,8 @@ use super::{BoundedQueueConfig, RequestId};
 pub type PluginKey = String;
 
 /// Default bounded mailbox config for a single plugin worker.
-pub const PLUGIN_WORKER_QUEUE: BoundedQueueConfig = BoundedQueueConfig::new("worker.plugin", 512);
+/// Sum of class caps: MCP 192 + Surface 128 + Event 128 + Maintenance 64 + Control 64.
+pub const PLUGIN_WORKER_QUEUE: BoundedQueueConfig = BoundedQueueConfig::new("worker.plugin", 576);
 
 /// Plugin capability families that can own executable handlers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

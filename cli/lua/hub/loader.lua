@@ -880,8 +880,14 @@ function M.list_plugins()
     local registry = state.get("plugin_registry", {})
     local result = {}
     for name, entry in pairs(registry) do
+        local key = entry.key or name
+        local worker_metrics = nil
+        if type(__plugin_worker_class_metrics) == "function" then
+            local metrics_ok, snap = pcall(__plugin_worker_class_metrics, key)
+            if metrics_ok then worker_metrics = snap end
+        end
         table.insert(result, {
-            key = entry.key or name,
+            key = key,
             name = entry.name or name,
             path = entry.path,
             source = entry.source,
@@ -891,6 +897,7 @@ function M.list_plugins()
             loaded_at = entry.loaded_at,
             error_at = entry.error_at,
             reload_count = entry.reload_count or 0,
+            worker_metrics = worker_metrics,
         })
     end
     table.sort(result, function(a, b) return (a.key or a.name) < (b.key or b.name) end)

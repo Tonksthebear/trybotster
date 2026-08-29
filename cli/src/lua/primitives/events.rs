@@ -279,19 +279,17 @@ fn invoke_plugin_event(
     event: &str,
     data: Value,
 ) -> LuaResult<()> {
-    let invoke: LuaFunction = lua.globals().get("__plugin_worker_invoke")?;
     let payload = lua.create_table()?;
     payload.set("event", event)?;
     payload.set("data", data)?;
-    invoke.call::<Value>((
-        owner_plugin.to_string(),
-        "event".to_string(),
-        handler_id.to_string(),
-        Option::<String>::None,
-        payload,
-        5000_u64,
-    ))?;
-    Ok(())
+    crate::lua::primitives::plugin_worker::invoke_plugin_handler_async(
+        lua,
+        owner_plugin,
+        "event",
+        handler_id,
+        Value::Table(payload),
+        5000,
+    )
 }
 
 pub(crate) fn collect_event_callbacks(

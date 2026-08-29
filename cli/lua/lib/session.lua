@@ -27,6 +27,38 @@ local Session = state.class("Session")
 
 -- Session registry keyed by session_uuid (persistent across reloads)
 local sessions = state.get("agent_registry", {})
+-- owner_plugin -> { [session_uuid] = true }. Hub:list_owned_sessions is O(owned).
+local owner_index = state.get("session_owner_index", {})
+
+local function session_owner_plugin(session)
+    if type(session) ~= "table" then return nil end
+    if type(session.owner_plugin) == "string" and session.owner_plugin ~= "" then
+        return session.owner_plugin
+    end
+    local metadata = session.metadata
+    if type(metadata) == "table" and type(metadata.owner_plugin) == "string" and metadata.owner_plugin ~= "" then
+        return metadata.owner_plugin
+    end
+    return nil
+end
+
+local function index_owner(session)
+    local owner = session_owner_plugin(session)
+    local uuid = session and session.session_uuid
+    if not owner or type(uuid) ~= "string" or uuid == "" then return end
+    if type(owner_index[owner]) ~= "table" then owner_index[owner] = {} end
+    owner_index[owner][uuid] = true
+end
+
+local function unindex_owner(session)
+    local owner = session_owner_plugin(session)
+    local uuid = session and session.session_uuid
+    if not owner or type(uuid) ~= "string" or uuid == "" then return end
+    local bucket = owner_index[owner]
+    if type(bucket) ~= "table" then return end
+    bucket[uuid] = nil
+    if next(bucket) == nil then owner_index[owner] = nil end
+end
 
 local function plugin_worker_hub_proxy_enabled()
     local parent_hub_id = rawget(_G, "_plugin_worker_parent_hub_id")
@@ -631,6 +663,7 @@ function Session._init(self, config)
 
     -- Register in session registry (keyed by session_uuid)
     sessions[session_uuid] = self
+    index_owner(self)
     sync_manifest_workspaces()
 
     -- Notify observers
@@ -752,6 +785,7 @@ function Session._init_recovered(self, config)
 
     -- Register in session registry
     sessions[self.session_uuid] = self
+    index_owner(self)
     sync_manifest_workspaces()
 
     log.info(string.format("Session recovered: %s (uuid=%s, type=%s)",
@@ -785,6 +819,7 @@ function Session:update(fields)
     local changed = false
     local changed_fields = {}
     local needs_sync = false
+    local previous_owner = session_owner_plugin(self)
     for k, v in pairs(fields) do
         if self[k] ~= v then
             self[k] = v
@@ -794,6 +829,13 @@ function Session:update(fields)
                 needs_sync = true
             end
         end
+    end
+    if fields.metadata ~= nil or fields.owner_plugin ~= nil then
+        if previous_owner then
+            local previous = { session_uuid = self.session_uuid, owner_plugin = previous_owner, metadata = {} }
+            unindex_owner(previous)
+        end
+        index_owner(self)
     end
     if changed then
         if needs_sync then
@@ -849,7 +891,15 @@ end
 -- @param key string Metadata key
 -- @param value any Metadata value
 function Session:set_meta(key, value)
+    if key == "owner_plugin" then
+        unindex_owner(self)
+        self.owner_plugin = value
+    end
+    if type(self.metadata) ~= "table" then self.metadata = {} end
     self.metadata[key] = value
+    if key == "owner_plugin" then
+        index_owner(self)
+    end
     self:_sync_session_manifest()
 end
 
@@ -1153,6 +1203,7 @@ function Session:close(delete_worktree)
     self.status = "closed"
 
     -- Remove from registry
+    unindex_owner(self)
     sessions[self.session_uuid] = nil
     sync_manifest_workspaces()
 
@@ -1386,6 +1437,47 @@ function Session.get(session_uuid)
     return sessions[session_uuid]
 end
 
+
+function Session._index_owner_for_tests(session)
+    if type(session) ~= "table" or type(session.session_uuid) ~= "string" then return end
+    sessions[session.session_uuid] = session
+    index_owner(session)
+end
+
+function Session._unindex_owner_for_tests(session)
+    if type(session) ~= "table" then return end
+    unindex_owner(session)
+    if type(session.session_uuid) == "string" then
+        sessions[session.session_uuid] = nil
+    end
+end
+
+--- List sessions owned by a plugin. O(owned), not O(all sessions).
+-- @param owner_plugin string Plugin key
+-- @return array of Session subclass instances
+function Session.list_owned(owner_plugin)
+    if type(owner_plugin) ~= "string" or owner_plugin == "" then return {} end
+    if plugin_worker_hub_proxy_enabled() then
+        local result = {}
+        for _, sess in ipairs(proxy_session_list()) do
+            if session_owner_plugin(sess) == owner_plugin then
+                result[#result + 1] = sess
+            end
+        end
+        return result
+    end
+    local result = {}
+    local bucket = owner_index[owner_plugin]
+    if type(bucket) ~= "table" then return result end
+    for session_uuid in pairs(bucket) do
+        local sess = sessions[session_uuid]
+        if sess then result[#result + 1] = sess end
+    end
+    table.sort(result, function(a, b)
+        return (a.created_at or 0) < (b.created_at or 0)
+    end)
+    return result
+end
 
 --- List all sessions in creation order.
 -- @return array of Session subclass instances

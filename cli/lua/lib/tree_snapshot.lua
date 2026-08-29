@@ -254,6 +254,15 @@ function M.build_frames(opts)
                     if surface_state.path == nil then
                         surface_state.path = subpath
                     end
+                    if surface_state.subscription_key == nil then
+                        surface_state.subscription_key = opts.subscription_key
+                    end
+                    if surface_state.peer_id == nil
+                        and type(opts.client) == "table"
+                        and type(opts.client.peer_id) == "string"
+                    then
+                        surface_state.peer_id = opts.client.peer_id
+                    end
                     local frame = render_one(surface_name, surface_state)
                     if frame then
                         local key = bucket_key(surface_name, frame.subpath)

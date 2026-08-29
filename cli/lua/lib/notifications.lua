@@ -10,6 +10,8 @@ local observers = {}
 local claims = {}
 
 local DEFAULT_TIMEOUT_MS = 5000
+-- Claims decide delivery before send. Keep this on the interceptor budget.
+local CLAIM_TIMEOUT_MS = 10
 
 local function current_plugin_key()
     local key = rawget(_G, "_loading_plugin_key") or rawget(_G, "_loading_plugin_name")
@@ -208,11 +210,16 @@ function M.notify_observers(phase, intent, decision)
     for _, wrapped in ipairs(sorted_entries(observers)) do
         local entry = wrapped.entry
         if (entry.phase == "both" or entry.phase == phase) and scope_matches(entry.scope, intent) then
-            local ok, err = invoke(
-                entry,
+            local ok, err = require("lib.plugin_supervisor").fire_and_forget(
+                entry.owner_plugin,
                 "notification_observer:" .. entry.name,
-                "notification_observer",
-                { phase = phase, intent = intent, decision = decision },
+                entry.handler,
+                {
+                    timeout_ms = entry.timeout_ms or DEFAULT_TIMEOUT_MS,
+                    handler_kind = "notification_observer",
+                    handler_id = entry.name,
+                    payload = { phase = phase, intent = intent, decision = decision },
+                },
                 phase,
                 intent,
                 decision)
@@ -233,11 +240,16 @@ function M.evaluate(intent)
     for _, wrapped in ipairs(sorted_entries(claims)) do
         local entry = wrapped.entry
         if scope_matches(entry.scope, intent) then
-            local ok, result = invoke(
-                entry,
+            local ok, result = require("lib.plugin_supervisor").invoke(
+                entry.owner_plugin,
                 "notification_claim:" .. entry.name,
-                "notification_claim",
-                { intent = intent },
+                entry.handler,
+                {
+                    timeout_ms = entry.timeout_ms or CLAIM_TIMEOUT_MS,
+                    handler_kind = "notification_claim",
+                    handler_id = entry.name,
+                    payload = { intent = intent },
+                },
                 intent)
             if ok then
                 local decision = normalize_decision(result)

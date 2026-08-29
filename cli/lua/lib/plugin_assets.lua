@@ -4,6 +4,10 @@
 -- handing the browser arbitrary filesystem paths. The browser resolves
 -- `botster-plugin-asset://<asset_id>?v=<version>` URLs over the existing hub
 -- transport and mounts the response in a sandboxed iframe.
+--
+-- Production reads Hub-registered assets only. `expose_file` registers the
+-- file on the parent Hub during plugin load. A Hub-registry miss returns
+-- "Unknown plugin asset".
 
 local state = require("hub.state")
 
@@ -136,23 +140,7 @@ end
 function M.read(asset_id)
     local entry = M.get(asset_id)
     if not entry then
-        local plugin_key = plugin_key_from_asset_id(asset_id)
-        if rawget(_G, "_plugin_worker_key") == nil
-            and type(plugin_key) == "string"
-            and plugin_key ~= "builtin"
-            and type(__plugin_worker_invoke) == "function" then
-            local ok, result = pcall(
-                __plugin_worker_invoke,
-                plugin_key,
-                "plugin_asset_read",
-                asset_id,
-                nil,
-                { asset_id = asset_id },
-                2000)
-            if ok and type(result) == "table" then
-                return result, nil
-            end
-        end
+        -- Typed miss. Plugins must register assets on the Hub with expose_file.
         return nil, "Unknown plugin asset"
     end
     local content, err = fs.read(entry.path)
@@ -226,7 +214,8 @@ local function dispatch_message(envelope, ctx)
     }
 
     if handler_entry.plugin_name ~= "builtin" and not running_in_plugin_worker(handler_entry.plugin_name) then
-        local ok, result = require("lib.plugin_supervisor").invoke(
+        local completed, completed_ok, completed_result = false, nil, nil
+        local accepted, admission_error = require("lib.plugin_supervisor").invoke_async(
             handler_entry.plugin_name,
             "asset_message:" .. tostring(action_name),
             handler_entry.handler,
@@ -240,10 +229,22 @@ local function dispatch_message(envelope, ctx)
                     ctx = worker_ctx,
                 },
             },
+            function(ok, result)
+                completed = true
+                completed_ok = ok
+                completed_result = result
+                if not ok and log and log.warn then
+                    log.warn("plugin_assets message failed: " .. tostring(result))
+                end
+            end,
             payload.payload,
             worker_ctx)
-        if not ok then error(result) end
-        return true, result
+        if not accepted then error(admission_error) end
+        if completed then
+            if not completed_ok then error(completed_result) end
+            return true, completed_result
+        end
+        return true, { pending = true, request_id = admission_error }
     end
 
     return true, normalize_message_result(handler_entry.handler(payload.payload, local_ctx))

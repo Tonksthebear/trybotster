@@ -265,25 +265,14 @@ function M.dispatch(envelope, ctx)
     local slot = registry[envelope.id]
     if slot then
         local supervisor = require("lib.plugin_supervisor")
-        for _, entry in ipairs(slot) do
-            handler_count = handler_count + 1
-            local ok, result = supervisor.invoke(
-                entry.owner_plugin,
-                "ui_action:" .. envelope.id .. ":" .. entry.name,
-                entry.handler,
-                {
-                    timeout_ms = entry.timeout_ms,
-                    handler_kind = "ui_action",
-                    handler_id = envelope.id,
-                    handler_name = entry.name,
-                    payload = { envelope = envelope, ctx = worker_ctx(ctx) },
-                },
-                envelope,
-                ctx)
+        local pending = 0
+        local finish
+
+        local function apply_handler_result(ok, result, entry_name)
             if not ok then
                 log.warn(string.format(
                     "action handler %s for %s raised: %s",
-                    entry.name, envelope.id, tostring(result)))
+                    entry_name, envelope.id, tostring(result)))
                 ok_result = false
                 error_message = tostring(result)
             elseif type(result) == "table" and result.__plugin_action_status == "handled" then
@@ -305,17 +294,59 @@ function M.dispatch(envelope, ctx)
                 if type(result.navigate) == "table" then navigate = result.navigate end
                 if type(result.presentation) == "table" then presentation = result.presentation end
             end
-            -- Any other return value: observed but not consumed. Fall
-            -- through to remaining handlers (observer semantics).
         end
-    end
 
-    if handled_count > 0 then
-        return {
-            handled = true, via = "handler", ok = ok_result,
-            message = message, error = error_message, navigate = navigate, presentation = presentation,
-            handler_count = handler_count, handled_count = handled_count,
-        }
+        finish = function()
+            if handled_count > 0 then
+                return
+            end
+            local cmd = fallback_command(envelope)
+            if cmd then
+                local commands = require("lib.commands")
+                pcall(commands.dispatch, ctx.client, ctx.sub_id, cmd)
+            end
+        end
+
+        for _, entry in ipairs(slot) do
+            handler_count = handler_count + 1
+            pending = pending + 1
+            local accepted, admission_error = supervisor.invoke_async(
+                entry.owner_plugin,
+                "ui_action:" .. envelope.id .. ":" .. entry.name,
+                entry.handler,
+                {
+                    timeout_ms = entry.timeout_ms,
+                    handler_kind = "ui_action",
+                    handler_id = envelope.id,
+                    handler_name = entry.name,
+                    payload = { envelope = envelope, ctx = worker_ctx(ctx) },
+                },
+                function(ok, result)
+                    apply_handler_result(ok, result, entry.name)
+                    pending = pending - 1
+                    if pending <= 0 then finish() end
+                end,
+                envelope,
+                ctx)
+            if not accepted then
+                apply_handler_result(false, admission_error, entry.name)
+                pending = pending - 1
+            end
+        end
+        if pending > 0 then
+            return {
+                handled = true, via = "pending", ok = true,
+                request_id = admission_error,
+                handler_count = handler_count, handled_count = handled_count,
+            }
+        end
+        if handled_count > 0 then
+            return {
+                handled = true, via = "handler", ok = ok_result,
+                message = message, error = error_message, navigate = navigate, presentation = presentation,
+                handler_count = handler_count, handled_count = handled_count,
+            }
+        end
     end
 
     -- Fallback: mirror Phase-1 behavior for action ids the browser already

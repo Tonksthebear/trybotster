@@ -955,17 +955,26 @@ end
 -- @return array of { session_uuid, label, metadata, status }
 function Hub:list_owned_sessions(owner_plugin)
     if self._is_local then
-        local owned = {}
-        for _, session in ipairs(Agent.list()) do
-            if session.owner_plugin == owner_plugin
-                    or (session.metadata and session.metadata.owner_plugin == owner_plugin) then
-                owned[#owned + 1] = {
-                    session_uuid = session.session_uuid,
-                    label = session.label,
-                    metadata = session.metadata,
-                    status = session.status,
-                }
+        local Session = require("lib.session")
+        local listed = {}
+        if type(Session.list_owned) == "function" then
+            listed = Session.list_owned(owner_plugin) or {}
+        else
+            for _, session in ipairs(Agent.list()) do
+                if session.owner_plugin == owner_plugin
+                        or (session.metadata and session.metadata.owner_plugin == owner_plugin) then
+                    listed[#listed + 1] = session
+                end
             end
+        end
+        local owned = {}
+        for _, session in ipairs(listed) do
+            owned[#owned + 1] = {
+                session_uuid = session.session_uuid,
+                label = session.label,
+                metadata = session.metadata,
+                status = session.status,
+            }
         end
         return owned
     end

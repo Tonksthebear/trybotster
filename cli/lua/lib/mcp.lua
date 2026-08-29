@@ -182,7 +182,7 @@ end
 local function invoke_proxy_auth_error(proxy)
     if type(proxy) ~= "table" or type(proxy.on_auth_error) ~= "function" then return end
     if proxy.owner_plugin then
-        local ok, err = require("lib.plugin_supervisor").invoke(
+        local ok, err = require("lib.plugin_supervisor").fire_and_forget(
             proxy.owner_plugin,
             "mcp_proxy_auth_error:" .. tostring(proxy.url),
             proxy.on_auth_error,
@@ -728,7 +728,8 @@ function M.call_tool(name, params, context, callback)
 
     local ok, result
     if tool.owner_plugin then
-        ok, result = require("lib.plugin_supervisor").invoke(
+        local completed, completed_ok, completed_result = false, nil, nil
+        local accepted, admission_error = require("lib.plugin_supervisor").invoke_async(
             tool.owner_plugin,
             "mcp_tool:" .. tostring(name),
             tool.handler,
@@ -738,8 +739,22 @@ function M.call_tool(name, params, context, callback)
                 handler_id = tool.handler_id or mcp_handler_id("tool", name),
                 payload = { name = name, params = params or {}, context = context or {} },
             },
+            function(invoke_ok, invoke_result)
+                completed = true
+                completed_ok = invoke_ok
+                completed_result = invoke_result
+            end,
             params or {},
             context or {})
+        if not accepted then
+            if callback then callback(nil, tostring(admission_error)) return end
+            return nil, admission_error
+        end
+        if not completed then
+            if callback then return admission_error end
+            return nil, "plugin worker invoke pending"
+        end
+        ok, result = completed_ok, completed_result
     else
         ok, result = pcall(tool.handler, params or {}, context or {})
     end
@@ -1104,7 +1119,8 @@ function M.get_prompt(name, args, context, callback)
 
     local ok, result
     if prompt.owner_plugin then
-        ok, result = require("lib.plugin_supervisor").invoke(
+        local completed, completed_ok, completed_result = false, nil, nil
+        local accepted, admission_error = require("lib.plugin_supervisor").invoke_async(
             prompt.owner_plugin,
             "mcp_prompt:" .. tostring(name),
             prompt.handler,
@@ -1114,7 +1130,21 @@ function M.get_prompt(name, args, context, callback)
                 handler_id = prompt.handler_id or mcp_handler_id("prompt", name),
                 payload = { name = name, args = args or {}, context = context or {} },
             },
+            function(invoke_ok, invoke_result)
+                completed = true
+                completed_ok = invoke_ok
+                completed_result = invoke_result
+            end,
             args or {})
+        if not accepted then
+            if callback then callback(nil, tostring(admission_error)) return end
+            return nil, admission_error
+        end
+        if not completed then
+            if callback then return admission_error end
+            return nil, "plugin worker invoke pending"
+        end
+        ok, result = completed_ok, completed_result
     else
         ok, result = pcall(prompt.handler, args or {})
     end
@@ -1406,7 +1436,8 @@ function M.read_resource(uri, context, callback)
 
     local ok, result
     if matched_template.owner_plugin then
-        ok, result = require("lib.plugin_supervisor").invoke(
+        local completed, completed_ok, completed_result = false, nil, nil
+        local accepted, admission_error = require("lib.plugin_supervisor").invoke_async(
             matched_template.owner_plugin,
             "mcp_resource:" .. tostring(matched_template.uri_template),
             matched_template.handler,
@@ -1421,8 +1452,22 @@ function M.read_resource(uri, context, callback)
                     context = context or {},
                 },
             },
+            function(invoke_ok, invoke_result)
+                completed = true
+                completed_ok = invoke_ok
+                completed_result = invoke_result
+            end,
             params or {},
             context or {})
+        if not accepted then
+            if callback then callback(nil, tostring(admission_error)) return end
+            return nil, admission_error
+        end
+        if not completed then
+            if callback then return admission_error end
+            return nil, "plugin worker invoke pending"
+        end
+        ok, result = completed_ok, completed_result
     else
         ok, result = pcall(matched_template.handler, params or {}, context or {})
     end

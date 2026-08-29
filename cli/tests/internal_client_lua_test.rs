@@ -385,6 +385,12 @@ fn hub_create_agent_mints_request_id_and_lists_owned_sessions() {
               end,
               get = function(_, default) return default end,
             }}
+            package.loaded["lib.session"] = {{
+              list_owned = function(owner)
+                if owner == "workflow" then return {{ owned_session }} end
+                return {{}}
+              end,
+            }}
             package.loaded["lib.agent"] = {{
               list = function() return {{ owned_session, other_session }} end,
               get = function() return nil end,

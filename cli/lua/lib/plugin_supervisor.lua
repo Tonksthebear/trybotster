@@ -165,6 +165,21 @@ function M.invoke_async(plugin_key, label, fn, opts, callback, ...)
     local has_plugin_owner = type(plugin_key) == "string" and plugin_key ~= ""
 
     if has_plugin_owner and type(__plugin_worker_invoke_async) == "function" and opts.handler_kind then
+        local async_available = true
+        if type(__plugin_worker_async_available) == "function" then
+            local avail_ok, available = pcall(__plugin_worker_async_available)
+            async_available = avail_ok and available == true
+        end
+        if not async_available then
+            if log and log.warn then
+                log.warn(string.format(
+                    "plugin %s %s using sync fallback: Hub event channel is unavailable",
+                    tostring(plugin_key), tostring(label or "handler")))
+            end
+            local returns = table.pack(M.invoke(plugin_key, label, fn, opts, ...))
+            callback(table.unpack(returns, 1, returns.n))
+            return true
+        end
         local accepted, request_or_error = pcall(
             __plugin_worker_invoke_async,
             plugin_key,
@@ -198,9 +213,16 @@ function M.invoke_async(plugin_key, label, fn, opts, callback, ...)
         return true, request_or_error
     end
 
-    local ok, result = M.invoke(plugin_key, label, fn, opts, ...)
-    callback(ok, result)
+    local returns = table.pack(M.invoke(plugin_key, label, fn, opts, ...))
+    callback(table.unpack(returns, 1, returns.n))
     return true
+end
+
+--- Admit a plugin handler without waiting on the Hub owner loop.
+-- Failures are logged by `invoke_async`. Callers must not wait for the result.
+function M.fire_and_forget(plugin_key, label, fn, opts, ...)
+    local function discard(_ok, _result) end
+    return M.invoke_async(plugin_key, label, fn, opts, discard, ...)
 end
 
 return M

@@ -313,7 +313,9 @@ function M.run(session_uuid, action_id, context)
     local worker_payload = copy_worker_payload(context)
     worker_payload.session = session
     worker_payload.action = action
-    local ok, result, err = require("lib.plugin_supervisor").invoke(
+    local completed, completed_ok, completed_result, completed_err = false, nil, nil, nil
+    local admitted = false
+    local accepted, request_id_or_error = require("lib.plugin_supervisor").invoke_async(
         entry.owner_plugin,
         "session_action:" .. action_id,
         entry.run,
@@ -326,22 +328,52 @@ function M.run(session_uuid, action_id, context)
                 payload = worker_payload,
             },
         },
+        function(ok, result, err)
+            completed = true
+            completed_ok = ok
+            completed_result = result
+            completed_err = err
+            if not ok then
+                if log and log.warn then
+                    log.warn(string.format(
+                        "session action %s failed: %s",
+                        action_id, tostring(result)))
+                end
+                if admitted and context and context.client and type(context.client.send) == "function" then
+                    pcall(context.client.send, context.client, {
+                        subscriptionId = context.sub_id,
+                        type = "session_action_error",
+                        error = tostring(result),
+                        request_id = request_id_or_error,
+                    })
+                end
+            end
+        end,
         session_uuid,
         action_id,
         payload)
-    if not ok then
-        return nil, result
+    admitted = true
+    if not accepted then
+        return nil, request_id_or_error
     end
-    if type(result) == "table" and result.ok == false then
-        return nil, result.error or "session action failed"
+    if completed then
+        if not completed_ok then
+            return nil, completed_result
+        end
+        local result = completed_result
+        if type(result) == "table" and result.ok == false then
+            return nil, result.error or "session action failed"
+        end
+        if type(result) == "table" and result.ok == true and result.result ~= nil then
+            return true, result.result
+        end
+        if (result == nil or result == false) and completed_err ~= nil then
+            return nil, completed_err
+        end
+        return true, result
     end
-    if type(result) == "table" and result.ok == true and result.result ~= nil then
-        return true, result.result
-    end
-    if (result == nil or result == false) and err ~= nil then
-        return nil, err
-    end
-    return true, result
+    -- Owner loop does not wait. Worker completion is fire-and-forget.
+    return true, { ok = true, pending = true, request_id = request_id_or_error }
 end
 
 function M._reset_for_tests()

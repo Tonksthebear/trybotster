@@ -242,18 +242,16 @@ fn invoke_plugin_watch(
     handler_id: &str,
     event_table: LuaTable,
 ) -> LuaResult<()> {
-    let invoke: LuaFunction = lua.globals().get("__plugin_worker_invoke")?;
     let payload = lua.create_table()?;
     payload.set("event", event_table)?;
-    invoke.call::<LuaValue>((
-        owner_plugin.to_string(),
-        "watch".to_string(),
-        handler_id.to_string(),
-        Option::<String>::None,
-        payload,
-        5000_u64,
-    ))?;
-    Ok(())
+    crate::lua::primitives::plugin_worker::invoke_plugin_handler_async(
+        lua,
+        owner_plugin,
+        "watch",
+        handler_id,
+        LuaValue::Table(payload),
+        5000,
+    )
 }
 
 /// Register watch primitives with the Lua state.

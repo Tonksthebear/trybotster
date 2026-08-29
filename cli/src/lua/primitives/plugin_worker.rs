@@ -3,14 +3,24 @@
 //! Exposes a small synchronous bridge used by `lib.plugin_supervisor`.
 //! Each plugin key owns one worker thread and one Lua VM. The hub VM keeps
 //! routing/descriptor state; plugin-owned handler execution happens here.
+//!
+//! Remaining Hub-thread synchronous waits:
+//! - `hook_interceptor` (`hooks.call`) so a plugin can allow, modify, or
+//!   block an action before that action continues. Default budget is 10 ms.
+//! - `notification_claim` so delivery ownership is decided before send.
+//!   Default budget is 10 ms; a missed claim falls back to default delivery.
+//! Interceptors that miss their budget keep the previous value.
+//!
+//! Mailbox classes and caps: MCP 192, Surface 128, Event 128, Maintenance 64,
+//! Control 64. Shutdown is the only request that skips fair round-robin.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -103,6 +113,33 @@ fn remaining_handler_timeout_ms(deadline: Instant) -> Option<u64> {
         None
     } else {
         Some(remaining.as_millis().max(1) as u64)
+    }
+}
+
+/// Typed failure from a plugin-worker handler.
+///
+/// `Timeout` comes from `__worker_timed` after `__hook_timed_pcall`.
+/// Callers must not string-match handler errors for timeout accounting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WorkerFail {
+    Timeout,
+    ExpiredInQueue,
+    Canceled,
+    Handler(String),
+}
+
+impl WorkerFail {
+    fn as_message(&self) -> String {
+        match self {
+            Self::Timeout => "plugin worker invoke timeout".to_string(),
+            Self::ExpiredInQueue => "plugin worker invoke expired in queue".to_string(),
+            Self::Canceled => "plugin worker invoke canceled".to_string(),
+            Self::Handler(message) => message.clone(),
+        }
+    }
+
+    fn is_timeout(&self) -> bool {
+        matches!(self, Self::Timeout | Self::ExpiredInQueue)
     }
 }
 
@@ -234,7 +271,7 @@ pub(crate) struct PluginWorkerRegistry {
 
 #[derive(Clone)]
 struct PluginWorkerHandle {
-    tx: mpsc::SyncSender<PluginWorkerRequest>,
+    mailbox: WorkerMailbox,
     parent_rx: Arc<Mutex<mpsc::Receiver<WorkerParentRequest>>>,
     admission: Arc<Mutex<PluginWorkerAdmission>>,
 }
@@ -244,6 +281,281 @@ struct PluginWorkerAdmission {
     shutdown_reason: Option<String>,
 }
 
+/// Invoke class used for admission and fair dequeue.
+///
+/// HTTP, WebSocket, timer, watch, and webhook callbacks share the Control
+/// class and round-robin with MCP/surface/event/maintenance. Shutdown is
+/// the only request that skips fairness. One plugin worker thread still
+/// runs handlers serially; classes bound the mailbox and pick the next
+/// queued invoke fairly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkClass {
+    Mcp,
+    Surface,
+    Event,
+    Maintenance,
+    Control,
+}
+
+impl WorkClass {
+    const ALL: [Self; 5] = [
+        Self::Mcp,
+        Self::Surface,
+        Self::Event,
+        Self::Maintenance,
+        Self::Control,
+    ];
+
+    fn from_handler_kind(kind: &str) -> Self {
+        match kind {
+            "mcp_tool" | "mcp_prompt" | "mcp_resource" | "mcp_proxy_auth_error" => Self::Mcp,
+            "surface_route" | "ui_action" | "asset_message" | "plugin_asset_read" => Self::Surface,
+            "event" | "hook_observer" | "notification_observer" => Self::Event,
+            "hook_interceptor" | "command" | "session_action" | "timer" | "watch"
+            | "notification_claim" => Self::Maintenance,
+            "ac_message" | "ac_unregister" => Self::Control,
+            _ => Self::Maintenance,
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            Self::Mcp => 0,
+            Self::Surface => 1,
+            Self::Event => 2,
+            Self::Maintenance => 3,
+            Self::Control => 4,
+        }
+    }
+
+    fn cap(self) -> usize {
+        match self {
+            Self::Mcp => 192,
+            Self::Surface => 128,
+            Self::Event => 128,
+            Self::Maintenance => 64,
+            Self::Control => 64,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Mcp => "mcp",
+            Self::Surface => "surface",
+            Self::Event => "event",
+            Self::Maintenance => "maintenance",
+            Self::Control => "control",
+        }
+    }
+}
+
+struct ClassMetrics {
+    queued: [AtomicU64; 5],
+    shed: [AtomicU64; 5],
+    timeouts: [AtomicU64; 5],
+    executed: [AtomicU64; 5],
+    wait_ms: [AtomicU64; 5],
+    exec_ms: [AtomicU64; 5],
+    max_wait_ms: [AtomicU64; 5],
+    max_exec_ms: [AtomicU64; 5],
+}
+
+impl ClassMetrics {
+    fn new() -> Self {
+        Self {
+            queued: std::array::from_fn(|_| AtomicU64::new(0)),
+            shed: std::array::from_fn(|_| AtomicU64::new(0)),
+            timeouts: std::array::from_fn(|_| AtomicU64::new(0)),
+            executed: std::array::from_fn(|_| AtomicU64::new(0)),
+            wait_ms: std::array::from_fn(|_| AtomicU64::new(0)),
+            exec_ms: std::array::from_fn(|_| AtomicU64::new(0)),
+            max_wait_ms: std::array::from_fn(|_| AtomicU64::new(0)),
+            max_exec_ms: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    fn snapshot(&self) -> serde_json::Value {
+        let mut classes = serde_json::Map::new();
+        for class in WorkClass::ALL {
+            let i = class.index();
+            classes.insert(
+                class.as_str().to_string(),
+                serde_json::json!({
+                    "queued": self.queued[i].load(Ordering::Relaxed),
+                    "shed": self.shed[i].load(Ordering::Relaxed),
+                    "timeouts": self.timeouts[i].load(Ordering::Relaxed),
+                    "executed": self.executed[i].load(Ordering::Relaxed),
+                    "wait_ms": self.wait_ms[i].load(Ordering::Relaxed),
+                    "exec_ms": self.exec_ms[i].load(Ordering::Relaxed),
+                    "max_wait_ms": self.max_wait_ms[i].load(Ordering::Relaxed),
+                    "max_exec_ms": self.max_exec_ms[i].load(Ordering::Relaxed),
+                    "cap": class.cap(),
+                }),
+            );
+        }
+        serde_json::json!({ "classes": classes })
+    }
+}
+
+struct MailboxInner {
+    shutdown: Option<PluginWorkerRequest>,
+    classes: [VecDeque<(Instant, PluginWorkerRequest)>; 5],
+    rr: usize,
+    closed: bool,
+}
+
+#[derive(Clone)]
+struct WorkerMailbox {
+    inner: Arc<Mutex<MailboxInner>>,
+    cv: Arc<Condvar>,
+    metrics: Arc<ClassMetrics>,
+}
+
+impl WorkerMailbox {
+    fn new() -> Self {
+        debug_assert_eq!(
+            WorkClass::Mcp.cap()
+                + WorkClass::Surface.cap()
+                + WorkClass::Event.cap()
+                + WorkClass::Maintenance.cap()
+                + WorkClass::Control.cap(),
+            PLUGIN_WORKER_QUEUE.capacity
+        );
+        Self {
+            inner: Arc::new(Mutex::new(MailboxInner {
+                shutdown: None,
+                classes: std::array::from_fn(|_| VecDeque::new()),
+                rr: 0,
+                closed: false,
+            })),
+            cv: Arc::new(Condvar::new()),
+            metrics: Arc::new(ClassMetrics::new()),
+        }
+    }
+
+    fn try_enqueue(&self, request: PluginWorkerRequest) -> Result<(), String> {
+        let class = invoke_class(&request);
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("WorkerMailbox mutex poisoned");
+        if inner.closed {
+            return Err("plugin worker mailbox closed".to_string());
+        }
+        if matches!(request, PluginWorkerRequest::Shutdown { .. }) {
+            inner.shutdown = Some(request);
+            self.cv.notify_one();
+            return Ok(());
+        }
+        let class = class.unwrap_or(WorkClass::Control);
+        let i = class.index();
+        if inner.classes[i].len() >= class.cap() {
+            self.metrics.shed[i].fetch_add(1, Ordering::Relaxed);
+            log::warn!(
+                "plugin worker {} queue shed cap={}",
+                class.as_str(),
+                class.cap()
+            );
+            return Err(format!(
+                "plugin worker {} queue is full ({})",
+                class.as_str(),
+                class.cap()
+            ));
+        }
+        inner.classes[i].push_back((Instant::now(), request));
+        self.metrics.queued[i].store(inner.classes[i].len() as u64, Ordering::Relaxed);
+        self.cv.notify_one();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn try_recv(&self) -> Option<PluginWorkerRequest> {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("WorkerMailbox mutex poisoned");
+        pop_next(&mut inner, &self.metrics).map(|(_, _, request)| request)
+    }
+
+    fn recv(&self) -> Option<(Option<WorkClass>, Duration, PluginWorkerRequest)> {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("WorkerMailbox mutex poisoned");
+        loop {
+            if let Some(item) = pop_next(&mut inner, &self.metrics) {
+                return Some(item);
+            }
+            if inner.closed {
+                return None;
+            }
+            inner = self
+                .cv
+                .wait(inner)
+                .expect("WorkerMailbox condvar poisoned");
+        }
+    }
+
+    fn close(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("WorkerMailbox mutex poisoned");
+        inner.closed = true;
+        self.cv.notify_all();
+    }
+
+    fn drain(&self) -> Vec<PluginWorkerRequest> {
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("WorkerMailbox mutex poisoned");
+        let mut out = Vec::new();
+        if let Some(request) = inner.shutdown.take() {
+            out.push(request);
+        }
+        for queue in &mut inner.classes {
+            out.extend(queue.drain(..).map(|(_, request)| request));
+        }
+        out
+    }
+}
+
+fn invoke_class(request: &PluginWorkerRequest) -> Option<WorkClass> {
+    match request {
+        PluginWorkerRequest::Invoke { kind, .. }
+        | PluginWorkerRequest::InvokeAsync { kind, .. } => Some(WorkClass::from_handler_kind(kind)),
+        PluginWorkerRequest::HttpResponse(_)
+        | PluginWorkerRequest::WebSocketEvent(_)
+        | PluginWorkerRequest::TimerFired { .. }
+        | PluginWorkerRequest::UserFileWatch { .. }
+        | PluginWorkerRequest::LocalWebhook(_) => Some(WorkClass::Control),
+        PluginWorkerRequest::Shutdown { .. } => None,
+    }
+}
+
+fn pop_next(
+    inner: &mut MailboxInner,
+    metrics: &ClassMetrics,
+) -> Option<(Option<WorkClass>, Duration, PluginWorkerRequest)> {
+    if let Some(request) = inner.shutdown.take() {
+        return Some((None, Duration::ZERO, request));
+    }
+    for step in 0..WorkClass::ALL.len() {
+        let i = (inner.rr + step) % WorkClass::ALL.len();
+        if let Some((enqueued_at, request)) = inner.classes[i].pop_front() {
+            inner.rr = (i + 1) % WorkClass::ALL.len();
+            metrics.queued[i].store(inner.classes[i].len() as u64, Ordering::Relaxed);
+            let wait = enqueued_at.elapsed();
+            let wait_ms = wait.as_millis() as u64;
+            metrics.wait_ms[i].fetch_add(wait_ms, Ordering::Relaxed);
+            metrics.max_wait_ms[i].fetch_max(wait_ms, Ordering::Relaxed);
+            return Some((Some(WorkClass::ALL[i]), wait, request));
+        }
+    }
+    None
+}
+
 enum PluginWorkerRequest {
     Invoke {
         kind: String,
@@ -251,6 +563,7 @@ enum PluginWorkerRequest {
         name: Option<String>,
         payload: serde_json::Value,
         timeout_ms: u64,
+        deadline: Instant,
         response: mpsc::Sender<Result<serde_json::Value, String>>,
     },
     InvokeAsync {
@@ -278,34 +591,43 @@ enum PluginWorkerRequest {
     LocalWebhook(local_webhooks::LocalWebhookRequest),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub(crate) struct PluginWorkerEventTx {
-    tx: mpsc::SyncSender<PluginWorkerRequest>,
+    mailbox: WorkerMailbox,
+}
+
+impl std::fmt::Debug for PluginWorkerEventTx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PluginWorkerEventTx").finish_non_exhaustive()
+    }
 }
 
 impl PluginWorkerEventTx {
-    fn new(tx: mpsc::SyncSender<PluginWorkerRequest>) -> Self {
-        Self { tx }
+    fn new(mailbox: WorkerMailbox) -> Self {
+        Self { mailbox }
     }
 
     pub(crate) fn send_http_response(&self, response: http::CompletedHttpResponse) {
         if let Err(err) = self
-            .tx
-            .try_send(PluginWorkerRequest::HttpResponse(response))
+            .mailbox
+            .try_enqueue(PluginWorkerRequest::HttpResponse(response))
         {
             log::warn!("plugin worker queue rejected HTTP response: {err}");
         }
     }
 
     pub(crate) fn send_websocket_event(&self, event: websocket::WsEvent) {
-        if let Err(err) = self.tx.try_send(PluginWorkerRequest::WebSocketEvent(event)) {
+        if let Err(err) = self
+            .mailbox
+            .try_enqueue(PluginWorkerRequest::WebSocketEvent(event))
+        {
             log::warn!("plugin worker queue rejected WebSocket event: {err}");
         }
     }
 
     pub(crate) fn send_timer_fired(&self, timer_id: String) -> bool {
-        self.tx
-            .try_send(PluginWorkerRequest::TimerFired { timer_id })
+        self.mailbox
+            .try_enqueue(PluginWorkerRequest::TimerFired { timer_id })
             .is_ok()
     }
 
@@ -314,8 +636,8 @@ impl PluginWorkerEventTx {
         watch_id: String,
         events: Vec<crate::file_watcher::FileEvent>,
     ) -> bool {
-        self.tx
-            .try_send(PluginWorkerRequest::UserFileWatch { watch_id, events })
+        self.mailbox
+            .try_enqueue(PluginWorkerRequest::UserFileWatch { watch_id, events })
             .is_ok()
     }
 
@@ -323,17 +645,14 @@ impl PluginWorkerEventTx {
         &self,
         request: local_webhooks::LocalWebhookRequest,
     ) -> Result<(), mpsc::TrySendError<local_webhooks::LocalWebhookRequest>> {
-        self.tx
-            .try_send(PluginWorkerRequest::LocalWebhook(request))
-            .map_err(|err| match err {
-                mpsc::TrySendError::Full(PluginWorkerRequest::LocalWebhook(request)) => {
+        self.mailbox
+            .try_enqueue(PluginWorkerRequest::LocalWebhook(request.clone()))
+            .map_err(|err| {
+                if err.contains("closed") {
+                    mpsc::TrySendError::Disconnected(request)
+                } else {
                     mpsc::TrySendError::Full(request)
                 }
-                mpsc::TrySendError::Disconnected(PluginWorkerRequest::LocalWebhook(request)) => {
-                    mpsc::TrySendError::Disconnected(request)
-                }
-                mpsc::TrySendError::Full(_) => unreachable!("request variant changed"),
-                mpsc::TrySendError::Disconnected(_) => unreachable!("request variant changed"),
             })
     }
 }
@@ -463,6 +782,20 @@ pub(crate) fn register(lua: &Lua, registry: PluginWorkerRegistry) -> Result<()> 
         .set("__plugin_worker_invoke_async", invoke_async_fn)
         .map_err(|e| anyhow!("set __plugin_worker_invoke_async: {e}"))?;
 
+    let available_registry = registry.clone();
+    let available_fn = lua
+        .create_function(move |_, ()| {
+            Ok(available_registry
+                .hub_event_channel
+                .lock()
+                .expect("PluginWorkerRegistry hub_event_channel mutex poisoned")
+                .is_some())
+        })
+        .map_err(|e| anyhow!("create __plugin_worker_async_available: {e}"))?;
+    lua.globals()
+        .set("__plugin_worker_async_available", available_fn)
+        .map_err(|e| anyhow!("set __plugin_worker_async_available: {e}"))?;
+
     let fail_session_registry = registry.clone();
     let fail_session_fn = lua
         .create_function(move |lua, (session_uuid, error): (String, String)| {
@@ -485,7 +818,85 @@ pub(crate) fn register(lua: &Lua, registry: PluginWorkerRegistry) -> Result<()> 
         .set("__plugin_worker_shutdown", shutdown_fn)
         .map_err(|e| anyhow!("set __plugin_worker_shutdown: {e}"))?;
 
+    let metrics_registry = registry.clone();
+    let metrics_fn = lua
+        .create_function(move |lua, plugin_key: String| {
+            let workers = metrics_registry
+                .workers
+                .lock()
+                .expect("PluginWorkerRegistry mutex poisoned");
+            let Some(handle) = workers.get(&plugin_key) else {
+                return json_to_lua(lua, &serde_json::json!({ "error": "plugin worker not loaded" }));
+            };
+            json_to_lua(lua, &handle.mailbox.metrics.snapshot())
+        })
+        .map_err(|e| anyhow!("create __plugin_worker_class_metrics: {e}"))?;
+    lua.globals()
+        .set("__plugin_worker_class_metrics", metrics_fn)
+        .map_err(|e| anyhow!("set __plugin_worker_class_metrics: {e}"))?;
+
     Ok(())
+}
+
+/// Admit a plugin handler without waiting on the Hub owner loop.
+///
+/// Admission failures are logged. The Hub thread must not block on ordinary
+/// plugin handlers.
+pub(crate) fn invoke_plugin_handler_async(
+    lua: &Lua,
+    owner_plugin: &str,
+    kind: &str,
+    handler_id: &str,
+    payload: Value,
+    timeout_ms: u64,
+) -> mlua::Result<()> {
+    let available = lua
+        .globals()
+        .get::<Option<mlua::Function>>("__plugin_worker_async_available")
+        .ok()
+        .flatten()
+        .and_then(|probe| probe.call::<bool>(()).ok())
+        .unwrap_or(true);
+    if !available {
+        log::warn!(
+            "plugin worker async {kind} using sync fallback owner={owner_plugin}: Hub event channel is unavailable"
+        );
+        let invoke: mlua::Function = lua.globals().get("__plugin_worker_invoke")?;
+        invoke.call::<Value>((
+            owner_plugin.to_string(),
+            kind.to_string(),
+            handler_id.to_string(),
+            Option::<String>::None,
+            payload,
+            timeout_ms,
+        ))?;
+        return Ok(());
+    }
+    let invoke_async: mlua::Function = lua.globals().get("__plugin_worker_invoke_async")?;
+    let kind_owned = kind.to_string();
+    let callback = lua.create_function(move |_, (_result, err): (Value, Option<String>)| {
+        if let Some(err) = err {
+            log::warn!("plugin worker async {kind_owned} failed: {err}");
+        }
+        Ok(())
+    })?;
+    match invoke_async.call::<String>((
+        owner_plugin.to_string(),
+        kind.to_string(),
+        handler_id.to_string(),
+        Option::<String>::None,
+        payload,
+        timeout_ms,
+        callback,
+    )) {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            log::warn!(
+                "plugin worker async {kind} admission failed owner={owner_plugin}: {error}"
+            );
+            Ok(())
+        }
+    }
 }
 
 fn table_to_spec(table: Table) -> mlua::Result<WorkerSpec> {
@@ -521,7 +932,7 @@ impl PluginWorkerRegistry {
     fn load(&self, lua: &Lua, spec: WorkerSpec) -> Result<()> {
         self.shutdown(&spec.plugin_key, "replace");
 
-        let (tx, rx) = mpsc::sync_channel(PLUGIN_WORKER_QUEUE.capacity);
+        let mailbox = WorkerMailbox::new();
         let (parent_tx, parent_rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let admission = Arc::new(Mutex::new(PluginWorkerAdmission::default()));
@@ -531,15 +942,16 @@ impl PluginWorkerRegistry {
             .lock()
             .expect("PluginWorkerRegistry hub_event_channel mutex poisoned")
             .clone();
-        let worker_event_tx = PluginWorkerEventTx::new(tx.clone());
+        let worker_event_tx = PluginWorkerEventTx::new(mailbox.clone());
         let worker_admission = Arc::clone(&admission);
         let worker_canceled = Arc::clone(&self.canceled);
+        let worker_mailbox = mailbox.clone();
         thread::Builder::new()
             .name(format!("plugin-worker-{plugin_key}"))
             .spawn(move || {
                 worker_loop(
                     spec,
-                    rx,
+                    worker_mailbox,
                     worker_event_tx,
                     parent_tx,
                     ready_tx,
@@ -558,7 +970,7 @@ impl PluginWorkerRegistry {
                     .insert(
                         plugin_key,
                         PluginWorkerHandle {
-                            tx,
+                            mailbox,
                             parent_rx: Arc::new(Mutex::new(parent_rx)),
                             admission,
                         },
@@ -599,13 +1011,14 @@ impl PluginWorkerRegistry {
             return Err(anyhow!("plugin worker is shutting down: {reason}"));
         }
         handle
-            .tx
-            .try_send(PluginWorkerRequest::Invoke {
+            .mailbox
+            .try_enqueue(PluginWorkerRequest::Invoke {
                 kind,
                 id,
                 name,
                 payload,
                 timeout_ms,
+                deadline: Instant::now() + Duration::from_millis(timeout_ms.max(1)),
                 response: response_tx,
             })
             .map_err(|e| anyhow!("plugin worker queue rejected invoke: {e}"))?;
@@ -688,7 +1101,7 @@ impl PluginWorkerRegistry {
             self.drop_async_callback(lua, &request_id);
             return Err(anyhow!("plugin worker is shutting down: {reason}"));
         }
-        if let Err(error) = handle.tx.try_send(PluginWorkerRequest::InvokeAsync {
+        if let Err(error) = handle.mailbox.try_enqueue(PluginWorkerRequest::InvokeAsync {
             kind,
             id,
             name,
@@ -848,7 +1261,7 @@ impl PluginWorkerRegistry {
                 .lock()
                 .expect("PluginWorkerHandle admission mutex poisoned");
             admission.shutdown_reason = Some(reason.to_string());
-            let _ = handle.tx.try_send(PluginWorkerRequest::Shutdown {
+            let _ = handle.mailbox.try_enqueue(PluginWorkerRequest::Shutdown {
                 reason: reason.to_string(),
             });
         }
@@ -867,7 +1280,7 @@ impl PluginWorkerRegistry {
                 .lock()
                 .expect("PluginWorkerHandle admission mutex poisoned");
             admission.shutdown_reason = Some(reason.to_string());
-            let _ = handle.tx.try_send(PluginWorkerRequest::Shutdown {
+            let _ = handle.mailbox.try_enqueue(PluginWorkerRequest::Shutdown {
                 reason: reason.to_string(),
             });
             log::debug!("plugin worker {plugin_key} shutdown requested: {reason}");
@@ -877,7 +1290,7 @@ impl PluginWorkerRegistry {
 
 fn worker_loop(
     spec: WorkerSpec,
-    rx: mpsc::Receiver<PluginWorkerRequest>,
+    mailbox: WorkerMailbox,
     worker_event_tx: PluginWorkerEventTx,
     parent_tx: mpsc::Sender<WorkerParentRequest>,
     ready_tx: mpsc::Sender<Result<(), String>>,
@@ -946,13 +1359,13 @@ fn worker_loop(
             .shutdown_reason
             .clone();
         if let Some(reason) = shutdown_reason {
-            fail_pending_worker_requests(&rx, &reason);
+            fail_pending_worker_requests(mailbox.drain(), &reason);
             break;
         }
-        let request = match rx.recv() {
-            Ok(request) => request,
-            Err(_) => break,
+        let Some((class, _wait, request)) = mailbox.recv() else {
+            break;
         };
+        let exec_started = Instant::now();
 
         match request {
             PluginWorkerRequest::Invoke {
@@ -961,18 +1374,29 @@ fn worker_loop(
                 name,
                 payload,
                 timeout_ms,
+                deadline,
                 response,
             } => {
+                if Instant::now() >= deadline {
+                    let _ = response.send(Err(WorkerFail::ExpiredInQueue.as_message()));
+                    record_class_timeout(&mailbox.metrics, class);
+                    continue;
+                }
+                let Some(remaining_ms) = remaining_handler_timeout_ms(deadline) else {
+                    let _ = response.send(Err(WorkerFail::ExpiredInQueue.as_message()));
+                    record_class_timeout(&mailbox.metrics, class);
+                    continue;
+                };
+                let budget_ms = remaining_ms.min(timeout_ms);
                 let perf_started = lua_perf_enabled().then(Instant::now);
                 let _guard = enter_plugin_worker(&spec.plugin_key);
-                // The Hub waits for this synchronous invocation and services
-                // the fallback parent-request queue during that wait. Routing
+                // Remaining interceptors still wait on the hub thread. Routing
                 // a parent request back through the Hub event queue here would
                 // deadlock the worker and the Hub until the invoke timeout.
                 let _parent_route_guard =
                     ParentHubRouteGuard::use_synchronous_fallback(&parent_hub_event_ready);
                 let result =
-                    invoke_in_worker(&runtime, &kind, &id, name.as_deref(), payload, timeout_ms);
+                    invoke_in_worker(&runtime, &kind, &id, name.as_deref(), payload, budget_ms);
                 if let Some(started) = perf_started {
                     log::info!(
                         "[PERF][plugin_worker] plugin={} kind={} id={} phase=execute ok={} elapsed_ms={}",
@@ -983,7 +1407,9 @@ fn worker_loop(
                         started.elapsed().as_millis()
                     );
                 }
-                let _ = response.send(result);
+                let timed_out = result.as_ref().is_err_and(WorkerFail::is_timeout);
+                let _ = response.send(result.map_err(|fail| fail.as_message()));
+                record_class_execution(&mailbox.metrics, class, exec_started, timed_out);
             }
             PluginWorkerRequest::InvokeAsync {
                 kind,
@@ -998,11 +1424,12 @@ fn worker_loop(
                 let mut pending =
                     CompletionGuard::new(request_id.clone(), completion_tx, completion_runtime);
                 if PluginWorkerRegistry::is_canceled(&canceled, &request_id) {
-                    pending.send(Err("plugin worker invoke canceled".to_string()));
+                    pending.send(Err(WorkerFail::Canceled.as_message()));
                     continue;
                 }
                 let Some(timeout_ms) = remaining_handler_timeout_ms(deadline) else {
-                    pending.send(Err("plugin worker invoke expired".to_string()));
+                    pending.send(Err(WorkerFail::ExpiredInQueue.as_message()));
+                    record_class_timeout(&mailbox.metrics, class);
                     continue;
                 };
                 let perf_started = lua_perf_enabled().then(Instant::now);
@@ -1019,7 +1446,9 @@ fn worker_loop(
                         started.elapsed().as_millis()
                     );
                 }
-                pending.send(result);
+                let timed_out = result.as_ref().is_err_and(WorkerFail::is_timeout);
+                pending.send(result.map_err(|fail| fail.as_message()));
+                record_class_execution(&mailbox.metrics, class, exec_started, timed_out);
             }
             PluginWorkerRequest::Shutdown { reason } => {
                 log::debug!(
@@ -1027,7 +1456,8 @@ fn worker_loop(
                     spec.plugin_key,
                     reason
                 );
-                fail_pending_worker_requests(&rx, &reason);
+                fail_pending_worker_requests(mailbox.drain(), &reason);
+                mailbox.close();
                 break;
             }
             PluginWorkerRequest::HttpResponse(response) => {
@@ -1051,8 +1481,40 @@ fn worker_loop(
     close_worker_plugin_databases(&runtime, &spec.plugin_key);
 }
 
-fn fail_pending_worker_requests(rx: &mpsc::Receiver<PluginWorkerRequest>, reason: &str) {
-    while let Ok(request) = rx.try_recv() {
+fn record_class_timeout(metrics: &ClassMetrics, class: Option<WorkClass>) {
+    let Some(class) = class else {
+        return;
+    };
+    metrics.timeouts[class.index()].fetch_add(1, Ordering::Relaxed);
+    log::warn!("plugin worker {} invoke expired in queue", class.as_str());
+}
+
+fn record_class_execution(
+    metrics: &ClassMetrics,
+    class: Option<WorkClass>,
+    started: Instant,
+    timed_out: bool,
+) {
+    let Some(class) = class else {
+        return;
+    };
+    let i = class.index();
+    metrics.executed[i].fetch_add(1, Ordering::Relaxed);
+    let exec_ms = started.elapsed().as_millis() as u64;
+    metrics.exec_ms[i].fetch_add(exec_ms, Ordering::Relaxed);
+    metrics.max_exec_ms[i].fetch_max(exec_ms, Ordering::Relaxed);
+    if timed_out {
+        metrics.timeouts[i].fetch_add(1, Ordering::Relaxed);
+        log::warn!(
+            "plugin worker {} invoke timed out exec_ms={}",
+            class.as_str(),
+            exec_ms
+        );
+    }
+}
+
+fn fail_pending_worker_requests(requests: Vec<PluginWorkerRequest>, reason: &str) {
+    for request in requests {
         let error = format!("plugin worker shutting down: {reason}");
         match request {
             PluginWorkerRequest::Invoke { response, .. } => {
@@ -1458,6 +1920,19 @@ fn install_worker_bootstrap(runtime: &LuaRuntime, spec: &WorkerSpec) -> Result<(
         safe_require("lib.entity_broadcast")
         _G.mcp = safe_require("lib.mcp")
 
+        function __worker_timed(fn)
+            local ok, result = __hook_timed_pcall(fn, __handler_timeout_ms)
+            if ok then
+                return { __worker_ok = true, __worker_value = result }
+            end
+            local message = tostring(result)
+            local fail = "handler"
+            if type(result) == "string" and string.sub(result, 1, 13) == "hook timeout:" then
+                fail = "timeout"
+            end
+            return { __worker_ok = false, __worker_fail = fail, __worker_error = message }
+        end
+
         local plugin_db = safe_require("lib.plugin_db")
         if plugin_db and type(plugin_db.install) == "function" then
             plugin_db.install()
@@ -1507,6 +1982,31 @@ fn load_plugin_into_worker(runtime: &LuaRuntime, spec: &WorkerSpec) -> Result<()
     .map_err(|e| e.to_string())
 }
 
+fn unwrap_worker_timed(_lua: &Lua, result: Value) -> Result<Value, WorkerFail> {
+    let Value::Table(table) = result else {
+        return Ok(result);
+    };
+    let ok: Option<bool> = table.get("__worker_ok").ok();
+    let Some(ok) = ok else {
+        return Ok(Value::Table(table));
+    };
+    if ok {
+        return table
+            .get("__worker_value")
+            .map_err(|e| WorkerFail::Handler(e.to_string()));
+    }
+    let fail: String = table
+        .get("__worker_fail")
+        .unwrap_or_else(|_| "handler".to_string());
+    let error: String = table
+        .get("__worker_error")
+        .unwrap_or_else(|_| "plugin worker handler failed".to_string());
+    match fail.as_str() {
+        "timeout" => Err(WorkerFail::Timeout),
+        _ => Err(WorkerFail::Handler(error)),
+    }
+}
+
 fn invoke_in_worker(
     runtime: &LuaRuntime,
     kind: &str,
@@ -1514,280 +2014,247 @@ fn invoke_in_worker(
     name: Option<&str>,
     payload: serde_json::Value,
     timeout_ms: u64,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, WorkerFail> {
     let lua = runtime.lua();
-    let payload_lua = json_to_lua(lua, &payload).map_err(|e| e.to_string())?;
+    let payload_lua = json_to_lua(lua, &payload).map_err(|e| WorkerFail::Handler(e.to_string()))?;
     let globals = lua.globals();
-    globals.set("__handler_id", id).map_err(|e| e.to_string())?;
+    globals
+        .set("__handler_id", id)
+        .map_err(|e| WorkerFail::Handler(e.to_string()))?;
     globals
         .set("__handler_name", name)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| WorkerFail::Handler(e.to_string()))?;
     globals
         .set("__handler_timeout_ms", timeout_ms)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| WorkerFail::Handler(e.to_string()))?;
     globals
         .set("__payload", payload_lua)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| WorkerFail::Handler(e.to_string()))?;
     let result: Value = match kind {
         "ui_action" => lua
             .load(
                 r#"
                 local action = require("lib.action")
-                local ok, result = __hook_timed_pcall(function()
+                return __worker_timed(function()
                     return action._invoke_registered(__handler_id, __handler_name, __payload.envelope, __payload.ctx)
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_ui_action")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "session_action" => lua
             .load(
                 r#"
                 local actions = require("lib.session_actions")
-                local ok, result = __hook_timed_pcall(function()
+                return __worker_timed(function()
                     return actions._invoke_registered(__handler_id, __payload.session_uuid, __payload.payload)
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_session_action")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "command" => lua
             .load(
                 r#"
                 local commands = require("lib.commands")
-                local ok, result = __hook_timed_pcall(function()
+                return __worker_timed(function()
                     return commands._invoke_registered(__handler_id, __payload.command)
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_command")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "hook_observer" => lua
             .load(
                 r#"
                 local hooks = require("hub.hooks")
-                local ok, result = __hook_timed_pcall(function()
+                return __worker_timed(function()
                     return hooks._invoke_observer(__handler_id, __handler_name, __payload.args)
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_hook_observer")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "hook_interceptor" => lua
             .load(
                 r#"
                 local hooks = require("hub.hooks")
-                local ok, result = __hook_timed_pcall(function()
+                return __worker_timed(function()
                     return hooks._invoke_interceptor(__handler_id, __handler_name, __payload.args)
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_hook_interceptor")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "notification_observer" => lua
             .load(
                 r#"
                 local notifications = require("lib.notifications")
-                local ok, result = __hook_timed_pcall(function()
+                return __worker_timed(function()
                     return notifications._invoke_observer(
                         __handler_id,
                         __payload.phase,
                         __payload.intent,
                         __payload.decision)
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_notification_observer")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "notification_claim" => lua
             .load(
                 r#"
                 local notifications = require("lib.notifications")
-                local ok, result = __hook_timed_pcall(function()
+                return __worker_timed(function()
                     return notifications._invoke_claim(__handler_id, __payload.intent)
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_notification_claim")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "surface_route" => lua
             .load(
                 r#"
                 local surfaces = require("lib.surfaces")
-                local ok, result = __hook_timed_pcall(function()
+                return __worker_timed(function()
                     return surfaces._invoke_render(__handler_id, __payload.render_state)
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_surface_route")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "asset_message" => lua
             .load(
                 r#"
                 local plugin_assets = require("lib.plugin_assets")
-                local ok, result = __hook_timed_pcall(function()
+                return __worker_timed(function()
                     return plugin_assets._invoke_message(
                         __handler_name,
                         __handler_id,
                         __payload.message,
                         __payload.ctx
                     )
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_asset_message")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "plugin_asset_read" => lua
             .load(
                 r#"
                 local plugin_assets = require("lib.plugin_assets")
-                local ok, result, err = __hook_timed_pcall(function()
-                    return plugin_assets.read(__payload.asset_id)
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                if not result then error(err or "Unknown plugin asset") end
-                return result
+                return __worker_timed(function()
+                    local result, err = plugin_assets.read(__payload.asset_id)
+                    if not result then error(err or "Unknown plugin asset") end
+                    return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_plugin_asset_read")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "timer" => lua
             .load(
                 r#"
-                local ok, result = __hook_timed_pcall(function()
+                return __worker_timed(function()
                     return timer._invoke_registered(__handler_id)
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_timer")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "event" => lua
             .load(
                 r#"
-                local ok, result = __hook_timed_pcall(function()
+                return __worker_timed(function()
                     return events._invoke_registered(__handler_id, __payload.data)
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_event")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "watch" => lua
             .load(
                 r#"
-                local ok, result = __hook_timed_pcall(function()
+                return __worker_timed(function()
                     return watch._invoke_registered(__handler_id, __payload.event)
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_watch")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "mcp_tool" => lua
             .load(
                 r#"
                 local mcp = require("lib.mcp")
-                local ok, result = __hook_timed_pcall(function()
+                return __worker_timed(function()
                     return mcp._invoke_tool(__handler_id, __payload.params, __payload.context)
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_mcp_tool")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "mcp_prompt" => lua
             .load(
                 r#"
                 local mcp = require("lib.mcp")
-                local ok, result = __hook_timed_pcall(function()
+                return __worker_timed(function()
                     return mcp._invoke_prompt(__handler_id, __payload.args)
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_mcp_prompt")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "mcp_resource" => lua
             .load(
                 r#"
                 local mcp = require("lib.mcp")
-                local ok, result = __hook_timed_pcall(function()
+                return __worker_timed(function()
                     return mcp._invoke_resource(__handler_id, __payload.params, __payload.context)
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_mcp_resource")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "mcp_proxy_auth_error" => lua
             .load(
                 r#"
                 local mcp = require("lib.mcp")
-                local ok, result = __hook_timed_pcall(function()
+                return __worker_timed(function()
                     return mcp._invoke_proxy_auth_error(__handler_id)
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_mcp_proxy_auth_error")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "ac_message" => lua
             .load(
                 r#"
                 local action_cable = require("lib.action_cable")
-                local ok, result = __hook_timed_pcall(function()
+                return __worker_timed(function()
                     return action_cable._invoke_ac_message(__handler_id, __payload.channel_id, __payload.message)
-                end, __handler_timeout_ms)
-                if not ok then error(result) end
-                return result
+                end)
                 "#,
             )
             .set_name("plugin_worker_invoke_ac_message")
             .eval()
-            .map_err(|e| e.to_string())?,
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
         "ac_unregister" => lua
             .load(
                 r#"
@@ -1798,12 +2265,17 @@ fn invoke_in_worker(
             )
             .set_name("plugin_worker_invoke_ac_unregister")
             .eval()
-            .map_err(|e| e.to_string())?,
-        _ => return Err(format!("unsupported plugin handler kind: {kind}")),
+            .map_err(|e| WorkerFail::Handler(e.to_string()))?,
+        _ => {
+            return Err(WorkerFail::Handler(format!(
+                "unsupported plugin handler kind: {kind}"
+            )));
+        }
     };
 
+    let result = unwrap_worker_timed(lua, result)?;
     lua.from_value(result)
-        .map_err(|e| format!("plugin worker result conversion failed: {e}"))
+        .map_err(|e| WorkerFail::Handler(format!("plugin worker result conversion failed: {e}")))
 }
 
 #[cfg(test)]
@@ -2160,17 +2632,251 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_fair_dequeue_does_not_starve_surface_behind_mcp() {
+        let mailbox = WorkerMailbox::new();
+        for _ in 0..8 {
+            let (response, _) = mpsc::channel();
+            mailbox
+                .try_enqueue(PluginWorkerRequest::Invoke {
+                    kind: "mcp_tool".to_string(),
+                    id: "slow".to_string(),
+                    name: None,
+                    payload: serde_json::json!({}),
+                    timeout_ms: 1000,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    response,
+                })
+                .expect("queue mcp");
+        }
+        let (response, _) = mpsc::channel();
+        mailbox
+            .try_enqueue(PluginWorkerRequest::Invoke {
+                kind: "surface_route".to_string(),
+                id: "fast".to_string(),
+                name: None,
+                payload: serde_json::json!({}),
+                timeout_ms: 1000,
+                deadline: Instant::now() + Duration::from_secs(1),
+                response,
+            })
+            .expect("queue surface");
+
+        let mut kinds = Vec::new();
+        while let Some(PluginWorkerRequest::Invoke { kind, .. }) = mailbox.try_recv() {
+            kinds.push(kind);
+        }
+        assert_eq!(kinds.len(), 9);
+        assert_eq!(kinds[0], "mcp_tool");
+        assert_eq!(
+            kinds[1], "surface_route",
+            "surface must run after one MCP, not after the full MCP burst"
+        );
+        assert_eq!(
+            kinds.iter().filter(|kind| *kind == "surface_route").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn mailbox_full_mcp_class_does_not_delay_event_or_surface() {
+        let mailbox = WorkerMailbox::new();
+        for i in 0..WorkClass::Mcp.cap() {
+            let (response, _) = mpsc::channel();
+            mailbox
+                .try_enqueue(PluginWorkerRequest::Invoke {
+                    kind: "mcp_tool".to_string(),
+                    id: format!("mcp-{i}"),
+                    name: None,
+                    payload: serde_json::json!({}),
+                    timeout_ms: 1000,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    response,
+                })
+                .expect("queue mcp");
+        }
+        let (event_tx, _) = mpsc::channel();
+        mailbox
+            .try_enqueue(PluginWorkerRequest::Invoke {
+                kind: "event".to_string(),
+                id: "fast-event".to_string(),
+                name: None,
+                payload: serde_json::json!({}),
+                timeout_ms: 1000,
+                deadline: Instant::now() + Duration::from_secs(1),
+                response: event_tx,
+            })
+            .expect("queue event");
+        let (surface_tx, _) = mpsc::channel();
+        mailbox
+            .try_enqueue(PluginWorkerRequest::Invoke {
+                kind: "surface_route".to_string(),
+                id: "fast-surface".to_string(),
+                name: None,
+                payload: serde_json::json!({}),
+                timeout_ms: 1000,
+                deadline: Instant::now() + Duration::from_secs(1),
+                response: surface_tx,
+            })
+            .expect("queue surface");
+
+        let first = mailbox.try_recv().expect("first");
+        let second = mailbox.try_recv().expect("second");
+        let third = mailbox.try_recv().expect("third");
+        let kinds = [first, second, third].map(|request| match request {
+            PluginWorkerRequest::Invoke { kind, .. } => kind,
+            _ => "other".to_string(),
+        });
+        assert_eq!(kinds[0], "mcp_tool");
+        assert!(
+            kinds.contains(&"surface_route".to_string()),
+            "surface must dequeue within the first three jobs, got {kinds:?}"
+        );
+        assert!(
+            kinds.contains(&"event".to_string()),
+            "event must dequeue within the first three jobs, got {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn mailbox_control_flood_does_not_starve_surface() {
+        let mailbox = WorkerMailbox::new();
+        for i in 0..WorkClass::Control.cap() {
+            mailbox
+                .try_enqueue(PluginWorkerRequest::TimerFired {
+                    timer_id: format!("t{i}"),
+                })
+                .expect("queue control");
+        }
+        let (response, _) = mpsc::channel();
+        mailbox
+            .try_enqueue(PluginWorkerRequest::Invoke {
+                kind: "surface_route".to_string(),
+                id: "fast".to_string(),
+                name: None,
+                payload: serde_json::json!({}),
+                timeout_ms: 1000,
+                deadline: Instant::now() + Duration::from_secs(1),
+                response,
+            })
+            .expect("queue surface");
+        let mut saw_surface = false;
+        for _ in 0..3 {
+            match mailbox.try_recv() {
+                Some(PluginWorkerRequest::Invoke { kind, .. }) if kind == "surface_route" => {
+                    saw_surface = true;
+                    break;
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+        assert!(saw_surface, "surface must not wait behind a control flood");
+    }
+
+    #[test]
+    fn work_class_maps_emitted_kinds() {
+        assert_eq!(WorkClass::from_handler_kind("mcp_tool"), WorkClass::Mcp);
+        assert_eq!(WorkClass::from_handler_kind("mcp_prompt"), WorkClass::Mcp);
+        assert_eq!(WorkClass::from_handler_kind("mcp_resource"), WorkClass::Mcp);
+        assert_eq!(
+            WorkClass::from_handler_kind("mcp_proxy_auth_error"),
+            WorkClass::Mcp
+        );
+        assert_eq!(
+            WorkClass::from_handler_kind("surface_route"),
+            WorkClass::Surface
+        );
+        assert_eq!(WorkClass::from_handler_kind("ui_action"), WorkClass::Surface);
+        assert_eq!(
+            WorkClass::from_handler_kind("asset_message"),
+            WorkClass::Surface
+        );
+        assert_eq!(WorkClass::from_handler_kind("event"), WorkClass::Event);
+        assert_eq!(
+            WorkClass::from_handler_kind("hook_observer"),
+            WorkClass::Event
+        );
+        assert_eq!(
+            WorkClass::from_handler_kind("hook_interceptor"),
+            WorkClass::Maintenance
+        );
+        assert_eq!(WorkClass::from_handler_kind("command"), WorkClass::Maintenance);
+        assert_eq!(
+            WorkClass::from_handler_kind("session_action"),
+            WorkClass::Maintenance
+        );
+        assert_eq!(WorkClass::from_handler_kind("timer"), WorkClass::Maintenance);
+        assert_eq!(WorkClass::from_handler_kind("watch"), WorkClass::Maintenance);
+        assert_eq!(
+            WorkClass::from_handler_kind("notification_observer"),
+            WorkClass::Event
+        );
+        assert_eq!(
+            WorkClass::from_handler_kind("ac_message"),
+            WorkClass::Control
+        );
+    }
+
+    #[test]
+    fn mailbox_sheds_when_mcp_class_is_full() {
+        let mailbox = WorkerMailbox::new();
+        for i in 0..WorkClass::Mcp.cap() {
+            let (response, _) = mpsc::channel();
+            mailbox
+                .try_enqueue(PluginWorkerRequest::Invoke {
+                    kind: "mcp_tool".to_string(),
+                    id: format!("mcp-{i}"),
+                    name: None,
+                    payload: serde_json::json!({}),
+                    timeout_ms: 1000,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    response,
+                })
+                .expect("queue mcp under cap");
+        }
+        let (response, _) = mpsc::channel();
+        let err = mailbox
+            .try_enqueue(PluginWorkerRequest::Invoke {
+                kind: "mcp_tool".to_string(),
+                id: "overflow".to_string(),
+                name: None,
+                payload: serde_json::json!({}),
+                timeout_ms: 1000,
+                deadline: Instant::now() + Duration::from_secs(1),
+                response,
+            })
+            .expect_err("mcp class must shed");
+        assert!(err.contains("mcp queue is full"), "{err}");
+        let (response, _) = mpsc::channel();
+        mailbox
+            .try_enqueue(PluginWorkerRequest::Invoke {
+                kind: "surface_route".to_string(),
+                id: "still-ok".to_string(),
+                name: None,
+                payload: serde_json::json!({}),
+                timeout_ms: 1000,
+                deadline: Instant::now() + Duration::from_secs(1),
+                response,
+            })
+            .expect("full mcp class must not block surface admission");
+        assert_eq!(
+            mailbox.metrics.shed[WorkClass::Mcp.index()].load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[test]
     fn async_worker_invoke_admits_then_completes_through_hub_event() {
         let tokio_runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
         let registry = PluginWorkerRegistry::default();
         registry.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
-        let (worker_tx, worker_rx) = mpsc::sync_channel(1);
+        let mailbox = WorkerMailbox::new();
         let (_parent_tx, parent_rx) = mpsc::channel();
         registry.workers.lock().expect("worker registry").insert(
             "test-plugin".to_string(),
             PluginWorkerHandle {
-                tx: worker_tx,
+                mailbox: mailbox.clone(),
                 parent_rx: Arc::new(Mutex::new(parent_rx)),
                 admission: Arc::new(Mutex::new(PluginWorkerAdmission::default())),
             },
@@ -2198,7 +2904,7 @@ mod tests {
             .expect("admit async invoke");
         assert!(lua.globals().get::<Value>("async_result").unwrap().is_nil());
 
-        let request = worker_rx.try_recv().expect("worker request admitted");
+        let request = mailbox.try_recv().expect("worker request admitted");
         let PluginWorkerRequest::InvokeAsync {
             request_id: worker_request_id,
             completion_tx,
@@ -2273,12 +2979,12 @@ mod tests {
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
         let registry = PluginWorkerRegistry::default();
         registry.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
-        let (worker_tx, _worker_rx) = mpsc::sync_channel(1);
+        let mailbox = WorkerMailbox::new();
         let (_parent_tx, parent_rx) = mpsc::channel();
         registry.workers.lock().expect("worker registry").insert(
             "test-plugin".to_string(),
             PluginWorkerHandle {
-                tx: worker_tx,
+                mailbox: mailbox.clone(),
                 parent_rx: Arc::new(Mutex::new(parent_rx)),
                 admission: Arc::new(Mutex::new(PluginWorkerAdmission::default())),
             },
@@ -2327,12 +3033,12 @@ mod tests {
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
         let registry = PluginWorkerRegistry::default();
         registry.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
-        let (worker_tx, _worker_rx) = mpsc::sync_channel(1);
+        let mailbox = WorkerMailbox::new();
         let (_parent_tx, parent_rx) = mpsc::channel();
         registry.workers.lock().expect("worker registry").insert(
             "test-plugin".to_string(),
             PluginWorkerHandle {
-                tx: worker_tx,
+                mailbox: mailbox.clone(),
                 parent_rx: Arc::new(Mutex::new(parent_rx)),
                 admission: Arc::new(Mutex::new(PluginWorkerAdmission::default())),
             },
@@ -2371,12 +3077,12 @@ mod tests {
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
         let registry = PluginWorkerRegistry::default();
         registry.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
-        let (worker_tx, _worker_rx) = mpsc::sync_channel(2);
+        let mailbox = WorkerMailbox::new();
         let (_parent_tx, parent_rx) = mpsc::channel();
         registry.workers.lock().expect("worker registry").insert(
             "test-plugin".to_string(),
             PluginWorkerHandle {
-                tx: worker_tx,
+                mailbox: mailbox.clone(),
                 parent_rx: Arc::new(Mutex::new(parent_rx)),
                 admission: Arc::new(Mutex::new(PluginWorkerAdmission::default())),
             },
@@ -2419,12 +3125,12 @@ mod tests {
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
         let registry = PluginWorkerRegistry::default();
         registry.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
-        let (worker_tx, worker_rx) = mpsc::sync_channel(2);
+        let mailbox = WorkerMailbox::new();
         let (_parent_tx, parent_rx) = mpsc::channel();
         registry.workers.lock().expect("worker registry").insert(
             "test-plugin".to_string(),
             PluginWorkerHandle {
-                tx: worker_tx,
+                mailbox: mailbox.clone(),
                 parent_rx: Arc::new(Mutex::new(parent_rx)),
                 admission: Arc::new(Mutex::new(PluginWorkerAdmission::default())),
             },
@@ -2466,7 +3172,7 @@ mod tests {
             &registry.canceled,
             &request_id
         ));
-        let request = worker_rx.try_recv().expect("queued prompt invoke");
+        let request = mailbox.try_recv().expect("queued prompt invoke");
         assert!(matches!(request, PluginWorkerRequest::InvokeAsync { .. }));
         assert!(registry
             .async_callbacks
@@ -2481,12 +3187,12 @@ mod tests {
         let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
         let registry = PluginWorkerRegistry::default();
         registry.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
-        let (worker_tx, worker_rx) = mpsc::sync_channel(1);
+        let mailbox = WorkerMailbox::new();
         let (_parent_tx, parent_rx) = mpsc::channel();
         registry.workers.lock().expect("worker registry").insert(
             "test-plugin".to_string(),
             PluginWorkerHandle {
-                tx: worker_tx,
+                mailbox: mailbox.clone(),
                 parent_rx: Arc::new(Mutex::new(parent_rx)),
                 admission: Arc::new(Mutex::new(PluginWorkerAdmission::default())),
             },
@@ -2514,8 +3220,8 @@ mod tests {
             &request_id
         ));
         assert!(matches!(
-            worker_rx.try_recv(),
-            Ok(PluginWorkerRequest::InvokeAsync { .. })
+            mailbox.try_recv(),
+            Some(PluginWorkerRequest::InvokeAsync { .. })
         ));
     }
 
@@ -2536,12 +3242,12 @@ mod tests {
             .expect("fill Hub event queue");
         let registry = PluginWorkerRegistry::default();
         registry.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
-        let (worker_tx, _worker_rx) = mpsc::sync_channel(1);
+        let mailbox = WorkerMailbox::new();
         let (_parent_tx, parent_rx) = mpsc::channel();
         registry.workers.lock().expect("worker registry").insert(
             "test-plugin".to_string(),
             PluginWorkerHandle {
-                tx: worker_tx,
+                mailbox: mailbox.clone(),
                 parent_rx: Arc::new(Mutex::new(parent_rx)),
                 admission: Arc::new(Mutex::new(PluginWorkerAdmission::default())),
             },
@@ -2657,8 +3363,8 @@ mod tests {
         let request_id = "plugin-worker-async-skip".to_string();
         runtime.plugin_workers().mark_canceled(&request_id);
         handle
-            .tx
-            .try_send(PluginWorkerRequest::InvokeAsync {
+            .mailbox
+            .try_enqueue(PluginWorkerRequest::InvokeAsync {
                 kind: "mcp_tool".to_string(),
                 id: "marker".to_string(),
                 name: Some("marker".to_string()),
@@ -2703,8 +3409,8 @@ mod tests {
 
         let expired_id = "plugin-worker-async-expired".to_string();
         handle
-            .tx
-            .try_send(PluginWorkerRequest::InvokeAsync {
+            .mailbox
+            .try_enqueue(PluginWorkerRequest::InvokeAsync {
                 kind: "mcp_tool".to_string(),
                 id: "marker".to_string(),
                 name: Some("marker".to_string()),
@@ -2738,12 +3444,12 @@ mod tests {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(8);
         let registry = PluginWorkerRegistry::default();
         registry.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
-        let (worker_tx, worker_rx) = mpsc::sync_channel(2);
+        let mailbox = WorkerMailbox::new();
         let (_parent_tx, parent_rx) = mpsc::channel();
         registry.workers.lock().expect("worker registry").insert(
             "test-plugin".to_string(),
             PluginWorkerHandle {
-                tx: worker_tx,
+                mailbox: mailbox.clone(),
                 parent_rx: Arc::new(Mutex::new(parent_rx)),
                 admission: Arc::new(Mutex::new(PluginWorkerAdmission::default())),
             },
@@ -2770,7 +3476,7 @@ mod tests {
             .eval()
             .expect("admit async invoke");
         registry.shutdown("test-plugin", "reload");
-        fail_pending_worker_requests(&worker_rx, "reload");
+        fail_pending_worker_requests(mailbox.drain(), "reload");
 
         let event = event_rx.blocking_recv().expect("shutdown completion event");
         let HubEvent::PluginWorkerInvokeCompleted {
@@ -2876,5 +3582,329 @@ mod tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn plugin_worker_async_available_is_false_without_hub_channel() {
+        let lua = Lua::new();
+        register(&lua, PluginWorkerRegistry::default()).expect("register");
+        let available: bool = lua
+            .load("return __plugin_worker_async_available()")
+            .eval()
+            .expect("probe async availability");
+        assert!(!available);
+    }
+
+    #[test]
+    fn mailbox_class_caps_include_control() {
+        assert_eq!(
+            WorkClass::Mcp.cap()
+                + WorkClass::Surface.cap()
+                + WorkClass::Event.cap()
+                + WorkClass::Maintenance.cap()
+                + WorkClass::Control.cap(),
+            PLUGIN_WORKER_QUEUE.capacity
+        );
+        let _mailbox = WorkerMailbox::new();
+    }
+
+    #[test]
+    fn worker_fail_timeout_is_typed_not_string_matched() {
+        assert!(WorkerFail::Timeout.is_timeout());
+        assert!(WorkerFail::ExpiredInQueue.is_timeout());
+        assert!(!WorkerFail::Canceled.is_timeout());
+        assert!(!WorkerFail::Handler("hook timeout: 10ms exceeded".to_string()).is_timeout());
+        assert_eq!(
+            WorkerFail::Timeout.as_message(),
+            "plugin worker invoke timeout"
+        );
+        assert_eq!(
+            WorkerFail::ExpiredInQueue.as_message(),
+            "plugin worker invoke expired in queue"
+        );
+    }
+
+    #[test]
+    fn expired_queued_invokes_execute_zero_plugin_code_then_surface_runs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let marker = temp.path().join("ran");
+        let surface_marker = temp.path().join("surface");
+        let init_path = temp.path().join("init.lua");
+        std::fs::write(
+            &init_path,
+            format!(
+                r#"
+                local mcp = require("lib.mcp")
+                local surfaces = require("lib.surfaces")
+                mcp.tool("marker", {{
+                    description = "side effect",
+                    input_schema = {{ type = "object", properties = {{}} }},
+                    timeout_ms = 5000,
+                }}, function()
+                    local f = assert(io.open({marker}, "w"))
+                    f:write("ran")
+                    f:close()
+                    return "ran"
+                end)
+                surfaces.register("expire_surface", {{
+                    label = "Expire",
+                    timeout_ms = 2000,
+                    routes = {{
+                        {{
+                            path = "/",
+                            render = function()
+                                local f = assert(io.open({surface}, "w"))
+                                f:write("surface")
+                                f:close()
+                                return {{ type = "text", props = {{ text = "fast" }} }}
+                            end,
+                        }},
+                    }},
+                }})
+                return {{}}
+                "#,
+                marker = serde_json::to_string(&marker.to_string_lossy()).unwrap(),
+                surface = serde_json::to_string(&surface_marker.to_string_lossy()).unwrap(),
+            ),
+        )
+        .expect("write plugin");
+
+        let mut runtime = LuaRuntime::new().expect("runtime");
+        let lua_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua");
+        runtime
+            .update_package_path(&lua_path)
+            .expect("configure Lua path");
+        runtime
+            .lua()
+            .globals()
+            .set("_lua_base_path", lua_path.to_string_lossy().to_string())
+            .expect("worker Lua path");
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(8);
+        runtime.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
+        runtime
+            .lua()
+            .load(format!(
+                r#"
+                local loader = require("hub.loader")
+                local ok, err = loader.load_plugin({init_path}, "expire-plugin", {{ source = "device" }})
+                assert(ok, tostring(err))
+                "#,
+                init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+            ))
+            .exec()
+            .expect("load plugin");
+
+        let handle = runtime
+            .plugin_workers()
+            .workers
+            .lock()
+            .expect("workers")
+            .values()
+            .next()
+            .cloned()
+            .expect("worker handle");
+        let mut responses = Vec::new();
+        for _ in 0..3 {
+            let (response_tx, response_rx) = mpsc::channel();
+            handle
+                .mailbox
+                .try_enqueue(PluginWorkerRequest::Invoke {
+                    kind: "mcp_tool".to_string(),
+                    id: "marker".to_string(),
+                    name: Some("marker".to_string()),
+                    payload: json!({}),
+                    timeout_ms: 50,
+                    deadline: Instant::now() - Duration::from_millis(100),
+                    response: response_tx,
+                })
+                .expect("queue expired invoke");
+            responses.push(response_rx);
+        }
+        std::thread::sleep(Duration::from_millis(80));
+        assert!(
+            !marker.exists(),
+            "expired handler must not run plugin code"
+        );
+        assert_eq!(
+            handle.mailbox.metrics.timeouts[WorkClass::Mcp.index()].load(Ordering::Relaxed),
+            3
+        );
+        assert_eq!(
+            handle.mailbox.metrics.executed[WorkClass::Mcp.index()].load(Ordering::Relaxed),
+            0
+        );
+        for response_rx in responses {
+            let err = response_rx.recv_timeout(Duration::from_secs(1)).expect("expired reply");
+            assert!(
+                err.unwrap_err().contains("expired in queue"),
+                "expired invoke must report ExpiredInQueue"
+            );
+        }
+
+        let (surface_tx, surface_rx) = mpsc::channel();
+        handle
+            .mailbox
+            .try_enqueue(PluginWorkerRequest::Invoke {
+                kind: "surface_route".to_string(),
+                id: "expire_surface".to_string(),
+                name: None,
+                payload: json!({ "render_state": { "path": "/" } }),
+                timeout_ms: 2000,
+                deadline: Instant::now() + Duration::from_secs(2),
+                response: surface_tx,
+            })
+            .expect("queue surface");
+        let surface = surface_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("surface reply");
+        assert!(surface.is_ok(), "surface must run after expired work, got {surface:?}");
+        assert!(surface_marker.exists(), "surface handler must run");
+        runtime.shutdown_plugin_workers("test_complete");
+    }
+
+    #[test]
+    fn mcp_class_cap_sheds_and_owner_loop_stays_bounded() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let init_path = temp.path().join("init.lua");
+        std::fs::write(
+            &init_path,
+            r#"
+            local mcp = require("lib.mcp")
+            local surfaces = require("lib.surfaces")
+            mcp.tool("slow_cap", {
+                description = "Slow MCP",
+                input_schema = { type = "object", properties = {} },
+                timeout_ms = 4000,
+            }, function()
+                -- Stay queued behind a long handler budget (4000 ms) without
+                -- making this test wait the full budget on teardown.
+                local until_clock = os.clock() + 2
+                while os.clock() < until_clock do end
+                return "slow"
+            end)
+            surfaces.register("cap_surface", {
+                label = "Cap",
+                timeout_ms = 2000,
+                routes = {
+                    {
+                        path = "/",
+                        render = function()
+                            return { type = "text", props = { text = "fast" } }
+                        end,
+                    },
+                },
+            })
+            return {}
+            "#,
+        )
+        .expect("write plugin");
+
+        let mut runtime = LuaRuntime::new().expect("runtime");
+        let lua_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("lua");
+        runtime
+            .update_package_path(&lua_path)
+            .expect("configure Lua path");
+        runtime
+            .lua()
+            .globals()
+            .set("_lua_base_path", lua_path.to_string_lossy().to_string())
+            .expect("worker Lua path");
+        let tokio_runtime = tokio::runtime::Runtime::new().expect("Tokio runtime");
+        let (event_tx, _event_rx) = tokio::sync::mpsc::channel(512);
+        runtime.set_hub_event_tx(HubEventTx::from(event_tx), tokio_runtime.handle().clone());
+        let listed: mlua::Table = runtime
+            .lua()
+            .load(format!(
+                r#"
+                local loader = require("hub.loader")
+                local ok, err = loader.load_plugin({init_path}, "cap-plugin", {{ source = "device" }})
+                assert(ok, tostring(err))
+
+                local mcp = require("lib.mcp")
+                local surfaces = require("lib.surfaces")
+                local Session = require("lib.session")
+                for i = 1, 200 do
+                    local uuid = string.format("sess-%03d", i)
+                    Session._index_owner_for_tests({{
+                        session_uuid = uuid,
+                        owner_plugin = "cap-plugin",
+                        created_at = i,
+                        metadata = {{ owner_plugin = "cap-plugin" }},
+                        status = "running",
+                        label = uuid,
+                    }})
+                end
+                for i = 191, 200 do
+                    Session._unindex_owner_for_tests({{
+                        session_uuid = string.format("sess-%03d", i),
+                        owner_plugin = "cap-plugin",
+                        metadata = {{ owner_plugin = "cap-plugin" }},
+                    }})
+                end
+
+                for _ = 1, 200 do
+                    mcp.call_tool("slow_cap", {{}}, {{}}, function() end)
+                end
+                local extra_ok, extra_err = true, ""
+                local started = os.clock()
+                local tree = surfaces.render_node("cap_surface", {{ path = "/" }})
+                local event_count = events.emit("cap_event", {{}})
+                local owned = Session.list_owned("cap-plugin")
+                local plugins = loader.list_plugins()
+                local elapsed_ms = math.floor((os.clock() - started) * 1000)
+                local metrics = __plugin_worker_class_metrics("cap-plugin")
+                return {{
+                    extra_ok = extra_ok,
+                    extra_err = tostring(extra_err),
+                    tree_status = tree and tree.props and tree.props.surface_status,
+                    tree_text = tree and tree.props and tree.props.text,
+                    elapsed_ms = elapsed_ms,
+                    owned = #owned,
+                    shed = metrics.classes.mcp.shed,
+                    queued = metrics.classes.mcp.queued,
+                    cap = metrics.classes.mcp.cap,
+                    max_wait_ms = metrics.classes.mcp.max_wait_ms,
+                    max_exec_ms = metrics.classes.mcp.max_exec_ms,
+                    event_count = event_count,
+                    plugins = plugins,
+                }}
+                "#,
+                init_path = serde_json::to_string(&init_path.to_string_lossy()).unwrap(),
+            ))
+            .eval()
+            .expect("run cap isolation");
+
+        let elapsed_ms: i64 = listed.get("elapsed_ms").expect("elapsed");
+        let shed: i64 = listed.get("shed").expect("shed");
+        let cap: i64 = listed.get("cap").expect("cap");
+        let owned: i64 = listed.get("owned").expect("owned");
+        let extra_err: String = listed.get("extra_err").unwrap_or_default();
+        assert_eq!(cap, 192);
+        assert!(
+            shed >= 1,
+            "MCP class cap must shed overflow, shed={shed} extra_err={extra_err}"
+        );
+        assert_eq!(owned, 190);
+        assert!(
+            elapsed_ms < 500,
+            "owner loop must stay bounded under MCP cap, elapsed_ms={elapsed_ms}"
+        );
+        let plugins: mlua::Table = listed.get("plugins").expect("plugins");
+        let mut saw_metrics = false;
+        for pair in plugins.sequence_values::<mlua::Table>() {
+            let plugin = pair.expect("plugin row");
+            let key: String = plugin.get("key").unwrap_or_default();
+            if key == "cap-plugin" {
+                let metrics: mlua::Table = plugin.get("worker_metrics").expect("worker_metrics");
+                let classes: mlua::Table = metrics.get("classes").expect("classes");
+                let mcp: mlua::Table = classes.get("mcp").expect("mcp class");
+                let listed_cap: i64 = mcp.get("cap").expect("listed cap");
+                assert_eq!(listed_cap, 192);
+                saw_metrics = true;
+            }
+        }
+        assert!(saw_metrics, "list_plugins must expose worker_metrics");
+        runtime.shutdown_plugin_workers("test_complete");
     }
 }

@@ -352,22 +352,15 @@ impl Hub {
                             if let (Some(owner), Some(hid)) =
                                 (&entry.owner_plugin, &entry.handler_id)
                             {
-                                if let Ok(invoke) = self
-                                    .lua
-                                    .lua_ref()
-                                    .globals()
-                                    .get::<mlua::Function>("__plugin_worker_invoke")
-                                {
-                                    if let Err(e) = invoke.call::<mlua::Value>((
-                                        owner.clone(),
-                                        "ac_unregister".to_string(),
-                                        hid.clone(),
-                                        mlua::Value::Nil,
-                                        mlua::Value::Nil,
-                                        250u64,
-                                    )) {
-                                        log::warn!("[ActionCable] Failed to unregister owned handler {hid} in worker {owner}: {e}");
-                                    }
+                                if let Err(e) = crate::lua::primitives::plugin_worker::invoke_plugin_handler_async(
+                                    self.lua.lua_ref(),
+                                    owner,
+                                    "ac_unregister",
+                                    hid,
+                                    mlua::Value::Nil,
+                                    250,
+                                ) {
+                                    log::warn!("[ActionCable] Failed to unregister owned handler {hid} in worker {owner}: {e}");
                                 }
                             }
                         }
@@ -407,22 +400,15 @@ impl Hub {
                             if let (Some(owner), Some(hid)) =
                                 (&entry.owner_plugin, &entry.handler_id)
                             {
-                                if let Ok(invoke) = self
-                                    .lua
-                                    .lua_ref()
-                                    .globals()
-                                    .get::<mlua::Function>("__plugin_worker_invoke")
-                                {
-                                    if let Err(e) = invoke.call::<mlua::Value>((
-                                        owner.clone(),
-                                        "ac_unregister".to_string(),
-                                        hid.clone(),
-                                        mlua::Value::Nil,
-                                        mlua::Value::Nil,
-                                        250u64,
-                                    )) {
-                                        log::warn!("[ActionCable] Failed to unregister owned handler {hid} in worker {owner}: {e}");
-                                    }
+                                if let Err(e) = crate::lua::primitives::plugin_worker::invoke_plugin_handler_async(
+                                    self.lua.lua_ref(),
+                                    owner,
+                                    "ac_unregister",
+                                    hid,
+                                    mlua::Value::Nil,
+                                    250,
+                                ) {
+                                    log::warn!("[ActionCable] Failed to unregister owned handler {hid} in worker {owner}: {e}");
                                 }
                             }
                         }

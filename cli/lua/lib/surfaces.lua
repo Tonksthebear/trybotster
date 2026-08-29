@@ -52,6 +52,17 @@
 --      `surfaces_changed` hook firing, so browsers can discover new routes
 --      without a Rails change.
 --
+-- Plugin surface snapshot cache (owner-loop isolation):
+--   * render_node never waits on a plugin worker. It returns the last
+--     immutable tree, or a loading/stale placeholder.
+--   * A refresh starts only when the slot is missing, marked dirty, or
+--     older than SNAPSHOT_TTL_SECS, and no refresh is in flight.
+--   * Worker completion never starts another refresh. Plugins call
+--     surfaces.invalidate(name) when their data changes.
+--   * A completion broadcasts only when the encoded tree changed.
+--   * Slots are keyed by name, path, subscription, and a hash of the
+--     serializable render_state (client handles are excluded).
+--
 -- Storage lives in `hub.state` so hot-reload (Lua module reload, `plugin:reload`)
 -- preserves the registry across the reload cycle; the module body is
 -- re-evaluated but the underlying table identity is reused.
@@ -73,6 +84,15 @@ local M = {}
 local registry = state.get("surfaces.registry", { by_name = {}, seq = 0 })
 if registry.by_name == nil then registry.by_name = {} end
 if registry.seq == nil then registry.seq = 0 end
+-- Immutable snapshot cache: Hub owner loop never waits for plugin render.
+-- Keyed by surface name + path + subscription + serializable state hash.
+local snapshots = state.get("surfaces.snapshots", {})
+-- Refresh at most once per TTL unless invalidate() marks the slot dirty.
+local SNAPSHOT_TTL_SECS = 2
+-- Depth cap applies only to the render_state key hash. Tree equality uses
+-- a full-depth JSON encode so nested UiNode changes still broadcast.
+local KEY_STATE_DEPTH = 4
+local MAX_SLOTS_PER_SURFACE = 256
 local PERF = os.getenv("BOTSTER_LUA_PERF") == "1"
 
 local function elapsed_ms(started)
@@ -569,10 +589,149 @@ end
 --- Remove a previously registered surface.
 -- @param name string
 -- @return true if the entry existed and was removed, false otherwise.
+local KEY_SKIP = {
+    client = true,
+    subscription_key = true,
+    peer_id = true,
+    sub_id = true,
+}
+
+local function serializable_state(value, depth, max_depth)
+    if max_depth and depth and depth > max_depth then return nil end
+    local t = type(value)
+    if t == "string" or t == "number" or t == "boolean" then return value end
+    if t ~= "table" then return nil end
+    local out = {}
+    for k, v in pairs(value) do
+        if not KEY_SKIP[k] and type(k) ~= "function" then
+            local copied = serializable_state(v, (depth or 0) + 1, max_depth)
+            if copied ~= nil then out[k] = copied end
+        end
+    end
+    return out
+end
+
+local function encode_json(value)
+    if type(json) == "table" and type(json.encode) == "function" then
+        local ok, encoded = pcall(json.encode, value)
+        if ok and type(encoded) == "string" then return encoded end
+    end
+    return tostring(value)
+end
+
+local function encode_state_key(render_state)
+    return encode_json(serializable_state(render_state or {}, 0, KEY_STATE_DEPTH) or {})
+end
+
+local function encode_tree(tree)
+    return encode_json(tree)
+end
+
+local function snapshot_key(name, render_state)
+    render_state = render_state or {}
+    local path = tostring(render_state.path or "/")
+    local sub = tostring(
+        render_state.sub_id
+            or render_state.subscription_key
+            or render_state.peer_id
+            or "")
+    return tostring(name) .. "\0" .. path .. "\0" .. sub .. "\0" .. encode_state_key(render_state)
+end
+
+local function subscription_token(render_state)
+    render_state = render_state or {}
+    local token = render_state.sub_id or render_state.subscription_key or render_state.peer_id
+    if type(token) == "string" and token ~= "" then return token end
+    return nil
+end
+
+local function loading_tree(name, status, err)
+    return {
+        type = "text",
+        props = {
+            text = (status == "stale")
+                and ("surface stale: " .. tostring(name))
+                or ("surface loading: " .. tostring(name)),
+            surface_status = status or "loading",
+            surface_name = name,
+            error = err,
+        },
+    }
+end
+
+local function refresh_surface_clients(name)
+    local ok_snap, snap = pcall(require, "lib.tree_snapshot")
+    if ok_snap and type(snap) == "table" and type(snap.forget_surface) == "function" then
+        pcall(snap.forget_surface, name)
+    end
+    local ok_conn, conn = pcall(require, "handlers.connections")
+    if ok_conn and type(conn) == "table" and type(conn.broadcast_ui_tree_snapshots) == "function" then
+        pcall(conn.broadcast_ui_tree_snapshots)
+    end
+end
+
+local function trees_equal(a, b)
+    if a == b then return true end
+    return encode_tree(a) == encode_tree(b)
+end
+
+local function evict_oldest_slots(surface_name)
+    local prefix = tostring(surface_name) .. "\0"
+    local slots = {}
+    for key, slot in pairs(snapshots) do
+        if type(slot) == "table" and (key == surface_name or key:sub(1, #prefix) == prefix) then
+            slots[#slots + 1] = { key = key, at = tonumber(slot.refreshed_at) or 0 }
+        end
+    end
+    if #slots <= MAX_SLOTS_PER_SURFACE then return end
+    table.sort(slots, function(a, b) return a.at < b.at end)
+    local overflow = #slots - MAX_SLOTS_PER_SURFACE
+    for i = 1, overflow do
+        snapshots[slots[i].key] = nil
+    end
+end
+
+local function now_secs()
+    return os.time()
+end
+
+local function should_refresh(slot)
+    if type(slot) ~= "table" then return true end
+    if slot.in_flight then return false end
+    if slot.dirty == true then return true end
+    if slot.tree == nil then return true end
+    local refreshed_at = tonumber(slot.refreshed_at) or 0
+    return (now_secs() - refreshed_at) >= SNAPSHOT_TTL_SECS
+end
+
+local function store_snapshot(key, name, tree)
+    local slot = snapshots[key]
+    if type(slot) ~= "table" then
+        slot = {}
+        snapshots[key] = slot
+    end
+    local changed = not trees_equal(slot.tree, tree)
+    slot.tree = tree
+    slot.status = "ready"
+    slot.in_flight = false
+    slot.dirty = false
+    slot.error = nil
+    slot.refreshed_at = now_secs()
+    if changed then
+        refresh_surface_clients(name)
+    end
+end
+
 function M.unregister(name)
     if not is_nonempty_string(name) then return false end
     if registry.by_name[name] == nil then return false end
     registry.by_name[name] = nil
+    local prefix = name .. "\0"
+    for key in pairs(snapshots) do
+        if key == name or key:sub(1, #prefix) == prefix then
+            snapshots[key] = nil
+        end
+    end
     if log and log.debug then
         log.debug(string.format("surfaces.unregister: name=%s", name))
     end
@@ -752,30 +911,108 @@ function M.render_node(name, render_state)
     local entry = M.get(name)
     if not entry then return nil end
     if entry.owner_plugin and not running_in_plugin_worker(entry.owner_plugin) then
-        local started = PERF and os.clock() or nil
-        local ok, result = require("lib.plugin_supervisor").invoke(
-            entry.owner_plugin,
-            "surface_route:" .. tostring(name),
-            entry.render,
-            {
-                timeout_ms = entry.timeout_ms or 5000,
-                handler_kind = "surface_route",
-                handler_id = name,
-                payload = { render_state = render_state or {} },
-            },
-            render_state)
-        if started then
-            log_perf(string.format(
-                "surface=%s owner=%s ok=%s elapsed_ms=%d",
-                tostring(name),
-                tostring(entry.owner_plugin),
-                tostring(ok),
-                elapsed_ms(started)))
+        local key = snapshot_key(name, render_state)
+        local cached = snapshots[key]
+        if not cached then
+            cached = { status = "loading", in_flight = false, dirty = true }
+            snapshots[key] = cached
         end
-        if not ok then error(result) end
-        return result
+        cached.subscription = cached.subscription or subscription_token(render_state)
+        cached.surface_name = name
+        evict_oldest_slots(name)
+        if should_refresh(cached) then
+            cached.in_flight = true
+            cached.dirty = false
+            local started = PERF and os.clock() or nil
+            local accepted, admission_error = require("lib.plugin_supervisor").invoke_async(
+                entry.owner_plugin,
+                "surface_route:" .. tostring(name),
+                entry.render,
+                {
+                    timeout_ms = entry.timeout_ms or 5000,
+                    handler_kind = "surface_route",
+                    handler_id = name,
+                    payload = { render_state = render_state or {} },
+                },
+                function(ok, result)
+                    local slot = snapshots[key]
+                    if type(slot) ~= "table" then return end
+                    slot.in_flight = false
+                    if started then
+                        log_perf(string.format(
+                            "surface=%s owner=%s ok=%s elapsed_ms=%d",
+                            tostring(name),
+                            tostring(entry.owner_plugin),
+                            tostring(ok),
+                            elapsed_ms(started)))
+                    end
+                    if ok then
+                        store_snapshot(key, name, result)
+                    else
+                        slot.status = slot.tree and "stale" or "error"
+                        slot.error = result
+                    end
+                end,
+                render_state)
+            if not accepted then
+                cached.in_flight = false
+                cached.status = cached.tree and "stale" or "error"
+                cached.error = admission_error
+            end
+        end
+        if cached.tree then
+            return cached.tree
+        end
+        return loading_tree(name, cached.status, cached.error)
     end
     return entry.render(render_state)
+end
+
+--- Mark plugin surface snapshots dirty so the next render_node may refresh.
+-- Completion callbacks never call this. Plugins call it after entity changes.
+function M.invalidate(name)
+    local prefix = nil
+    if is_nonempty_string(name) then
+        prefix = name .. "\0"
+    end
+    for key, slot in pairs(snapshots) do
+        if type(slot) == "table" then
+            if prefix == nil or key == name or key:sub(1, #prefix) == prefix then
+                slot.dirty = true
+            end
+        end
+    end
+end
+
+--- Drop snapshot slots bound to a disconnected subscription or peer.
+function M.forget_subscription(token)
+    if type(token) ~= "string" or token == "" then return 0 end
+    local removed = 0
+    for key, slot in pairs(snapshots) do
+        if type(slot) == "table" and slot.subscription == token then
+            snapshots[key] = nil
+            removed = removed + 1
+        end
+    end
+    return removed
+end
+
+function M._trees_equal_for_tests(a, b)
+    return trees_equal(a, b)
+end
+
+function M._snapshot_count_for_tests(name)
+    if not is_nonempty_string(name) then
+        local n = 0
+        for _ in pairs(snapshots) do n = n + 1 end
+        return n
+    end
+    local prefix = name .. "\0"
+    local n = 0
+    for key in pairs(snapshots) do
+        if key == name or key:sub(1, #prefix) == prefix then n = n + 1 end
+    end
+    return n
 end
 
 function M._invoke_render(name, render_state)
@@ -838,8 +1075,21 @@ end
 --- state by design.
 function M._reset_for_tests()
     for k in pairs(registry.by_name) do registry.by_name[k] = nil end
+    for k in pairs(snapshots) do snapshots[k] = nil end
     registry.seq = 0
 end
+
+pcall(function()
+    local hooks = require("hub.hooks")
+    hooks.on("client_disconnected", "surfaces_drop_subscription_snapshots", function(info)
+        M.forget_subscription(info and info.peer_id)
+        M.forget_subscription(info and info.sub_id)
+    end)
+    hooks.on("client_unsubscribed", "surfaces_drop_subscription_snapshots_unsub", function(info)
+        M.forget_subscription(info and info.sub_id)
+        M.forget_subscription(info and info.peer_id)
+    end)
+end)
 
 -- Test-only export: expose internal helpers for unit-level coverage without
 -- requiring the full layout broadcast wire-up.

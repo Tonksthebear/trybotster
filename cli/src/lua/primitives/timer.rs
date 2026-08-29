@@ -194,16 +194,14 @@ enum FiredTimer {
 }
 
 fn invoke_plugin_timer(lua: &Lua, owner_plugin: &str, handler_id: &str) -> LuaResult<()> {
-    let invoke: LuaFunction = lua.globals().get("__plugin_worker_invoke")?;
-    invoke.call::<LuaValue>((
-        owner_plugin.to_string(),
-        "timer".to_string(),
-        handler_id.to_string(),
-        LuaValue::Nil,
-        lua.create_table()?,
-        5000_u64,
-    ))?;
-    Ok(())
+    crate::lua::primitives::plugin_worker::invoke_plugin_handler_async(
+        lua,
+        owner_plugin,
+        "timer",
+        handler_id,
+        LuaValue::Table(lua.create_table()?),
+        5000,
+    )
 }
 
 fn fire_local_timer(lua: &Lua, key: &LuaRegistryKey) -> LuaResult<()> {

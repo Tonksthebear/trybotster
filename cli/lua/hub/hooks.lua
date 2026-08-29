@@ -197,7 +197,7 @@ function M.notify(event, ...)
     for _, entry in ipairs(sorted) do
         local ok, err
         if entry.h.owner_plugin then
-            ok, err = require("lib.plugin_supervisor").invoke(
+            ok, err = require("lib.plugin_supervisor").fire_and_forget(
                 entry.h.owner_plugin,
                 "hook_observer:" .. tostring(event) .. ":" .. tostring(entry.name),
                 entry.h.callback,

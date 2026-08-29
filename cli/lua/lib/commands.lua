@@ -150,7 +150,8 @@ function M.dispatch(client, sub_id, command)
     if entry then
         local ok, err
         if entry.owner_plugin then
-            ok, err = require("lib.plugin_supervisor").invoke(
+            local completed, completed_ok, completed_result = false, nil, nil
+            local accepted, admission_error = require("lib.plugin_supervisor").invoke_async(
                 entry.owner_plugin,
                 "command:" .. tostring(cmd_type),
                 entry.handler,
@@ -160,15 +161,56 @@ function M.dispatch(client, sub_id, command)
                     handler_id = cmd_type,
                     payload = { command = command },
                 },
+                function(callback_ok, callback_err)
+                    completed = true
+                    completed_ok = callback_ok
+                    completed_result = callback_err
+                    if not callback_ok then
+                        log.error(string.format("Command '%s' error: %s", cmd_type, tostring(callback_err)))
+                        send_failure_response(client, sub_id, command, callback_err)
+                    end
+                    hooks.notify("after_hub_command", {
+                        command = cmd_type,
+                        client = client,
+                        sub_id = sub_id,
+                        success = callback_ok,
+                        error = not callback_ok and callback_err or nil,
+                    })
+                end,
                 client,
                 sub_id,
                 command)
+            if completed then
+                ok = completed_ok
+                err = completed_result
+            else
+                ok = accepted
+                err = admission_error
+            end
+            if not accepted then
+                log.error(string.format("Command '%s' error: %s", cmd_type, tostring(admission_error)))
+                send_failure_response(client, sub_id, command, admission_error)
+                hooks.notify("after_hub_command", {
+                    command = cmd_type,
+                    client = client,
+                    sub_id = sub_id,
+                    success = false,
+                    error = admission_error,
+                })
+            end
         else
             ok, err = pcall(entry.handler, client, sub_id, command)
-        end
-        if not ok then
-            log.error(string.format("Command '%s' error: %s", cmd_type, tostring(err)))
-            send_failure_response(client, sub_id, command, err)
+            if not ok then
+                log.error(string.format("Command '%s' error: %s", cmd_type, tostring(err)))
+                send_failure_response(client, sub_id, command, err)
+            end
+            hooks.notify("after_hub_command", {
+                command = cmd_type,
+                client = client,
+                sub_id = sub_id,
+                success = ok,
+                error = not ok and err or nil,
+            })
         end
         if started then
             log_perf(string.format(
@@ -179,13 +221,6 @@ function M.dispatch(client, sub_id, command)
                 elapsed_ms(started),
                 describe_command(cmd_type, command)))
         end
-        hooks.notify("after_hub_command", {
-            command = cmd_type,
-            client = client,
-            sub_id = sub_id,
-            success = ok,
-            error = not ok and err or nil,
-        })
         return ok, err
     else
         log.debug(string.format("Unknown hub command: %s", tostring(cmd_type)))
