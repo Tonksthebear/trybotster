@@ -1071,12 +1071,6 @@ pub(super) fn test_webrtc_peer_cleanup_removes_terminal_client_worker() {
         .stream_frame_tx(hub.webrtc.stream_frame_tx())
         .pty_input_tx(hub.webrtc.pty_input_tx())
         .file_input_tx(hub.webrtc.file_input_tx())
-        .crypto_service(
-            hub.browser
-                .crypto_service
-                .clone()
-                .expect("crypto service required"),
-        )
         .build();
     let generation = hub.webrtc.next_offer_generation(browser_identity);
     let _ = hub.webrtc.complete_offer(
@@ -1174,12 +1168,6 @@ pub(super) fn test_failed_webrtc_offer_completion_records_start_failed_metric() 
         .stream_frame_tx(hub.webrtc.stream_frame_tx())
         .pty_input_tx(hub.webrtc.pty_input_tx())
         .file_input_tx(hub.webrtc.file_input_tx())
-        .crypto_service(
-            hub.browser
-                .crypto_service
-                .clone()
-                .expect("crypto service required"),
-        )
         .build();
     let generation = hub.webrtc.next_offer_generation(browser_identity);
 

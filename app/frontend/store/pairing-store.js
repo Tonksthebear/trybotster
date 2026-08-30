@@ -14,7 +14,7 @@ import { create } from 'zustand'
 export const usePairingStore = create((set, get) => ({
   // --- State ---
   status: 'idle',      // idle | paste | ready | verifying | success | error
-  bundle: null,        // parsed DeviceKeyBundle (identityKey, signingKey, oneTimeKey, etc.)
+  bundle: null,        // parsed route, hub public key, one-time secret, and expiry
   rawCode: null,       // raw base32 fragment for copy-to-clipboard
   errorMessage: null,
   pasteLinkError: null,

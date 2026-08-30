@@ -23,7 +23,7 @@ module Api
     # Test that hub tokens work for authentication
 
     test "hub token authenticates successfully" do
-      get devices_url,
+      patch hub_heartbeat_url(@hub),
           headers: { "X-API-Key" => @hub_token.token },
           as: :json
 
@@ -31,7 +31,7 @@ module Api
     end
 
     test "invalid hub token returns unauthorized" do
-      get devices_url,
+      patch hub_heartbeat_url(@hub),
           headers: { "X-API-Key" => "btstr_invalid_token_here" },
           as: :json
 
@@ -41,7 +41,7 @@ module Api
     end
 
     test "invalid token without btstr prefix returns unauthorized" do
-      get devices_url,
+      patch hub_heartbeat_url(@hub),
           headers: { "X-API-Key" => "some_random_token" },
           as: :json
 
@@ -51,17 +51,17 @@ module Api
     end
 
     test "missing api key returns unauthorized for json" do
-      get devices_url, as: :json
+      patch hub_heartbeat_url(@hub), as: :json
 
-      # DevicesController falls back to Devise session auth
-      # For JSON requests without auth, Devise returns 401
+      # The heartbeat endpoint falls back to Devise session authentication.
+      # Devise returns 401 for JSON requests without authentication.
       assert_response :unauthorized
     end
 
     test "hub token updates last_used_at on successful auth" do
       assert_nil @hub_token.last_used_at
 
-      get devices_url,
+      patch hub_heartbeat_url(@hub),
           headers: { "X-API-Key" => @hub_token.token },
           as: :json
 
@@ -71,7 +71,7 @@ module Api
     end
 
     test "hub token records last_ip on successful auth" do
-      get devices_url,
+      patch hub_heartbeat_url(@hub),
           headers: { "X-API-Key" => @hub_token.token },
           as: :json
 
@@ -86,7 +86,7 @@ module Api
       token_value = @hub_token.token
       @hub_token.destroy
 
-      get devices_url,
+      patch hub_heartbeat_url(@hub),
           headers: { "X-API-Key" => token_value },
           as: :json
 

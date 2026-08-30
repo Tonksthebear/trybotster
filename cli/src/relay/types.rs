@@ -1,7 +1,7 @@
 //! Data types for the terminal relay protocol.
 //!
 //! This module defines the message and event types used for communication
-//! between the CLI and browser via E2E encryption (Matrix Olm/Megolm).
+//! between the CLI and browser through authenticated WebRTC DataChannels.
 //!
 //! # Message Types
 //!
@@ -11,7 +11,7 @@
 //! # Transport
 //!
 //! Messages are sent as JSON over WebRTC DataChannel. E2E encryption is
-//! handled by Matrix Olm (1:1 sessions) and Megolm (group sessions).
+//! handled by WebRTC DTLS and the browser admission protocol.
 
 // Rust guideline compliant 2026-03
 

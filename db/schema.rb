@@ -10,7 +10,7 @@
 #
 # It's strongly recommended that you check this file into your version control system.
 
-ActiveRecord::Schema[8.1].define(version: 2026_05_27_211440) do
+ActiveRecord::Schema[8.1].define(version: 2026_08_30_214000) do
   # These are extensions that must be enabled in order to support this database
   enable_extension "pg_catalog.plpgsql"
 
@@ -80,19 +80,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_05_27_211440) do
     t.index ["created_at"], name: "index_action_mcp_sse_events_on_created_at"
     t.index ["session_id", "event_id"], name: "index_action_mcp_sse_events_on_session_id_and_event_id", unique: true
     t.index ["session_id"], name: "index_action_mcp_sse_events_on_session_id"
-  end
-
-  create_table "browser_keys", force: :cascade do |t|
-    t.datetime "created_at", null: false
-    t.string "fingerprint", null: false
-    t.datetime "last_seen_at"
-    t.string "name", null: false
-    t.string "public_key", null: false
-    t.datetime "updated_at", null: false
-    t.bigint "user_id", null: false
-    t.index ["public_key"], name: "index_browser_keys_on_public_key", unique: true
-    t.index ["user_id", "fingerprint"], name: "index_browser_keys_on_user_id_and_fingerprint", unique: true
-    t.index ["user_id"], name: "index_browser_keys_on_user_id"
   end
 
   create_table "github_messages", force: :cascade do |t|
@@ -270,7 +257,6 @@ ActiveRecord::Schema[8.1].define(version: 2026_05_27_211440) do
   add_foreign_key "action_mcp_session_resources", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_session_subscriptions", "action_mcp_sessions", column: "session_id", on_delete: :cascade
   add_foreign_key "action_mcp_sse_events", "action_mcp_sessions", column: "session_id"
-  add_foreign_key "browser_keys", "users"
   add_foreign_key "hub_authorizations", "users"
   add_foreign_key "hub_commands", "hubs"
   add_foreign_key "hub_tokens", "hubs"

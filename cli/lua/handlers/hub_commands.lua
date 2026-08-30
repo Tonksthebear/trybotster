@@ -54,7 +54,7 @@ end
 
 -- Reuse existing connection or create a new one
 if not handles.conn then
-    handles.conn = action_cable.connect({ crypto = true })
+    handles.conn = action_cable.connect()
 end
 
 -- Subscribe to HubCommandChannel (reuse existing or create new)

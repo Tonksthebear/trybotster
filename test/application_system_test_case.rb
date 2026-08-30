@@ -48,22 +48,7 @@ class ApplicationSystemTestCase < ActionDispatch::SystemTestCase
       localStorage.clear();
       sessionStorage.clear();
 
-      // Step 1: Tell the SharedWorker to clear all in-memory sessions.
-      function clearWorker() {
-        return new Promise(function(resolve) {
-          try {
-            var workerUrl = document.querySelector('meta[name="crypto-worker-url"]');
-            if (!workerUrl || !workerUrl.content) { resolve(); return; }
-            var worker = new SharedWorker(workerUrl.content, { name: "vodozemac-crypto" });
-            worker.port.onmessage = function(e) { if (e.data.id === 999999) resolve(); };
-            worker.port.start();
-            worker.port.postMessage({ id: 999999, action: "clearAllSessions" });
-            setTimeout(resolve, 3000);
-          } catch(e) { resolve(); }
-        });
-      }
-
-      // Step 2: Best-effort delete IndexedDB databases left by older builds.
+      // Delete IndexedDB databases, including browser signing credentials.
       function clearIDB() {
         return new Promise(function(resolve) {
           try {
@@ -85,13 +70,12 @@ class ApplicationSystemTestCase < ActionDispatch::SystemTestCase
         });
       }
 
-      clearWorker().then(clearIDB).then(done);
+      clearIDB().then(done);
     JS
 
     # Navigate to about:blank to destroy all JS singletons
     # (ConnectionManager, bridge, etc.) between tests.
-    # SharedWorkers persist across navigations in the same origin,
-    # but module-level singletons are destroyed on full page unload.
+    # A full page unload destroys module-level singletons.
     page.driver.browser.navigate.to("about:blank")
   rescue => e
     # Don't fail test if cleanup fails

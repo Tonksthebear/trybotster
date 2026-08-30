@@ -94,8 +94,17 @@ impl Hub {
         }
     }
 
-    pub(crate) fn init_crypto_service(&mut self) {
-        registration::init_crypto_service(&mut self.browser, &self.hub_identifier);
+    pub(crate) fn init_pairing_authority(&mut self) {
+        let server_hub_id = self.server_hub_id().to_string();
+        if let Err(error) = registration::init_pairing_authority(
+            &mut self.browser,
+            self.device.signing_key.clone(),
+            &self.hub_identifier,
+            &server_hub_id,
+        ) {
+            log::error!("{error}");
+            self.browser.relay_connected = false;
+        }
     }
 
     pub(crate) fn get_or_generate_connection_url(&mut self) -> Result<String, String> {
@@ -103,14 +112,6 @@ impl Hub {
         let server_hub_id = self.server_hub_id().to_string();
         let local_id = self.hub_identifier.clone();
         let server_url = self.config.server_url.clone();
-
-        if crate::env::is_encryption_disabled() {
-            let connection_url = format!("{server_url}/hubs/{server_hub_id}#no-encryption");
-            if let Err(error) = crate::relay::write_connection_url(&local_id, &connection_url) {
-                log::warn!("Failed to write connection URL: {error}");
-            }
-            return Ok(connection_url);
-        }
 
         registration::write_connection_url_lazy(
             &mut self.browser,

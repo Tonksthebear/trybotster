@@ -4,7 +4,7 @@
  * Opens TCP connections on the CLI side and forwards raw bytes bidirectionally.
  * Each stream maps to one TCP connection on the CLI.
  *
- * Frame format (after Olm decryption):
+ * DataChannel frame format:
  *   [0x02][frame_type:1][stream_id:2 BE][payload...]
  */
 

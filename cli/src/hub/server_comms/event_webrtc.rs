@@ -7,6 +7,10 @@ impl Hub {
         payload: Vec<u8>,
     ) {
         let started = Instant::now();
+        if !self.webrtc.is_authenticated(&browser_identity) {
+            self.handle_browser_authentication(&browser_identity, &payload);
+            return;
+        }
         self.process_webrtc_plaintext_payload(&browser_identity, &payload);
         self.record_hot_span(
             "webrtc_message.total",
@@ -14,15 +18,48 @@ impl Hub {
             payload.len(),
             &browser_identity,
         );
-        for restart_peer in self.webrtc.drain_decrypt_failure_triggers() {
-            self.request_transport_ratchet_restart(&restart_peer);
+    }
+
+    fn handle_browser_authentication(&mut self, browser_identity: &str, payload: &[u8]) {
+        let request = match serde_json::from_slice::<crate::relay::BrowserAuthRequest>(payload) {
+            Ok(request) => request,
+            Err(error) => {
+                log::warn!("[WebRTC-Auth] Invalid authentication request: {error}");
+                self.cleanup_webrtc_peer(browser_identity, "invalid_authentication_request");
+                return;
+            }
+        };
+        let admission = self
+            .browser
+            .pairing_authority
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("pairing authority is unavailable"))
+            .and_then(|authority| authority.verify(browser_identity, request));
+        let admission = match admission {
+            Ok(admission) => admission,
+            Err(error) => {
+                log::warn!("[WebRTC-Auth] Browser admission rejected: {error}");
+                self.cleanup_webrtc_peer(browser_identity, "browser_authentication_rejected");
+                return;
+            }
+        };
+        if !self.webrtc.mark_authenticated(browser_identity) {
+            return;
         }
+        let response = serde_json::to_vec(&admission.response)
+            .expect("authentication response serialization cannot fail");
+        self.queue_webrtc_peer_command(
+            browser_identity,
+            crate::worker::webrtc::WebRtcAdapterCommand::Json { data: response },
+        );
+        self.browser.handle_connected(&admission.credential_id);
+        self.complete_authenticated_webrtc_peer(browser_identity);
     }
 
     pub(super) fn handle_dc_opened_event(&mut self, browser_identity: String, generation: u64) {
         let opened_started = Instant::now();
         let current_generation = self.webrtc.current_offer_generation(&browser_identity);
-        let Some(peer_state) = self
+        let Some(_peer_state) = self
             .webrtc
             .mark_data_channel_open(&browser_identity, generation)
         else {
@@ -49,64 +86,31 @@ impl Hub {
             return;
         };
         log::info!(
-            "[WebRTC] DataChannel opened for {}, firing peer_connected",
+            "[WebRTC] DataChannel opened for {}, starting authentication",
             &browser_identity[..browser_identity.len().min(8)],
         );
 
-        let ready_path_started = Instant::now();
         if self.webrtc.start_recv_forwarder(
             &browser_identity,
             &self.tokio_runtime,
             self.hub_event_tx.clone(),
         ) {
             self.spawn_webrtc_peer_sender(&browser_identity);
-            let Some(peer_command_tx) = self.webrtc.peer_command_sender(&browser_identity) else {
-                log::warn!(
-                    "[WebRTC] DataChannel opened for {} but peer sender was unavailable",
-                    &browser_identity[..browser_identity.len().min(8)]
-                );
-                self.hub_event_metrics
-                    .record_counter("webrtc_open.peer_sender_missing", 1);
-                self.hub_event_metrics.record_span_with_threshold(
-                    "webrtc_open.total",
-                    opened_started.elapsed(),
-                    0,
-                    Self::HOT_SUBHANDLER_SLOW,
-                    &browser_identity,
-                );
+            let Some(authority) = self.browser.pairing_authority.as_mut() else {
+                self.cleanup_webrtc_peer(&browser_identity, "pairing_authority_unavailable");
                 return;
             };
+            let Some(dtls_binding) = self.webrtc.dtls_binding(&browser_identity) else {
+                self.cleanup_webrtc_peer(&browser_identity, "dtls_binding_unavailable");
+                return;
+            };
+            let challenge = authority.begin_challenge(&browser_identity, dtls_binding);
+            let data = serde_json::to_vec(&challenge)
+                .expect("authentication challenge serialization cannot fail");
             self.queue_webrtc_peer_command(
                 &browser_identity,
-                crate::worker::webrtc::WebRtcAdapterCommand::Json {
-                    data: serde_json::to_vec(&serde_json::json!({
-                        "type": "dc_ready",
-                    }))
-                    .expect("static JSON serialization cannot fail"),
-                },
+                crate::worker::webrtc::WebRtcAdapterCommand::Json { data },
             );
-            let worker =
-                self.spawn_webrtc_client_worker_adapter(browser_identity.clone(), peer_command_tx);
-            self.webrtc
-                .register_client_worker_route(browser_identity.clone(), worker.clone());
-            self.browser_client_workers
-                .insert(browser_identity.clone(), worker);
-
-            self.spawn_dc_ping_task(&browser_identity);
-            // Connected is a data-plane-ready state: if recv forwarding or
-            // peer command routing failed above, leave the peer unconnected
-            // and rely on the failure counters/cleanup path instead.
-            self.handle_transport_control_message(peer_state);
-            self.hub_event_metrics.record_span_with_threshold(
-                "webrtc_open.ready_path",
-                ready_path_started.elapsed(),
-                0,
-                Self::HOT_SUBHANDLER_SLOW,
-                &browser_identity,
-            );
-            if let Err(e) = self.lua.call_peer_connected(&browser_identity) {
-                log::warn!("[WebRTC] Lua peer_connected callback error: {e}");
-            }
         } else {
             self.hub_event_metrics
                 .record_counter("webrtc_open.recv_forwarder_failed", 1);
@@ -118,6 +122,49 @@ impl Hub {
             Self::HOT_SUBHANDLER_SLOW,
             &browser_identity,
         );
+    }
+
+    fn complete_authenticated_webrtc_peer(&mut self, browser_identity: &str) {
+        let ready_path_started = Instant::now();
+        let Some(peer_command_tx) = self.webrtc.peer_command_sender(browser_identity) else {
+            self.cleanup_webrtc_peer(browser_identity, "peer_sender_missing_after_auth");
+            return;
+        };
+        self.queue_webrtc_peer_command(
+            browser_identity,
+            crate::worker::webrtc::WebRtcAdapterCommand::Json {
+                data: serde_json::to_vec(&serde_json::json!({ "type": "dc_ready" }))
+                    .expect("static JSON serialization cannot fail"),
+            },
+        );
+        let worker = self
+            .spawn_webrtc_client_worker_adapter(browser_identity.to_string(), peer_command_tx);
+        self.webrtc
+            .register_client_worker_route(browser_identity.to_string(), worker.clone());
+        self.browser_client_workers
+            .insert(browser_identity.to_string(), worker);
+        self.spawn_dc_ping_task(browser_identity);
+        let generation = self.webrtc.current_offer_generation(browser_identity);
+        self.handle_transport_control_message(
+            crate::worker::hub_control::HubControlMessage::TransportPeerStateChanged {
+                client_id: crate::client::ClientId::browser(browser_identity.to_string()),
+                browser_identity: browser_identity.to_string(),
+                state: crate::worker::hub_control::TransportPeerState::Connected {
+                    generation,
+                    mode: crate::worker::hub_control::TransportConnectionMode::Unknown,
+                },
+            },
+        );
+        self.hub_event_metrics.record_span_with_threshold(
+            "webrtc_auth.ready_path",
+            ready_path_started.elapsed(),
+            0,
+            Self::HOT_SUBHANDLER_SLOW,
+            browser_identity,
+        );
+        if let Err(error) = self.lua.call_peer_connected(browser_identity) {
+            log::warn!("[WebRTC] Lua peer_connected callback error: {error}");
+        }
     }
 
     pub(super) fn handle_webrtc_ingress_backpressure_event(

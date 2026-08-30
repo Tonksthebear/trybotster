@@ -1,3 +1,5 @@
+import { extractDtlsFingerprint } from "transport/browser_pairing"
+
 export const PEER_LOST_REASONS = Object.freeze({
   DATACHANNEL_CLOSE: "datachannel_close",
   DATACHANNEL_ERROR: "datachannel_error",
@@ -139,6 +141,8 @@ export class HubPeerLifecycle {
 
     const offer = await pc.createOffer()
     await pc.setLocalDescription(offer)
+    conn.browserFingerprint = extractDtlsFingerprint(offer.sdp)
+    if (!conn.browserFingerprint) throw new Error("Browser DTLS fingerprint is missing")
 
     const envelope = await this.#callbacks.encryptSignal(hubId, {
       type: "offer",
@@ -192,6 +196,8 @@ export class HubPeerLifecycle {
     }
 
     const answer = new RTCSessionDescription({ type: "answer", sdp })
+    conn.hubFingerprint = extractDtlsFingerprint(sdp)
+    if (!conn.hubFingerprint) throw new Error("Hub DTLS fingerprint is missing")
     await conn.pc.setRemoteDescription(answer)
 
     for (const candidate of conn.pendingCandidates) {

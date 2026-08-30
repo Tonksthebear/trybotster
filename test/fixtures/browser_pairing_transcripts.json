@@ -1,0 +1,14 @@
+{
+  "route": "/hubs/42",
+  "hub_public_key": "hub-key",
+  "challenge": "challenge",
+  "browser_public_key": "AQI",
+  "expires_at": 123,
+  "credential_id": "credential",
+  "paired": true,
+  "browser_fingerprint": "sha-256 browser",
+  "hub_fingerprint": "sha-256 hub",
+  "pairing_transcript": "botster-pairing-v1\n/hubs/42\nhub-key\nchallenge\nAQI\n123\nsha-256 browser\nsha-256 hub",
+  "authentication_transcript": "botster-auth-v1\n/hubs/42\nhub-key\nchallenge\nAQI\nsha-256 browser\nsha-256 hub",
+  "accepted_transcript": "botster-auth-accepted-v1\n/hubs/42\nchallenge\nAQI\ncredential\npair\nsha-256 browser\nsha-256 hub"
+}

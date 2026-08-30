@@ -6,16 +6,16 @@
 //! # Responsibilities
 //!
 //! - Hub registration for message routing (with device fingerprint)
-//! - Vodozemac crypto initialization for E2E encryption (lazy bundle generation)
+//! - Browser pairing authority initialization
 //!
 //! # Lazy Bundle Generation
 //!
 //! To avoid blocking boot, device key bundle generation is deferred until the
 //! connection URL is first requested. The flow is:
 //!
-//! 1. `init_crypto_service()` - creates CryptoService only (fast)
-//! 2. `get_or_generate_connection_bundle()` - generates bundle on first request
-//! 3. `write_connection_url_lazy()` - generates bundle + writes URL to disk
+//! 1. `init_pairing_authority()` loads the hub key and browser credentials.
+//! 2. `get_or_generate_connection_bundle()` creates a one-time pairing secret.
+//! 3. `write_connection_url_lazy()` writes the secret only in the URL fragment.
 //!
 //! Bundle generation is triggered by:
 //! - TUI QR code display request (`GetConnectionCode` command)
@@ -106,31 +106,23 @@ pub fn register_hub_with_server(
     local_identifier.to_string()
 }
 
-/// Initialize CryptoService for E2E encryption (vodozemac Olm).
-///
-/// Creates the CryptoService (`Arc<Mutex<VodozemacCrypto>>`). DeviceKeyBundle
-/// generation is deferred until the connection URL is first requested (lazy
-/// initialization).
-///
-/// # Usage
-///
-/// After calling this, use `get_or_generate_connection_bundle()` to lazily
-/// generate the bundle when the TUI displays the QR code or external automation
-/// requests the connection URL.
-pub fn init_crypto_service(browser: &mut BrowserState, local_identifier: &str) {
-    use crate::relay::create_crypto_service;
-
-    let crypto_service = create_crypto_service(local_identifier);
-
-    // Store the crypto service for E2E encryption
-    browser.crypto_service = Some(crypto_service);
-
-    // Mark relay as ready to connect (bundle generated lazily on first request)
+/// Initialize the hub-owned browser pairing authority.
+pub fn init_pairing_authority(
+    browser: &mut BrowserState,
+    signing_key: ed25519_dalek::SigningKey,
+    local_identifier: &str,
+    server_hub_id: &str,
+) -> Result<(), String> {
+    let route = format!("/hubs/{server_hub_id}");
+    let authority = crate::relay::PairingAuthority::load(signing_key, local_identifier, route)
+        .map_err(|error| format!("Cannot initialize browser pairing authority: {error}"))?;
+    browser.pairing_authority = Some(authority);
     browser.relay_connected = true;
-    log::info!("CryptoService created - bundle will be generated on first request");
+    log::info!("Browser pairing authority initialized");
+    Ok(())
 }
 
-/// Generate the DeviceKeyBundle lazily on first request.
+/// Generate the pairing bundle lazily on first request.
 ///
 /// This is called when the connection URL is first needed (TUI QR display,
 /// external automation, etc.). The bundle is cached in `BrowserState` for
@@ -138,46 +130,34 @@ pub fn init_crypto_service(browser: &mut BrowserState, local_identifier: &str) {
 ///
 /// # Returns
 ///
-/// The generated `DeviceKeyBundle`, or an error if generation fails.
+/// The generated pairing bundle, or an error if generation fails.
 ///
 /// # Errors
 ///
 /// Returns an error if:
-/// - CryptoService is not initialized
+/// - The pairing authority is not initialized
 /// - Bundle generation fails
 pub fn get_or_generate_connection_bundle(
     browser: &mut BrowserState,
     _runtime: &tokio::runtime::Runtime,
-) -> Result<crate::relay::DeviceKeyBundle, String> {
+) -> Result<crate::relay::PairingBundle, String> {
     // Return cached bundle if available and not used
-    if let Some(ref bundle) = browser.device_key_bundle {
+    if let Some(ref bundle) = browser.pairing_bundle {
         if !browser.bundle_used {
             return Ok(bundle.clone());
         }
         // Bundle was used, need to regenerate
-        log::info!("Previous bundle was used, generating fresh bundle");
+        log::info!("Previous pairing secret was used, generating a fresh secret");
     }
 
-    // Get crypto service
-    let crypto_service = browser
-        .crypto_service
-        .clone()
-        .ok_or_else(|| "CryptoService not initialized".to_string())?;
-
-    // Generate bundle (synchronous via mutex)
-    let bundle = crypto_service
-        .lock()
-        .map_err(|e| format!("Crypto mutex poisoned: {e}"))?
-        .build_device_key_bundle()
-        .map_err(|e| format!("Failed to generate DeviceKeyBundle: {e}"))?;
-
-    log::info!(
-        "Vodozemac bundle generated: curve25519={:.8}...",
-        bundle.curve25519_key
-    );
+    let authority = browser
+        .pairing_authority
+        .as_mut()
+        .ok_or_else(|| "Browser pairing authority is not initialized".to_string())?;
+    let bundle = authority.create_pairing_bundle();
 
     // Cache the bundle
-    browser.device_key_bundle = Some(bundle.clone());
+    browser.pairing_bundle = Some(bundle.clone());
     browser.bundle_used = false;
 
     Ok(bundle)
@@ -211,7 +191,7 @@ pub fn write_connection_url_lazy(
     // Serialize to binary and encode
     let bytes = bundle
         .to_binary()
-        .map_err(|e| format!("Cannot serialize PreKeyBundle: {e}"))?;
+        .map_err(|e| format!("Cannot serialize pairing bundle: {e}"))?;
     let encoded = BASE32_NOPAD.encode(&bytes);
 
     // Build connection URL
@@ -262,114 +242,38 @@ pub fn shutdown(client: &Client, server_url: &str, hub_identifier: &str, api_key
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Arc, OnceLock};
+    use ed25519_dalek::SigningKey;
 
-    /// Single shared tokio runtime for all registration tests.
-    fn shared_test_runtime() -> Arc<tokio::runtime::Runtime> {
-        static RT: OnceLock<Arc<tokio::runtime::Runtime>> = OnceLock::new();
-        Arc::clone(RT.get_or_init(|| Arc::new(tokio::runtime::Runtime::new().unwrap())))
+    fn browser() -> BrowserState {
+        BrowserState {
+            pairing_authority: Some(crate::relay::PairingAuthority::in_memory(
+                SigningKey::from_bytes(&[5; 32]),
+                "/hubs/42".into(),
+            )),
+            relay_connected: true,
+            ..BrowserState::default()
+        }
     }
 
     #[test]
-    fn test_init_crypto_service_only_starts_crypto_service() {
-        // Verify that init_crypto_service doesn't block or generate bundle
-        let mut browser = BrowserState::default();
-
-        // Before init: no crypto service
-        assert!(browser.crypto_service.is_none());
-        assert!(browser.device_key_bundle.is_none());
-        assert!(!browser.relay_connected);
-
-        // Init should start crypto service but NOT generate bundle
-        init_crypto_service(&mut browser, "test-hub-id");
-
-        // After init: crypto service started, but no bundle yet
-        assert!(
-            browser.crypto_service.is_some(),
-            "CryptoService should be started"
-        );
-        assert!(
-            browser.device_key_bundle.is_none(),
-            "Bundle should NOT be generated at init"
-        );
-        assert!(
-            browser.relay_connected,
-            "relay_connected should be true after init"
-        );
+    fn pairing_bundle_is_cached_until_consumed() {
+        let mut browser = browser();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let first = get_or_generate_connection_bundle(&mut browser, &runtime).unwrap();
+        let second = get_or_generate_connection_bundle(&mut browser, &runtime).unwrap();
+        assert_eq!(first, second);
+        assert!(browser.pairing_bundle.is_some());
     }
 
     #[test]
-    fn test_lazy_bundle_generation_returns_cached() {
-        // Use unique hub_id to avoid test interference
-        let hub_id = format!("test-lazy-bundle-{}", uuid::Uuid::new_v4());
-
-        // Create a browser state with crypto service
-        let mut browser = BrowserState::default();
-        init_crypto_service(&mut browser, &hub_id);
-
-        let runtime = shared_test_runtime();
-
-        // First call should generate bundle
-        let result1 = get_or_generate_connection_bundle(&mut browser, &runtime);
-        assert!(result1.is_ok(), "First bundle generation should succeed");
-        assert!(
-            browser.device_key_bundle.is_some(),
-            "Bundle should be cached"
-        );
-        assert!(!browser.bundle_used, "Bundle should not be marked as used");
-
-        // Get the curve25519 key from first bundle (identity key equivalent)
-        let curve25519_1 = result1.unwrap().curve25519_key;
-
-        // Second call should return cached bundle (same identity)
-        let result2 = get_or_generate_connection_bundle(&mut browser, &runtime);
-        assert!(result2.is_ok());
-        assert_eq!(
-            result2.unwrap().curve25519_key,
-            curve25519_1,
-            "Should return cached bundle"
-        );
-    }
-
-    #[test]
-    fn test_lazy_bundle_regenerates_when_used() {
-        // Use unique hub_id to avoid test interference
-        let hub_id = format!("test-regen-bundle-{}", uuid::Uuid::new_v4());
-
-        let mut browser = BrowserState::default();
-        init_crypto_service(&mut browser, &hub_id);
-
-        let runtime = shared_test_runtime();
-
-        // Generate first bundle
-        let result1 = get_or_generate_connection_bundle(&mut browser, &runtime);
-        assert!(result1.is_ok(), "First bundle generation should succeed");
-        let bundle1 = result1.unwrap();
-
-        // Mark bundle as used (simulating a browser connection)
+    fn consumed_pairing_bundle_gets_a_fresh_secret() {
+        let mut browser = browser();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let first = get_or_generate_connection_bundle(&mut browser, &runtime).unwrap();
         browser.bundle_used = true;
-
-        // Next call should regenerate (not return cached)
-        let result2 = get_or_generate_connection_bundle(&mut browser, &runtime);
-        assert!(result2.is_ok(), "Second bundle generation should succeed");
-        let bundle2 = result2.unwrap();
-
-        // bundle_used should be reset after regeneration
-        assert!(
-            !browser.bundle_used,
-            "bundle_used should be reset after regeneration"
-        );
-
-        // Both bundles should have the same curve25519 key (same crypto service)
-        assert_eq!(
-            bundle1.curve25519_key, bundle2.curve25519_key,
-            "Curve25519 key should remain same"
-        );
-
-        // Both bundles should have valid one-time keys
-        assert!(
-            !bundle2.one_time_key.is_empty(),
-            "Regenerated bundle should have a one-time key"
-        );
+        let second = get_or_generate_connection_bundle(&mut browser, &runtime).unwrap();
+        assert_ne!(first.pairing_secret, second.pairing_secret);
+        assert_eq!(first.hub_public_key, second.hub_public_key);
+        assert!(!browser.bundle_used);
     }
 }

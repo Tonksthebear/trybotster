@@ -39,6 +39,12 @@ pub(crate) const WEBRTC_ICE_APPLY_IN_FLIGHT_PER_BROWSER: usize = 8;
 /// steady-state ICE application while still avoiding serial mDNS timeout tails.
 pub(crate) const WEBRTC_QUEUED_ICE_REPLAY_IN_FLIGHT_PER_BROWSER: usize = 4;
 
+fn credential_id(browser_identity: &str) -> &str {
+    browser_identity
+        .split_once(':')
+        .map_or(browser_identity, |(credential_id, _)| credential_id)
+}
+
 /// Item queued for a per-peer async WebRTC send task.
 #[derive(Debug)]
 pub(crate) enum WebRtcAdapterCommand {
@@ -67,11 +73,6 @@ pub(crate) enum WebRtcAdapterCommand {
         stream_id: u16,
         /// Frame payload.
         payload: Vec<u8>,
-    },
-    /// Bundle refresh (ratchet restart, unencrypted).
-    BundleRefresh {
-        /// DeviceKeyBundle bytes.
-        bundle_bytes: Vec<u8>,
     },
 }
 
@@ -162,7 +163,6 @@ pub(crate) struct WebRtcOfferRequest {
     pub(crate) hub_id: String,
     pub(crate) server_url: String,
     pub(crate) api_key: String,
-    pub(crate) crypto_service: Option<crate::relay::CryptoService>,
     pub(crate) outgoing_signal_tx:
         tokio::sync::mpsc::Sender<crate::channel::webrtc::OutgoingSignal>,
     pub(crate) stream_frame_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::StreamIncoming>,
@@ -178,7 +178,6 @@ pub(crate) struct WebRtcOfferStart {
     pub(crate) generation: u64,
     pub(crate) channel: crate::channel::WebRtcChannel,
     pub(crate) config: crate::channel::ChannelConfig,
-    pub(crate) crypto_service: Option<crate::relay::CryptoService>,
 }
 
 #[derive(Debug)]
@@ -248,9 +247,10 @@ pub(crate) struct WebRtcPeerRegistry {
     ping_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
     pending_closes: HashMap<String, tokio::sync::watch::Receiver<bool>>,
     offer_generation: HashMap<String, u64>,
+    pending_browser_fingerprints: HashMap<String, String>,
+    dtls_bindings: HashMap<String, crate::relay::DtlsBinding>,
     pending_ice_candidates: HashMap<String, Vec<(u64, serde_json::Value)>>,
     ice_apply_limits: HashMap<String, Arc<tokio::sync::Semaphore>>,
-    ratchet_restarted_peers: HashSet<String>,
     backpressure_recovery: HashMap<String, BackpressureRecoveryEntry>,
     outgoing_signal_tx: tokio::sync::mpsc::Sender<crate::channel::webrtc::OutgoingSignal>,
     outgoing_signal_rx: Option<tokio::sync::mpsc::Receiver<crate::channel::webrtc::OutgoingSignal>>,
@@ -483,7 +483,6 @@ impl WebRtcTransportRunner {
             generation,
             mut channel,
             config,
-            crypto_service,
         } = start;
         let started_at = Instant::now();
         let answer_signal = if let Err(error) = channel.connect(config).await {
@@ -493,14 +492,7 @@ impl WebRtcTransportRunner {
             );
             None
         } else {
-            Self::handle_offer_and_build_answer(
-                &channel,
-                &browser_identity,
-                &sdp,
-                crypto_service.as_ref(),
-                started_at,
-            )
-            .await
+            Self::handle_offer_and_build_answer(&channel, &browser_identity, &sdp, started_at).await
         };
 
         WebRtcOfferCompletion {
@@ -515,10 +507,8 @@ impl WebRtcTransportRunner {
         channel: &crate::channel::WebRtcChannel,
         browser_identity: &str,
         sdp: &str,
-        crypto_service: Option<&crate::relay::CryptoService>,
         started_at: Instant,
     ) -> Option<serde_json::Value> {
-        let olm_key = crate::relay::extract_olm_key(&browser_identity).to_string();
         match channel.handle_sdp_offer(sdp, browser_identity).await {
             Ok(answer_sdp) => {
                 log::info!(
@@ -526,41 +516,10 @@ impl WebRtcTransportRunner {
                     &browser_identity[..browser_identity.len().min(12)],
                     started_at.elapsed().as_millis()
                 );
-                let answer_payload = serde_json::json!({
+                Some(serde_json::json!({
                     "type": "answer",
                     "sdp": answer_sdp,
-                });
-                let Some(crypto_service) = crypto_service else {
-                    return Some(answer_payload);
-                };
-                let plaintext = serde_json::to_vec(&answer_payload).unwrap_or_default();
-                match crypto_service.lock() {
-                    Ok(mut guard) => match guard.encrypt(&plaintext, &olm_key) {
-                        Ok(envelope) => match serde_json::to_value(&envelope) {
-                            Ok(value) => Some(value),
-                            Err(error) => {
-                                log::error!(
-                                    "[WebRTC] Failed to serialize answer envelope: {error}"
-                                );
-                                None
-                            }
-                        },
-                        Err(error) => {
-                            log::error!(
-                                "[WebRTC] Failed to encrypt answer after {}ms: {error}",
-                                started_at.elapsed().as_millis()
-                            );
-                            None
-                        }
-                    },
-                    Err(error) => {
-                        log::error!(
-                            "[WebRTC] Crypto mutex poisoned after {}ms: {error}",
-                            started_at.elapsed().as_millis()
-                        );
-                        None
-                    }
-                }
+                }))
             }
             Err(error) => {
                 log::error!(
@@ -595,9 +554,10 @@ impl WebRtcPeerRegistry {
             ping_tasks: HashMap::new(),
             pending_closes: HashMap::new(),
             offer_generation: HashMap::new(),
+            pending_browser_fingerprints: HashMap::new(),
+            dtls_bindings: HashMap::new(),
             pending_ice_candidates: HashMap::new(),
             ice_apply_limits: HashMap::new(),
-            ratchet_restarted_peers: HashSet::new(),
             backpressure_recovery: HashMap::new(),
             outgoing_signal_tx,
             outgoing_signal_rx: Some(outgoing_signal_rx),
@@ -787,7 +747,6 @@ impl WebRtcPeerRegistry {
             | WebRtcAdapterCommand::Json { data }
             | WebRtcAdapterCommand::Binary { data }
             | WebRtcAdapterCommand::Stream { payload: data, .. } => data.len(),
-            WebRtcAdapterCommand::BundleRefresh { bundle_bytes } => bundle_bytes.len(),
         }
     }
 
@@ -894,23 +853,31 @@ impl WebRtcPeerRegistry {
     }
 
     pub(crate) fn same_device_channels(&self, browser_identity: &str) -> Vec<String> {
-        let olm_key = crate::relay::extract_olm_key(browser_identity);
+        let current_credential_id = credential_id(browser_identity);
         self.channels
             .keys()
             .filter(|id| {
-                id.as_str() != browser_identity && crate::relay::extract_olm_key(id) == olm_key
+                id.as_str() != browser_identity && credential_id(id) == current_credential_id
             })
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn channels_for_credential(&self, browser_credential_id: &str) -> Vec<String> {
+        self.channels
+            .keys()
+            .filter(|id| credential_id(id) == browser_credential_id)
             .cloned()
             .collect()
     }
 
     pub(crate) fn wait_for_replaced_peer_close(
         &mut self,
-        olm_key: &str,
+        credential_id: &str,
         timeout: Duration,
         runtime: &tokio::runtime::Runtime,
     ) -> ReplacedPeerCloseWait {
-        let Some(mut close_rx) = self.pending_closes.remove(olm_key) else {
+        let Some(mut close_rx) = self.pending_closes.remove(credential_id) else {
             return ReplacedPeerCloseWait::NoPendingClose;
         };
         if *close_rx.borrow() {
@@ -947,7 +914,13 @@ impl WebRtcPeerRegistry {
         use crate::channel::{ChannelConfig, WebRtcChannel};
 
         let generation = self.next_offer_generation(&request.browser_identity);
-        let mut builder = WebRtcChannel::builder()
+        if let Some(fingerprint) = extract_dtls_fingerprint(&request.sdp) {
+            self.pending_browser_fingerprints
+                .insert(request.browser_identity.clone(), fingerprint);
+        } else {
+            self.pending_browser_fingerprints.remove(&request.browser_identity);
+        }
+        let builder = WebRtcChannel::builder()
             .server_url(&request.server_url)
             .api_key(&request.api_key)
             .signal_tx(request.outgoing_signal_tx)
@@ -956,17 +929,12 @@ impl WebRtcPeerRegistry {
             .pty_input_tx(request.pty_input_tx)
             .file_input_tx(request.file_input_tx);
 
-        if let Some(ref crypto_service) = request.crypto_service {
-            builder = builder.crypto_service(Arc::clone(crypto_service));
-        }
-
         let channel = builder.build();
         channel.set_offer_generation(generation);
         let config = ChannelConfig {
             channel_name: "WebRtcChannel".to_string(),
             hub_id: request.hub_id,
             browser_identity: Some(request.browser_identity.clone()),
-            encrypt: request.crypto_service.is_some(),
             compression_threshold: Some(4096),
             cli_subscription: false,
         };
@@ -980,7 +948,6 @@ impl WebRtcPeerRegistry {
             generation,
             channel,
             config,
-            crypto_service: request.crypto_service,
         }
     }
 
@@ -1020,6 +987,27 @@ impl WebRtcPeerRegistry {
             };
         };
 
+        let browser_fingerprint = self
+            .pending_browser_fingerprints
+            .remove(&browser_identity);
+        let hub_fingerprint = envelope
+            .get("sdp")
+            .and_then(serde_json::Value::as_str)
+            .and_then(extract_dtls_fingerprint);
+        if let (Some(browser_fingerprint), Some(hub_fingerprint)) =
+            (browser_fingerprint, hub_fingerprint)
+        {
+            self.dtls_bindings.insert(
+                browser_identity.clone(),
+                crate::relay::DtlsBinding {
+                    browser_fingerprint,
+                    hub_fingerprint,
+                },
+            );
+        } else {
+            self.dtls_bindings.remove(&browser_identity);
+        }
+
         if let Some(mut replaced) = self.channels.insert(browser_identity.clone(), channel) {
             runtime.spawn(async move {
                 replaced.disconnect().await;
@@ -1042,6 +1030,15 @@ impl WebRtcPeerRegistry {
         self.offer_generation.remove(browser_identity);
         self.pending_ice_candidates.remove(browser_identity);
         self.ice_apply_limits.remove(browser_identity);
+        self.pending_browser_fingerprints.remove(browser_identity);
+        self.dtls_bindings.remove(browser_identity);
+    }
+
+    pub(crate) fn dtls_binding(
+        &self,
+        browser_identity: &str,
+    ) -> Option<crate::relay::DtlsBinding> {
+        self.dtls_bindings.get(browser_identity).cloned()
     }
 
     pub(crate) fn queue_ice_for_current_generation(
@@ -1320,50 +1317,6 @@ impl WebRtcPeerRegistry {
         messages
     }
 
-    pub(crate) fn drain_decrypt_failure_triggers(&self) -> Vec<String> {
-        self.channels
-            .iter()
-            .filter_map(|(browser_identity, channel)| {
-                let failures = channel.decrypt_failure_count();
-                if failures >= 3 {
-                    channel.reset_decrypt_failures();
-                    Some(browser_identity.clone())
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    pub(crate) fn record_decrypt_failure(
-        &mut self,
-        browser_identity: &str,
-    ) -> Option<HubControlMessage> {
-        let olm_key = crate::relay::extract_olm_key(browser_identity).to_string();
-        let tab_id = browser_identity
-            .split_once(':')
-            .map(|(_, id)| id.to_string());
-        let already_restarted = self.ratchet_restarted_peers.contains(&olm_key)
-            || tab_id
-                .as_ref()
-                .is_some_and(|id| self.ratchet_restarted_peers.contains(id));
-        if already_restarted {
-            return None;
-        }
-        self.ratchet_restarted_peers.insert(olm_key);
-        if let Some(id) = tab_id {
-            self.ratchet_restarted_peers.insert(id);
-        }
-        Some(HubControlMessage::TransportRatchetRestartRequested {
-            client_id: ClientId::browser(browser_identity.to_string()),
-            browser_identity: browser_identity.to_string(),
-        })
-    }
-
-    pub(crate) fn clear_ratchet_restart_dedupe(&mut self) {
-        self.ratchet_restarted_peers.clear();
-    }
-
     #[cfg(test)]
     pub(crate) fn take_opened_peers(&self) -> Vec<String> {
         self.channels
@@ -1397,6 +1350,20 @@ impl WebRtcPeerRegistry {
             },
             |runner| runner.handle_plaintext_payload(payload),
         )
+    }
+
+    pub(crate) fn mark_authenticated(&self, browser_identity: &str) -> bool {
+        let Some(channel) = self.channels.get(browser_identity) else {
+            return false;
+        };
+        channel.mark_authenticated();
+        true
+    }
+
+    pub(crate) fn is_authenticated(&self, browser_identity: &str) -> bool {
+        self.channels
+            .get(browser_identity)
+            .is_some_and(crate::channel::WebRtcChannel::is_authenticated)
     }
 
     pub(crate) fn queue_command(
@@ -1842,8 +1809,8 @@ impl WebRtcPeerRegistry {
             .map(|connected_at| connected_at.elapsed());
 
         let close_rx = channel.close_receiver();
-        let olm_key = crate::relay::extract_olm_key(browser_identity).to_string();
-        self.pending_closes.insert(olm_key, close_rx);
+        self.pending_closes
+            .insert(credential_id(browser_identity).to_string(), close_rx);
 
         runtime.spawn(async move {
             channel.disconnect().await;
@@ -1853,6 +1820,8 @@ impl WebRtcPeerRegistry {
         self.connection_started.remove(browser_identity);
         self.offer_generation.remove(browser_identity);
         self.pending_ice_candidates.remove(browser_identity);
+        self.pending_browser_fingerprints.remove(browser_identity);
+        self.dtls_bindings.remove(browser_identity);
 
         if let Some(state) = self.send_tasks.remove(browser_identity) {
             drop(state.tx);
@@ -1877,6 +1846,8 @@ impl WebRtcPeerRegistry {
         self.connected_at.remove(browser_identity);
         self.offer_generation.remove(browser_identity);
         self.pending_ice_candidates.remove(browser_identity);
+        self.pending_browser_fingerprints.remove(browser_identity);
+        self.dtls_bindings.remove(browser_identity);
         self.ice_apply_limits.remove(browser_identity);
         if let Some(state) = self.send_tasks.remove(browser_identity) {
             drop(state.tx);
@@ -1919,12 +1890,21 @@ impl WebRtcPeerRegistry {
         self.connected_at.clear();
         self.pending_ice_candidates.clear();
         self.ice_apply_limits.clear();
-        self.ratchet_restarted_peers.clear();
         self.pending_closes.clear();
         self.offer_generation.clear();
+        self.pending_browser_fingerprints.clear();
+        self.dtls_bindings.clear();
         self.backpressure_recovery.clear();
         self.runners.clear();
     }
+}
+
+fn extract_dtls_fingerprint(sdp: &str) -> Option<String> {
+    sdp.lines().find_map(|line| {
+        let line = line.trim();
+        let value = line.strip_prefix("a=fingerprint:")?.trim();
+        (!value.is_empty()).then(|| value.to_ascii_lowercase())
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1980,9 +1960,6 @@ pub(crate) async fn execute_adapter_command(
             sender
                 .send_stream_raw(frame_type, stream_id, &payload)
                 .await
-        }
-        WebRtcAdapterCommand::BundleRefresh { bundle_bytes } => {
-            sender.send_bundle_refresh(&bundle_bytes).await
         }
     }
 }
@@ -2098,6 +2075,35 @@ impl TransportAdapter for WebRtcTransportAdapter {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dtls_fingerprint_is_normalized_from_sdp() {
+        assert_eq!(
+            extract_dtls_fingerprint("v=0\r\na=fingerprint:SHA-256 AA:BB\r\n"),
+            Some("sha-256 aa:bb".to_string())
+        );
+    }
+
+    #[test]
+    fn revocation_finds_every_live_channel_for_one_credential() {
+        let mut registry = WebRtcPeerRegistry::new();
+        registry
+            .channels
+            .insert("credential-a:tab-1".into(), test_channel());
+        registry
+            .channels
+            .insert("credential-a:tab-2".into(), test_channel());
+        registry
+            .channels
+            .insert("credential-b:tab-1".into(), test_channel());
+
+        let mut channels = registry.channels_for_credential("credential-a");
+        channels.sort();
+        assert_eq!(
+            channels,
+            vec!["credential-a:tab-1", "credential-a:tab-2"]
+        );
+    }
+
     fn test_channel() -> crate::channel::WebRtcChannel {
         crate::channel::WebRtcChannel::builder()
             .server_url("https://example.test")
@@ -2118,7 +2124,6 @@ mod tests {
             hub_id: "hub-test".to_string(),
             server_url: "https://example.test".to_string(),
             api_key: "test-key".to_string(),
-            crypto_service: Some(crate::relay::create_crypto_service("hub-test")),
             outgoing_signal_tx,
             stream_frame_tx,
             hub_event_tx: hub_event_tx.into(),
@@ -2345,7 +2350,6 @@ mod tests {
             start.config.browser_identity.as_deref(),
             Some(browser_identity)
         );
-        assert!(start.config.encrypt);
         assert_eq!(start.config.compression_threshold, Some(4096));
         assert!(!start.config.cli_subscription);
         assert_eq!(registry.current_offer_generation(browser_identity), 1);
@@ -2354,16 +2358,11 @@ mod tests {
     }
 
     #[test]
-    fn start_offer_supports_plaintext_transport() {
+    fn start_offer_uses_data_channel_transport_security() {
         let mut registry = WebRtcPeerRegistry::new();
         let browser_identity = "anon:tab-1";
-        let mut request = test_offer_request(browser_identity);
-        request.crypto_service = None;
+        let start = registry.start_offer(test_offer_request(browser_identity));
 
-        let start = registry.start_offer(request);
-
-        assert!(!start.config.encrypt);
-        assert!(start.crypto_service.is_none());
         assert_eq!(
             start.config.browser_identity.as_deref(),
             Some(browser_identity)
@@ -2660,29 +2659,6 @@ mod tests {
         registry.clear_offer_state(browser_identity);
         assert_eq!(registry.current_offer_generation(browser_identity), 0);
         assert!(registry.drain_pending_ice(browser_identity).is_none());
-    }
-
-    #[test]
-    fn decrypt_failure_ratchet_trigger_deduplicates_by_olm_key_and_tab_id() {
-        let mut registry = WebRtcPeerRegistry::new();
-        let first = registry.record_decrypt_failure("olm-key:tab-1");
-        assert!(matches!(
-            first,
-            Some(HubControlMessage::TransportRatchetRestartRequested {
-                ref browser_identity,
-                ..
-            }) if browser_identity == "olm-key:tab-1"
-        ));
-
-        assert!(registry.record_decrypt_failure("olm-key:tab-2").is_none());
-        assert!(registry
-            .record_decrypt_failure("different-olm:tab-1")
-            .is_none());
-
-        registry.clear_ratchet_restart_dedupe();
-        assert!(registry
-            .record_decrypt_failure("different-olm:tab-1")
-            .is_some());
     }
 
     #[test]

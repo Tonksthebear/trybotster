@@ -381,7 +381,7 @@ impl Hub {
                     envelope,
                 } => {
                     if self.emit_outgoing_signal(&browser_identity, envelope, "answer") {
-                        log::info!("[WebRTC] Encrypted answer sent via Lua relay (async)");
+                        log::info!("[WebRTC] Answer sent via Lua relay (async)");
                     }
                 }
             },
@@ -396,9 +396,6 @@ impl Hub {
                     state
                 );
             }
-            HubControlMessage::TransportRatchetRestartRequested {
-                browser_identity, ..
-            } => self.send_ratchet_bundle_refresh(&browser_identity),
             HubControlMessage::TransportBackpressure { pressure, .. } => {
                 self.hub_event_metrics
                     .record_counter("webrtc_transport.backpressure", 1);
@@ -510,8 +507,7 @@ impl Hub {
             }
             HubControlMessage::TransportBackpressure { .. }
             | HubControlMessage::TransportPeerStateChanged { .. }
-            | HubControlMessage::TransportSignalReady { .. }
-            | HubControlMessage::TransportRatchetRestartRequested { .. } => {
+            | HubControlMessage::TransportSignalReady { .. } => {
                 self.handle_transport_control_message(message);
             }
         }

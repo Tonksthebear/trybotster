@@ -127,14 +127,14 @@ pub enum TransportSignal {
     Ice {
         /// Target browser identity.
         browser_identity: String,
-        /// Already-serialized Olm envelope for ActionCable relay.
+        /// Opaque payload for ActionCable relay.
         envelope: serde_json::Value,
     },
     /// SDP answer envelope.
     Answer {
         /// Target browser identity.
         browser_identity: String,
-        /// Already-serialized Olm envelope for ActionCable relay.
+        /// Opaque payload for ActionCable relay.
         envelope: serde_json::Value,
     },
 }
@@ -197,13 +197,6 @@ pub enum HubControlMessage {
         client_id: ClientId,
         /// Signal to relay.
         signal: TransportSignal,
-    },
-    /// Adapter requests a fresh ratchet bundle from hub policy.
-    TransportRatchetRestartRequested {
-        /// Client represented by this peer.
-        client_id: ClientId,
-        /// Browser identity for the peer.
-        browser_identity: String,
     },
     /// A session process lifecycle state changed.
     SessionLifecycle {

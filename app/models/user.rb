@@ -12,7 +12,6 @@ class User < ApplicationRecord
   has_many :hubs, dependent: :destroy
   has_many :hub_tokens, through: :hubs
   has_many :mcp_tokens, through: :hubs, class_name: "Integrations::Github::MCPToken"
-  has_many :browser_keys, dependent: :destroy
 
   # Skip email/password validations for OAuth users
   validates :email, presence: true, uniqueness: true, if: -> { provider.blank? }  # Only if not OAuth

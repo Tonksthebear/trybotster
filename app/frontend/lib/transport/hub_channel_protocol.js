@@ -1,5 +1,3 @@
-import { parseBinaryBundle } from "matrix/bundle"
-
 export class HubChannelProtocol {
   #pendingSubscriptions = new Map()
   #callbacks
@@ -104,7 +102,6 @@ export class HubChannelProtocol {
       CONTENT_MSG,
       CONTENT_PTY,
       CONTENT_STREAM,
-      MSG_TYPE_BUNDLE_REFRESH,
     } = this.#constants
 
     try {
@@ -112,51 +109,35 @@ export class HubChannelProtocol {
 
       const raw = data instanceof ArrayBuffer ? new Uint8Array(data) : new Uint8Array(data.buffer || data)
 
-      const conn = this.#callbacks.getConnection(hubId)
-      const encryptionEnabled = conn?.encryptionEnabled !== false
-
-      if (encryptionEnabled && raw.length > 0 && raw[0] === MSG_TYPE_BUNDLE_REFRESH) {
-        const bundleBytes = raw.slice(1)
-        console.debug("[WebRTCTransport] Received bundle refresh from CLI via DataChannel")
-        try {
-          const bundle = parseBinaryBundle(bundleBytes)
-          const conn = this.#callbacks.getConnection(hubId)
-          await this.#callbacks.createSession(hubId, bundle, conn?.browserIdentity || null)
-          if (conn) conn.decryptFailures = 0
-          this.#callbacks.emit("session:refreshed", { hubId })
-        } catch (error) {
-          console.error("[WebRTCTransport] Bundle refresh failed:", error.message)
-          this.#callbacks.emit("session:invalid", { hubId, message: error.message })
-        }
-        return
-      }
-
       if (raw.length > 0) {
-        let plaintext
-        if (!encryptionEnabled) {
-          plaintext = raw
-        } else {
-          try {
-            const result = await this.#callbacks.decryptBinary(hubId, raw)
-            plaintext = result.data
-
-            if (!this.#isCurrentPeerGeneration(hubId, generation)) return
-
-            if (conn) conn.decryptFailures = 0
-          } catch (error) {
-            console.error("[WebRTCTransport] Olm decryption failed:", error.message || error)
-            return
-          }
-        }
+        const plaintext = raw
 
         if (!plaintext || plaintext.length === 0) return
 
         const contentType = plaintext[0]
+        const conn = this.#callbacks.getConnection(hubId)
 
         if (contentType === CONTENT_MSG) {
           const json = new TextDecoder().decode(plaintext.slice(1))
           const msg = JSON.parse(json)
+          if (msg.type === "auth_challenge") {
+            await this.#callbacks.authenticateChallenge(hubId, msg, generation)
+            return
+          }
+          if (msg.type === "auth_accepted") {
+            await this.#callbacks.authenticationAccepted(hubId, msg, generation)
+            return
+          }
+          if (!conn?.authenticated) {
+            console.warn("[WebRTCTransport] Rejected unauthenticated hub traffic")
+            return
+          }
           this.#routeControlMessage(hubId, msg, generation)
+          return
+        }
+
+        if (!conn?.authenticated) {
+          console.warn("[WebRTCTransport] Rejected unauthenticated hub traffic")
           return
         }
 

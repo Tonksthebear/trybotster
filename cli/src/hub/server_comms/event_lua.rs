@@ -8,13 +8,10 @@ impl Hub {
     ) {
         use crate::lua::primitives::action_cable;
 
-        let crypto = self.browser.crypto_service.as_ref();
         action_cable::fire_single_ac_message(
             self.lua.lua_ref(),
             &self.lua_ac_channels,
-            &self.lua_ac_connections,
             self.lua.ac_callback_registry(),
-            crypto,
             &channel_id,
             message,
         );
@@ -425,6 +422,31 @@ impl Hub {
             ConnectionRequest::CopyToClipboard => {
                 log::debug!("[Lua] Processing connection.copy_to_clipboard() request");
                 actions::dispatch(self, HubAction::CopyConnectionUrl);
+            }
+            ConnectionRequest::RevokeBrowser { credential_id } => {
+                let revoked = match self.browser.pairing_authority.as_mut() {
+                    Some(authority) => authority.revoke(&credential_id).map(Some),
+                    None => Ok(None),
+                };
+                match revoked {
+                    Ok(Some(true)) => {
+                        for browser_identity in
+                            self.webrtc.channels_for_credential(&credential_id)
+                        {
+                            self.cleanup_webrtc_peer(
+                                &browser_identity,
+                                "browser_credential_revoked",
+                            );
+                        }
+                        log::info!("Revoked browser credential {credential_id}");
+                    }
+                    Ok(Some(false) | None) => {
+                        log::warn!("Browser credential {credential_id} was not found");
+                    }
+                    Err(error) => {
+                        log::error!("Cannot revoke browser credential {credential_id}: {error}");
+                    }
+                }
             }
         }
     }

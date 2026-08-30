@@ -211,7 +211,7 @@ impl Hub {
         };
 
         // Send full keypair (private + public) for multi-device VAPID key copying.
-        // This is safe because the DataChannel is E2E encrypted via Olm.
+        // The authenticated WebRTC DataChannel protects this response.
         let msg = serde_json::json!({
             "type": "vapid_keys",
             "pub": vapid.public_key_base64url(),

@@ -704,7 +704,7 @@ impl Hub {
 
     /// Perform all initial setup steps.
     ///
-    /// Note: DeviceKeyBundle generation is deferred until the connection
+    /// Pairing bundle generation is deferred until the connection
     /// URL is first requested (TUI QR display, external automation, etc.).
     /// This avoids blocking boot on bundle generation.
     pub fn setup(&mut self) {
@@ -722,14 +722,10 @@ impl Hub {
         }
 
         if !offline {
-            if crate::env::is_encryption_disabled() {
-                log::warn!("WebRTC encryption is disabled");
-            } else {
-                self.init_crypto_service();
-            }
+            self.init_pairing_authority();
             self.init_web_push();
         } else {
-            log::info!("Offline mode: skipping crypto service and web push initialization");
+            log::info!("Offline mode: skipping pairing and web push initialization");
         }
 
         // ActionCable connections are now managed by Lua plugins
@@ -1256,12 +1252,11 @@ impl Hub {
         }
     }
 
-    /// Generate a connection URL and add a pairing bundle when encryption is enabled.
+    /// Generate a connection URL with a one-time pairing secret.
     ///
-    /// Encrypted format: `{server_url}/hubs/{id}/pairing#{base32_binary_bundle}`
-    /// Plaintext format: `{server_url}/hubs/{id}#no-encryption`
+    /// Format: `{server_url}/hubs/{id}/pairing#{base32_binary_bundle}`
     ///
-    /// On first call, this generates the PreKeyBundle (lazy initialization).
+    /// On first call, this generates the pairing bundle.
     /// Subsequent calls return the cached bundle unless it was used (in which
     /// case a fresh bundle is auto-generated).
     ///
@@ -1367,10 +1362,10 @@ mod tests {
             hub.botster_id.is_none(),
             "botster_id should be None in offline mode"
         );
-        // Crypto service was skipped
+        // Pairing authority was skipped.
         assert!(
-            hub.browser.crypto_service.is_none(),
-            "crypto_service should be None in offline mode"
+            hub.browser.pairing_authority.is_none(),
+            "pairing authority should be absent in offline mode"
         );
         // Connection URL should return an error, not panic
         let url_result = hub.generate_connection_url();
@@ -1385,13 +1380,13 @@ mod tests {
     /// Offline mode: generate_connection_url returns Err without panicking.
     ///
     /// This test does NOT require env var mutation — it tests the guard
-    /// indirectly by verifying the crypto_service=None path.
+    /// indirectly by verifying the missing pairing authority path.
     #[test]
-    fn test_generate_connection_url_without_crypto_returns_err() {
+    fn test_generate_connection_url_without_pairing_authority_returns_err() {
         let config = test_config();
         let mut hub = Hub::with_runtime(config, shared_test_runtime()).unwrap();
-        // Don't call setup() — crypto_service stays None
-        assert!(hub.browser.crypto_service.is_none());
+        // Do not call setup. The pairing authority stays absent.
+        assert!(hub.browser.pairing_authority.is_none());
         // The non-offline path should also fail gracefully (no panic)
         // when crypto isn't initialized
         let result = hub.get_or_generate_connection_url();

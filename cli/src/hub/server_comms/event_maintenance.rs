@@ -7,7 +7,6 @@ impl Hub {
         self.cleanup_stale_session_io_snapshots();
         self.poll_stream_frames_outgoing();
         self.dispatch_webrtc_recovery_snapshot_requests();
-        self.webrtc.clear_ratchet_restart_dedupe();
         self.log_hub_event_metrics_if_due();
         self.retry_pending_session_reconnects();
     }

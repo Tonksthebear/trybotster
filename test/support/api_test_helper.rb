@@ -10,8 +10,8 @@
 #   class HubsControllerTest < ActionDispatch::IntegrationTest
 #     include ApiTestHelper
 #
-#     test "list browser keys with valid token" do
-#       get devices_url, headers: auth_headers_for(:primary_user)
+#     test "heartbeat with valid token" do
+#       patch hub_heartbeat_url(hubs(:active_hub)), headers: auth_headers_for(:primary_user)
 #       assert_response :ok
 #       assert_json_response
 #     end
@@ -32,7 +32,7 @@ module ApiTestHelper
   # @return [Hash] Headers hash with Authorization bearer token
   #
   # @example
-  #   get devices_url, headers: auth_headers_for(:primary_user)
+  #   patch hub_heartbeat_url(hubs(:active_hub)), headers: auth_headers_for(:primary_user)
   #
   def auth_headers_for(user_fixture)
     user = users(user_fixture)

@@ -1,15 +1,15 @@
 //! Channel abstraction for browser communication.
 //!
 //! This module provides a unified `Channel` trait for WebRTC DataChannel
-//! communication with E2E encryption (Matrix Olm/Megolm) and gzip compression.
+//! communication with WebRTC transport encryption and gzip compression.
 //!
 //! # Architecture
 //!
 //! ```text
 //! Channel (trait)
 //!     │
-//!     └── WebRtcChannel (E2E encrypted via Matrix Olm)
-//!         └── DataChannel transport with DTLS + E2E encryption
+//!     └── WebRtcChannel
+//!         └── DataChannel transport with DTLS
 //! ```
 //!
 //! # Usage
@@ -19,13 +19,11 @@
 //! let channel = WebRtcChannel::builder()
 //!     .server_url(&server_url)
 //!     .api_key(&api_key)
-//!     .crypto_service(crypto_service.clone())
 //!     .build();
 //!
 //! channel.connect(ChannelConfig {
 //!     channel_name: "TerminalRelayChannel".into(), // Virtual channel for routing
 //!     hub_id: "hub-123".into(),
-//!     encrypt: true,
 //!     compression_threshold: Some(4096),
 //! }).await?;
 //!
@@ -45,7 +43,6 @@
 //!
 //! Rust guideline compliant 2025-01
 
-pub mod action_cable;
 pub mod compression;
 pub mod reliable;
 pub mod webrtc;
@@ -64,8 +61,6 @@ pub struct ChannelConfig {
     /// Browser identity for browser-specific streams (HubChannel only).
     /// When set, subscribes to `hub:{hub_id}:browser:{identity}` instead of CLI stream.
     pub browser_identity: Option<String>,
-    /// Whether to encrypt messages using E2E encryption.
-    pub encrypt: bool,
     /// Compression threshold in bytes. None disables compression.
     /// Payloads exceeding this size are gzip-compressed.
     pub compression_threshold: Option<usize>,
@@ -273,9 +268,6 @@ impl SharedConnectionState {
 }
 
 // Re-exports
-pub use action_cable::{
-    ActionCableChannel, ActionCableChannelBuilder, ChannelReceiverHandle, ChannelSenderHandle,
-};
 pub use compression::{maybe_compress, maybe_decompress, should_compress_response};
 pub use reliable::{ReliableMessage, ReliableReceiver, ReliableSender, ReliableSession};
 pub use webrtc::{WebRtcChannel, WebRtcChannelBuilder, WebRtcConfig, WebRtcSender};

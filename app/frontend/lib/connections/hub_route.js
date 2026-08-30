@@ -1,5 +1,5 @@
 import bridge from "workers/bridge";
-import { ensureMatrixReady } from "matrix/bundle";
+import { getBrowserCredentialId, hasBrowserCredential } from "transport/browser_pairing";
 import { observeBrowserSocketState } from "transport/hub_signaling_client";
 import { ConnectionState, BrowserStatus, CliStatus, ConnectionMode } from "connections/constants";
 
@@ -11,7 +11,6 @@ const SESSION_TIMEOUT_MS = 5000;
 const PEER_PROBE_TIMEOUT_MS = 1500;
 const PEER_PROBE_COOLDOWN_MS = 1000;
 const PEER_PROBE_MISSED_PONG_LIMIT = 3;
-const PLAINTEXT_OPT_IN_FRAGMENT = "#no-encryption";
 
 const HEALTH_STATUS_MAP = {
   offline: CliStatus.OFFLINE,
@@ -32,7 +31,6 @@ export class HubRoute {
   #signalingConnected = false;
   #subscriptionPending = null;
   #subscriptionGeneration = 0;
-  #sessionPending = null;
   #connectPending = null;
   #reconnectTimer = null;
   #idle = false;
@@ -52,8 +50,6 @@ export class HubRoute {
     this.subscriptionId = null;
     this.identityKey = null;
     this.browserIdentity = null;
-    this.plaintextAllowed = window.location.hash === PLAINTEXT_OPT_IN_FRAGMENT;
-    this.encryptionEnabled = null;
     this.state = ConnectionState.DISCONNECTED;
     this.browserSocketState = "disconnected";
     this.cliStatus = CliStatus.UNKNOWN;
@@ -69,7 +65,7 @@ export class HubRoute {
 
     this.#idle = false;
     this.#setState(ConnectionState.LOADING);
-    await this.#ensureMatrix();
+    await bridge.init();
     await this.#refreshIdentity();
     this.#bindBridgeListeners();
     await this.#connectSignaling();
@@ -105,7 +101,6 @@ export class HubRoute {
     this.subscriptionId = null;
     this.identityKey = null;
     this.browserIdentity = null;
-    this.encryptionEnabled = null;
     this.#hubConnected = false;
     this.#signalingConnected = false;
     this.browserSocketState = "disconnected";
@@ -292,16 +287,9 @@ export class HubRoute {
     }
   }
 
-  async #ensureMatrix() {
-    const cryptoWorkerUrl = document.querySelector('meta[name="crypto-worker-url"]')?.content;
-    const wasmJsUrl = document.querySelector('meta[name="crypto-wasm-js-url"]')?.content;
-    const wasmBinaryUrl = document.querySelector('meta[name="crypto-wasm-binary-url"]')?.content;
-    await ensureMatrixReady(cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl);
-  }
-
   async #refreshIdentity() {
     const hubId = this.getHubId();
-    const { hasPairing } = await bridge.hasPairing(hubId);
+    const hasPairing = await hasBrowserCredential(hubId);
 
     if (!hasPairing) {
       this.identityKey = null;
@@ -313,11 +301,10 @@ export class HubRoute {
       return;
     }
 
-    const keyResult = await bridge.getIdentityKey(hubId);
-    this.identityKey = keyResult.identityKey;
+    this.identityKey = await getBrowserCredentialId(hubId);
     this.browserIdentity = `${this.identityKey}:${HubRoute.tabId}`;
 
-    if (this.errorCode === "unpaired" || this.errorCode === "session_invalid") {
+    if (this.errorCode === "unpaired") {
       this.errorCode = null;
       this.errorReason = null;
       this.lastError = null;
@@ -375,35 +362,6 @@ export class HubRoute {
           this.#setState(ConnectionState.CLI_DISCONNECTED);
         }
       }),
-      bridge.on("transport:config", (event) => {
-        if (event.hubId !== hubId) return;
-        if (event.error === "plaintext_opt_in_required") {
-          this.encryptionEnabled = null;
-          this.errorCode = event.error;
-          this.errorReason = "Open the no-encryption connection URL to allow plaintext transport";
-          this.lastError = this.errorReason;
-          this.emit("error", { reason: this.errorCode, message: this.errorReason });
-          return;
-        }
-        if (typeof event.e2e_enabled !== "boolean") {
-          this.encryptionEnabled = null;
-          return;
-        }
-        this.encryptionEnabled = event.e2e_enabled !== false;
-        if (!this.encryptionEnabled && this.errorCode === "unpaired") {
-          this.errorCode = null;
-          this.errorReason = null;
-          this.lastError = null;
-        }
-        if (this.encryptionEnabled && !this.identityKey) {
-          this.errorCode = "unpaired";
-          this.errorReason = "Scan connection code";
-          this.lastError = this.errorReason;
-          this.emit("error", { reason: this.errorCode, message: this.errorReason });
-          return;
-        }
-        this.#ensureConnected().catch(() => {});
-      }),
       bridge.on("connection:state", (event) => {
         if (event.hubId !== hubId) return;
         if (event.state === "connected") {
@@ -447,25 +405,6 @@ export class HubRoute {
           console.warn(`[HubRoute] WebRTC subscribe ready for hub ${hubId} in ${event.subscribeReadyMs}ms`);
         }
       }),
-      bridge.on("session:invalid", (event) => {
-        if (event.hubId !== hubId) return;
-        this.errorCode = "session_invalid";
-        this.errorReason = event.message || "Session invalid";
-        this.lastError = this.errorReason;
-        this.#clearSubscription();
-        this.#setState(ConnectionState.ERROR);
-        this.emit("error", { reason: this.errorCode, message: this.errorReason });
-      }),
-      bridge.on("session:refreshed", (event) => {
-        if (event.hubId !== hubId) return;
-        if (this.errorCode === "session_invalid") {
-          this.errorCode = null;
-          this.errorReason = null;
-          this.lastError = null;
-          this.#setState(ConnectionState.DISCONNECTED);
-        }
-        this.#ensureConnected().catch(() => {});
-      }),
       bridge.on("push:status", (event) => {
         if (event.hubId !== hubId) return;
         this.emit("push:status", event);
@@ -501,7 +440,6 @@ export class HubRoute {
       this.#markPeerHealthDirty("pageshow");
       this.#ensureConnected().catch(() => {});
     };
-
     document.addEventListener("visibilitychange", onVisibilityChange);
     window.addEventListener("pageshow", onPageShow);
     this.#unsubscribers.push(
@@ -518,12 +456,10 @@ export class HubRoute {
     const result = await bridge.send("connectSignaling", {
       hubId: this.getHubId(),
       browserIdentity: this.browserIdentity,
-      allowPlaintext: this.plaintextAllowed,
     });
 
     this.#hubConnected = true;
     this.#setBrowserSocketState(result?.browserSocketState || "disconnected");
-
     if (result?.state === "connected") {
       this.#signalingConnected = true;
       this.#setConnectionMode(result?.mode || this.connectionMode);
@@ -533,10 +469,9 @@ export class HubRoute {
   async #ensureConnected() {
     if (this.#destroyed) return;
     if (this.#idle) return;
-    if (this.errorCode === "session_invalid") return;
+    if (this.errorCode === "unpaired") return;
     if (!this.#hubConnected) return;
-    if (this.encryptionEnabled === null) return;
-    if (this.encryptionEnabled && !this.identityKey) return;
+    if (!this.identityKey) return;
     // WebRTC is gated only by the raw browser->Rails socket plus live hub
     // health. If both are ready, attempt the peer even if prior callbacks were
     // delayed or missed.
@@ -569,7 +504,6 @@ export class HubRoute {
 
     this.#connectPending = (async () => {
       this.#setState(ConnectionState.CONNECTING);
-      await this.#ensureActiveSession();
       await bridge.send("connectPeer", { hubId: this.getHubId() });
       // Reused shared peers may already be connected and therefore not emit a
       // fresh connection:state event for this route. Ensure the route's
@@ -695,40 +629,6 @@ export class HubRoute {
     if (!resolve) return;
     this.#peerProbeResolve = null;
     resolve(alive);
-  }
-
-  async #ensureActiveSession() {
-    if (!this.encryptionEnabled) return true;
-
-    if (this.#sessionPending) {
-      return this.#sessionPending;
-    }
-
-    this.#sessionPending = (async () => {
-      const hubId = this.getHubId();
-      const hasSession = await bridge.hasSession(hubId, this.browserIdentity);
-      if (hasSession.hasSession) return true;
-
-      const bundleArrived = await bridge.send("awaitFreshBundle", {
-        hubId,
-        timeoutMs: 750,
-      });
-      if (!bundleArrived?.refreshed) {
-        await bridge.send("requestFreshBundle", { hubId });
-      }
-
-      const refreshed = await bridge.hasSession(hubId, this.browserIdentity);
-      if (!refreshed.hasSession) {
-        throw new Error("No active session");
-      }
-      return true;
-    })();
-
-    try {
-      return await this.#sessionPending;
-    } finally {
-      this.#sessionPending = null;
-    }
   }
 
   /**

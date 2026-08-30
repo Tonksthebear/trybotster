@@ -142,7 +142,7 @@ M.primitives = {
         name = "action_cable",
         description = "ActionCable WebSocket (Rails)",
         methods = {
-            { sig = "action_cable.connect(opts?)",                  desc = "Connect to hub's ActionCable. opts={crypto=true} for E2E → conn_id" },
+            { sig = "action_cable.connect()",                      desc = "Connect to the hub's ActionCable endpoint → conn_id" },
             { sig = "action_cable.subscribe(conn, chan, params, cb)", desc = "Subscribe to channel. cb(msg, ch_id) → channel_id" },
             { sig = "action_cable.perform(ch_id, action, data)",    desc = "Perform action on channel" },
             { sig = "action_cable.unsubscribe(ch_id)",              desc = "Unsubscribe from channel" },
@@ -189,6 +189,7 @@ M.primitives = {
             { sig = "connection.get_url()",          desc = "Get cached connection URL" },
             { sig = "connection.generate()",          desc = "Lazy-generate a new connection code" },
             { sig = "connection.regenerate()",         desc = "Force regeneration" },
+            { sig = "connection.revoke_browser(id)",   desc = "Revoke one browser credential and disconnect its sessions" },
             { sig = "connection.copy_to_clipboard()", desc = "Copy URL to system clipboard (OSC 52)" },
         },
     },

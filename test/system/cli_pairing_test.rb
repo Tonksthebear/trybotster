@@ -5,13 +5,12 @@ require "support/cli_test_helper"
 
 # System tests for the CLI pairing link (QR code URL) flow.
 #
-# The CLI generates a connection URL containing a PreKeyBundle in the URL
-# fragment. The browser parses this Base32-encoded bundle to establish an
-# E2E encrypted Olm session, then negotiates a WebRTC connection.
+# The CLI generates a connection URL with a pairing bundle in the fragment.
+# The browser keeps its signing key and authenticates inside the DataChannel.
 #
 # Flow:
 #   CLI starts -> writes connection_url.txt -> URL has /hubs/:id#<base32_bundle>
-#   Browser visits URL -> parses fragment -> creates Olm session via SharedWorker
+#   Browser visits URL -> stores the pinned hub key and its browser signing key
 #   WebRTC connection established -> status indicators turn green
 #
 class CliPairingTest < ApplicationSystemTestCase
@@ -35,8 +34,8 @@ class CliPairingTest < ApplicationSystemTestCase
   # Verifies the CLI writes a connection_url.txt with the expected structure:
   # - Path matches /hubs/:id
   # - Fragment is present and Base32-encoded
-  # - Decoded fragment is exactly 161 bytes (v6 DeviceKeyBundle)
-  # - First byte is version 0x06
+  # - Decoded fragment contains route, hub key, secret, and expiry
+  # - First byte is version 0x07
   test "CLI generates valid connection URL with correct path and bundle" do
     @cli = start_cli(@hub)
 
@@ -51,21 +50,23 @@ class CliPairingTest < ApplicationSystemTestCase
     assert_match %r{\A/hubs/\d+/pairing\z}, uri.path,
       "URL path should be /hubs/:id/pairing, got: #{uri.path}"
 
-    # Fragment should be present and reasonably long (Base32 of 161 bytes ~ 258 chars)
+    # The fragment carries all pairing data.
     assert fragment.present?, "URL should have a fragment (Base32-encoded bundle)"
-    assert fragment.length >= 250, "Fragment should be ~258+ Base32 chars, got #{fragment.length}"
+    assert fragment.length >= 120, "Pairing fragment is too short: #{fragment.length}"
 
     # Decode and validate the binary bundle
     bytes = base32_decode(fragment)
-    assert_equal 161, bytes.length, "Decoded bundle should be exactly 161 bytes, got #{bytes.length}"
-    assert_equal 0x06, bytes[0], "Bundle version byte should be 0x06 (v6), got 0x#{bytes[0].to_s(16)}"
+    route_length = bytes[9, 2].pack("C*").unpack1("n")
+    assert_equal 11 + route_length + 64, bytes.length
+    assert_equal 0x07, bytes[0]
+    assert_equal "/hubs/#{@cli.hub.id}", bytes[11, route_length].pack("C*")
   end
 
-  # -- Test 2: Pairing URL establishes encrypted session ---------------------
+  # -- Test 2: Pairing URL authenticates a WebRTC connection -----------------
   #
   # The full happy path: CLI running, browser visits connection URL with
   # the PreKeyBundle fragment, connection status progresses to connected.
-  test "pairing URL establishes encrypted session and WebRTC connection" do
+  test "pairing URL authenticates a WebRTC connection" do
     @cli = start_cli(@hub)
 
     url = @cli.connection_url
@@ -91,7 +92,7 @@ class CliPairingTest < ApplicationSystemTestCase
     sign_in_as(@user)
     visit "#{page.server_url}/hubs/#{@hub.id}#INVALIDGARBAGE1234567890ABCDEF"
 
-    # Connection section should show "unpaired" (bundle parse failure -> no Olm session).
+    # Connection section shows "unpaired" after bundle parsing fails.
     # The state transitions: connecting -> (ActionCable subscribes) -> unpaired.
     assert_sidebar_connection_status(connection: "unpaired", wait: 45)
   end
@@ -99,7 +100,7 @@ class CliPairingTest < ApplicationSystemTestCase
   # -- Test 4: Stale session requires new QR scan ---------------------------
   #
   # Scenario: Browser connected to CLI #1, CLI #1 stops, CLI #2 starts with
-  # new keys. The browser's cached Olm session (from CLI #1) is now stale
+  # a changed hub key. The browser must reject that changed trust anchor
   # and should not auto-reconnect to CLI #2. The connection should surface
   # an expired/stale-session state instead of silently reusing bad keys.
   test "stale session does not reconnect after CLI restart with new keys" do
@@ -133,7 +134,7 @@ class CliPairingTest < ApplicationSystemTestCase
     assert new_url.present?
 
     # Phase 3: Visit the hub page WITHOUT the new bundle fragment.
-    # The browser still has the stale Olm session from CLI #1, so the SPA
+    # The browser still pins the first hub key, so the SPA
     # should prompt for a fresh pairing instead of reconnecting automatically.
     visit hub_path(@hub)
 
@@ -153,13 +154,13 @@ class CliPairingTest < ApplicationSystemTestCase
   # -- Test 5: Hub page without fragment shows scan prompt -------------------
   #
   # Visiting the hub URL with no fragment at all (no bundle) means the
-  # browser has no way to create an Olm session. The connection section
+  # browser has no stored browser credential. The connection section
   # should show "unpaired" with the QR code icon (Scan Code indicator).
   test "hub page without fragment shows unpaired scan prompt" do
     sign_in_as(@user)
     visit "#{page.server_url}/hubs/#{@hub.id}"
 
-    # Connection section should show "unpaired" (no bundle -> no Olm session).
+    # Connection section shows "unpaired" without a browser credential.
     # The state transitions: connecting -> (ActionCable subscribes) -> unpaired.
     assert_sidebar_connection_status(connection: "unpaired", wait: 45)
   end

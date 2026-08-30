@@ -29,6 +29,9 @@ const mocks = vi.hoisted(() => {
       decrypt: vi.fn(),
       encrypt: vi.fn(() => Promise.resolve({ encrypted: { t: 1, b: "signal" } })),
     },
+    buildAuthenticationRequest: vi.fn(() => Promise.resolve({ type: "auth_response" })),
+    verifyAuthenticationAccepted: vi.fn(() => Promise.resolve({ credentialId: "browser" })),
+    extractDtlsFingerprint: vi.fn((sdp) => String(sdp).match(/a=fingerprint:([^\r\n]+)/i)?.[1].trim().toLowerCase() || null),
   }
 })
 
@@ -38,6 +41,12 @@ vi.mock("@rails/actioncable", () => ({
 
 vi.mock("workers/bridge", () => ({
   default: mocks.bridge,
+}))
+
+vi.mock("transport/browser_pairing", () => ({
+  buildAuthenticationRequest: mocks.buildAuthenticationRequest,
+  verifyAuthenticationAccepted: mocks.verifyAuthenticationAccepted,
+  extractDtlsFingerprint: mocks.extractDtlsFingerprint,
 }))
 
 class MockDataChannel {
@@ -66,7 +75,10 @@ class MockRTCPeerConnection {
       this.connectionState = "closed"
     })
     this.createDataChannel = vi.fn(() => this.dataChannel)
-    this.createOffer = vi.fn(() => Promise.resolve({ type: "offer", sdp: "offer-sdp" }))
+    this.createOffer = vi.fn(() => Promise.resolve({
+      type: "offer",
+      sdp: "v=0\r\na=fingerprint:SHA-256 BROWSER\r\n",
+    }))
     this.setLocalDescription = vi.fn(() => Promise.resolve())
     this.setRemoteDescription = vi.fn(() => Promise.resolve())
     this.addIceCandidate = vi.fn(() => Promise.resolve())
@@ -77,8 +89,7 @@ class MockRTCPeerConnection {
 }
 
 async function flushPromises() {
-  await Promise.resolve()
-  await Promise.resolve()
+  for (let index = 0; index < 8; index += 1) await Promise.resolve()
 }
 
 describe("HubPeerConnection peer lost transitions", () => {
@@ -130,7 +141,45 @@ describe("HubPeerConnection peer lost transitions", () => {
   async function connectPeer(hubId = "hub-1") {
     await transport.connectSignaling(hubId, "browser-identity")
     await transport.connectPeer(hubId)
-    return MockRTCPeerConnection.instances.at(-1)
+    const pc = MockRTCPeerConnection.instances.at(-1)
+    const subscription = mocks.subscriptions.create.mock.results.at(-1).value
+    subscription.received({
+      type: "signal",
+      envelope: {
+        type: "answer",
+        sdp: "v=0\r\na=fingerprint:SHA-256 HUB\r\n",
+      },
+    })
+    await flushPromises()
+    return pc
+  }
+
+  async function authenticatePeer(pc, hubId = "hub-1") {
+    if (pc.dataChannel.readyState !== "open") {
+      pc.dataChannel.readyState = "open"
+      pc.dataChannel.onopen()
+    }
+    pc.dataChannel.onmessage({ data: encodeControlMessage({
+      type: "auth_challenge",
+      protocol: 7,
+      challenge: "challenge",
+      route: `/hubs/${hubId}`,
+      hub_public_key: "hub-key",
+      browser_fingerprint: "sha-256 browser",
+      hub_fingerprint: "sha-256 hub",
+    }).buffer })
+    await flushPromises()
+    pc.dataChannel.onmessage({ data: encodeControlMessage({
+      type: "auth_accepted",
+      protocol: 7,
+      challenge: "challenge",
+      credential_id: "browser",
+      browser_public_key: "browser-key",
+      hub_public_key: "hub-key",
+      signature: "signature",
+      paired: false,
+    }).buffer })
+    await flushPromises()
   }
 
   function disconnectedEvents() {
@@ -161,10 +210,12 @@ describe("HubPeerConnection peer lost transitions", () => {
     return plaintext
   }
 
-  it("emits peer-ready timing when the data channel opens", async () => {
+  it("emits peer-ready timing only after hub authentication", async () => {
     const pc = await connectPeer()
-
+    pc.dataChannel.readyState = "open"
     pc.dataChannel.onopen()
+    expect(connectedEvents()).toHaveLength(0)
+    await authenticatePeer(pc)
 
     expect(connectedEvents()).toHaveLength(1)
     expect(connectedEvents()[0]).toMatchObject({
@@ -175,127 +226,96 @@ describe("HubPeerConnection peer lost transitions", () => {
     expect(connectedEvents()[0].peerReadyMs).toBeGreaterThanOrEqual(0)
   })
 
-  it("uses plaintext signaling and data after the health handshake disables encryption", async () => {
-    await transport.connectSignaling("hub-plain", "anon:tab", true)
+  it("routes opaque signaling without application encryption", async () => {
+    await transport.connectSignaling("hub-plain", "browser:tab")
     const subscription = mocks.subscriptions.create.mock.results.at(-1).value
-    subscription.received({
-      type: "signal",
-      envelope: { type: "transport_config", e2e_enabled: false },
-    })
-
     await transport.connectPeer("hub-plain")
-    const pc = MockRTCPeerConnection.instances.at(-1)
-
-    expect(mocks.bridge.encrypt).not.toHaveBeenCalled()
     expect(subscription.perform).toHaveBeenCalledWith("signal", {
-      envelope: { type: "offer", sdp: "offer-sdp" },
+      envelope: {
+        type: "offer",
+        sdp: "v=0\r\na=fingerprint:SHA-256 BROWSER\r\n",
+      },
     })
+  })
 
+  it("rejects unauthenticated PTY and stream frames", async () => {
+    const pc = await connectPeer()
+    const subscriptionMessages = []
+    const streamFrames = []
+    transport.on("subscription:message", (event) => subscriptionMessages.push(event))
+    transport.on("stream:frame", (event) => streamFrames.push(event))
     pc.dataChannel.readyState = "open"
-    pc.dataChannel.onmessage({ data: encodeControlMessage({ type: "dc_ready" }) })
+    pc.dataChannel.onopen()
+
+    pc.dataChannel.onmessage({ data: encodePtyMessage("sub-1", "blocked").buffer })
+    pc.dataChannel.onmessage({ data: new Uint8Array([2, 1, 0, 7, 9]).buffer })
     await flushPromises()
 
-    const subscribe = transport.subscribe(
-      "hub-plain",
-      "terminal",
-      {},
-      "sub-plain",
-      encodeControlMessage({
-        type: "subscribe",
-        subscriptionId: "sub-plain",
-        channel: "terminal",
-        params: {},
-      }),
-    )
+    expect(subscriptionMessages).toEqual([])
+    expect(streamFrames).toEqual([])
+  })
+
+  it("disconnects after a replayed authentication challenge", async () => {
+    const pc = await connectPeer()
+    pc.dataChannel.readyState = "open"
+    pc.dataChannel.onopen()
+    const challenge = encodeControlMessage({
+      type: "auth_challenge",
+      protocol: 7,
+      challenge: "challenge",
+      route: "/hubs/hub-1",
+      hub_public_key: "hub-key",
+      browser_fingerprint: "sha-256 browser",
+      hub_fingerprint: "sha-256 hub",
+    }).buffer
+
+    pc.dataChannel.onmessage({ data: challenge })
+    pc.dataChannel.onmessage({ data: challenge })
     await flushPromises()
-    pc.dataChannel.onmessage({
-      data: encodeControlMessage({ type: "subscribed", subscriptionId: "sub-plain" }),
-    })
 
-    await expect(subscribe).resolves.toEqual({ subscriptionId: "sub-plain" })
-    expect(mocks.bridge.encryptBinary).not.toHaveBeenCalled()
-    expect(mocks.bridge.decryptBinary).not.toHaveBeenCalled()
+    expect(disconnectedEvents().at(-1)?.reason).toBe("authentication_rejected")
   })
 
-  it("requires fresh transport config after signaling reconnects", async () => {
-    const configs = []
-    transport.on("transport:config", (event) => configs.push(event))
-    await transport.connectSignaling("hub-config", "browser-identity", true)
-    const subscription = mocks.subscriptions.create.mock.results.at(-1).value
+  it("disconnects after a replayed authentication acceptance", async () => {
+    const pc = await connectPeer()
+    await authenticatePeer(pc)
+    pc.dataChannel.onmessage({ data: encodeControlMessage({
+      type: "auth_accepted",
+      protocol: 7,
+      challenge: "challenge",
+      credential_id: "browser",
+      browser_public_key: "browser-key",
+      hub_public_key: "hub-key",
+      signature: "signature",
+      paired: false,
+    }).buffer })
+    await flushPromises()
 
-    subscription.received({
-      type: "signal",
-      envelope: { type: "transport_config", e2e_enabled: false },
-    })
-    subscription.connected()
-
-    expect(configs).toEqual([
-      { hubId: "hub-config", e2e_enabled: false },
-      { hubId: "hub-config", e2e_enabled: null },
-    ])
+    expect(disconnectedEvents().at(-1)?.reason).toBe("authentication_rejected")
   })
 
-  it("rejects plaintext mode for a paired browser without explicit opt-in", async () => {
-    const configs = []
-    transport.on("transport:config", (event) => configs.push(event))
-    await transport.connectSignaling("hub-paired", "browser-identity")
-    const subscription = mocks.subscriptions.create.mock.results.at(-1).value
+  it("disconnects when the hub signature is invalid", async () => {
+    mocks.verifyAuthenticationAccepted.mockRejectedValueOnce(new Error("bad signature"))
+    const pc = await connectPeer()
+    await authenticatePeer(pc)
 
-    subscription.received({
-      type: "signal",
-      envelope: { type: "transport_config", e2e_enabled: false },
-    })
-
-    expect(configs.at(-1)).toEqual({
-      hubId: "hub-paired",
-      e2e_enabled: null,
-      error: "plaintext_opt_in_required",
-    })
-    expect(MockRTCPeerConnection.instances).toHaveLength(0)
-  })
-
-  it("tears down the peer when a pending transport mode changes", async () => {
-    await transport.connectSignaling("hub-change", "browser-identity", true)
-    const subscription = mocks.subscriptions.create.mock.results.at(-1).value
-    subscription.received({
-      type: "signal",
-      envelope: { type: "transport_config", e2e_enabled: false },
-    })
-    await transport.connectPeer("hub-change")
-    const pc = MockRTCPeerConnection.instances.at(-1)
-
-    subscription.connected()
-    subscription.received({
-      type: "signal",
-      envelope: { type: "transport_config", e2e_enabled: true },
-    })
-
-    expect(pc.close).toHaveBeenCalledOnce()
-    expect(disconnectedEvents().at(-1)).toMatchObject({
-      hubId: "hub-change",
-      reason: "transport_config_changed",
-    })
+    expect(disconnectedEvents().at(-1)?.reason).toBe("authentication_rejected")
   })
 
   it("emits subscription-ready timing after data channel subscribe ack", async () => {
     const pc = await connectPeer()
     const readyEvents = []
     transport.on("subscription:ready", (event) => readyEvents.push(event))
-    pc.dataChannel.readyState = "open"
-
-    mocks.bridge.decryptBinary.mockResolvedValueOnce({
-      data: encodeControlMessage({ type: "dc_ready" }),
-    })
-    pc.dataChannel.onmessage({ data: new Uint8Array([0]) })
+    await authenticatePeer(pc)
+    pc.dataChannel.onmessage({ data: encodeControlMessage({ type: "dc_ready" }).buffer })
     await flushPromises()
 
     const subscribe = transport.subscribe("hub-1", "terminal", {}, "sub-1", new Uint8Array([1, 2, 3]))
     await flushPromises()
 
-    mocks.bridge.decryptBinary.mockResolvedValueOnce({
-      data: encodeControlMessage({ type: "subscribed", subscriptionId: "sub-1" }),
+    pc.dataChannel.onmessage({
+      data: encodeControlMessage({ type: "subscribed", subscriptionId: "sub-1" }).buffer,
     })
-    pc.dataChannel.onmessage({ data: new Uint8Array([0]) })
 
     await expect(subscribe).resolves.toEqual({ subscriptionId: "sub-1" })
     expect(readyEvents).toHaveLength(1)
@@ -309,19 +329,14 @@ describe("HubPeerConnection peer lost transitions", () => {
 
   it("registers subscription confirmation before sending subscribe frame", async () => {
     const pc = await connectPeer()
-    pc.dataChannel.readyState = "open"
-
-    mocks.bridge.decryptBinary.mockResolvedValueOnce({
-      data: encodeControlMessage({ type: "dc_ready" }),
-    })
-    pc.dataChannel.onmessage({ data: new Uint8Array([0]) })
+    await authenticatePeer(pc)
+    pc.dataChannel.onmessage({ data: encodeControlMessage({ type: "dc_ready" }).buffer })
     await flushPromises()
 
-    mocks.bridge.decryptBinary.mockResolvedValueOnce({
-      data: encodeControlMessage({ type: "subscribed", subscriptionId: "sub-fast" }),
-    })
     pc.dataChannel.send.mockImplementationOnce(() => {
-      pc.dataChannel.onmessage({ data: new Uint8Array([0]) })
+      pc.dataChannel.onmessage({
+        data: encodeControlMessage({ type: "subscribed", subscriptionId: "sub-fast" }).buffer,
+      })
     })
 
     await expect(
@@ -331,12 +346,8 @@ describe("HubPeerConnection peer lost transitions", () => {
 
   it("clears pending subscription confirmation when subscribe send throws", async () => {
     const pc = await connectPeer()
-    pc.dataChannel.readyState = "open"
-
-    mocks.bridge.decryptBinary.mockResolvedValueOnce({
-      data: encodeControlMessage({ type: "dc_ready" }),
-    })
-    pc.dataChannel.onmessage({ data: new Uint8Array([0]) })
+    await authenticatePeer(pc)
+    pc.dataChannel.onmessage({ data: encodeControlMessage({ type: "dc_ready" }).buffer })
     await flushPromises()
 
     pc.dataChannel.send.mockImplementationOnce(() => {
@@ -348,70 +359,6 @@ describe("HubPeerConnection peer lost transitions", () => {
     ).rejects.toThrow("send failed")
 
     await vi.advanceTimersByTimeAsync(10_000)
-  })
-
-  it("ignores dc_ready from an old peer generation after reconnect", async () => {
-    const serverReadyEvents = []
-    transport.on("connection:server-ready", (event) => serverReadyEvents.push(event))
-    const firstPc = await connectPeer()
-    let resolveOldDecrypt
-    const oldDecrypt = new Promise((resolve) => {
-      resolveOldDecrypt = resolve
-    })
-
-    mocks.bridge.decryptBinary.mockReturnValueOnce(oldDecrypt)
-    firstPc.dataChannel.onmessage({ data: new Uint8Array([0]) })
-    await flushPromises()
-
-    firstPc.dataChannel.onclose()
-    const secondPc = await connectPeer()
-    resolveOldDecrypt({
-      data: encodeControlMessage({ type: "dc_ready" }),
-    })
-    await flushPromises()
-
-    expect(serverReadyEvents).toEqual([])
-
-    mocks.bridge.decryptBinary.mockResolvedValueOnce({
-      data: encodeControlMessage({ type: "dc_ready" }),
-    })
-    secondPc.dataChannel.onmessage({ data: new Uint8Array([0]) })
-    await flushPromises()
-
-    expect(serverReadyEvents).toEqual([{ hubId: "hub-1" }])
-  })
-
-  it("ignores decrypted binary payloads from an old peer generation after reconnect", async () => {
-    const subscriptionMessages = []
-    transport.on("subscription:message", (event) => subscriptionMessages.push(event))
-    const firstPc = await connectPeer()
-    let resolveOldDecrypt
-    const oldDecrypt = new Promise((resolve) => {
-      resolveOldDecrypt = resolve
-    })
-
-    mocks.bridge.decryptBinary.mockReturnValueOnce(oldDecrypt)
-    firstPc.dataChannel.onmessage({ data: new Uint8Array([0]) })
-    await flushPromises()
-
-    firstPc.dataChannel.onclose()
-    const secondPc = await connectPeer()
-    resolveOldDecrypt({
-      data: encodePtyMessage("sub-old", "old-output"),
-    })
-    await flushPromises()
-
-    expect(subscriptionMessages).toEqual([])
-
-    mocks.bridge.decryptBinary.mockResolvedValueOnce({
-      data: encodePtyMessage("sub-new", "new-output"),
-    })
-    secondPc.dataChannel.onmessage({ data: new Uint8Array([0]) })
-    await flushPromises()
-
-    expect(subscriptionMessages).toHaveLength(1)
-    expect(subscriptionMessages[0].subscriptionId).toBe("sub-new")
-    expect(new TextDecoder().decode(subscriptionMessages[0].message)).toBe("new-output")
   })
 
   it("emits one datachannel_close event and tears down peer timers", async () => {

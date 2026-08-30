@@ -23,10 +23,8 @@ fn test_config() -> Config {
     config
 }
 
-/// Create a Hub with TUI registered via Lua and crypto service initialized.
+/// Create a Hub with TUI registered via Lua and pairing initialized.
 fn test_hub() -> Hub {
-    use crate::relay::create_crypto_service;
-
     let config = test_config();
     let mut hub = Hub::with_runtime(config, shared_test_runtime()).unwrap();
 
@@ -35,42 +33,23 @@ fn test_hub() -> Hub {
         tokio::sync::mpsc::unbounded_channel::<crate::client::TuiRequest>();
     let _output_rx = hub.register_tui_via_lua(request_rx);
 
-    // Initialize crypto service for browser client tests
-    let crypto_service = create_crypto_service("test-hub");
-    hub.browser.crypto_service = Some(crypto_service);
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&[7; 32]);
+    let mut authority = crate::relay::PairingAuthority::in_memory(
+        signing_key,
+        "/hubs/test-hub/signaling".to_string(),
+    );
+    hub.browser.pairing_bundle = Some(authority.create_pairing_bundle());
+    hub.browser.pairing_authority = Some(authority);
 
     hub
 }
 
 // === Connection URL Tests ===
 
-/// Create a test DeviceKeyBundle for unit tests.
-fn create_test_device_key_bundle() -> crate::relay::DeviceKeyBundle {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-
-    // Create properly sized base64 keys (32 bytes for Curve25519/Ed25519, 64 bytes for signature)
-    let curve25519_bytes = [0u8; 32];
-    let ed25519_bytes = [1u8; 32];
-    let one_time_bytes = [2u8; 32];
-    let signature_bytes = [3u8; 64];
-
-    crate::relay::DeviceKeyBundle {
-        version: 6,
-        hub_id: "test-hub-123".to_string(),
-        curve25519_key: STANDARD.encode(curve25519_bytes),
-        ed25519_key: STANDARD.encode(ed25519_bytes),
-        one_time_key: STANDARD.encode(one_time_bytes),
-        signature: STANDARD.encode(signature_bytes),
-    }
-}
-
-/// TEST: Copy connection URL generates URL fresh from device key bundle.
+/// TEST: Copy connection URL generates a URL from the pairing bundle.
 #[test]
 fn test_copy_connection_url_generates_fresh_url() {
     let mut hub = test_hub();
-
-    // Set up a mock device key bundle (required for URL generation)
-    hub.browser.device_key_bundle = Some(create_test_device_key_bundle());
 
     // Dispatch CopyConnectionUrl action - should not panic
     dispatch(&mut hub, HubAction::CopyConnectionUrl);
@@ -94,16 +73,13 @@ fn test_copy_connection_url_generates_fresh_url() {
     );
 }
 
-/// TEST: Copy connection URL fails gracefully when no device key bundle is available.
+/// TEST: Copy connection URL fails gracefully when no pairing bundle is available.
 #[test]
 fn test_copy_connection_url_no_bundle_no_panic() {
     let mut hub = test_hub();
 
-    // Verify no device key bundle
-    assert!(
-        hub.browser.device_key_bundle.is_none(),
-        "Should start with no device key bundle"
-    );
+    hub.browser.pairing_bundle = None;
+    hub.browser.pairing_authority = None;
 
     // This should not panic - error is logged but not propagated
     dispatch(&mut hub, HubAction::CopyConnectionUrl);

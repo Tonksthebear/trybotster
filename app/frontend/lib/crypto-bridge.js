@@ -1,41 +1,40 @@
 /**
- * Crypto Bridge — connects to the crypto worker (workers/bridge.js)
- * and bundle parser (matrix/bundle.js) via direct imports.
+ * Browser pairing helpers.
  */
 
+import {
+  parsePairingBundle,
+  parsePairingBundleFromUrl,
+  preparePairing,
+} from 'transport/browser_pairing'
 import bridge from 'workers/bridge'
-import * as bundleModule from 'matrix/bundle'
 
 /**
- * Initialize the crypto worker (idempotent).
- * Reads WASM URLs from <meta> tags.
+ * Initialize the WebRTC transport.
  */
 export async function ensureCryptoReady() {
-  const cryptoWorkerUrl = document.querySelector('meta[name="crypto-worker-url"]')?.content
-  const wasmJsUrl = document.querySelector('meta[name="crypto-wasm-js-url"]')?.content
-  const wasmBinaryUrl = document.querySelector('meta[name="crypto-wasm-binary-url"]')?.content
-  await bundleModule.ensureMatrixReady(cryptoWorkerUrl, wasmJsUrl, wasmBinaryUrl)
+  await bridge.init()
 }
 
 /**
- * Parse a DeviceKeyBundle from the current page's URL fragment.
+ * Parse a pairing bundle from the current page's URL fragment.
  * Returns the parsed bundle or null.
  */
 export function parseBundleFromFragment() {
-  return bundleModule.parseBundleFromFragment()
+  return parsePairingBundle(window.location.hash)
 }
 
 /**
- * Parse a DeviceKeyBundle from a pasted URL string.
+ * Parse a pairing bundle from a pasted URL string.
  * Returns the parsed bundle or null.
  */
 export function parseBundleFromUrl(urlString) {
-  return bundleModule.parseBundleFromUrl(urlString)
+  return parsePairingBundleFromUrl(urlString)
 }
 
 /**
- * Create an E2E encrypted session with the hub using the parsed bundle.
+ * Store the pinned hub key and browser signing credential.
  */
 export async function createSession(hubId, bundle) {
-  return bridge.createSession(hubId, bundle)
+  return preparePairing(hubId, bundle)
 }

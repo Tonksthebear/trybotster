@@ -45,23 +45,29 @@ pub enum ConnectionRequest {
     /// Generate the connection URL (lazy, with auto-regeneration).
     ///
     /// Hub calls `generate_connection_url()` which:
-    /// - Generates the PreKeyBundle on first call
-    /// - Auto-regenerates if the previous bundle was consumed by a browser
+    /// - Generates the pairing bundle on first call
+    /// - Auto-regenerates if a browser consumed the previous pairing secret
     /// - Caches the result in HandleCache
     /// - Fires `connection_code_ready` Lua event for broadcast
     Generate,
 
-    /// Force-regenerate the connection code (DeviceKeyBundle).
+    /// Force-regenerate the one-time pairing code.
     ///
-    /// Hub will regenerate the crypto bundle unconditionally
+    /// Hub will regenerate the pairing bundle unconditionally
     /// and update the cached connection URL.
     Regenerate,
 
     /// Copy the connection URL to the system clipboard.
     ///
-    /// Hub generates the URL (fresh from current crypto bundle) and
+    /// Hub generates the URL with the current pairing bundle and
     /// copies it to clipboard via OSC 52 terminal escape sequence.
     CopyToClipboard,
+
+    /// Revoke one stored browser credential and disconnect its live sessions.
+    RevokeBrowser {
+        /// Stable identifier derived from the browser public key.
+        credential_id: String,
+    },
 }
 
 /// Register connection primitives with the Lua state.
@@ -69,6 +75,7 @@ pub enum ConnectionRequest {
 /// Adds the following functions to the `connection` table:
 /// - `connection.get_url()` - Get the cached connection URL (or nil + error)
 /// - `connection.regenerate()` - Request connection code regeneration (async)
+/// - `connection.revoke_browser(credential_id)` - Revoke one browser credential
 ///
 /// # Arguments
 ///
@@ -108,8 +115,8 @@ pub(crate) fn register(
     // connection.generate() - Send a lazy generation event
     //
     // Triggers Hub-side generation which:
-    // - Creates the PreKeyBundle on first call
-    // - Auto-regenerates if previous bundle was consumed
+    // - Creates the pairing bundle on first call
+    // - Auto-regenerates if a browser consumed the previous pairing secret
     // - Caches result in HandleCache
     // - Fires connection_code_ready Lua event for broadcast
     let tx = hub_event_tx.clone();
@@ -154,7 +161,7 @@ pub(crate) fn register(
         .map_err(|e| anyhow!("Failed to set connection.regenerate: {e}"))?;
 
     // connection.copy_to_clipboard() - Copy connection URL to system clipboard
-    let tx = hub_event_tx;
+    let tx = hub_event_tx.clone();
     let copy_fn = lua
         .create_function(move |_, ()| {
             let guard = tx.lock().expect("HubEventSender mutex poisoned");
@@ -170,6 +177,26 @@ pub(crate) fn register(
     connection
         .set("copy_to_clipboard", copy_fn)
         .map_err(|e| anyhow!("Failed to set connection.copy_to_clipboard: {e}"))?;
+
+    let revoke_fn = lua
+        .create_function(move |_, credential_id: String| {
+            let guard = hub_event_tx
+                .lock()
+                .expect("HubEventSender mutex poisoned");
+            if let Some(ref sender) = *guard {
+                let _ = sender.send(HubEvent::LuaConnectionRequest(
+                    ConnectionRequest::RevokeBrowser { credential_id },
+                ));
+            } else {
+                ::log::warn!("[Connection] revoke_browser() called before hub_event_tx set");
+            }
+            Ok(())
+        })
+        .map_err(|e| anyhow!("Failed to create connection.revoke_browser function: {e}"))?;
+
+    connection
+        .set("revoke_browser", revoke_fn)
+        .map_err(|e| anyhow!("Failed to set connection.revoke_browser: {e}"))?;
 
     // Register globally
     lua.globals()
@@ -216,6 +243,7 @@ mod tests {
         assert!(conn.contains_key("generate").unwrap());
         assert!(conn.contains_key("regenerate").unwrap());
         assert!(conn.contains_key("copy_to_clipboard").unwrap());
+        assert!(conn.contains_key("revoke_browser").unwrap());
     }
 
     #[test]
@@ -341,6 +369,24 @@ mod tests {
         assert!(matches!(
             event,
             HubEvent::LuaConnectionRequest(ConnectionRequest::CopyToClipboard)
+        ));
+    }
+
+    #[test]
+    fn test_revoke_browser_sends_credential_id() {
+        let lua = Lua::new();
+        let (tx, cache, mut rx) = create_test_sender_and_cache_with_channel();
+        register(&lua, tx, cache).expect("Should register");
+
+        lua.load("connection.revoke_browser('browser-id')")
+            .exec()
+            .unwrap();
+
+        let event = rx.try_recv().expect("Should have received an event");
+        assert!(matches!(
+            event,
+            HubEvent::LuaConnectionRequest(ConnectionRequest::RevokeBrowser { credential_id })
+                if credential_id == "browser-id"
         ));
     }
 }

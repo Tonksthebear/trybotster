@@ -48,33 +48,9 @@ impl Hub {
             .unwrap_or("");
 
         match msg_type {
-            "transport_config_request" => {
-                if browser_identity.is_empty() {
-                    log::warn!("[Lua] transport_config_request missing browser_identity");
-                    return;
-                }
-                let config = serde_json::json!({
-                    "type": "transport_config",
-                    "e2e_enabled": !crate::env::is_encryption_disabled(),
-                });
-                self.emit_outgoing_signal(browser_identity, config, "transport config");
-            }
             "signal" => {
                 if browser_identity.is_empty() {
                     log::warn!("[Lua] Signal message missing browser_identity");
-                    return;
-                }
-
-                if message
-                    .get("decrypt_failed")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    log::warn!(
-                        "Signal decryption failed for browser {}, requesting ratchet restart",
-                        browser_identity
-                    );
-                    self.request_transport_ratchet_restart(browser_identity);
                     return;
                 }
 
@@ -120,13 +96,6 @@ impl Hub {
                         );
                     }
                 }
-            }
-            "bundle_request" => {
-                if browser_identity.is_empty() {
-                    log::warn!("[Lua] bundle_request missing browser_identity");
-                    return;
-                }
-                self.send_ratchet_bundle_refresh(browser_identity);
             }
             other => {
                 log::warn!("[Lua] Unsupported signaling message type: {}", other);
@@ -210,9 +179,6 @@ impl Hub {
         for (browser_identity, payload) in messages {
             self.process_webrtc_plaintext_payload(&browser_identity, &payload);
         }
-        for browser_identity in self.webrtc.drain_decrypt_failure_triggers() {
-            self.request_transport_ratchet_restart(&browser_identity);
-        }
     }
 
     #[cfg(test)]
@@ -243,60 +209,6 @@ impl Hub {
         }
     }
 
-    pub(super) fn request_transport_ratchet_restart(&mut self, browser_identity: &str) {
-        let Some(message) = self.webrtc.record_decrypt_failure(browser_identity) else {
-            return;
-        };
-        log::warn!(
-            "[RatchetRestart] Initiating restart for {}",
-            &browser_identity[..browser_identity.len().min(8)]
-        );
-        self.handle_transport_control_message(message);
-    }
-
-    pub(super) fn send_ratchet_bundle_refresh(&mut self, browser_identity: &str) {
-        let peer_olm_key = crate::relay::extract_olm_key(browser_identity).to_string();
-        let Some(ref cs) = self.browser.crypto_service else {
-            log::warn!("[RatchetRestart] No crypto service available");
-            return;
-        };
-
-        let bundle_bytes = match cs.lock() {
-            Ok(mut guard) => match guard.refresh_bundle_for_peer(&peer_olm_key) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    log::error!("[RatchetRestart] Failed to generate refresh bundle: {e}");
-                    return;
-                }
-            },
-            Err(e) => {
-                log::error!("[RatchetRestart] Crypto mutex poisoned: {e}");
-                return;
-            }
-        };
-
-        // Send type 2 via DataChannel — non-blocking via per-peer send task
-        self.queue_webrtc_peer_command(
-            browser_identity,
-            crate::worker::webrtc::WebRtcAdapterCommand::BundleRefresh {
-                bundle_bytes: bundle_bytes.clone(),
-            },
-        );
-
-        // Also send via ActionCable
-        let envelope = serde_json::json!({
-            "t": 2,
-            "b": base64::engine::general_purpose::STANDARD_NO_PAD
-                .encode(&bundle_bytes),
-        });
-        self.emit_outgoing_signal(&browser_identity, envelope, "bundle refresh");
-
-        log::info!(
-            "[RatchetRestart] Sent fresh bundle to {}",
-            &browser_identity[..browser_identity.len().min(8)]
-        );
-    }
-
     pub(super) fn cleanup_webrtc_peer_registry(&mut self) {
         let scan_started = Instant::now();
 
@@ -325,6 +237,9 @@ impl Hub {
 
     pub(super) fn cleanup_webrtc_peer(&mut self, browser_identity: &str, reason: &str) {
         let cleanup_started = Instant::now();
+        if let Some(authority) = self.browser.pairing_authority.as_mut() {
+            authority.remove_peer(browser_identity);
+        }
         let reason_counter = match reason {
             "disconnected" => "cleanup.webrtc.reason.disconnected",
             "timeout" => "cleanup.webrtc.reason.timeout",
@@ -707,7 +622,7 @@ impl Hub {
                 } => {
                     self.emit_outgoing_signal(&browser_identity, envelope, "ICE candidate");
                     log::debug!(
-                        "[Crypto] Relayed ICE candidate to browser {}",
+                        "[WebRTC] Relayed ICE candidate to browser {}",
                         &browser_identity[..browser_identity.len().min(8)]
                     );
                 }
@@ -722,17 +637,6 @@ impl Hub {
             return;
         }
 
-        let encryption_disabled = crate::env::is_encryption_disabled();
-        let crypto_service = if encryption_disabled {
-            None
-        } else {
-            self.browser.crypto_service.clone()
-        };
-        if !encryption_disabled && crypto_service.is_none() {
-            log::error!("[WebRTC] Rejecting encrypted offer because crypto is not ready");
-            return;
-        }
-
         let hub_id = self.server_hub_id().to_string();
         let server_url = self.config.server_url.clone();
         let api_key = self.config.get_api_key().to_string();
@@ -743,10 +647,10 @@ impl Hub {
         );
 
         if !self.webrtc.has_channel(browser_identity) {
-            // Clean up stale channels from the same device (same Olm key, different tab UUID).
+            // Clean up stale channels from the same browser credential.
             let replacement_started = Instant::now();
             let mut did_replacement_work = false;
-            let olm_key = crate::relay::extract_olm_key(browser_identity);
+            let credential_id = browser_identity.split(':').next().unwrap_or(browser_identity);
             let stale = self.webrtc.same_device_channels(browser_identity);
             if !stale.is_empty() {
                 did_replacement_work = true;
@@ -761,7 +665,7 @@ impl Hub {
 
             // Wait briefly for the previous connection's sockets to be released.
             match self.webrtc.wait_for_replaced_peer_close(
-                olm_key,
+                credential_id,
                 std::time::Duration::from_millis(100),
                 &self.tokio_runtime,
             ) {
@@ -800,7 +704,6 @@ impl Hub {
             hub_id,
             server_url,
             api_key,
-            crypto_service,
             outgoing_signal_tx: self.webrtc.outgoing_signal_tx(),
             stream_frame_tx: self.webrtc.stream_frame_tx(),
             hub_event_tx: self.hub_event_tx.clone(),
@@ -818,7 +721,7 @@ impl Hub {
         );
         let event_tx = self.hub_event_tx.clone();
 
-        // Spawn an async task for SDP negotiation and optional answer encryption.
+        // Spawn an async task for SDP negotiation.
         self.tokio_runtime.spawn(async move {
             let completion =
                 crate::worker::webrtc::WebRtcTransportRunner::negotiate_offer(start).await;

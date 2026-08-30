@@ -11,18 +11,10 @@
 //! correct worker Lua via the handler mailbox; the hub only sees descriptor
 //! metadata (owner_plugin + handler_id).
 //!
-//! # Crypto
-//!
-//! When `crypto = true` is passed to `action_cable.connect()`, incoming
-//! encrypted signaling messages have their `envelope` field automatically
-//! decrypted via the hub's `CryptoService` before any Lua handler is invoked
-//! (in the appropriate VM).
-//!
 //! # Usage in Lua
 //!
 //! ```lua
-//! -- Connect with encryption
-//! local conn = action_cable.connect({ crypto = true })
+//! local conn = action_cable.connect()
 //!
 //! -- Subscribe to a channel with a message callback (plugin-owned callbacks
 //! -- are automatically routed through the worker boundary).
@@ -44,13 +36,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
-use mlua::{Lua, LuaSerdeExt, Table, Value};
+use mlua::{Lua, LuaSerdeExt, Value};
+#[cfg(test)]
+use mlua::Table;
 
 use super::HubEventSender;
 use crate::hub::action_cable_connection::{ActionCableConnection, ChannelHandle};
 use crate::hub::events::HubEvent;
 use crate::lua::primitives::plugin_worker;
-use crate::relay::{CryptoService, OlmEnvelope};
 
 // =============================================================================
 // Callback registry (Lua-thread-pinned, shared with Hub)
@@ -114,8 +107,6 @@ pub enum ActionCableRequest {
     Connect {
         /// Unique connection identifier (e.g., "ac_conn_0").
         connection_id: String,
-        /// Whether to auto-decrypt signal envelopes on this connection.
-        crypto: bool,
     },
     /// Subscribe to a channel on an existing connection.
     ///
@@ -164,15 +155,13 @@ pub enum ActionCableRequest {
 // Hub-owned state
 // =============================================================================
 
-/// A Lua-managed ActionCable connection with its crypto preference.
+/// A Lua-managed ActionCable connection.
 ///
 /// Owned by the Hub, keyed by connection_id in a `HashMap`.
 #[derive(Debug)]
 pub struct LuaAcConnection {
     /// The underlying WebSocket connection.
     pub connection: ActionCableConnection,
-    /// Whether signal envelopes should be auto-decrypted.
-    pub crypto_enabled: bool,
 }
 
 /// A Lua-managed channel subscription.
@@ -182,7 +171,7 @@ pub struct LuaAcConnection {
 pub struct LuaAcChannel {
     /// The channel handle for receiving messages and performing actions.
     pub handle: ChannelHandle,
-    /// The connection this channel belongs to (for crypto lookup).
+    /// The connection that owns this channel.
     pub connection_id: String,
     /// Handle for the forwarding task that reads from `message_rx` and sends
     /// [`HubEvent::AcChannelMessage`]. `None` in test mode (poll-based).
@@ -210,9 +199,7 @@ impl Drop for LuaAcChannel {
 
 /// Poll all Lua ActionCable channels for incoming messages and fire callbacks.
 ///
-/// For each channel, drains `handle.try_recv()`. If the channel's connection
-/// has `crypto_enabled` and the message has `type == "signal"`, the `envelope`
-/// field is automatically decrypted via `CryptoService` before the callback fires.
+/// For each channel, drains `handle.try_recv()` and sends each message to its callback.
 ///
 /// Callbacks (or ownership descriptors) are looked up from the
 /// [`ActionCableCallbackRegistry`] by channel ID. For platform-owned
@@ -220,11 +207,7 @@ impl Drop for LuaAcChannel {
 /// registries. For plugin-owned subscriptions the registry holds only a
 /// descriptor; the executable is invoked exclusively via the worker boundary.
 ///
-/// # Deadlock Prevention
-///
-/// Messages are collected first, then callbacks are fired without holding any
-/// locks on the channel map or callback registry. Crypto decryption acquires
-/// the `CryptoService` mutex briefly per envelope.
+/// Messages are collected first. The function then fires callbacks without holding registry locks.
 ///
 /// # Returns
 ///
@@ -232,9 +215,7 @@ impl Drop for LuaAcChannel {
 pub fn poll_lua_action_cable_channels(
     lua: &Lua,
     channels: &mut HashMap<String, LuaAcChannel>,
-    connections: &HashMap<String, LuaAcConnection>,
     callback_registry: &ActionCableCallbackRegistry,
-    crypto_service: Option<&CryptoService>,
 ) -> usize {
     // Phase 1: collect all pending messages with cloned callback keys and channel IDs.
     let mut pending: Vec<(mlua::RegistryKey, serde_json::Value, String)> = Vec::new();
@@ -256,31 +237,7 @@ pub fn poll_lua_action_cable_channels(
             continue;
         }
 
-        // Look up crypto status for this channel's connection
-        let crypto_enabled = connections
-            .get(&channel.connection_id)
-            .map_or(false, |c| c.crypto_enabled);
-
-        while let Some(mut msg) = channel.handle.try_recv() {
-            // Auto-decrypt encrypted signal envelopes when crypto is enabled.
-            // Public preview signaling is plaintext and must pass through.
-            if crypto_enabled {
-                if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str()) {
-                    if msg_type == "signal" {
-                        if let Some(envelope_val) = msg.get("envelope").cloned() {
-                            if should_auto_decrypt_signal(&msg, &envelope_val) {
-                                msg = decrypt_signal_envelope(
-                                    &msg,
-                                    &envelope_val,
-                                    crypto_service,
-                                    channel_id,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-
+        while let Some(msg) = channel.handle.try_recv() {
             let key = entry
                 .callback_key
                 .as_ref()
@@ -330,24 +287,21 @@ pub fn poll_lua_action_cable_channels(
 ///
 /// Called from [`handle_hub_event`] for [`HubEvent::AcChannelMessage`] events.
 /// Looks up the callback from the [`ActionCableCallbackRegistry`] by channel ID,
-/// performs crypto decryption if enabled, then fires the callback with
-/// `(message, channel_id)`.
+/// fires the callback with `(message, channel_id)`.
 ///
 /// Does nothing if the channel or callback has been removed (unsubscribed
 /// between send and receive — benign race).
 pub(crate) fn fire_single_ac_message(
     lua: &Lua,
     channels: &HashMap<String, LuaAcChannel>,
-    connections: &HashMap<String, LuaAcConnection>,
     callback_registry: &ActionCableCallbackRegistry,
-    crypto_service: Option<&CryptoService>,
     channel_id: &str,
-    mut message: serde_json::Value,
+    message: serde_json::Value,
 ) {
-    let Some(channel) = channels.get(channel_id) else {
+    if !channels.contains_key(channel_id) {
         // Channel was unsubscribed between send and receive — benign race.
         return;
-    };
+    }
 
     // Phase 1: Look up the full entry (key + ownership metadata).
     // For owned plugins the key is None; executable is in worker via handler_id.
@@ -391,28 +345,6 @@ pub(crate) fn fire_single_ac_message(
             }
         }
     };
-
-    // Auto-decrypt if needed (unchanged).
-    let crypto_enabled = connections
-        .get(&channel.connection_id)
-        .map_or(false, |c| c.crypto_enabled);
-
-    if crypto_enabled {
-        if let Some(msg_type) = message.get("type").and_then(|t| t.as_str()) {
-            if msg_type == "signal" {
-                if let Some(envelope_val) = message.get("envelope").cloned() {
-                    if should_auto_decrypt_signal(&message, &envelope_val) {
-                        message = decrypt_signal_envelope(
-                            &message,
-                            &envelope_val,
-                            crypto_service,
-                            channel_id,
-                        );
-                    }
-                }
-            }
-        }
-    }
 
     // Phase 2: Fire via the correct path (the actual bypass cut).
     let result: mlua::Result<()> = (|| {
@@ -470,89 +402,6 @@ pub(crate) fn fire_single_ac_message(
 ///
 /// On success, replaces the `envelope` field with the decrypted JSON payload.
 /// On failure, logs a warning and returns the original message unmodified.
-fn should_auto_decrypt_signal(msg: &serde_json::Value, envelope_val: &serde_json::Value) -> bool {
-    if msg
-        .get("browser_identity")
-        .and_then(|v| v.as_str())
-        .is_some_and(|identity| identity.starts_with("preview:"))
-    {
-        return false;
-    }
-
-    let Some(envelope) = envelope_val.as_object() else {
-        return false;
-    };
-
-    envelope.contains_key("t") && envelope.contains_key("b")
-}
-
-fn decrypt_signal_envelope(
-    msg: &serde_json::Value,
-    envelope_val: &serde_json::Value,
-    crypto_service: Option<&CryptoService>,
-    channel_id: &str,
-) -> serde_json::Value {
-    let Some(crypto) = crypto_service else {
-        log::warn!(
-            "[ActionCable-Lua] Channel '{}': crypto enabled but no CryptoService available",
-            channel_id
-        );
-        return msg.clone();
-    };
-
-    // Parse the envelope JSON into an OlmEnvelope
-    let envelope: OlmEnvelope = match serde_json::from_value(envelope_val.clone()) {
-        Ok(e) => e,
-        Err(e) => {
-            log::warn!(
-                "[ActionCable-Lua] Channel '{}': failed to parse OlmEnvelope: {e}",
-                channel_id
-            );
-            return msg.clone();
-        }
-    };
-
-    // Decrypt via CryptoService (brief mutex lock)
-    let plaintext = match crypto.lock() {
-        Ok(mut guard) => match guard.decrypt(&envelope, envelope.sender_key.as_deref()) {
-            Ok(pt) => pt,
-            Err(e) => {
-                log::warn!(
-                    "[ActionCable-Lua] Channel '{}': decryption failed: {e}",
-                    channel_id
-                );
-                let mut result = msg.clone();
-                if let Some(obj) = result.as_object_mut() {
-                    obj.insert("decrypt_failed".to_string(), serde_json::Value::Bool(true));
-                }
-                return result;
-            }
-        },
-        Err(e) => {
-            log::error!("[ActionCable-Lua] CryptoService mutex poisoned: {e}");
-            return msg.clone();
-        }
-    };
-
-    // Parse decrypted plaintext as JSON and replace the envelope field
-    match serde_json::from_slice::<serde_json::Value>(&plaintext) {
-        Ok(decrypted_payload) => {
-            let mut result = msg.clone();
-            if let Some(obj) = result.as_object_mut() {
-                obj.insert("envelope".to_string(), decrypted_payload);
-            }
-            result
-        }
-        Err(e) => {
-            log::warn!(
-                "[ActionCable-Lua] Channel '{}': failed to parse decrypted payload as JSON: {e}",
-                channel_id
-            );
-            msg.clone()
-        }
-    }
-}
-
 // =============================================================================
 // Lua registration
 // =============================================================================
@@ -592,18 +441,10 @@ pub(crate) fn register_action_cable(
         .create_table()
         .map_err(|e| anyhow!("Failed to create action_cable table: {e}"))?;
 
-    // action_cable.connect(opts?) -> connection_id
-    //
-    // Options table:
-    //   crypto: boolean (default false) - enable auto-decryption of signal envelopes
+    // action_cable.connect() -> connection_id
     let tx = Arc::clone(&hub_event_tx);
     let connect_fn = lua
-        .create_function(move |_, opts: Option<Table>| {
-            let crypto = opts
-                .as_ref()
-                .and_then(|t| t.get::<bool>("crypto").ok())
-                .unwrap_or(false);
-
+        .create_function(move |_, ()| {
             let connection_id = format!(
                 "ac_conn_{}",
                 ACTION_CABLE_CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
@@ -613,7 +454,6 @@ pub(crate) fn register_action_cable(
                 &tx,
                 ActionCableRequest::Connect {
                     connection_id: connection_id.clone(),
-                    crypto,
                 },
             );
 
@@ -880,7 +720,7 @@ mod tests {
         register_action_cable(&lua, tx, registry).expect("Should register action_cable primitives");
 
         let conn_id: String = lua
-            .load(r#"return action_cable.connect({ crypto = true })"#)
+            .load(r#"return action_cable.connect()"#)
             .eval()
             .expect("connect should return a string");
 
@@ -891,35 +731,10 @@ mod tests {
 
         let event = rx.try_recv().expect("Should have received an event");
         match event {
-            HubEvent::LuaActionCableRequest(ActionCableRequest::Connect {
-                connection_id,
-                crypto,
-            }) => {
+            HubEvent::LuaActionCableRequest(ActionCableRequest::Connect { connection_id }) => {
                 assert_eq!(connection_id, conn_id);
-                assert!(crypto);
             }
             _ => panic!("Expected LuaActionCableRequest(Connect), got: {event:?}"),
-        }
-    }
-
-    #[test]
-    fn test_connect_default_no_crypto() {
-        let lua = Lua::new();
-        let (tx, mut rx) = setup_with_channel();
-        let registry = new_callback_registry();
-        register_action_cable(&lua, tx, registry).expect("Should register action_cable primitives");
-
-        let _: String = lua
-            .load(r#"return action_cable.connect()"#)
-            .eval()
-            .expect("connect without opts should work");
-
-        let event = rx.try_recv().expect("Should have received an event");
-        match event {
-            HubEvent::LuaActionCableRequest(ActionCableRequest::Connect { crypto, .. }) => {
-                assert!(!crypto, "Default crypto should be false");
-            }
-            _ => panic!("Expected LuaActionCableRequest(Connect)"),
         }
     }
 
@@ -1106,64 +921,11 @@ mod tests {
     }
 
     #[test]
-    fn test_decrypt_signal_envelope_no_crypto_service() {
-        let msg = serde_json::json!({
-            "type": "signal",
-            "envelope": { "t": 0, "b": "dGVzdA==", "k": "abc" }
-        });
-        let envelope_val = msg.get("envelope").unwrap().clone();
-
-        let result = decrypt_signal_envelope(&msg, &envelope_val, None, "test_ch");
-
-        // Without crypto service, message should be returned unmodified
-        assert_eq!(result, msg);
-    }
-
-    #[test]
-    fn test_should_auto_decrypt_signal_rejects_public_preview_identity() {
-        let msg = serde_json::json!({
-            "type": "signal",
-            "browser_identity": "preview:sess-123:tab-456",
-            "envelope": { "type": "offer", "sdp": "v=0..." }
-        });
-        let envelope_val = msg.get("envelope").unwrap();
-
-        assert!(!should_auto_decrypt_signal(&msg, envelope_val));
-    }
-
-    #[test]
-    fn test_should_auto_decrypt_signal_rejects_plaintext_signal_payload() {
-        let msg = serde_json::json!({
-            "type": "signal",
-            "browser_identity": "browser-123",
-            "envelope": { "type": "offer", "sdp": "v=0..." }
-        });
-        let envelope_val = msg.get("envelope").unwrap();
-
-        assert!(!should_auto_decrypt_signal(&msg, envelope_val));
-    }
-
-    #[test]
-    fn test_should_auto_decrypt_signal_accepts_olm_envelope() {
-        let msg = serde_json::json!({
-            "type": "signal",
-            "browser_identity": "browser-123",
-            "envelope": { "t": 1, "b": "ciphertext", "k": "sender" }
-        });
-        let envelope_val = msg.get("envelope").unwrap();
-
-        assert!(should_auto_decrypt_signal(&msg, envelope_val));
-    }
-
-    #[test]
     fn test_poll_empty_channels_returns_zero() {
         let lua = Lua::new();
         let mut channels: HashMap<String, LuaAcChannel> = HashMap::new();
-        let connections: HashMap<String, LuaAcConnection> = HashMap::new();
-
         let registry = new_callback_registry();
-        let count =
-            poll_lua_action_cable_channels(&lua, &mut channels, &connections, &registry, None);
+        let count = poll_lua_action_cable_channels(&lua, &mut channels, &registry);
         assert_eq!(count, 0);
     }
 

@@ -62,63 +62,13 @@ class WebrtcConnectionTest < ApplicationSystemTestCase
     )
   end
 
-  test "crypto SharedWorker reaches ready and init on hub page" do
+  test "hub page does not load application crypto worker metadata" do
     sign_in_as(@user)
     visit hub_path(@hub)
 
-    # SharedWorker bootstrap is part of the real browser connection path.
-    # Prove ready -> init explicitly so regressions fail before later WebRTC
-    # assertions become ambiguous.
-    result = page.evaluate_async_script(<<~JS)
-      const done = arguments[arguments.length - 1];
-      const workerMeta = document.querySelector('meta[name="crypto-worker-url"]');
-      const wasmJsMeta = document.querySelector('meta[name="crypto-wasm-js-url"]');
-      const wasmBinaryMeta = document.querySelector('meta[name="crypto-wasm-binary-url"]');
-
-      if (!workerMeta?.content || !wasmJsMeta?.content) {
-        done({ ok: false, error: "missing worker meta tags" });
-        return;
-      }
-
-      let settled = false;
-      const finish = (payload) => {
-        if (settled) return;
-        settled = true;
-        done(payload);
-      };
-
-      const timer = setTimeout(() => {
-        finish({ ok: false, error: "timeout waiting for SharedWorker init" });
-      }, 30000);
-
-      try {
-        const worker = new SharedWorker(workerMeta.content, { name: "vodozemac-crypto-test" });
-        worker.port.onmessage = (event) => {
-          const data = event.data || {};
-
-          if (data.event === "ready") {
-            worker.port.postMessage({
-              id: 424242,
-              action: "init",
-              wasmJsUrl: wasmJsMeta.content,
-              wasmBinaryUrl: wasmBinaryMeta?.content || null,
-            });
-            return;
-          }
-
-          if (data.id === 424242) {
-            clearTimeout(timer);
-            finish({ ok: !!data.success, error: data.error || null, result: data.result || null });
-          }
-        };
-        worker.port.start();
-      } catch (error) {
-        clearTimeout(timer);
-        finish({ ok: false, error: String(error) });
-      }
-    JS
-
-    assert_equal true, result["ok"], "Expected SharedWorker init to succeed, got: #{result.inspect}"
+    assert_no_selector 'meta[name="crypto-worker-url"]'
+    assert_no_selector 'meta[name="crypto-wasm-js-url"]'
+    assert_no_selector 'meta[name="crypto-wasm-binary-url"]'
   end
 
   test "connection URL with fragment loads pairing confirmation" do

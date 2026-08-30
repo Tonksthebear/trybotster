@@ -12,7 +12,6 @@ pub(super) use crate::config::Config;
 pub(super) use crate::hub::agent_handle::{PtyHandle, SessionHandle, SessionType};
 pub(super) use crate::hub::{Hub, PendingTerminalAttachRequest};
 pub(super) use crate::lua::BrowserTerminalSubscriptionRequest;
-pub(super) use crate::relay::create_crypto_service;
 pub(super) use crate::socket::framing::{Frame, FrameDecoder};
 
 /// Single shared tokio runtime for all server_comms tests.
@@ -32,7 +31,7 @@ pub(super) fn e2e_config() -> Config {
     config
 }
 
-/// Create a Hub with TUI registered, crypto initialized, and all real
+/// Create a Hub with TUI registered and all real
 /// Lua handlers loaded. Returns the Hub plus the TUI channels for
 /// sending requests and receiving output.
 ///
@@ -45,9 +44,6 @@ pub(super) fn e2e_hub() -> (
 ) {
     let config = e2e_config();
     let mut hub = Hub::with_runtime(config, shared_test_runtime()).unwrap();
-
-    let crypto_service = create_crypto_service("test-hub");
-    hub.browser.crypto_service = Some(crypto_service);
 
     // Register Hub primitives (must happen before loading init script)
     hub.lua

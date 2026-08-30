@@ -6,7 +6,6 @@
 //! ~/.config/botster/
 //!     vapid_keys.enc                         # Device-level VAPID keys (AES-GCM)
 //!     push_subscriptions.enc                 # Device-level browser push subscriptions (AES-GCM)
-//!     hubs/<hub_id>/vodozemac_account.enc    # Hub-level CLI long-term Olm identity (AES-GCM)
 //! OS Keyring (consolidated):
 //!     botster/credentials  # Contains crypto_keys[key_id] = base64 AES key
 //! ```
@@ -25,7 +24,6 @@ use crate::crypto::EncryptedData;
 use crate::keyring::Credentials;
 
 use std::sync::{OnceLock, RwLock};
-use vodozemac::olm::AccountPickle;
 
 /// Cache for encryption keys to avoid repeated keyring access.
 /// Maps hub_id -> encryption key.
@@ -162,9 +160,6 @@ const VAPID_VERSION: u8 = 1;
 
 /// Push subscription persistence format version.
 const PUSH_SUB_VERSION: u8 = 1;
-
-/// CLI long-term vodozemac account persistence format version.
-const ACCOUNT_VERSION: u8 = 1;
 
 /// Device-level config directory (same as `device.json` location).
 ///
@@ -309,65 +304,6 @@ pub fn save_push_subscriptions(store: &PushSubscriptionStore) -> Result<()> {
     Ok(())
 }
 
-/// Load the CLI's persisted long-term vodozemac account for a hub.
-///
-/// Returns `None` if the hub has never been paired before and no identity
-/// exists yet. Only the long-term account is stored; sessions remain ephemeral.
-pub fn load_vodozemac_account(hub_id: &str) -> Result<Option<AccountPickle>> {
-    let state_dir = hub_state_dir(hub_id)?;
-    let account_path = state_dir.join("vodozemac_account.enc");
-
-    if !account_path.exists() {
-        return Ok(None);
-    }
-
-    let key = get_or_create_encryption_key(hub_id)?;
-    let content =
-        fs::read_to_string(&account_path).context("Failed to read vodozemac account file")?;
-    let encrypted: EncryptedData =
-        serde_json::from_str(&content).context("Failed to parse vodozemac account file")?;
-    let plaintext = crate::crypto::decrypt(&key, &encrypted)?;
-    let account: AccountPickle =
-        serde_json::from_slice(&plaintext).context("Failed to deserialize vodozemac account")?;
-
-    log::info!(
-        "Loaded persisted vodozemac account for hub {}",
-        &hub_id[..hub_id.len().min(8)]
-    );
-    Ok(Some(account))
-}
-
-/// Save the CLI's long-term vodozemac account for a hub.
-///
-/// This preserves the hub identity/signing keys across reboot while keeping
-/// per-peer sessions out of storage.
-pub fn save_vodozemac_account(hub_id: &str, account: &AccountPickle) -> Result<()> {
-    let key = get_or_create_encryption_key(hub_id)?;
-    let state_dir = hub_state_dir(hub_id)?;
-    let account_path = state_dir.join("vodozemac_account.enc");
-
-    let plaintext = serde_json::to_vec(account).context("Failed to serialize vodozemac account")?;
-    let encrypted = crate::crypto::encrypt(&key, &plaintext, ACCOUNT_VERSION)?;
-    let content = serde_json::to_string_pretty(&encrypted)
-        .context("Failed to serialize encrypted vodozemac account")?;
-    fs::write(&account_path, content).context("Failed to write vodozemac account file")?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o600);
-        fs::set_permissions(&account_path, perms)
-            .context("Failed to set vodozemac account file permissions")?;
-    }
-
-    log::debug!(
-        "Saved encrypted vodozemac account for hub {} to {:?}",
-        &hub_id[..hub_id.len().min(8)],
-        account_path
-    );
-    Ok(())
-}
-
 /// Write the connection URL to a file for external access.
 ///
 /// This allows external tools (like test harnesses) to retrieve the
@@ -376,6 +312,14 @@ pub fn write_connection_url(hub_id: &str, url: &str) -> Result<()> {
     let state_dir = hub_state_dir(hub_id)?;
     let url_path = state_dir.join("connection_url.txt");
     fs::write(&url_path, url).context("Failed to write connection URL")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&url_path, fs::Permissions::from_mode(0o600))
+            .context("Failed to set connection URL permissions")?;
+    }
+
     log::debug!("Wrote connection URL to {:?}", url_path);
     Ok(())
 }
@@ -431,7 +375,7 @@ mod tests {
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
         let key = [0u8; 32];
-        let plaintext = b"Hello, Matrix crypto!";
+        let plaintext = b"Hello, encrypted state!";
 
         let encrypted = crate::crypto::encrypt(&key, plaintext, TEST_CRYPTO_VERSION).unwrap();
         let decrypted = crate::crypto::decrypt(&key, &encrypted).unwrap();

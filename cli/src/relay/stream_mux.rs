@@ -5,7 +5,7 @@
 //!
 //! # Frame Format
 //!
-//! After Olm decryption, CONTENT_STREAM frames have sub-framing:
+//! CONTENT_STREAM DataChannel frames have this sub-framing:
 //! ```text
 //! [0x02][frame_type:1][stream_id:2 BE][payload...]
 //! ```

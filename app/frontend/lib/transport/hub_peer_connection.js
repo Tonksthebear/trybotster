@@ -8,8 +8,10 @@
  * - HubChannelProtocol: DataChannel message protocol
  */
 
-import bridge from "workers/bridge"
-import { parseBinaryBundle } from "matrix/bundle"
+import {
+  buildAuthenticationRequest,
+  verifyAuthenticationAccepted,
+} from "transport/browser_pairing"
 import { HubSignalingClient } from "transport/hub_signaling_client"
 import { HubChannelProtocol } from "transport/hub_channel_protocol"
 import { HubPeerLifecycle, PEER_LOST_REASONS } from "transport/hub_peer_lifecycle"
@@ -34,7 +36,6 @@ const CONTENT_PTY = 0x01
 const CONTENT_STREAM = 0x02
 const CONTENT_FILE = 0x03
 const CONTENT_FILE_CHUNK = 0x04
-const MSG_TYPE_BUNDLE_REFRESH = 0x02
 
 const DISCONNECT_GRACE_PERIOD_MS = 3000
 const STALLED_EVENT_COOLDOWN_MS = 2000
@@ -45,15 +46,9 @@ const MAX_PENDING_REMOTE_ICE = 128
 const ICE_CONFIG_CACHE_TTL_MS = 60_000
 const ICE_CONFIG_FETCH_TIMEOUT_MS = 3000
 const PEER_SETUP_TIMEOUT_MS = 15_000
-const TRANSPORT_CONFIG_FALLBACK_MS = 5_000
 const DIRECT_CHURN_WINDOW_MS = 60_000
 const DIRECT_CHURN_THRESHOLD = 1
 const RELAY_FALLBACK_MS = 5 * 60_000
-
-function base64ToBytes(b64) {
-  const binary = atob(b64)
-  return Uint8Array.from(binary, c => c.charCodeAt(0))
-}
 
 function buildControlFrame(payload) {
   const jsonBytes = new TextEncoder().encode(JSON.stringify(payload))
@@ -67,7 +62,6 @@ class HubPeerConnection {
   #connections = new Map()
   #connectPromises = new Map()
   #peerConnectPromises = new Map()
-  #bundleRefreshPromises = new Map()
   #dataMessageChains = new Map()
   #serverReadyWaiters = new Map()
   #eventListeners = new Map()
@@ -87,9 +81,10 @@ class HubPeerConnection {
       callbacks: {
         emit: (event, payload) => this.#emit(event, payload),
         getConnection: (hubId) => this.#connections.get(hubId),
-        createSession: (hubId, bundle, browserIdentity) =>
-          bridge.createSession(String(hubId), bundle, browserIdentity),
-        decryptBinary: (hubId, raw) => bridge.decryptBinary(String(hubId), raw),
+        authenticateChallenge: (hubId, challenge, generation) =>
+          this.#authenticateChallenge(hubId, challenge, generation),
+        authenticationAccepted: (hubId, response, generation) =>
+          this.#authenticationAccepted(hubId, response, generation),
         isCurrentPeerGeneration: (hubId, generation) =>
           this.#isCurrentPeerGeneration(hubId, generation),
         markServerReady: (hubId, generation) => this.#markServerReady(hubId, generation),
@@ -98,7 +93,6 @@ class HubPeerConnection {
         CONTENT_MSG,
         CONTENT_PTY,
         CONTENT_STREAM,
-        MSG_TYPE_BUNDLE_REFRESH,
       },
     })
 
@@ -108,7 +102,7 @@ class HubPeerConnection {
         getConnection: (hubId) => this.#connections.get(hubId),
         getSignalingSubscription: (hubId) => this.#signalingClient.getSubscription(hubId),
         getIceConfig: (hubId, conn) => this.#getIceConfig(hubId, conn),
-        encryptSignal: (hubId, payload) => this.#encryptSignal(hubId, payload),
+        encryptSignal: (_hubId, payload) => payload,
         setupDataChannel: (hubId, dataChannel, generation) =>
           this.#setupDataChannel(hubId, dataChannel, generation),
         peerLost: (hubId, reason) => this.#handlePeerLost(hubId, reason),
@@ -134,7 +128,6 @@ class HubPeerConnection {
       this.#graceTimers.clear()
 
       for (const [hubId, conn] of this.#connections) {
-        clearTimeout(conn.transportConfigTimer)
         this.#peerLifecycle.teardownPeer(conn)
         this.#signalingClient.disconnect(hubId)
       }
@@ -142,7 +135,6 @@ class HubPeerConnection {
       this.#connections.clear()
       this.#connectPromises.clear()
       this.#peerConnectPromises.clear()
-      this.#bundleRefreshPromises.clear()
     })
   }
 
@@ -176,12 +168,11 @@ class HubPeerConnection {
     }
   }
 
-  async connectSignaling(hubId, browserIdentity, allowPlaintext = false) {
+  async connectSignaling(hubId, browserIdentity) {
     this.#cancelGracePeriod(hubId)
 
     const existing = this.#connections.get(hubId)
     if (existing) {
-      existing.allowPlaintext ||= allowPlaintext
       this.#prefetchIceConfig(hubId, existing)
       this.#signalingClient.emitBrowserSocketStateForHub(hubId)
       if (existing.lastHealth) {
@@ -200,14 +191,16 @@ class HubPeerConnection {
       mode: ConnectionMode.UNKNOWN,
       hubId,
       browserIdentity,
-      allowPlaintext,
+      authenticated: false,
+      authChallenge: null,
+      browserFingerprint: null,
+      hubFingerprint: null,
       subscriptions: new Map(),
       pendingCandidates: [],
       iceRestartAttempts: 0,
       iceRestartTimer: null,
       iceDisconnectedTimer: null,
       iceDisrupted: false,
-      decryptFailures: 0,
       activeFileTransferIds: new Set(),
       nextFileTransferId: 0,
       lastStalledAt: 0,
@@ -223,9 +216,6 @@ class HubPeerConnection {
       forceRelayUntil: 0,
       signalingConnected: true,
       lastHealth: null,
-      encryptionEnabled: null,
-      transportConfigPending: true,
-      transportConfigTimer: null,
     }
 
     this.#connections.set(hubId, conn)
@@ -289,108 +279,6 @@ class HubPeerConnection {
       this.#closeConnection(hubId)
     }, DISCONNECT_GRACE_PERIOD_MS)
     this.#graceTimers.set(hubId, timer)
-  }
-
-  async requestFreshBundle(hubId, timeoutMs = 5000) {
-    const conn = this.#connections.get(hubId)
-    if (!conn) throw new Error(`No signaling connection for hub ${hubId}`)
-    if (conn.encryptionEnabled === false) return { refreshed: false }
-    if (!conn.signalingConnected) throw new Error(`Signaling not connected for hub ${hubId}`)
-
-    const subscription = this.#signalingClient.getSubscription(hubId)
-    if (!subscription) throw new Error(`No signaling subscription for hub ${hubId}`)
-
-    const pending = this.#bundleRefreshPromises.get(hubId)
-    if (pending) return pending
-
-    const requestedAt = performance.now()
-    const promise = new Promise((resolve, reject) => {
-      let settled = false
-
-      const cleanup = () => {
-        clearTimeout(timer)
-        offRefreshed()
-        offInvalid()
-        this.#bundleRefreshPromises.delete(hubId)
-      }
-
-      const offRefreshed = this.on("session:refreshed", (event) => {
-        if (settled || event.hubId !== hubId) return
-        settled = true
-        cleanup()
-        console.debug(
-          `[WebRTCTransport] Fresh bundle request completed for hub ${hubId} in ${Math.round(performance.now() - requestedAt)}ms`,
-        )
-        resolve({ refreshed: true })
-      })
-
-      const offInvalid = this.on("session:invalid", (event) => {
-        if (settled || event.hubId !== hubId) return
-        settled = true
-        cleanup()
-        reject(new Error(event.message || `Fresh bundle request failed for hub ${hubId}`))
-      })
-
-      const timer = setTimeout(() => {
-        if (settled) return
-        settled = true
-        cleanup()
-        reject(new Error(`Fresh bundle request timed out for hub ${hubId}`))
-      }, timeoutMs)
-
-      try {
-        subscription.perform("request_bundle", {})
-      } catch (error) {
-        settled = true
-        cleanup()
-        reject(error)
-      }
-    })
-
-    this.#bundleRefreshPromises.set(hubId, promise)
-    return promise
-  }
-
-  async awaitFreshBundle(hubId, timeoutMs = 750) {
-    const conn = this.#connections.get(hubId)
-    if (!conn || !conn.signalingConnected) {
-      return { refreshed: false }
-    }
-
-    const waitStartedAt = performance.now()
-    return new Promise((resolve) => {
-      let settled = false
-
-      const cleanup = () => {
-        clearTimeout(timer)
-        offRefreshed()
-        offInvalid()
-      }
-
-      const offRefreshed = this.on("session:refreshed", (event) => {
-        if (settled || event.hubId !== hubId) return
-        settled = true
-        cleanup()
-        console.debug(
-          `[WebRTCTransport] Auto fresh bundle arrived for hub ${hubId} in ${Math.round(performance.now() - waitStartedAt)}ms`,
-        )
-        resolve({ refreshed: true })
-      })
-
-      const offInvalid = this.on("session:invalid", (event) => {
-        if (settled || event.hubId !== hubId) return
-        settled = true
-        cleanup()
-        resolve({ refreshed: false, invalid: true, message: event.message })
-      })
-
-      const timer = setTimeout(() => {
-        if (settled) return
-        settled = true
-        cleanup()
-        resolve({ refreshed: false })
-      }, timeoutMs)
-    })
   }
 
   async subscribe(hubId, channelName, params, providedSubscriptionId = null, plaintext = null) {
@@ -642,7 +530,6 @@ class HubPeerConnection {
     if (!conn) return
 
     console.debug(`[WebRTCTransport] Closing connection for hub ${hubId}`)
-    clearTimeout(conn.transportConfigTimer)
     this.#handlePeerLost(hubId, PEER_LOST_REASONS.GRACE_EXPIRED)
     this.#signalingClient.disconnect(hubId)
     this.#connections.delete(hubId)
@@ -670,8 +557,10 @@ class HubPeerConnection {
       const conn = this.#connections.get(hubId)
       let peerReadyMs = null
       if (conn) {
-        conn.state = TransportState.CONNECTED
+        conn.state = TransportState.CONNECTING
         conn.serverReady = false
+        conn.authenticated = false
+        conn.authChallenge = null
         const timingStartedAt = conn.offerSentAt ?? conn.peerSetupStartedAt
         if (timingStartedAt != null) {
           peerReadyMs = Math.round(performance.now() - timingStartedAt)
@@ -681,9 +570,7 @@ class HubPeerConnection {
         }
       }
 
-      const mode = conn?.mode
-      this.#emit("connection:state", { hubId, state: "connected", mode, peerReadyMs })
-      if (mode) this.#emit("connection:mode", { hubId, mode })
+      if (conn) conn.peerReadyMs = peerReadyMs
     }
 
     dataChannel.onclose = () => {
@@ -701,6 +588,56 @@ class HubPeerConnection {
     dataChannel.onmessage = (event) => {
       this.#enqueueDataChannelMessage(hubId, event.data, generation)
     }
+  }
+
+  async #authenticateChallenge(hubId, challenge, generation) {
+    if (!this.#isCurrentPeerGeneration(hubId, generation)) return
+    const conn = this.#connections.get(hubId)
+    if (!conn || conn.authChallenge) {
+      this.#handlePeerLost(hubId, "authentication_rejected")
+      throw new Error("Authentication challenge replayed")
+    }
+    conn.authChallenge = challenge
+    try {
+      const request = await buildAuthenticationRequest(hubId, challenge, {
+        browserFingerprint: conn.browserFingerprint,
+        hubFingerprint: conn.hubFingerprint,
+      })
+      this.#sendAuthenticationFrame(conn, request)
+    } catch (error) {
+      this.#handlePeerLost(hubId, "authentication_rejected")
+      throw error
+    }
+  }
+
+  async #authenticationAccepted(hubId, response, generation) {
+    if (!this.#isCurrentPeerGeneration(hubId, generation)) return
+    const conn = this.#connections.get(hubId)
+    if (!conn?.authChallenge || conn.authenticated) {
+      this.#handlePeerLost(hubId, "authentication_rejected")
+      throw new Error("Authentication response replayed")
+    }
+    try {
+      await verifyAuthenticationAccepted(hubId, response, conn.authChallenge)
+    } catch (error) {
+      this.#handlePeerLost(hubId, "authentication_rejected")
+      throw error
+    }
+    conn.authenticated = true
+    conn.state = TransportState.CONNECTED
+    const mode = conn.mode
+    this.#emit("connection:state", {
+      hubId,
+      state: "connected",
+      mode,
+      peerReadyMs: conn.peerReadyMs,
+    })
+    if (mode) this.#emit("connection:mode", { hubId, mode })
+  }
+
+  #sendAuthenticationFrame(conn, payload) {
+    if (conn.dataChannel?.readyState !== "open") throw new Error("DataChannel not open")
+    conn.dataChannel.send(buildControlFrame(payload).buffer)
   }
 
   #isCurrentPeerGeneration(hubId, generation) {
@@ -870,9 +807,6 @@ class HubPeerConnection {
         const conn = this.#connections.get(hubId)
         if (!conn) return
         conn.signalingConnected = state === "connected"
-        if (state === "connected") {
-          this.#markTransportConfigPending(hubId, conn)
-        }
       },
     })
   }
@@ -881,144 +815,43 @@ class HubPeerConnection {
     if (data.type === "health") {
       const conn = this.#connections.get(hubId)
       if (conn) conn.lastHealth = data
-      if (data.cli === "offline" && conn) {
-        this.#markTransportConfigPending(hubId, conn, false)
-      } else if (data.cli === "online" && conn?.transportConfigPending) {
-        this.#signalingClient.getSubscription(hubId)?.perform("request_transport_config", {})
-        this.#scheduleTransportConfigFallback(hubId, conn)
-      }
       this.#emit("health", { hubId, ...data })
       return
     }
 
     if (data.type !== "signal") return
 
-    if (data.envelope?.type === "transport_config") {
-      const conn = this.#connections.get(hubId)
-      if (!conn?.transportConfigPending) return
-      clearTimeout(conn.transportConfigTimer)
-      conn.transportConfigTimer = null
-      const nextEncryptionEnabled = data.envelope.e2e_enabled !== false
-      if (!nextEncryptionEnabled && !conn.allowPlaintext) {
-        conn.transportConfigPending = false
-        this.#emit("transport:config", {
-          hubId,
-          e2e_enabled: null,
-          error: "plaintext_opt_in_required",
-        })
-        return
-      }
-
-      const previousEncryptionEnabled = conn.encryptionEnabled
-      conn.transportConfigPending = false
-      conn.encryptionEnabled = nextEncryptionEnabled
-      if (
-        typeof previousEncryptionEnabled === "boolean" &&
-        previousEncryptionEnabled !== nextEncryptionEnabled &&
-        conn.pc
-      ) {
-        this.#handlePeerLost(hubId, "transport_config_changed")
-      }
-      this.#emit("transport:config", {
-        hubId,
-        e2e_enabled: conn.encryptionEnabled,
-      })
-      return
-    }
-
-    if (data.envelope?.t === 2 && data.envelope?.b) {
-      console.debug("[WebRTCTransport] Received bundle refresh from CLI via ActionCable")
-      try {
-        const bundleBytes = base64ToBytes(data.envelope.b)
-        const bundle = parseBinaryBundle(bundleBytes)
-        const conn = this.#connections.get(hubId)
-        await bridge.createSession(String(hubId), bundle, conn?.browserIdentity || null)
-        if (conn) conn.decryptFailures = 0
-        this.#emit("session:refreshed", { hubId })
-      } catch (error) {
-        console.error("[WebRTCTransport] Bundle refresh via AC failed:", error.message)
-        this.#emit("session:invalid", { hubId, message: error.message })
-      }
-      return
-    }
-
     try {
-      const decrypted = await this.#decryptSignalEnvelope(hubId, data.envelope)
-      if (!decrypted) return
+      const signal = data.envelope
 
-      if (decrypted.type === "answer") {
+      if (signal.type === "answer") {
         console.debug("[WebRTCTransport] Received answer via ActionCable")
-        await this.#peerLifecycle.handleAnswer(hubId, decrypted.sdp)
+        await this.#peerLifecycle.handleAnswer(hubId, signal.sdp)
         return
       }
 
-      if (decrypted.type === "ice") {
+      if (signal.type === "ice") {
         console.debug("[WebRTCTransport] Received ICE candidate via ActionCable")
-        await this.#peerLifecycle.handleIceCandidate(hubId, decrypted.candidate)
+        await this.#peerLifecycle.handleIceCandidate(hubId, signal.candidate)
         return
       }
 
-      if (decrypted.type === "ice_batch") {
-        console.debug(`[WebRTCTransport] Received ${decrypted.candidates?.length || 0} batched ICE candidates via ActionCable`)
-        for (const candidate of (decrypted.candidates || [])) {
+      if (signal.type === "ice_batch") {
+        console.debug(`[WebRTCTransport] Received ${signal.candidates?.length || 0} batched ICE candidates via ActionCable`)
+        for (const candidate of (signal.candidates || [])) {
           await this.#peerLifecycle.handleIceCandidate(hubId, candidate)
         }
       }
     } catch (error) {
-      console.error("[WebRTCTransport] Signal decryption/handling error:", error)
+      console.error("[WebRTCTransport] Signal handling error:", error)
     }
-  }
-
-  async #decryptSignalEnvelope(hubId, envelope) {
-    if (this.#connections.get(hubId)?.encryptionEnabled === false) {
-      return envelope
-    }
-    try {
-      const { plaintext } = await bridge.decrypt(String(hubId), envelope)
-      return typeof plaintext === "string" ? JSON.parse(plaintext) : plaintext
-    } catch (error) {
-      console.error("[WebRTCTransport] Signal decryption failed:", error.message || error)
-      return null
-    }
-  }
-
-  async #encryptSignal(hubId, payload) {
-    if (this.#connections.get(hubId)?.encryptionEnabled === false) {
-      return payload
-    }
-    const { encrypted } = await bridge.encrypt(String(hubId), payload)
-    return encrypted
   }
 
   async #encodeDataChannelFrame(hubId, plaintext) {
     const bytes = plaintext instanceof Uint8Array ? plaintext : new Uint8Array(plaintext)
-    if (this.#connections.get(hubId)?.encryptionEnabled === false) {
-      return bytes
-    }
-    const { data } = await bridge.encryptBinary(String(hubId), bytes)
-    return data instanceof Uint8Array ? data : new Uint8Array(data)
-  }
-
-  #markTransportConfigPending(hubId, conn, scheduleFallback = true) {
-    clearTimeout(conn.transportConfigTimer)
-    conn.transportConfigTimer = null
-    conn.transportConfigPending = true
-    this.#emit("transport:config", { hubId, e2e_enabled: null })
-    if (scheduleFallback) this.#scheduleTransportConfigFallback(hubId, conn)
-  }
-
-  #scheduleTransportConfigFallback(hubId, conn) {
-    if (conn.transportConfigTimer || !conn.transportConfigPending) return
-    conn.transportConfigTimer = setTimeout(() => {
-      conn.transportConfigTimer = null
-      if (!conn.transportConfigPending) return
-      conn.encryptionEnabled ??= true
-      this.#emit("transport:config", {
-        hubId,
-        e2e_enabled: conn.encryptionEnabled,
-        fallback: true,
-      })
-    }, TRANSPORT_CONFIG_FALLBACK_MS)
+    const conn = this.#connections.get(hubId)
+    if (!conn?.authenticated) throw new Error("Browser is not authenticated")
+    return bytes
   }
 }
 

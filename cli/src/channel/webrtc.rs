@@ -1,7 +1,7 @@
 //! WebRTC DataChannel implementation.
 //!
 //! This module provides `WebRtcChannel`, an implementation of the `Channel`
-//! trait that communicates through a WebRTC DataChannel with optional E2E encryption.
+//! trait that communicates through an authenticated WebRTC DataChannel.
 //!
 //! # Architecture
 //!
@@ -9,7 +9,6 @@
 //! WebRtcChannel
 //!     |-- PeerConnection (rustrtc)
 //!     |-- DataChannel (SCTP - reliable ordered, no message size limit)
-//!     |-- Optional E2E encryption (via CryptoService = Arc<Mutex<VodozemacCrypto>>)
 //!     |-- Gzip compression (via compression module)
 //!     `-- Signaling via ActionCable
 //! ```
@@ -18,13 +17,13 @@
 //!
 //! - No custom reliable delivery needed (SCTP provides it natively)
 //! - Peer-to-peer when possible, TURN relay as fallback
-//! - Signaling (offer/answer/ICE) via ActionCable, with optional E2E encryption
+//! - Signaling (offer/answer/ICE) via an opaque ActionCable relay
 
 use async_trait::async_trait;
 use mdns_sd::{HostnameResolutionEvent, ScopedIp, ServiceDaemon};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -37,10 +36,16 @@ use rustrtc::{
     IceServer, PeerConnection, PeerConnectionEvent, RtcConfiguration, SdpType, SessionDescription,
 };
 
-use crate::relay::crypto_service::CryptoService;
-use crate::relay::olm_crypto::{
-    CONTENT_FILE, CONTENT_FILE_CHUNK, CONTENT_MSG, CONTENT_PTY, CONTENT_STREAM,
-};
+/// JSON control frame content type.
+pub const CONTENT_MSG: u8 = 0x00;
+/// Terminal input and output frame content type.
+pub const CONTENT_PTY: u8 = 0x01;
+/// Stream multiplexer frame content type.
+pub const CONTENT_STREAM: u8 = 0x02;
+/// Single-frame file content type.
+pub const CONTENT_FILE: u8 = 0x03;
+/// Chunked file content type.
+pub const CONTENT_FILE_CHUNK: u8 = 0x04;
 
 /// Shared ICE config cache for all WebRTC channels in this process.
 ///
@@ -186,11 +191,11 @@ pub(crate) struct RawIncoming {
 /// by `server_comms` tick loop, and forwarded through `CommandChannelHandle::perform`.
 #[derive(Debug)]
 pub enum OutgoingSignal {
-    /// Encrypted ICE candidate for a specific browser.
+    /// ICE candidate for a specific browser.
     Ice {
         /// Target browser identity (`identityKey:tabId`).
         browser_identity: String,
-        /// E2E encrypted envelope (opaque to Rails).
+        /// Opaque signaling payload for Rails to relay.
         envelope: serde_json::Value,
     },
 }
@@ -212,7 +217,6 @@ pub struct WebRtcConfig {
 pub struct WebRtcChannelBuilder {
     server_url: Option<String>,
     api_key: Option<String>,
-    crypto_service: Option<CryptoService>,
     signal_tx: Option<mpsc::Sender<OutgoingSignal>>,
     stream_frame_tx: Option<mpsc::Sender<StreamIncoming>>,
     pty_input_tx: Option<mpsc::Sender<PtyInputIncoming>>,
@@ -224,7 +228,6 @@ impl std::fmt::Debug for WebRtcChannelBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebRtcChannelBuilder")
             .field("server_url", &self.server_url)
-            .field("crypto_service", &self.crypto_service.is_some())
             .field("signal_tx", &self.signal_tx.is_some())
             .field("stream_frame_tx", &self.stream_frame_tx.is_some())
             .field("pty_input_tx", &self.pty_input_tx.is_some())
@@ -239,7 +242,6 @@ impl Default for WebRtcChannelBuilder {
         Self {
             server_url: None,
             api_key: None,
-            crypto_service: None,
             signal_tx: None,
             stream_frame_tx: None,
             pty_input_tx: None,
@@ -267,13 +269,6 @@ impl WebRtcChannelBuilder {
     #[must_use]
     pub fn api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
-        self
-    }
-
-    /// Set the crypto service for E2E encryption.
-    #[must_use]
-    pub fn crypto_service(mut self, cs: CryptoService) -> Self {
-        self.crypto_service = Some(cs);
         self
     }
 
@@ -323,7 +318,6 @@ impl WebRtcChannelBuilder {
         WebRtcChannel {
             server_url: self.server_url.expect("server_url required"),
             api_key: self.api_key.expect("api_key required"),
-            crypto_service: self.crypto_service,
             signal_tx: self.signal_tx,
             stream_frame_tx: self.stream_frame_tx,
             pty_input_tx: self.pty_input_tx,
@@ -336,10 +330,9 @@ impl WebRtcChannelBuilder {
             config: Arc::new(Mutex::new(None)),
             recv_rx: Arc::new(Mutex::new(None)),
             recv_tx: Arc::new(Mutex::new(None)),
-            peer_olm_key: Arc::new(Mutex::new(None)),
-            decrypt_failures: Arc::new(AtomicU32::new(0)),
             offer_generation: Arc::new(AtomicU64::new(0)),
             dc_opened: Arc::new(AtomicBool::new(false)),
+            authenticated: Arc::new(AtomicBool::new(false)),
             hub_event_tx: self.hub_event_tx,
             close_complete_tx: close_tx,
             close_complete_rx: close_rx,
@@ -357,8 +350,6 @@ pub struct WebRtcChannel {
     server_url: String,
     /// API key for auth.
     api_key: String,
-    /// Optional crypto service for E2E encryption.
-    crypto_service: Option<CryptoService>,
     /// Sender for outgoing signals (ICE candidates) to relay via ActionCable.
     signal_tx: Option<mpsc::Sender<OutgoingSignal>>,
     /// Sender for incoming stream multiplexer frames.
@@ -383,15 +374,13 @@ pub struct WebRtcChannel {
     recv_rx: Arc<Mutex<Option<mpsc::Receiver<RawIncoming>>>>,
     /// Send side of receive queue.
     recv_tx: Arc<Mutex<Option<mpsc::Sender<RawIncoming>>>>,
-    /// Peer's Olm identity key (set when SDP offer is handled).
-    peer_olm_key: Arc<Mutex<Option<String>>>,
-    /// Consecutive decryption failure count for session health monitoring.
-    decrypt_failures: Arc<AtomicU32>,
     /// Hub-side offer generation that owns this channel instance.
     offer_generation: Arc<AtomicU64>,
     /// Set to `true` when the DataChannel opens; consumed by `take_dc_opened()`.
     /// Kept as test-only fallback when `hub_event_tx` is None.
     dc_opened: Arc<AtomicBool>,
+    /// True only after the hub verifies this browser for the current channel.
+    authenticated: Arc<AtomicBool>,
     /// Event channel sender for DC opened notifications.
     /// When set, the event loop sends `HubEvent::DcOpened` instead of
     /// setting the atomic bool.
@@ -408,7 +397,6 @@ impl std::fmt::Debug for WebRtcChannel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebRtcChannel")
             .field("server_url", &self.server_url)
-            .field("crypto_service", &self.crypto_service.is_some())
             .field("signal_tx", &self.signal_tx.is_some())
             .field("stream_frame_tx", &self.stream_frame_tx.is_some())
             .field("pty_input_tx", &self.pty_input_tx.is_some())
@@ -722,12 +710,6 @@ impl WebRtcChannel {
             ChannelError::ConnectionFailed(format!("Failed to set local description: {e}"))
         })?;
 
-        // Store the peer's Olm key for encrypt routing.
-        {
-            let mut olm_key = self.peer_olm_key.lock().await;
-            *olm_key = Some(crate::relay::extract_olm_key(browser_identity).to_string());
-        }
-
         // Store PC clone in struct (for handle_ice_candidate and send methods)
         *pc_guard = Some(pc.clone());
         drop(pc_guard);
@@ -785,19 +767,17 @@ impl WebRtcChannel {
         let close_complete = self.close_complete_tx.clone();
         let recv_tx = Arc::clone(&self.recv_tx);
         let peers = Arc::clone(&self.peers);
-        let crypto_service = self.crypto_service.clone();
         let browser_id = browser_identity.to_string();
-        let decrypt_failures = Arc::clone(&self.decrypt_failures);
         let stream_frame_tx = self.stream_frame_tx.clone();
         let pty_input_tx = self.pty_input_tx.clone();
         let file_input_tx = self.file_input_tx.clone();
         let dc_opened = Arc::clone(&self.dc_opened);
+        let authenticated = Arc::clone(&self.authenticated);
         let offer_generation = Arc::clone(&self.offer_generation);
         let hub_event_tx = self.hub_event_tx.clone();
 
         // Subscribe to ICE candidates for forwarding
         let mut ice_rx = pc.subscribe_ice_candidates();
-        let ice_crypto = self.crypto_service.clone();
         let ice_signal_tx = self.signal_tx.clone();
         let ice_browser_id = browser_id.clone();
 
@@ -822,41 +802,10 @@ impl WebRtcChannel {
                                 "candidate": candidate_json,
                             });
 
-                            // Encrypt with E2E encryption
-                            let envelope = if let Some(ref cs) = ice_crypto {
-                                let plaintext = serde_json::to_vec(&payload).unwrap_or_default();
-                                match cs.lock() {
-                                    Ok(mut guard) => match guard.encrypt(
-                                        &plaintext,
-                                        crate::relay::extract_olm_key(&ice_browser_id),
-                                    ) {
-                                        Ok(env) => match serde_json::to_value(&env) {
-                                            Ok(v) => v,
-                                            Err(e) => {
-                                                log::error!("[WebRTC] Failed to serialize ICE envelope: {e}");
-                                                continue;
-                                            }
-                                        },
-                                        Err(e) => {
-                                            log::error!(
-                                                "[WebRTC] Failed to encrypt ICE candidate: {e}"
-                                            );
-                                            continue;
-                                        }
-                                    },
-                                    Err(e) => {
-                                        log::error!("[WebRTC] Crypto mutex poisoned: {e}");
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                payload
-                            };
-
                             if let Some(ref tx) = ice_signal_tx {
                                 match tx.try_send(OutgoingSignal::Ice {
                                     browser_identity: ice_browser_id.clone(),
-                                    envelope,
+                                    envelope: payload,
                                 }) {
                                     Ok(()) => {}
                                     Err(mpsc::error::TrySendError::Full(_)) => {
@@ -926,13 +875,12 @@ impl WebRtcChannel {
                                 // Spawn DataChannel message reader
                                 let recv_tx = Arc::clone(&recv_tx);
                                 let peers = Arc::clone(&peers);
-                                let crypto = crypto_service.clone();
                                 let browser = browser_id.clone();
-                                let failures = Arc::clone(&decrypt_failures);
                                 let stream_tx = stream_frame_tx.clone();
                                 let pty_tx = pty_input_tx.clone();
                                 let file_tx = file_input_tx.clone();
                                 let hub_tx = hub_event_tx.clone();
+                                let admitted = Arc::clone(&authenticated);
                                 let dc_reader = Arc::clone(&dc);
                                 let dc_closed_signal = Arc::clone(&dc_closed);
 
@@ -944,14 +892,13 @@ impl WebRtcChannel {
                                                 handle_dc_message(
                                                     &data,
                                                     &browser,
-                                                    &crypto,
-                                                    &failures,
                                                     &recv_tx,
                                                     &peers,
                                                     &stream_tx,
                                                     &pty_tx,
                                                     &file_tx,
                                                     &hub_tx,
+                                                    &admitted,
                                                     &mut chunk_assemblies,
                                                 )
                                                 .await;
@@ -1247,12 +1194,6 @@ impl WebRtcChannel {
         format!("{truncated}...<truncated,len={count}>")
     }
 
-    /// Get the peer's Olm identity key for encrypting messages.
-    async fn get_peer_olm_key(&self) -> Result<String, ChannelError> {
-        self.peer_olm_key.lock().await.clone().ok_or_else(|| {
-            ChannelError::EncryptionError("No peer Olm key (SDP offer not yet handled)".into())
-        })
-    }
 }
 
 struct MdnsResolveCleanup {
@@ -1332,27 +1273,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plaintext_control_frame_routes_without_crypto() {
-        let payload = br#"{"type":"subscribe"}"#;
+    async fn authentication_frame_routes_before_admission() {
+        let payload = br#"{"type":"auth_response"}"#;
         let mut frame = vec![CONTENT_MSG];
         frame.extend_from_slice(payload);
         let (recv_tx, mut recv_rx) = mpsc::channel(1);
         let recv_tx = Arc::new(Mutex::new(Some(recv_tx)));
         let peers = Arc::new(RwLock::new(HashSet::new()));
-        let decrypt_failures = Arc::new(AtomicU32::new(0));
+        let authenticated = Arc::new(AtomicBool::new(false));
         let mut chunk_assemblies = HashMap::new();
 
         handle_dc_message(
             &frame,
             "anon:tab-1",
-            &None,
-            &decrypt_failures,
             &recv_tx,
             &peers,
             &None,
             &None,
             &None,
             &None,
+            &authenticated,
             &mut chunk_assemblies,
         )
         .await;
@@ -1361,6 +1301,33 @@ mod tests {
         assert_eq!(incoming.payload, payload);
         assert_eq!(incoming.sender.as_ref(), "anon:tab-1");
         assert!(peers.read().await.contains(&PeerId("anon:tab-1".into())));
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_subscription_is_rejected() {
+        let payload = br#"{"type":"subscribe"}"#;
+        let mut frame = vec![CONTENT_MSG];
+        frame.extend_from_slice(payload);
+        let (recv_tx, mut recv_rx) = mpsc::channel(1);
+        let recv_tx = Arc::new(Mutex::new(Some(recv_tx)));
+        let authenticated = Arc::new(AtomicBool::new(false));
+        let mut chunk_assemblies = HashMap::new();
+
+        handle_dc_message(
+            &frame,
+            "browser:tab-1",
+            &recv_tx,
+            &Arc::new(RwLock::new(HashSet::new())),
+            &None,
+            &None,
+            &None,
+            &None,
+            &authenticated,
+            &mut chunk_assemblies,
+        )
+        .await;
+
+        assert!(recv_rx.try_recv().is_err());
     }
 }
 
@@ -1504,16 +1471,6 @@ impl WebRtcChannel {
         Arc::clone(&self.recv_rx)
     }
 
-    /// Get consecutive decryption failure count.
-    pub fn decrypt_failure_count(&self) -> u32 {
-        self.decrypt_failures.load(Ordering::Relaxed)
-    }
-
-    /// Reset decryption failure counter.
-    pub fn reset_decrypt_failures(&self) {
-        self.decrypt_failures.store(0, Ordering::Relaxed);
-    }
-
     /// Stamp this channel with the hub offer generation that owns it.
     ///
     /// DataChannel-open events carry this value back to the hub so stale opens
@@ -1530,6 +1487,16 @@ impl WebRtcChannel {
         self.dc_opened.swap(false, Ordering::Relaxed)
     }
 
+    /// Admit this browser for application traffic on the current DataChannel.
+    pub(crate) fn mark_authenticated(&self) {
+        self.authenticated.store(true, Ordering::Release);
+    }
+
+    /// Return whether the hub admitted this browser on the current DataChannel.
+    pub(crate) fn is_authenticated(&self) -> bool {
+        self.authenticated.load(Ordering::Acquire)
+    }
+
     /// Returns a watch receiver for close-complete signaling.
     ///
     /// The value transitions to `true` when the connection closes and
@@ -1543,19 +1510,12 @@ impl WebRtcChannel {
 
     /// Check if the channel is ready for application messages.
     ///
-    /// With vodozemac, the session is established on first PreKey decrypt --
-    /// no separate handshake needed.
+    /// The channel is ready only after the hub admits the browser.
     pub fn is_ready(&self) -> bool {
-        if self.crypto_service.is_none() {
-            return true;
-        }
-        self.crypto_service
-            .as_ref()
-            .and_then(|cs| cs.lock().ok())
-            .is_some_and(|guard| guard.has_session())
+        self.is_authenticated()
     }
 
-    /// Send PTY output through the hot path with optional Olm encryption.
+    /// Send PTY output through the hot path.
     ///
     /// Zero base64, zero JSON. Binary inner format:
     /// `[0x01][flags:1][sub_id_len:1][sub_id][raw payload]`
@@ -1639,51 +1599,14 @@ impl WebRtcChannel {
         Ok(())
     }
 
-    /// Send a bundle refresh (type 2) via DataChannel.
-    ///
-    /// Wire format: `[0x02][161-byte DeviceKeyBundle]` (unencrypted).
-    /// The browser verifies the identity key matches the original QR trust anchor,
-    /// then creates a new outbound Olm session from the fresh one-time key.
-    pub async fn send_bundle_refresh(&self, bundle_bytes: &[u8]) -> Result<(), ChannelError> {
-        let pc_guard = self.peer_connection.lock().await;
-        let pc = pc_guard
-            .as_ref()
-            .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
-
-        let dc_id = self
-            .data_channel_id
-            .lock()
-            .await
-            .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
-
-        let mut frame = Vec::with_capacity(1 + bundle_bytes.len());
-        frame.push(crate::relay::MSG_TYPE_BUNDLE_REFRESH);
-        frame.extend_from_slice(bundle_bytes);
-
-        pc.send_data(dc_id, &frame)
-            .await
-            .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
-
-        Ok(())
-    }
-
     async fn encode_data_channel_frame(&self, plaintext: Vec<u8>) -> Result<Vec<u8>, ChannelError> {
-        let Some(ref crypto_service) = self.crypto_service else {
-            return Ok(plaintext);
-        };
-        let peer_key = self.get_peer_olm_key().await?;
-        crypto_service
-            .lock()
-            .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
-            .encrypt_binary(&plaintext, &peer_key)
-            .map_err(|e| ChannelError::EncryptionError(e.to_string()))
+        Ok(plaintext)
     }
 }
 
 /// Lightweight, cloneable send handle for a [`WebRtcChannel`].
 ///
-/// Holds only the `Arc`-wrapped fields needed by the async send methods
-/// (`send_pty_raw`, `send_to`, `send_stream_raw`, `send_bundle_refresh`).
+/// Holds only the `Arc`-wrapped fields needed by the async send methods.
 /// Designed to be moved into a per-peer `tokio::spawn` task so that
 /// DataChannel sends run off the Hub event loop.
 #[derive(Clone)]
@@ -1692,24 +1615,19 @@ pub struct WebRtcSender {
     peer_connection: Arc<Mutex<Option<PeerConnection>>>,
     /// SCTP stream ID for `pc.send_data(channel_id, ...)`.
     data_channel_id: Arc<Mutex<Option<u16>>>,
-    /// Optional Olm crypto for E2E encryption.
-    crypto_service: Option<CryptoService>,
     /// Channel configuration (compression threshold, etc.).
     config: Arc<Mutex<Option<ChannelConfig>>>,
-    /// Peer's Olm identity key for encryption.
-    peer_olm_key: Arc<Mutex<Option<String>>>,
 }
 
 impl std::fmt::Debug for WebRtcSender {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WebRtcSender")
-            .field("crypto_service", &self.crypto_service.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl WebRtcSender {
-    /// Compress and send PTY output with optional encryption.
+    /// Compress and send PTY output.
     ///
     /// Same logic as [`WebRtcChannel::send_pty_raw`] but operates on the
     /// extracted Arc fields so it can run in a spawned task.
@@ -1753,7 +1671,7 @@ impl WebRtcSender {
         Ok(())
     }
 
-    /// Serialize and send a JSON message with optional encryption.
+    /// Serialize and send a JSON message.
     ///
     /// Same logic as [`WebRtcChannel::send_to`] but for the extracted handle.
     pub async fn send_json(&self, payload: &[u8]) -> Result<(), ChannelError> {
@@ -1821,112 +1739,60 @@ impl WebRtcSender {
         Ok(())
     }
 
-    /// Send a bundle refresh (type 2) via DataChannel (unencrypted).
-    pub async fn send_bundle_refresh(&self, bundle_bytes: &[u8]) -> Result<(), ChannelError> {
-        let pc_guard = self.peer_connection.lock().await;
-        let pc = pc_guard
-            .as_ref()
-            .ok_or_else(|| ChannelError::SendFailed("No peer connection".to_string()))?;
-
-        let dc_id = self
-            .data_channel_id
-            .lock()
-            .await
-            .ok_or_else(|| ChannelError::SendFailed("No data channel".to_string()))?;
-
-        let mut frame = Vec::with_capacity(1 + bundle_bytes.len());
-        frame.push(crate::relay::MSG_TYPE_BUNDLE_REFRESH);
-        frame.extend_from_slice(bundle_bytes);
-
-        pc.send_data(dc_id, &frame)
-            .await
-            .map_err(|e| ChannelError::SendFailed(e.to_string()))?;
-
-        Ok(())
-    }
-
-    /// Get the peer's Olm identity key.
-    async fn get_peer_olm_key(&self) -> Result<String, ChannelError> {
-        self.peer_olm_key
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| ChannelError::EncryptionError("No peer Olm key set".into()))
-    }
-
     async fn encode_data_channel_frame(&self, plaintext: Vec<u8>) -> Result<Vec<u8>, ChannelError> {
-        let Some(ref crypto_service) = self.crypto_service else {
-            return Ok(plaintext);
-        };
-        let peer_key = self.get_peer_olm_key().await?;
-        crypto_service
-            .lock()
-            .map_err(|e| ChannelError::EncryptionError(format!("Crypto mutex poisoned: {e}")))?
-            .encrypt_binary(&plaintext, &peer_key)
-            .map_err(|e| ChannelError::EncryptionError(e.to_string()))
+        Ok(plaintext)
     }
 }
 
 impl WebRtcChannel {
     /// Create a [`WebRtcSender`] handle for off-event-loop async sends.
     ///
-    /// The sender holds `Arc` clones of the fields needed for encryption
-    /// and DataChannel transmission. Safe to move into a `tokio::spawn` task.
+    /// The sender holds the fields needed for DataChannel transmission.
     pub fn sender(&self) -> WebRtcSender {
         WebRtcSender {
             peer_connection: Arc::clone(&self.peer_connection),
             data_channel_id: Arc::clone(&self.data_channel_id),
-            crypto_service: self.crypto_service.clone(),
             config: Arc::clone(&self.config),
-            peer_olm_key: Arc::clone(&self.peer_olm_key),
         }
     }
 }
 
-/// Handle an incoming DataChannel message: decrypt and route by content type.
+/// Handle an incoming DataChannel message and route it by content type.
 ///
 /// Extracted as a standalone async fn to avoid deep nesting in the event loop.
 #[allow(clippy::too_many_arguments)]
 async fn handle_dc_message(
     data: &[u8],
     browser_identity: &str,
-    crypto_service: &Option<CryptoService>,
-    decrypt_failures: &Arc<AtomicU32>,
     recv_tx: &Arc<Mutex<Option<mpsc::Sender<RawIncoming>>>>,
     peers: &Arc<RwLock<HashSet<PeerId>>>,
     stream_frame_tx: &Option<mpsc::Sender<StreamIncoming>>,
     pty_input_tx: &Option<mpsc::Sender<PtyInputIncoming>>,
     file_input_tx: &Option<mpsc::Sender<FileInputIncoming>>,
     hub_event_tx: &Option<crate::hub::events::HubEventTx>,
+    authenticated: &Arc<AtomicBool>,
     chunk_assemblies: &mut std::collections::HashMap<u8, FileChunkAssembly>,
 ) {
-    let plaintext = if let Some(ref cs) = crypto_service {
-        let peer_olm_key = crate::relay::extract_olm_key(browser_identity);
-        match cs.lock() {
-            Ok(mut guard) => match guard.decrypt_binary(data, Some(peer_olm_key)) {
-                Ok(pt) => {
-                    decrypt_failures.store(0, Ordering::Relaxed);
-                    pt
-                }
-                Err(e) => {
-                    decrypt_failures.fetch_add(1, Ordering::Relaxed);
-                    log::error!("[WebRTC-DC] Olm decryption FAILED: {e}");
-                    return;
-                }
-            },
-            Err(e) => {
-                log::error!("[WebRTC-DC] Crypto mutex poisoned: {e}");
-                return;
-            }
-        }
-    } else {
-        data.to_vec()
-    };
+    let plaintext = data.to_vec();
 
     // Parse binary inner content: first byte = content type
     if plaintext.is_empty() {
-        log::warn!("[WebRTC-DC] Empty decrypted content");
+        log::warn!("[WebRTC-DC] Empty content");
         return;
+    }
+
+    if !authenticated.load(Ordering::Acquire) {
+        if plaintext[0] != CONTENT_MSG {
+            log::warn!("[WebRTC-Auth] Rejected unauthenticated binary traffic");
+            return;
+        }
+        let request_type = serde_json::from_slice::<serde_json::Value>(&plaintext[1..])
+            .ok()
+            .and_then(|value| value.get("type").and_then(|kind| kind.as_str()).map(str::to_owned));
+        if !matches!(request_type.as_deref(), Some("pair_request" | "auth_response")) {
+            log::warn!("[WebRTC-Auth] Rejected unauthenticated application traffic");
+            return;
+        }
     }
 
     let body_bytes = match plaintext[0] {

@@ -4,8 +4,11 @@ const mocks = vi.hoisted(() => {
   const listeners = new Map();
   const subscriptionListeners = new Map();
   const sendCalls = [];
+  const hasBrowserCredential = vi.fn(() => Promise.resolve(true));
+  const getBrowserCredentialId = vi.fn(() => Promise.resolve("browser-key"));
 
   const bridge = {
+    init: vi.fn(() => Promise.resolve()),
     hasPairing: vi.fn(() => Promise.resolve({ hasPairing: true })),
     getIdentityKey: vi.fn(() => Promise.resolve({ identityKey: "browser-key" })),
     hasSession: vi.fn(() => Promise.resolve({ hasSession: true })),
@@ -79,13 +82,16 @@ const mocks = vi.hoisted(() => {
       bridge.on.mockClear();
       bridge.onSubscriptionMessage.mockClear();
       bridge.clearSubscriptionListeners.mockClear();
+      hasBrowserCredential.mockReset();
+      hasBrowserCredential.mockResolvedValue(true);
     },
     sendCalls,
   };
 
   return {
     bridge,
-    ensureMatrixReady: vi.fn(() => Promise.resolve()),
+    hasBrowserCredential,
+    getBrowserCredentialId,
     observeBrowserSocketState: vi.fn((callback) => {
       callback("connected");
       return Promise.resolve(() => {});
@@ -97,8 +103,9 @@ vi.mock("workers/bridge", () => ({
   default: mocks.bridge,
 }));
 
-vi.mock("matrix/bundle", () => ({
-  ensureMatrixReady: mocks.ensureMatrixReady,
+vi.mock("transport/browser_pairing", () => ({
+  hasBrowserCredential: mocks.hasBrowserCredential,
+  getBrowserCredentialId: mocks.getBrowserCredentialId,
 }));
 
 vi.mock("transport/hub_signaling_client", () => ({
@@ -167,55 +174,28 @@ describe("HubRoute peer health probes", () => {
     await flushPromises();
   }
 
-  it("keeps an open local peer after one missed encrypted pong", async () => {
+  it("keeps an open local peer after one missed pong", async () => {
     await emitStallAndWaitForProbe();
 
     expect(disconnectPeerCalls()).toHaveLength(0);
     expect(route.subscriptionId).toBe("hub:hub-1");
   });
 
-  it("connects an unpaired browser when the live hub disables encryption", async () => {
+  it("does not connect an unpaired browser", async () => {
     route.destroy();
     route = null;
     mocks.bridge.reset();
-    mocks.bridge.hasPairing.mockResolvedValue({ hasPairing: false });
-    window.location.hash = "#no-encryption";
-    mocks.bridge.send.mockImplementation((type, payload) => {
-      mocks.bridge.sendCalls.push([type, payload]);
-      if (type === "connectSignaling") {
-        queueMicrotask(() => {
-          mocks.bridge.emit("transport:config", {
-            hubId: payload.hubId,
-            e2e_enabled: false,
-          });
-          mocks.bridge.emit("health", { hubId: payload.hubId, cli: "online" });
-        });
-        return Promise.resolve({
-          state: "connected",
-          browserSocketState: "connected",
-          mode: "direct",
-        });
-      }
-      return Promise.resolve({});
-    });
+    mocks.hasBrowserCredential.mockResolvedValueOnce(false);
 
     route = new TestHubRoute("hub-1", { hubId: "hub-1" }, manager);
     await route.initialize();
     await flushPromises();
 
-    expect(mocks.bridge.sendCalls).toContainEqual([
-      "connectSignaling",
-      {
-        hubId: "hub-1",
-        browserIdentity: expect.stringMatching(/^anon:/),
-        allowPlaintext: true,
-      },
-    ]);
-    expect(mocks.bridge.sendCalls.some(([type]) => type === "connectPeer")).toBe(true);
-    expect(mocks.bridge.hasSession).not.toHaveBeenCalled();
+    expect(mocks.bridge.sendCalls.some(([type]) => type === "connectPeer")).toBe(false);
+    expect(route.getError()).toBe("Scan connection code");
   });
 
-  it("passes the Hub connection URL plaintext opt-in to the transport", async () => {
+  it("does not treat no-encryption as a transport option", async () => {
     route.destroy();
     route = null;
     mocks.bridge.reset();
@@ -229,10 +209,10 @@ describe("HubRoute peer health probes", () => {
       "connectSignaling",
       {
         hubId: "hub-1",
-        browserIdentity: expect.any(String),
-        allowPlaintext: true,
+        browserIdentity: expect.stringMatching(/^browser-key:/),
       },
     ]);
+    expect(localStorage.getItem("botster:hub:hub-1:allowPlaintext")).toBeNull();
   });
 
   it("rebuilds after repeated missed encrypted pongs while local peer is open", async () => {

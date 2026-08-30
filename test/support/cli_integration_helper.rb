@@ -50,8 +50,8 @@ module CliIntegrationHelper
     wait_for_hub_ready if gate_hub_ready
   end
 
-  # If the SPA has dropped into a "pairing_needed" state (stale session or a
-  # lost Olm handshake), revisit the pairing URL once to re-drive the flow.
+  # If the SPA has entered a "pairing_needed" state, revisit the pairing URL
+  # once to restart authentication.
   # Otherwise a no-op. Used by tests that do a pre-pair visit to the hub page
   # and by tests that stop/restart the CLI mid-test.
   def revisit_pairing_url_if_needed(url, hub: @hub)

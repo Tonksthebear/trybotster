@@ -7,7 +7,7 @@ require "test_helper"
 # This is the browser's channel for WebRTC signaling. It:
 # - Streams scoped signals from CLI (via hub:id:signal:identity)
 # - Streams shared health updates (via hub:id:health)
-# - Relays opaque encrypted envelopes from browser → CLI (via hub_command stream)
+# - Relays opaque signaling envelopes from browser to CLI.
 #
 # Auth: Browser session (Warden) — NOT for CLI use.
 # CLI uses HubCommandChannel for the other direction.
@@ -69,34 +69,15 @@ class HubSignalingChannelTest < ActionCable::Channel::TestCase
     assert_equal "offline", health["cli"]
   end
 
-  test "subscribe requests a fresh bundle for paired browsers" do
-    assert_broadcast_on("hub_command:#{@hub.id}", {
-      type: "bundle_request",
-      browser_identity: @browser_identity
-    }) do
-      subscribe hub_id: @hub.id, browser_identity: @browser_identity
-    end
-  end
-
-  test "subscribe requests transport config from the live hub" do
-    assert_broadcast_on("hub_command:#{@hub.id}", {
-      type: "transport_config_request",
-      browser_identity: @browser_identity
-    }) do
-      subscribe hub_id: @hub.id, browser_identity: @browser_identity
-    end
-  end
-
-
-  test "anonymous subscribe requests config but not a bundle" do
-    assert_broadcasts("hub_command:#{@hub.id}", 1) do
+  test "subscribe does not make trust decisions" do
+    assert_broadcasts("hub_command:#{@hub.id}", 0) do
       subscribe hub_id: @hub.id, browser_identity: "anon:test-tab"
     end
 
     assert subscription.confirmed?
   end
 
-  test "subscribe does not request a bundle while hub is offline" do
+  test "offline subscribe does not broadcast" do
     @hub.update!(alive: false)
 
     assert_broadcasts("hub_command:#{@hub.id}", 0) do
@@ -145,31 +126,9 @@ class HubSignalingChannelTest < ActionCable::Channel::TestCase
     assert_broadcast_on(hub_command_stream, {
       type: "signal",
       browser_identity: @browser_identity,
-      envelope: { "ciphertext" => "encrypted_offer" }
+      envelope: { "type" => "offer", "sdp" => "opaque-sdp" }
     }) do
-      perform :signal, envelope: { ciphertext: "encrypted_offer" }
-    end
-  end
-
-  test "request_bundle relays a fresh bundle request to hub_command stream for CLI" do
-    subscribe hub_id: @hub.id, browser_identity: @browser_identity
-
-    assert_broadcast_on("hub_command:#{@hub.id}", {
-      type: "bundle_request",
-      browser_identity: @browser_identity
-    }) do
-      perform :request_bundle
-    end
-  end
-
-  test "request_transport_config relays a config request to the live hub" do
-    subscribe hub_id: @hub.id, browser_identity: @browser_identity
-
-    assert_broadcast_on("hub_command:#{@hub.id}", {
-      type: "transport_config_request",
-      browser_identity: @browser_identity
-    }) do
-      perform :request_transport_config
+      perform :signal, envelope: { type: "offer", sdp: "opaque-sdp" }
     end
   end
 

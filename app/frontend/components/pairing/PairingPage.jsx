@@ -92,7 +92,7 @@ export default function PairingPage({ hubId, redirectUrl }) {
   const inputRef = useRef(null)
   const [copyLabel, setCopyLabel] = useState('Copy Code')
 
-  // Initialize on mount: parse bundle from URL fragment, init crypto
+  // Parse the bundle and initialize the WebRTC transport.
   useEffect(() => {
     let cancelled = false
 
@@ -107,13 +107,13 @@ export default function PairingPage({ hubId, redirectUrl }) {
         history.replaceState(null, '', location.pathname + location.search)
       }
 
-      // Initialize crypto worker
+      // Initialize the WebRTC transport.
       try {
         await ensureCryptoReady()
       } catch (error) {
-        console.error('[PairingPage] Failed to initialize crypto:', error)
+        console.error('[PairingPage] Failed to initialize transport:', error)
         if (!cancelled) {
-          store.fail('Failed to initialize encryption. Please refresh and try again.')
+          store.fail('Failed to initialize the browser transport. Please refresh and try again.')
         }
         return
       }
@@ -192,7 +192,9 @@ export default function PairingPage({ hubId, redirectUrl }) {
     }
   }
 
-  const fingerprint = store.bundle?.identityKey?.slice(0, 8)
+  const fingerprint = store.bundle?.hubPublicKey
+    ? Array.from(store.bundle.hubPublicKey.slice(0, 4), byte => byte.toString(16).padStart(2, '0')).join('')
+    : null
 
   return (
     <div className="min-h-[calc(100vh-8rem)] flex items-center justify-center px-4 py-12">
@@ -241,7 +243,7 @@ export default function PairingPage({ hubId, redirectUrl }) {
             <div className="flex items-start gap-2 p-3 bg-zinc-900/50 border border-zinc-800 rounded-lg">
               <ShieldCheckIcon className="size-4 text-emerald-500 mt-0.5 shrink-0" />
               <p className="text-xs text-zinc-400">
-                The connection link contains encrypted keys that never touch the server. Your session is end-to-end encrypted.
+                The connection link contains a one-time secret. The URL fragment never goes to the server.
               </p>
             </div>
           </div>
@@ -257,9 +259,9 @@ export default function PairingPage({ hubId, redirectUrl }) {
                     <LockIcon className="size-5 text-primary-400" />
                   </div>
                   <div>
-                    <h3 className="text-sm font-medium text-zinc-200">End-to-end encrypted</h3>
+                    <h3 className="text-sm font-medium text-zinc-200">Hub identity pinned</h3>
                     <p className="text-xs text-zinc-500 mt-1">
-                      Your private keys are generated locally and never leave this device. Not even Botster's servers can read your messages.
+                      This browser creates its own signing key. The private key stays in this browser.
                     </p>
                   </div>
                 </div>
@@ -294,7 +296,7 @@ export default function PairingPage({ hubId, redirectUrl }) {
             <div className="inline-flex items-center justify-center w-12 h-12 bg-primary-500/10 rounded-xl mb-4">
               <SpinnerIcon className="w-6 h-6 text-primary-400 animate-spin" />
             </div>
-            <Text>Establishing encrypted session...</Text>
+            <Text>Saving the browser credential...</Text>
           </div>
         )}
 
@@ -339,7 +341,7 @@ export default function PairingPage({ hubId, redirectUrl }) {
           </div>
         )}
 
-        {/* Idle/initializing — blank, crypto loading */}
+        {/* Idle while the browser transport loads. */}
         {store.status === 'idle' && (
           <div className="text-center py-8">
             <SpinnerIcon className="w-6 h-6 text-zinc-500 animate-spin mx-auto" />

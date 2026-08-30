@@ -216,10 +216,7 @@ impl Hub {
         use crate::lua::primitives::ActionCableRequest;
 
         match request {
-            ActionCableRequest::Connect {
-                connection_id,
-                crypto,
-            } => {
+            ActionCableRequest::Connect { connection_id } => {
                 let handle = self.tokio_runtime.handle().clone();
                 let _guard = handle.enter();
                 let connection =
@@ -229,16 +226,9 @@ impl Hub {
                     );
                 self.lua_ac_connections.insert(
                     connection_id.clone(),
-                    LuaAcConnection {
-                        connection,
-                        crypto_enabled: crypto,
-                    },
+                    LuaAcConnection { connection },
                 );
-                log::info!(
-                    "[ActionCable-Lua] Connection '{}' opened (crypto={})",
-                    connection_id,
-                    crypto
-                );
+                log::info!("[ActionCable-Lua] Connection '{}' opened", connection_id);
             }
 
             ActionCableRequest::Subscribe {
@@ -656,13 +646,10 @@ impl Hub {
     pub(super) fn poll_lua_action_cable_channels(&mut self) {
         use crate::lua::primitives::action_cable;
 
-        let crypto = self.browser.crypto_service.as_ref();
         let _count = action_cable::poll_lua_action_cable_channels(
             self.lua.lua_ref(),
             &mut self.lua_ac_channels,
-            &self.lua_ac_connections,
             self.lua.ac_callback_registry(),
-            crypto,
         );
     }
 

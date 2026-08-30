@@ -3,13 +3,13 @@
 //! This module provides the browser relay functionality, handling WebRTC
 //! DataChannel communication with connected browser clients. It manages:
 //!
-//! - E2E encrypted communication (vodozemac Olm)
+//! - Key-authenticated browser admission
 //! - Terminal output streaming
 //!
 //! # Architecture
 //!
 //! ```text
-//! Browser ◄──WebRTC DataChannel (E2E encrypted)──► CLI
+//! Browser ◄──WebRTC DataChannel──► CLI
 //!                                                    │
 //!                              Hub ◄─── HubCommandChannel (signaling via Rails)
 //!                              │
@@ -18,33 +18,17 @@
 //!                    TerminalRelayChannel (PTY I/O subscription type)
 //! ```
 //!
-//! # Encryption
-//!
-//! All communication between the CLI and browser is E2E encrypted using
-//! vodozemac Olm (direct, no matrix-sdk-crypto wrapper).
-//!
-//! ## Vodozemac Crypto (v6)
-//!
-//! Uses Olm (1:1 Double Ratchet) from vodozemac directly.
-//! Key bundles are 161 bytes (fixed size), fitting easily in QR codes.
-//!
-//! 1. CLI creates vodozemac Account
-//! 2. CLI displays QR code with DeviceKeyBundle
-//! 3. Browser scans QR, creates outbound Olm session
-//! 4. Browser sends PreKey message via DataChannel
-//! 5. CLI creates inbound session, both sides encrypted
+//! WebRTC DataChannels provide transport encryption. The hub admits each
+//! browser with a one-time pairing secret or a stored browser public key.
 //!
 //! # Modules
 //!
-//! - [`crypto_service`] - Thread-safe crypto wrapper (`Arc<Mutex<VodozemacCrypto>>`)
-//! - [`olm_crypto`] - Vodozemac Olm E2E encryption
 //! - [`persistence`] - Encrypted storage for relay-side secrets and metadata
 //! - [`state`] - Browser connection state management
 //! - [`types`] - Protocol message types
 //! - [`stream_mux`] - TCP stream multiplexer for preview tunneling
 
-pub mod crypto_service;
-pub mod olm_crypto;
+pub mod pairing;
 pub mod persistence;
 pub mod state;
 pub mod stream_mux;
@@ -54,11 +38,8 @@ pub use state::BrowserState;
 
 pub use types::{AgentInfo, BrowserCommand, BrowserResize, TerminalMessage};
 
-pub use olm_crypto::{
-    binary_format, extract_olm_key, DeviceKeyBundle, OlmEnvelope, VodozemacCrypto,
-    MSG_TYPE_BUNDLE_REFRESH, MSG_TYPE_NORMAL, MSG_TYPE_PREKEY, PROTOCOL_VERSION,
-};
-
 pub use persistence::{delete_connection_url, read_connection_url, write_connection_url};
-
-pub use crypto_service::{create_crypto_service, CryptoService};
+pub use pairing::{
+    AuthAccepted, AuthChallenge, BrowserAdmission, BrowserAuthRequest, BrowserCredential,
+    DtlsBinding, PairingAuthority, PairingBundle, PAIRING_PROTOCOL_VERSION,
+};

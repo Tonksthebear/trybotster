@@ -350,9 +350,6 @@ ActionCable (Rails):
   action_cable.close(conn)          -- closes connection and all its channels
   -- action_cable.unsubscribe(ch)   -- or unsubscribe a single channel
 
-  -- With E2E crypto (auto-decrypts signal envelopes on this connection):
-  local crypto_conn = action_cable.connect({ crypto = true })
-
 Raw WebSocket:
   local ws, err = websocket.connect("wss://...", {
     on_open    = function() log.info("connected") end,

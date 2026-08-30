@@ -52,9 +52,6 @@ Rails.application.routes.draw do
     end
   end
 
-  # Browser key registration (E2E keypairs - backward compat with CLI API calls)
-  resources :devices, only: [ :index, :create, :destroy ]
-
   # User settings
   resource :settings, only: [ :show ]
 

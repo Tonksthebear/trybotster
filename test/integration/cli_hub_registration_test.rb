@@ -25,22 +25,28 @@ class CliHubRegistrationTest < CliIntegrationTestCase
     assert cli.hub.fingerprint.present?, "Hub should have a fingerprint"
   end
 
-  test "CLI creates connection URL with vodozemac DeviceKeyBundle" do
+  test "CLI creates connection URL with key-authenticated pairing bundle" do
     cli = start_cli(@hub, timeout: 20)
 
     connection_url = cli.connection_url
     assert connection_url.present?, "Connection URL should be available"
 
     # URL format: /hubs/{id}#{base32_bundle}
-    # Fragment contains raw Base32-encoded DeviceKeyBundle (no prefix for QR efficiency)
+    # The fragment contains the pairing bundle and never reaches Rails.
     uri = URI.parse(connection_url)
-    assert uri.fragment.present?, "URL should have fragment with DeviceKeyBundle"
+    assert uri.fragment.present?, "URL should have a pairing fragment"
 
     # Bundle should be Base32-encoded data (uppercase A-Z, 2-7)
     assert uri.fragment.match?(/\A[A-Z2-7]+\z/),
       "Fragment should be raw Base32 encoded. Got: #{uri.fragment[0..50]}..."
-    assert uri.fragment.length >= 250,
-      "Bundle should be ~258 chars for v6 vodozemac bundle (161 bytes). Got: #{uri.fragment.length}"
+    assert uri.fragment.length >= 120, "Pairing bundle should contain route and key data"
+
+    bytes = base32_decode(uri.fragment)
+    route_length = bytes[9, 2].pack("C*").unpack1("n")
+    route = bytes[11, route_length].pack("C*")
+    assert_equal 7, bytes.first
+    assert_equal "/hubs/#{cli.hub.id}", route
+    assert_equal 11 + route_length + 64, bytes.length
   end
 
   test "CLI updates hub last_seen_at on registration" do
@@ -92,5 +98,13 @@ class CliHubRegistrationTest < CliIntegrationTestCase
 
     # Output should contain startup info
     assert output.present?, "Should have captured output"
+  end
+
+  private
+
+  def base32_decode(input)
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+    bits = input.chars.map { |character| alphabet.index(character).to_s(2).rjust(5, "0") }.join
+    (bits.length / 8).times.map { |index| bits[index * 8, 8].to_i(2) }
   end
 end

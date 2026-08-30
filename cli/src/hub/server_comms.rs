@@ -2,7 +2,7 @@
 //!
 //! This module handles all communication with the Rails server, including:
 //!
-//! - WebRTC peer connections and signaling (E2E encrypted with vodozemac Olm)
+//! - Key-authenticated WebRTC peer connections and opaque signaling
 //! - Agent notification delivery via background worker
 //! - Device and hub registration
 //! - Lua plugin event processing (ActionCable, WebSocket, timers, HTTP, etc.)
@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 use crate::hub::actions::{self, HubAction};
 use crate::hub::{registration, Hub, PendingTerminalAttach, PendingTerminalAttachRequest};
 use crate::notifications::push::send_push_direct;
-use base64::Engine;
 
 mod event_lua;
 mod event_maintenance;
