@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useMemo } from 'react'
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import {
   Dialog,
   DialogTitle,
@@ -15,8 +15,10 @@ export default function ShareHub({ hubId }) {
   const [status, setStatus] = useState('idle') // idle | loading | success | error
   const [errorMessage, setErrorMessage] = useState('')
   const [copyStatus, setCopyStatus] = useState('')
+  const requestedRevisionRef = useRef(null)
   const connectionCodeOrder = useConnectionCodeStore((state) => state.order)
   const connectionCodesById = useConnectionCodeStore((state) => state.byId)
+  const connectionCodeRevision = useConnectionCodeStore((state) => state.revision)
   const connectionCode = connectionCodesById[connectionCodeOrder[0]]
   const url = connectionCode?.url || ''
   const qrAscii = useMemo(() => {
@@ -26,25 +28,26 @@ export default function ShareHub({ hubId }) {
 
   useEffect(() => {
     if (!open) return
+    if (requestedRevisionRef.current !== null) {
+      if (connectionCodeRevision <= requestedRevisionRef.current) return
+      requestedRevisionRef.current = null
+    }
     if (connectionCode?.error) {
       setStatus('error')
       setErrorMessage(String(connectionCode.error))
     } else if (url && qrAscii) {
       setStatus('success')
     }
-  }, [open, connectionCode?.error, url, qrAscii])
+  }, [open, connectionCode?.error, connectionCodeRevision, url, qrAscii])
 
   const requestCode = useCallback(async () => {
-    if (url && qrAscii) {
-      setStatus('success')
-      return
-    }
-
-    setStatus(connectionCode?.error ? 'error' : 'loading')
+    requestedRevisionRef.current = connectionCodeRevision
+    setStatus('loading')
     setErrorMessage('')
 
     const hub = await waitForHub(hubId)
     if (!hub) {
+      requestedRevisionRef.current = null
       setStatus('error')
       setErrorMessage('Connection unavailable')
       return
@@ -53,14 +56,16 @@ export default function ShareHub({ hubId }) {
     try {
       const sent = await hub.requestConnectionCode()
       if (!sent) {
+        requestedRevisionRef.current = null
         setStatus('error')
         setErrorMessage('Failed to send request - not connected')
       }
     } catch (err) {
+      requestedRevisionRef.current = null
       setStatus('error')
       setErrorMessage(err.message || 'Connection failed')
     }
-  }, [connectionCode?.error, hubId, qrAscii, url])
+  }, [connectionCodeRevision, hubId])
 
   function handleOpen() {
     setOpen(true)

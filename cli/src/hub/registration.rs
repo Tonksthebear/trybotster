@@ -141,13 +141,16 @@ pub fn get_or_generate_connection_bundle(
     browser: &mut BrowserState,
     _runtime: &tokio::runtime::Runtime,
 ) -> Result<crate::relay::PairingBundle, String> {
-    // Return cached bundle if available and not used
+    // Return the cached bundle only while its secret is valid and unused.
     if let Some(ref bundle) = browser.pairing_bundle {
-        if !browser.bundle_used {
+        if !browser.bundle_used && !bundle.is_expired() {
             return Ok(bundle.clone());
         }
-        // Bundle was used, need to regenerate
-        log::info!("Previous pairing secret was used, generating a fresh secret");
+        if browser.bundle_used {
+            log::info!("Previous pairing secret was used, generating a fresh secret");
+        } else {
+            log::info!("Previous pairing secret expired, generating a fresh secret");
+        }
     }
 
     let authority = browser
@@ -274,6 +277,20 @@ mod tests {
         let second = get_or_generate_connection_bundle(&mut browser, &runtime).unwrap();
         assert_ne!(first.pairing_secret, second.pairing_secret);
         assert_eq!(first.hub_public_key, second.hub_public_key);
+        assert!(!browser.bundle_used);
+    }
+
+    #[test]
+    fn expired_pairing_bundle_gets_a_fresh_secret() {
+        let mut browser = browser();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let first = get_or_generate_connection_bundle(&mut browser, &runtime).unwrap();
+        browser.pairing_bundle.as_mut().unwrap().expires_at = 0;
+
+        let second = get_or_generate_connection_bundle(&mut browser, &runtime).unwrap();
+
+        assert_ne!(first.pairing_secret, second.pairing_secret);
+        assert!(!second.is_expired());
         assert!(!browser.bundle_used);
     }
 }

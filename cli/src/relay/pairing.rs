@@ -35,6 +35,10 @@ pub struct PairingBundle {
 }
 
 impl PairingBundle {
+    pub fn is_expired(&self) -> bool {
+        self.expires_at < now_epoch_secs()
+    }
+
     /// Binary format: version, expiry, route length, route, hub key, secret.
     pub fn to_binary(&self) -> Result<Vec<u8>> {
         let route = self.route.as_bytes();
